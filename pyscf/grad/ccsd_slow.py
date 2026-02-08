@@ -29,6 +29,7 @@ from pyscf import lib
 from pyscf import ao2mo
 from pyscf.cc import ccsd_rdm
 from pyscf.grad import ccsd as ccsd_grad
+from pyscf.grad.mp2 import has_frozen_orbitals
 
 def kernel(cc, t1, t2, l1, l2, eris=None):
     if eris is None:
@@ -40,9 +41,7 @@ def kernel(cc, t1, t2, l1, l2, eris=None):
     nocc = numpy.count_nonzero(cc.mo_occ > 0)
     mo_e_o = mo_energy[:nocc]
     mo_e_v = mo_energy[nocc:]
-    with_frozen = not ((cc.frozen is None)
-                       or (isinstance(cc.frozen, (int, numpy.integer)) and cc.frozen == 0)
-                       or (len(cc.frozen) == 0))
+    with_frozen = has_frozen_orbitals(cc)
 
     d1 = _gamma1_intermediates(cc, t1, t2, l1, l2)
     d2 = _gamma2_intermediates(cc, t1, t2, l1, l2)
@@ -250,7 +249,7 @@ if __name__ == '__main__':
     ghf = grad.RHF(mf).grad()
     print('gcc')
     print(ghf+g1)
-    print(lib.finger(g1) - -0.042511000925747583)
+    print(lib.fp(g1) - -0.042511000925747583)
 #[[ 0   0                1.00950969e-02]
 # [ 0   2.28063353e-02  -5.04754844e-03]
 # [ 0  -2.28063353e-02  -5.04754844e-03]]
@@ -273,7 +272,7 @@ if __name__ == '__main__':
     ghf = grad.RHF(mf).grad()
     print('gcc')
     print(ghf+g1)
-    print(lib.finger(g1) - 0.10048468674687236)
+    print(lib.fp(g1) - 0.10048468674687236)
 #[[ -7.81105940e-17   3.81840540e-15   1.20415540e-02]
 # [  1.73095055e-16  -7.94568837e-02  -6.02077699e-03]
 # [ -9.49844615e-17   7.94568837e-02  -6.02077699e-03]]

@@ -23,13 +23,13 @@ myadc.kernel_gs()
 
 #IP-RADC(2) for 3 roots
 myadc.verbose = 4
-myadcip = adc.radc.RADCIP(myadc)
+myadcip = adc.radc_ip.RADCIP(myadc)
 eip,vip,pip,xip = myadcip.kernel(nroots=3)
 
 #EA-RADC(3) for 3 roots
 myadc.method = "adc(3)"
 myadc.kernel_gs()
-myadcea = adc.radc.RADCEA(myadc)
+myadcea = adc.radc_ea.RADCEA(myadc)
 eea,vea,pea,xea = myadcea.kernel(nroots=3)
 
 #Analyze eigenvectors only
@@ -39,4 +39,9 @@ myadcea.analyze()
 #IP/EA-RADC(3) for 1 root
 eip,vip,pip,xip,adc_es = myadc.ip_adc()
 eea,vea,pea,xea,adc_es = myadc.ea_adc()
+
+#EE-RADC(3) for 3 roots
+myadc.method = "adc(3)"
+myadc.method_type = "ee"
+myadc.ee_adc(nroots=3)
 

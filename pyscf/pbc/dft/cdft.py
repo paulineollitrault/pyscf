@@ -38,7 +38,7 @@ def cdft(mf,cell,offset,orbital,basis=None):
     '''
     Input:
         mf -- a mean field object for DFT or (in principle) HF (doesn't really matter)
-        shift -- float -- a semi aribitrary energy which displaces the selected orbitals by the diagonal
+        shift -- float -- a semi arbitrary energy which displaces the selected orbitals by the diagonal
         orbital -- int -- indicating which orbital are shifted in the selected basis
         basis -- 2D numpy array -- the working basis in the basis of AOs from 'cell' (Defaults to AO basis)
 
@@ -56,8 +56,8 @@ def cdft(mf,cell,offset,orbital,basis=None):
     #
 
     iaoi = a.T[orbital,:]
-    ##gonna try nomrlaizing to see if that makes life better
-    ##iaoi = iaoi / numpy.linalg.norm(iaoi)
+    # gonna try normalizing to see if that makes life better
+    # iaoi = iaoi / numpy.linalg.norm(iaoi)
     mf.shift_hamiltonian= numpy.diag(iaoi) * offset
     mf.constrained_dft = True
 
@@ -73,8 +73,8 @@ def cdft(mf,cell,offset,orbital,basis=None):
 
 def fast_iao_mullikan_pop(mf,cell,a=None):
     '''
-    Input: mf -- a preconverged mean fild object
-    Returns: mullikan populaion analysis in the basisIAO a
+    Input: mf -- a preconverged mean field object
+    Returns: mullikan population analysis in the basisIAO a
     '''
 
     #
@@ -123,7 +123,7 @@ if __name__ == '__main__':
     cell.build()
     cell.rcut*=2
 
-    print("running intial DFT calc to generate IAOs")
+    print("running initial DFT calc to generate IAOs")
     mf = dft.RKS(cell)
     mf.chkfile = 'graphene.chk'
     mf.init_guess = 'chkfile'

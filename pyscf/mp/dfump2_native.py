@@ -40,9 +40,6 @@ class DFUMP2(DFRMP2):
             auxbasis : name of auxiliary basis set, otherwise determined automatically
         '''
 
-        if not isinstance(mf, scf.uhf.UHF):
-            raise TypeError('Class initialization with non-UHF object')
-
         # UHF quantities are stored as numpy arrays
         self.mo_coeff = np.array(mf.mo_coeff)
         self.mo_energy = np.array(mf.mo_energy)
@@ -130,8 +127,15 @@ class DFUMP2(DFRMP2):
         '''
         Calculates the MP2 correlation energy.
         '''
+        logger = lib.logger
+        log = logger.new_logger(self)
+
+        cput0 = cput1 = (logger.process_clock(), logger.perf_counter())
+
         if not self.has_ints:
             self.calculate_integrals_()
+
+        cput1 = log.timer('ao2mo', *cput1)
 
         logger = lib.logger.new_logger(self)
         logger.info('')
@@ -139,6 +143,8 @@ class DFUMP2(DFRMP2):
         self.e_corr = emp2_uhf(self._intsfile, self.mo_energy, self.frozen_mask,
                                logger, ps=self.ps, pt=self.pt)
         logger.note('DF-MP2 correlation energy: {0:.14f}'.format(self.e_corr))
+        log.timer('kernel', *cput1)
+        log.timer(self.__class__.__name__, *cput0)
         return self.e_corr
 
     def make_rdm1(self, relaxed=False, ao_repr=False):
@@ -205,6 +211,8 @@ class DFUMP2(DFRMP2):
         '''
         Calculates the three center integrals for MP2.
         '''
+        if not isinstance(self._scf, scf.uhf.UHF):
+            raise TypeError('Class initialization with non-UHF object')
         intsfile = []
         logger = lib.logger.new_logger(self)
         logger.info('')
@@ -226,6 +234,8 @@ class DFUMP2(DFRMP2):
 
     def nuc_grad_method(self):
         raise NotImplementedError
+
+    to_gpu = lib.to_gpu
 
 
 MP2 = UMP2 = DFMP2 = DFUMP2
@@ -632,24 +642,3 @@ def solve_cphf_uhf(mf, Lvo, max_cycle, tol, logger):
                       max_cycle=max_cycle, tol=tol, verbose=cphf_verbose)[0]
     logger.info('CPHF iterations finished')
     return zvo
-
-
-if __name__ == '__main__':
-    from pyscf import gto
-
-    mol = gto.Mole()
-    mol.atom = [['O', (0.,   0., 0.)],
-                ['O', (1.21, 0., 0.)]]
-    mol.spin = 2
-    mol.basis = 'def2-SVP'
-    mol.verbose = lib.logger.INFO
-    mol.build()
-
-    mf = scf.UHF(mol)
-    mf.kernel()
-
-    with DFUMP2(mf) as pt:
-        pt.kernel()
-        natocc, _ = pt.make_natorbs()
-        print()
-        print(natocc)

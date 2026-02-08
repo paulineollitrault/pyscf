@@ -17,7 +17,6 @@
 #          Timothy Berkelbach <tim.berkelbach@gmail.com>
 #
 
-import copy
 from functools import reduce
 
 import numpy
@@ -42,8 +41,8 @@ from pyscf.pbc.mpitools import mpi_load_balancer, mpi
 from pyscf.pbc.tools.tril import tril_index, unpack_tril
 from pyscf.pbc.lib import kpts_helper
 import pyscf.pbc.cc.kccsd_rhf
-from pyscf.pbc.cc.eom_kccsd_rhf_ea import mask_frozen as mask_frozen_ea
-from pyscf.pbc.cc.eom_kccsd_rhf_ip import mask_frozen as mask_frozen_ip
+from pyscf.pbc.cc.eom_kccsd_ghf import mask_frozen_ea
+from pyscf.pbc.cc.eom_kccsd_ghf import mask_frozen_ip
 
 from mpi4py import MPI
 
@@ -66,8 +65,8 @@ def read_amplitudes(t1_shape, t2_shape, t1=None, t2=None, filename="t_amplitudes
         feri = h5py.File(filename, 'r', driver='mpio', comm=MPI.COMM_WORLD)
         saved_t1 = feri['t1']
         saved_t2 = feri['t2']
-        assert(saved_t1.shape == t1_shape)
-        assert(saved_t2.shape == t2_shape)
+        assert (saved_t1.shape == t1_shape)
+        assert (saved_t2.shape == t2_shape)
 
         task_list = generate_max_task_list(t1.shape)
         for block in task_list:
@@ -116,7 +115,7 @@ def read_eom_amplitudes(vec_shape, filename="reom_amplitudes.hdf5", vec=None):
         saved_v = feri['v']
         if vec is None:
             vec = np.empty(vec_shape,dtype=saved_v.dtype)
-        assert(saved_v.shape == vec_shape)
+        assert (saved_v.shape == vec_shape)
         task_list = generate_max_task_list(vec.shape)
         for block in task_list:
             which_slice = [slice(*x) for x in block]
@@ -197,7 +196,7 @@ def update_t1(cc,t1,t2,eris,ints1e):
     loader.set_ranges((range(nkpts),))
 
     good2go = True
-    while(good2go):
+    while (good2go):
         good2go, data = loader.slave_set()
         if good2go is False:
             break
@@ -247,7 +246,7 @@ def update_t1(cc,t1,t2,eris,ints1e):
     loader.set_ranges((range(nkpts),range(nkpts),))
 
     good2go = True
-    while(good2go):
+    while (good2go):
         good2go, data = loader.slave_set()
         if good2go is False:
             break
@@ -365,7 +364,7 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
 
     # Making Woooo terms
     good2go = True
-    while(good2go):
+    while (good2go):
         good2go, data = loader.slave_set()
         if good2go is False:
             break
@@ -460,7 +459,7 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
     # Making Wvvvv terms. Notice the change of for loops.
     def func3():
         good2go = True
-        while(good2go):
+        while (good2go):
             good2go, data = loader.slave_set()
             if good2go is False:
                 break
@@ -527,7 +526,7 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
     loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
 
     good2go = True
-    while(good2go):
+    while (good2go):
         good2go, data = loader.slave_set()
         if good2go is False:
             break
@@ -646,7 +645,7 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
     loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
 
     good2go = True
-    while(good2go):
+    while (good2go):
         good2go, data = loader.slave_set()
         if good2go is False:
             break
@@ -746,7 +745,7 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
     # Making last of the Wovov terms (part 1/2)
 
     good2go = True
-    while(good2go):
+    while (good2go):
         good2go, data = loader.slave_set()
         if good2go is False:
             break
@@ -832,7 +831,7 @@ def update_amps(cc, t1, t2, eris, max_memory=2000):
     # Making last of the Wovov terms (part 2/2)
 
     good2go = True
-    while(good2go):
+    while (good2go):
         good2go, data = loader.slave_set()
         if good2go is False:
             break
@@ -987,7 +986,7 @@ def energy_tril(cc, t1, t2, eris):
 
 def _update_procs_mf(mf):
     '''Update mean-field objects to be the same on all processors'''
-    mf1 = copy.copy(mf)
+    mf1 = mf.copy()
 
     mo_coeff  = comm.bcast(mf.mo_coeff, root=0)
     mo_energy = comm.bcast(mf.mo_energy, root=0)
@@ -1033,7 +1032,7 @@ class RCCSD(pyscf.pbc.cc.kccsd_rhf.RCCSD):
         loader.set_ranges((range(nkpts),range(nkpts),range(nkpts),))
 
         good2go = True
-        while(good2go):
+        while (good2go):
             good2go, data = loader.slave_set()
             if good2go is False:
                 break
@@ -1174,7 +1173,7 @@ class RCCSD(pyscf.pbc.cc.kccsd_rhf.RCCSD):
         loader.set_ranges((range(nkpts),range(nkpts),))
 
         good2go = True
-        while(good2go):
+        while (good2go):
             good2go, data = loader.slave_set()
             if good2go is False:
                 break
@@ -1297,7 +1296,7 @@ class RCCSD(pyscf.pbc.cc.kccsd_rhf.RCCSD):
         loader.set_ranges((range(nkpts),))
 
         good2go = True
-        while(good2go):
+        while (good2go):
             good2go, data = loader.slave_set()
             if good2go is False:
                 break
@@ -1320,7 +1319,7 @@ class RCCSD(pyscf.pbc.cc.kccsd_rhf.RCCSD):
         loader.set_ranges((range(nkpts),range(nkpts),))
 
         good2go = True
-        while(good2go):
+        while (good2go):
             good2go, data = loader.slave_set()
             if good2go is False:
                 break
@@ -1918,7 +1917,7 @@ class RCCSD(pyscf.pbc.cc.kccsd_rhf.RCCSD):
         loader.set_ranges((range(nkpts),range(nkpts),))
 
         good2go = True
-        while(good2go):
+        while (good2go):
             good2go, data = loader.slave_set()
             if good2go is False:
                 break
@@ -2030,7 +2029,7 @@ class RCCSD(pyscf.pbc.cc.kccsd_rhf.RCCSD):
         loader.set_ranges((range(nkpts),))
 
         good2go = True
-        while(good2go):
+        while (good2go):
             good2go, data = loader.slave_set()
             if good2go is False:
                 break
@@ -2061,7 +2060,7 @@ class RCCSD(pyscf.pbc.cc.kccsd_rhf.RCCSD):
         loader.set_ranges((range(nkpts),range(nkpts),))
 
         good2go = True
-        while(good2go):
+        while (good2go):
             good2go, data = loader.slave_set()
             if good2go is False:
                 break
@@ -2742,7 +2741,7 @@ class _ERIS:
             loader.set_ranges((range(nUnique_klist),))
 
             good2go = True
-            while(good2go):
+            while (good2go):
                 good2go, data = loader.slave_set()
                 if good2go is False:
                     break
@@ -2914,7 +2913,7 @@ class _ERIS:
             tmp_block = numpy.empty(shape=tmp_block_shape,dtype=ds_type)
             cput1 = logger.process_clock(), logger.perf_counter()
             good2go = True
-            while(good2go):
+            while (good2go):
                 good2go, data = loader.slave_set()
                 if good2go is False:
                     break
@@ -2965,7 +2964,7 @@ class _ERIS:
 
             cput1 = logger.process_clock(), logger.perf_counter()
             good2go = True
-            while(good2go):
+            while (good2go):
                 good2go, data = loader1.slave_set()
                 if good2go is False:
                     break
@@ -3028,7 +3027,7 @@ class _ERIS:
             tmp_block = numpy.empty(shape=tmp_block_shape,dtype=ds_type)
 
             good2go = True
-            while(good2go):
+            while (good2go):
                 good2go, data = loader2.slave_set()
                 if good2go is False:
                     break
@@ -3094,7 +3093,7 @@ class _ERIS:
 
     def __del__(self):
         if getattr(self, 'feri1', None):
-            #for key in self.feri1.keys(): del(self.feri1[key])
+            #for key in self.feri1.keys(): del (self.feri1[key])
             self.feri1.close()
 
 CCSD = RCCSD
@@ -3179,10 +3178,10 @@ class _IMDS:
 
     def __del__(self):
         if getattr(self, 'fint1', None):
-            #for key in self.feri1.keys(): del(self.feri1[key])
+            #for key in self.feri1.keys(): del (self.feri1[key])
             self.fint1.close()
         if getattr(self, 'fint2', None):
-            #for key in self.feri1.keys(): del(self.feri1[key])
+            #for key in self.feri1.keys(): del (self.feri1[key])
             self.fint2.close()
 
     def make_ea(self,cc):
@@ -3277,5 +3276,4 @@ class _IMDS:
         self.WvvvoR1  = self.fint2['WvvvoR1' ]
 
 def _cp(a):
-    return np.array(a, copy=False, order='C')
-
+    return np.array(a, order='C')

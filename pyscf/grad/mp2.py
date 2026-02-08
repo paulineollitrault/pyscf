@@ -24,6 +24,7 @@ MP2 analytical nuclear gradients
 import numpy
 from pyscf import lib
 from functools import reduce
+from pyscf import gto
 from pyscf.lib import logger
 from pyscf.grad import rhf as rhf_grad
 from pyscf.scf import cphf
@@ -41,13 +42,11 @@ def grad_elec(mp_grad, t2, atmlst=None, verbose=logger.INFO):
     doo, dvv = d1
     time1 = log.timer_debug1('rdm1 intermediates', *time0)
 
-# Set nocc, nvir for half-transformation of 2pdm.  Frozen orbitals are exculded.
+# Set nocc, nvir for half-transformation of 2pdm.  Frozen orbitals are excluded.
 # nocc, nvir should be updated to include the frozen orbitals when proceeding
 # the 1-particle quantities later.
     mol = mp_grad.mol
-    with_frozen = not ((mp.frozen is None)
-                       or (isinstance(mp.frozen, (int, numpy.integer)) and mp.frozen == 0)
-                       or (len(mp.frozen) == 0))
+    with_frozen = has_frozen_orbitals(mp)
     OA, VA, OF, VF = _index_frozen_active(mp.get_frozen_mask(), mp.mo_occ)
     orbo = mp.mo_coeff[:,OA]
     orbv = mp.mo_coeff[:,VA]
@@ -187,6 +186,17 @@ def grad_elec(mp_grad, t2, atmlst=None, verbose=logger.INFO):
     log.timer('%s gradients' % mp.__class__.__name__, *time0)
     return de
 
+def has_frozen_orbitals(post_hf):
+    '''Test if frozen orbitlas are enabled in a post-HF object.'''
+    with_frozen = False
+    if getattr(post_hf, 'frozen', None) is not None:
+        if isinstance(post_hf.frozen, (int, numpy.integer)):
+            with_frozen = post_hf.frozen != 0
+        elif hasattr(post_hf.frozen, '__len__'):
+            with_frozen = len(post_hf.frozen) != 0
+        else:
+            raise TypeError(f'Unsupported .frozen attribute {post_hf.frozen}')
+    return with_frozen
 
 def as_scanner(grad_mp):
     '''Generating a nuclear gradients scanner/solver (for geometry optimizer).
@@ -210,38 +220,46 @@ def as_scanner(grad_mp):
     >>> e_tot, grad = mp2_scanner(gto.M(atom='H 0 0 0; F 0 0 1.1'))
     >>> e_tot, grad = mp2_scanner(gto.M(atom='H 0 0 0; F 0 0 1.5'))
     '''
-    from pyscf import gto
     if isinstance(grad_mp, lib.GradScanner):
         return grad_mp
 
     logger.info(grad_mp, 'Create scanner for %s', grad_mp.__class__)
+    name = grad_mp.__class__.__name__ + MP2_GradScanner.__name_mixin__
+    return lib.set_class(MP2_GradScanner(grad_mp),
+                         (MP2_GradScanner, grad_mp.__class__), name)
 
-    class MP2_GradScanner(grad_mp.__class__, lib.GradScanner):
-        def __init__(self, g):
-            lib.GradScanner.__init__(self, g)
-        def __call__(self, mol_or_geom, **kwargs):
-            if isinstance(mol_or_geom, gto.Mole):
-                mol = mol_or_geom
-            else:
-                mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+class MP2_GradScanner(lib.GradScanner):
+    def __init__(self, g):
+        lib.GradScanner.__init__(self, g)
 
-            mp_scanner = self.base
-            mp_scanner(mol, with_t2=True)
-            de = self.kernel(mp_scanner.t2)
-            return mp_scanner.e_tot, de
-        @property
-        def converged(self):
-            return self.base._scf.converged
-    return MP2_GradScanner(grad_mp)
+    def __call__(self, mol_or_geom, **kwargs):
+        if isinstance(mol_or_geom, gto.MoleBase):
+            assert mol_or_geom.__class__ == gto.Mole
+            mol = mol_or_geom
+        else:
+            mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+        self.reset(mol)
+
+        mp_scanner = self.base
+        mp_scanner(mol, with_t2=True)
+        de = self.kernel(mp_scanner.t2)
+        return mp_scanner.e_tot, de
+    @property
+    def converged(self):
+        return self.base._scf.converged
 
 
 def _shell_prange(mol, start, stop, blksize):
+    l = mol._bas[start:stop,gto.ANG_OF]
+    if mol.cart:
+        dims = (l+1)*(l+2)//2 * mol._bas[start:stop,gto.NCTR_OF]
+    else:
+        dims = (l*2+1) * mol._bas[start:stop,gto.NCTR_OF]
     nao = 0
     ib0 = start
-    for ib in range(start, stop):
-        now = (mol.bas_angular(ib)*2+1) * mol.bas_nctr(ib)
+    for ib, now in zip(range(start, stop), dims):
         nao += now
-        if nao > blksize and nao > now:
+        if nao > blksize:
             yield (ib0, ib, nao-now)
             ib0 = ib
             nao = now
@@ -272,14 +290,17 @@ def _index_frozen_active(frozen_mask, mo_occ):
     VF = numpy.where((~frozen_mask) & (mo_occ==0))[0] # virtual frozen orbitals
     return OA, VA, OF, VF
 
-class Gradients(rhf_grad.GradientsMixin):
+class Gradients(rhf_grad.GradientsBase):
 
     grad_elec = grad_elec
 
     def kernel(self, t2=None, atmlst=None, verbose=None):
         log = logger.new_logger(self, verbose)
-        if t2 is None: t2 = self.base.t2
-        if t2 is None: t2 = self.base.kernel()
+        if t2 is None:
+            if self.base.t2 is None:
+                t2 = self.base.kernel()[1]
+            else:
+                t2 = self.base.t2
         if atmlst is None:
             atmlst = self.atmlst
         else:
@@ -300,84 +321,9 @@ class Gradients(rhf_grad.GradientsMixin):
 
     as_scanner = as_scanner
 
+    to_gpu = lib.to_gpu
+
 Grad = Gradients
 
 # Inject to RMP2 class
 mp2.MP2.Gradients = lib.class_as_method(Gradients)
-
-
-if __name__ == '__main__':
-    from pyscf import gto
-    from pyscf import scf
-
-    mol = gto.M(
-        atom = [
-            ["O" , (0. , 0.     , 0.)],
-            [1   , (0. ,-0.757  , 0.587)],
-            [1   , (0. , 0.757  , 0.587)]],
-        basis = '631g'
-    )
-    mf = scf.RHF(mol).run()
-    mp = mp2.MP2(mf).run()
-    g1 = Gradients(mp).kernel()
-# O    -0.0000000000    -0.0000000000     0.0089211366
-# H     0.0000000000     0.0222745046    -0.0044605683
-# H     0.0000000000    -0.0222745046    -0.0044605683
-    print(lib.finger(g1) - -0.035681171529705444)
-
-    mcs = mp.as_scanner()
-    mol.set_geom_([
-            ["O" , (0. , 0.     , 0.001)],
-            [1   , (0. ,-0.757  , 0.587)],
-            [1   , (0. , 0.757  , 0.587)]])
-    e1 = mcs(mol)
-    mol.set_geom_([
-            ["O" , (0. , 0.     ,-0.001)],
-            [1   , (0. ,-0.757  , 0.587)],
-            [1   , (0. , 0.757  , 0.587)]])
-    e2 = mcs(mol)
-    print(g1[0,2], (e1-e2)/0.002*lib.param.BOHR)
-
-    print('-----------------------------------')
-    mol = gto.M(
-        atom = [
-            ["O" , (0. , 0.     , 0.)],
-            [1   , (0. ,-0.757  , 0.587)],
-            [1   , (0. , 0.757  , 0.587)]],
-        basis = '631g'
-    )
-    mf = scf.RHF(mol).run()
-    mp = mp2.MP2(mf)
-    mp.frozen = [0,1,10,11,12]
-    mp.max_memory = 1
-    mp.kernel()
-    g1 = Gradients(mp).kernel()
-# O    -0.0000000000    -0.0000000000     0.0037319667
-# H    -0.0000000000    -0.0897959298    -0.0018659834
-# H     0.0000000000     0.0897959298    -0.0018659834
-    print(lib.finger(g1) - 0.12458103614793946)
-
-    mcs = mp.as_scanner()
-    mol.set_geom_([
-            ["O" , (0. , 0.     , 0.001)],
-            [1   , (0. ,-0.757  , 0.587)],
-            [1   , (0. , 0.757  , 0.587)]])
-    e1 = mcs(mol)
-    mol.set_geom_([
-            ["O" , (0. , 0.     ,-0.001)],
-            [1   , (0. ,-0.757  , 0.587)],
-            [1   , (0. , 0.757  , 0.587)]])
-    e2 = mcs(mol)
-    print(g1[0,2], (e1-e2)/0.002*lib.param.BOHR)
-
-    mol = gto.M(
-        atom = 'H 0 0 0; H 0 0 1.76',
-        basis = '631g',
-        unit='Bohr')
-    mf = scf.RHF(mol).run(conv_tol=1e-14)
-    mp = mp2.MP2(mf)
-    mp.kernel()
-    g1 = mp.Gradients().kernel()
-# H     0.0000000000     0.0000000000    -0.0800309688
-# H     0.0000000000     0.0000000000     0.0800309688
-

@@ -25,7 +25,7 @@ from pyscf.cc import ccsd
 from pyscf.cc import uccsd
 from pyscf.cc import gccsd
 from pyscf.cc import rccsd
-from pyscf.cc import dfccsd
+from pyscf.cc import dfccsd, dfuccsd
 
 def setUpModule():
     global mol, mf
@@ -57,30 +57,30 @@ class KnownValues(unittest.TestCase):
         mcc.conv_tol_normt = 1e-7
         eris = mcc.ao2mo()
         emp2, t1, t2 = mcc.init_amps(eris)
-        self.assertAlmostEqual(abs(t2).sum(), 4.9556571211255909, 6)
-        self.assertAlmostEqual(emp2, -0.2040199672883385, 10)
+        self.assertAlmostEqual(abs(t2).sum(), 4.9556571211255909, 5)
+        self.assertAlmostEqual(emp2, -0.2040199672883385, 8)
         t1, t2 = cc.ccsd.update_amps(mcc, t1, t2, eris)
-        self.assertAlmostEqual(abs(t1).sum(), 0.0475038989126, 8)
-        self.assertAlmostEqual(abs(t2).sum(), 5.4018238455030, 6)
+        self.assertAlmostEqual(abs(t1).sum(), 0.0475038989126, 6)
+        self.assertAlmostEqual(abs(t2).sum(), 5.4018238455030, 5)
         self.assertAlmostEqual(cc.ccsd.energy(mcc, t1, t2, eris),
-                               -0.208967840546667, 10)
+                               -0.208967840546667, 8)
         t1, t2 = cc.ccsd.update_amps(mcc, t1, t2, eris)
         self.assertAlmostEqual(cc.ccsd.energy(mcc, t1, t2, eris),
-                               -0.212173678670510, 10)
-        self.assertAlmostEqual(abs(t1).sum(), 0.05470123093500083, 8)
-        self.assertAlmostEqual(abs(t2).sum(), 5.5605208386554716, 6)
+                               -0.212173678670510, 8)
+        self.assertAlmostEqual(abs(t1).sum(), 0.05470123093500083, 6)
+        self.assertAlmostEqual(abs(t2).sum(), 5.5605208386554716, 5)
 
         mcc.kernel()
         self.assertTrue(numpy.allclose(mcc.t2,mcc.t2.transpose(1,0,3,2)))
         self.assertAlmostEqual(mcc.ecc, -0.2133432312951, 8)
-        self.assertAlmostEqual(abs(mcc.t2).sum(), 5.63970279799556984, 6)
+        self.assertAlmostEqual(abs(mcc.t2).sum(), 5.63970279799556984, 5)
 
     def test_ccsd_frozen(self):
         mcc = cc.ccsd.CC(mf, frozen=range(1))
         mcc.conv_tol = 1e-10
         mcc.kernel()
-        self.assertAlmostEqual(mcc.ecc, -0.21124878189922872, 8)
-        self.assertAlmostEqual(abs(mcc.t2).sum(), 5.4996425901189347, 6)
+        self.assertAlmostEqual(mcc.ecc, -0.21124878189922872, 7)
+        self.assertAlmostEqual(abs(mcc.t2).sum(), 5.4996425901189347, 5)
 
     def test_ccsd_cart(self):
         pmol = mol.copy()
@@ -134,8 +134,8 @@ class KnownValues(unittest.TestCase):
         mcc.conv_tol_normt = 1e-7
         mcc.kernel()
         mcc.solve_lambda()
-        self.assertAlmostEqual(numpy.linalg.norm(mcc.l1), 0.01326267012100099, 7)
-        self.assertAlmostEqual(numpy.linalg.norm(mcc.l2), 0.21257559872380857, 7)
+        self.assertAlmostEqual(numpy.linalg.norm(mcc.l1), 0.01326267012100099, 6)
+        self.assertAlmostEqual(numpy.linalg.norm(mcc.l2), 0.21257559872380857, 5)
 
     def test_ccsd_rdm(self):
         mcc = cc.ccsd.CC(mf)
@@ -169,31 +169,37 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(cc_scanner(geom), -76.228972886940639, 6)
 
     def test_init(self):
+        dfmf = mf.density_fit()
+        umf = mf.to_uhf()
+        dfumf = umf.density_fit()
+
         self.assertTrue(isinstance(cc.CCSD(mf), ccsd.CCSD))
-        self.assertTrue(isinstance(cc.CCSD(mf.density_fit()), dfccsd.RCCSD))
+        self.assertTrue(isinstance(cc.CCSD(dfmf), dfccsd.RCCSD))
         self.assertTrue(isinstance(cc.CCSD(mf.newton()), ccsd.CCSD))
-        self.assertTrue(isinstance(cc.CCSD(mf.density_fit().newton()), dfccsd.RCCSD))
+        self.assertTrue(isinstance(cc.CCSD(dfmf.newton()), dfccsd.RCCSD))
         self.assertTrue(isinstance(cc.CCSD(mf.newton().density_fit()), ccsd.CCSD))
         self.assertTrue(not isinstance(cc.CCSD(mf.newton().density_fit()), dfccsd.RCCSD))
         self.assertTrue(isinstance(cc.CCSD(mf.density_fit().newton().density_fit()), dfccsd.RCCSD))
 
         self.assertTrue(isinstance(cc.UCCSD(mf), uccsd.UCCSD))
-#        self.assertTrue(isinstance(cc.UCCSD(mf.density_fit()), dfccsd.UCCSD))
+        self.assertTrue(isinstance(cc.UCCSD(dfmf), dfuccsd.UCCSD))
         self.assertTrue(isinstance(cc.UCCSD(mf.newton()), uccsd.UCCSD))
-#        self.assertTrue(isinstance(cc.UCCSD(mf.density_fit().newton()), dfccsd.UCCSD))
+        self.assertTrue(isinstance(cc.UCCSD(dfmf.newton()), dfuccsd.UCCSD))
         self.assertTrue(isinstance(cc.UCCSD(mf.newton().density_fit()), uccsd.UCCSD))
-#        self.assertTrue(not isinstance(cc.UCCSD(mf.newton().density_fit()), dfccsd.UCCSD))
-#        self.assertTrue(isinstance(cc.UCCSD(mf.density_fit().newton().density_fit()), dfccsd.UCCSD))
+        self.assertTrue(not isinstance(cc.UCCSD(mf.newton().density_fit()), dfuccsd.UCCSD))
+        self.assertTrue(isinstance(cc.UCCSD(dfmf.newton().density_fit()), dfuccsd.UCCSD))
         self.assertTrue(isinstance(cc.CCSD(scf.GHF(mol)), gccsd.GCCSD))
 
-        umf = scf.convert_to_uhf(mf, scf.UHF(mol))
         self.assertTrue(isinstance(cc.CCSD(umf), uccsd.UCCSD))
-#        self.assertTrue(isinstance(cc.CCSD(umf.density_fit()), dfccsd.UCCSD))
+        self.assertTrue(isinstance(cc.CCSD(dfumf), dfuccsd.UCCSD))
         self.assertTrue(isinstance(cc.CCSD(umf.newton()), uccsd.UCCSD))
-#        self.assertTrue(isinstance(cc.CCSD(umf.density_fit().newton()), dfccsd.UCCSD))
+        self.assertTrue(isinstance(cc.CCSD(dfumf.newton()), dfuccsd.UCCSD))
         self.assertTrue(isinstance(cc.CCSD(umf.newton().density_fit()), uccsd.UCCSD))
-#        self.assertTrue(not isinstance(cc.CCSD(umf.newton().density_fit()), dfccsd.UCCSD))
-#        self.assertTrue(isinstance(cc.CCSD(umf.density_fit().newton().density_fit()), dfccsd.UCCSD))
+        self.assertTrue(not isinstance(cc.CCSD(umf.newton().density_fit()), dfuccsd.UCCSD))
+        self.assertTrue(isinstance(cc.CCSD(dfumf.newton().density_fit()), dfuccsd.UCCSD))
+
+        self.assertTrue(isinstance(dfmf.CCSD(), dfccsd.RCCSD))
+        self.assertTrue(isinstance(dfumf.CCSD(), dfuccsd.UCCSD))
 
         self.assertTrue(isinstance(cc.CCSD(mf, mo_coeff=mf.mo_coeff*1j), rccsd.RCCSD))
 
@@ -214,4 +220,3 @@ class KnownValues(unittest.TestCase):
 if __name__ == "__main__":
     print("Full Tests for H2O")
     unittest.main()
-

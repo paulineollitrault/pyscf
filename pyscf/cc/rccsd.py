@@ -42,7 +42,7 @@ MEMORYMIN = getattr(__config__, 'cc_ccsd_memorymin', 2000)
 
 def update_amps(cc, t1, t2, eris):
     # Ref: Hirata et al., J. Chem. Phys. 120, 2581 (2004) Eqs.(35)-(36)
-    assert(isinstance(eris, ccsd._ChemistsERIs))
+    assert (isinstance(eris, ccsd._ChemistsERIs))
     nocc, nvir = t1.shape
     fock = eris.fock
     mo_e_o = eris.mo_energy[:nocc]
@@ -186,7 +186,7 @@ class RCCSD(ccsd.CCSD):
 
         if eris is None:
             eris = self.ao2mo(self.mo_coeff)
-        return ccsd.CCSD.ccsd(self, t1, t2, eris)
+        return ccsd.CCSDBase.ccsd(self, t1, t2, eris)
 
     def ao2mo(self, mo_coeff=None):
         nmo = self.nmo
@@ -226,12 +226,6 @@ class RCCSD(ccsd.CCSD):
                                     verbose=self.verbose)
         return self.l1, self.l2
 
-    def ccsd_t(self, t1=None, t2=None, eris=None):
-        return ccsd.CCSD.ccsd_t(self, t1, t2, eris)
-
-    def density_fit(self, auxbasis=None, with_df=None):
-        raise NotImplementedError
-
 
 class _ChemistsERIs(ccsd._ChemistsERIs):
 
@@ -253,7 +247,11 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
         eri1 = ao2mofn(eris.mo_coeff).reshape([nmo]*4)
     else:
         eri1 = ao2mo.incore.full(mycc._scf._eri, eris.mo_coeff)
-        eri1 = ao2mo.restore(1, eri1, nmo)
+        if mycc._scf._eri.size == nmo**4:
+            # The N^4-sized full integral tensor.
+            eri1 = eri1.reshape([nmo]*4)
+        else:
+            eri1 = ao2mo.restore(1, eri1, nmo)
     eris.oooo = eri1[:nocc,:nocc,:nocc,:nocc].copy()
     eris.ovoo = eri1[:nocc,nocc:,:nocc,:nocc].copy()
     eris.ovov = eri1[:nocc,nocc:,:nocc,nocc:].copy()
@@ -265,6 +263,8 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
     return eris
 
 def _make_eris_outcore(mycc, mo_coeff=None):
+    from pyscf.scf.hf import RHF
+    assert isinstance(mycc._scf, RHF)
     cput0 = (logger.process_clock(), logger.perf_counter())
     log = logger.Logger(mycc.stdout, mycc.verbose)
     eris = _ChemistsERIs()
@@ -430,4 +430,3 @@ if __name__ == '__main__':
     t2ab = t2new[0::2,1::2,0::2,1::2]
     print(abs(t2ab-t2new_ref).max())
     print(abs(t2ab-t2ab.transpose(1,0,2,3) - t2aa).max())
-

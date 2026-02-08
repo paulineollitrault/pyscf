@@ -123,7 +123,7 @@ def from_ucisdvec(civec, nocc, orbspin):
     coefficient vector'''
     nmoa = numpy.count_nonzero(orbspin == 0)
     nmob = numpy.count_nonzero(orbspin == 1)
-    if isinstance(nocc, int):
+    if isinstance(nocc, (int, numpy.integer)):
         nocca = numpy.count_nonzero(orbspin[:nocc] == 0)
         noccb = numpy.count_nonzero(orbspin[:nocc] == 1)
     else:
@@ -157,7 +157,7 @@ def to_ucisdvec(civec, nmo, nocc, orbspin):
     return ucisdvec
 
 def to_fcivec(cisdvec, nelec, orbspin, frozen=None):
-    assert(numpy.count_nonzero(orbspin == 0) ==
+    assert (numpy.count_nonzero(orbspin == 0) ==
            numpy.count_nonzero(orbspin == 1))
     norb = len(orbspin)
     frozen_mask = numpy.zeros(norb, dtype=bool)
@@ -181,7 +181,7 @@ def from_fcivec(ci0, nelec, orbspin, frozen=None):
     if not (frozen is None or frozen == 0):
         raise NotImplementedError
 
-    assert(numpy.count_nonzero(orbspin == 0) ==
+    assert (numpy.count_nonzero(orbspin == 0) ==
            numpy.count_nonzero(orbspin == 1))
     norb = len(orbspin)
     frozen_mask = numpy.zeros(norb, dtype=bool)
@@ -197,7 +197,7 @@ def from_fcivec(ci0, nelec, orbspin, frozen=None):
              numpy.count_nonzero(orbspin[:nelec] == 1))
     ucisdvec = ucisd.from_fcivec(ci0, norb//2, nelec, frozen)
     nocc = numpy.count_nonzero(~frozen_mask[:sum(nelec)])
-    return from_ucisdvec(ucisdvec, nocc, orbspin[~frozen_mask])
+    return from_ucisdvec(ucisdvec, int(nocc), orbspin[~frozen_mask])
 
 
 def make_rdm1(myci, civec=None, nmo=None, nocc=None, ao_repr=False):
@@ -404,7 +404,7 @@ class GCISD(cisd.CISD):
             orbspin = getattr(self.mo_coeff, 'orbspin', None)
             if orbspin is not None:
                 orbspin = orbspin[self.get_frozen_mask()]
-        assert(orbspin is not None)
+        assert (orbspin is not None)
         return from_ucisdvec(civec, nocc, orbspin=orbspin)
     from_rcisdvec = from_ucisdvec
 
@@ -478,4 +478,3 @@ if __name__ == '__main__':
     print(myci.e_tot - e2)   # = 0
 
     print(abs(rdm1 - numpy.einsum('ijkk->ji', rdm2)/(mol.nelectron-1)).sum())
-

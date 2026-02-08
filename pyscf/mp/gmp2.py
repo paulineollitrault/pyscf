@@ -17,7 +17,6 @@ GMP2 in spin-orbital form
 E(MP2) = 1/4 <ij||ab><ab||ij>/(ei+ej-ea-eb)
 '''
 
-import copy
 import numpy
 from pyscf import lib
 from pyscf import ao2mo
@@ -33,7 +32,7 @@ def kernel(mp, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2, verbos
     if mo_energy is not None or mo_coeff is not None:
         # For backward compatibility.  In pyscf-1.4 or earlier, mp.frozen is
         # not supported when mo_energy or mo_coeff is given.
-        assert(mp.frozen == 0 or mp.frozen is None)
+        assert (mp.frozen == 0 or mp.frozen is None)
 
     if eris is None:
         eris = mp.ao2mo(mo_coeff)
@@ -71,7 +70,7 @@ def energy(mp, t2, eris):
 
 def update_amps(mp, t2, eris):
     '''Update non-canonical MP2 amplitudes'''
-    #assert(isinstance(eris, _PhysicistsERIs))
+    #assert (isinstance(eris, _PhysicistsERIs))
     nocc, nvir = t2.shape[1:3]
     fock = eris.fock
     mo_e_o = eris.mo_energy[:nocc]
@@ -89,7 +88,7 @@ def update_amps(mp, t2, eris):
     return t2new
 
 
-def make_rdm1(mp, t2=None, ao_repr=False):
+def make_rdm1(mp, t2=None, ao_repr=False, with_frozen=True):
     r'''
     One-particle density matrix in the molecular spin-orbital representation
     (the occupied-virtual blocks from the orbital response contribution are
@@ -103,11 +102,12 @@ def make_rdm1(mp, t2=None, ao_repr=False):
     '''
     from pyscf.cc import gccsd_rdm
     if t2 is None: t2 = mp.t2
+    assert t2 is not None
     doo, dvv = _gamma1_intermediates(mp, t2)
     nocc, nvir = t2.shape[1:3]
     dov = numpy.zeros((nocc,nvir))
     d1 = doo, dov, dov.T, dvv
-    return gccsd_rdm._make_rdm1(mp, d1, with_frozen=True, ao_repr=ao_repr)
+    return gccsd_rdm._make_rdm1(mp, d1, with_frozen=with_frozen, ao_repr=ao_repr)
 
 def _gamma1_intermediates(mp, t2):
     doo = lib.einsum('imef,jmef->ij', t2.conj(), t2) *-.5
@@ -127,6 +127,7 @@ def make_rdm2(mp, t2=None, ao_repr=False):
     E = einsum('pqrs,pqrs', eri, rdm2)
     '''
     if t2 is None: t2 = mp.t2
+    assert t2 is not None
     nmo0 = mp.nmo
     nocc = nocc0 = mp.nocc
 
@@ -174,9 +175,8 @@ def make_rdm2(mp, t2=None, ao_repr=False):
     return dm2
 
 
-class GMP2(mp2.MP2):
+class GMP2(mp2.MP2Base):
     def __init__(self, mf, frozen=None, mo_coeff=None, mo_occ=None):
-        assert(isinstance(mf, scf.ghf.GHF))
         mp2.MP2.__init__(self, mf, frozen, mo_coeff, mo_occ)
 
     def ao2mo(self, mo_coeff=None):
@@ -203,7 +203,7 @@ class GMP2(mp2.MP2):
         if with_df is not None:
             mymp.with_df = with_df
         if mymp.with_df.auxbasis != auxbasis:
-            mymp.with_df = copy.copy(mymp.with_df)
+            mymp.with_df = mymp.with_df.copy()
             mymp.with_df.auxbasis = auxbasis
         return mymp
 
@@ -215,6 +215,12 @@ class GMP2(mp2.MP2):
     update_amps = update_amps
     def init_amps(self, mo_energy=None, mo_coeff=None, eris=None, with_t2=WITH_T2):
         return kernel(self, mo_energy, mo_coeff, eris, with_t2)
+
+    def _finalize(self):
+        log = logger.new_logger(self)
+        log.note('E(%s) = %.15g  E_corr = %.15g',
+                 self.__class__.__name__, self.e_tot, self.e_corr)
+        return self
 
 MP2 = GMP2
 
@@ -228,7 +234,6 @@ class _PhysicistsERIs:
         self.mo_coeff = None
         self.nocc = None
         self.fock = None
-        self.e_hf = None
         self.orbspin = None
         self.oovv = None
 
@@ -257,13 +262,11 @@ class _PhysicistsERIs:
         if mp_mo_coeff is mp._scf.mo_coeff and mp._scf.converged:
             self.mo_energy = mp._scf.mo_energy[mo_idx]
             self.fock = numpy.diag(self.mo_energy)
-            self.e_hf = mp._scf.e_tot
         else:
             dm = mp._scf.make_rdm1(mp_mo_coeff, mp.mo_occ)
             vhf = mp._scf.get_veff(mp.mol, dm)
             fockao = mp._scf.get_fock(vhf=vhf, dm=dm)
             self.fock = self.mo_coeff.conj().T.dot(fockao).dot(self.mo_coeff)
-            self.e_hf = mp._scf.energy_tot(dm=dm, vhf=vhf)
             self.mo_energy = self.fock.diagonal().real
 
 def _make_eris_incore(mp, mo_coeff=None, ao2mofn=None, verbose=None):
@@ -306,6 +309,8 @@ def _make_eris_incore(mp, mo_coeff=None, ao2mofn=None, verbose=None):
     return eris
 
 def _make_eris_outcore(mp, mo_coeff=None, verbose=None):
+    from pyscf.scf.ghf import GHF
+    assert isinstance(mp._scf, GHF)
     cput0 = (logger.process_clock(), logger.perf_counter())
     log = logger.Logger(mp.stdout, mp.verbose)
     eris = _PhysicistsERIs()
@@ -314,7 +319,7 @@ def _make_eris_outcore(mp, mo_coeff=None, verbose=None):
     nocc = mp.nocc
     nao, nmo = eris.mo_coeff.shape
     nvir = nmo - nocc
-    assert(eris.mo_coeff.dtype == numpy.double)
+    assert (eris.mo_coeff.dtype == numpy.double)
     orboa = eris.mo_coeff[:nao//2,:nocc]
     orbob = eris.mo_coeff[nao//2:,:nocc]
     orbva = eris.mo_coeff[:nao//2,nocc:]
@@ -371,51 +376,4 @@ def _make_eris_outcore(mp, mo_coeff=None, verbose=None):
     cput0 = log.timer_debug1('transforming oovv', *cput0)
     return eris
 
-del(WITH_T2)
-
-
-if __name__ == '__main__':
-    from functools import reduce
-    from pyscf import scf
-    from pyscf import gto
-    mol = gto.Mole()
-    mol.atom = [['O', (0.,   0., 0.)],
-                ['O', (1.21, 0., 0.)]]
-    mol.basis = 'cc-pvdz'
-    mol.spin = 2
-    mol.build()
-    mf = scf.UHF(mol).run()
-    mf = scf.addons.convert_to_ghf(mf)
-
-    frozen = [0,1,2,3]
-    pt = GMP2(mf, frozen=frozen)
-    emp2, t2 = pt.kernel()
-    print(emp2 - -0.345306881488508)
-
-    pt.max_memory = 1
-    emp2, t2 = pt.kernel()
-    print(emp2 - -0.345306881488508)
-
-    dm1 = pt.make_rdm1(t2)
-    dm2 = pt.make_rdm2(t2)
-    nao = mol.nao_nr()
-    mo_a = mf.mo_coeff[:nao]
-    mo_b = mf.mo_coeff[nao:]
-    nmo = mo_a.shape[1]
-    eri = ao2mo.kernel(mf._eri, mo_a+mo_b, compact=False).reshape([nmo]*4)
-    orbspin = mf.mo_coeff.orbspin
-    sym_forbid = (orbspin[:,None] != orbspin)
-    eri[sym_forbid,:,:] = 0
-    eri[:,:,sym_forbid] = 0
-    hcore = scf.RHF(mol).get_hcore()
-    h1 = reduce(numpy.dot, (mo_a.T.conj(), hcore, mo_a))
-    h1+= reduce(numpy.dot, (mo_b.T.conj(), hcore, mo_b))
-    e1 = numpy.einsum('ij,ji', h1, dm1)
-    e1+= numpy.einsum('ijkl,ijkl', eri, dm2) * .5
-    e1+= mol.energy_nuc()
-    print(e1 - pt.e_tot)
-
-    mf = scf.UHF(mol).run(max_cycle=1)
-    mf = scf.addons.convert_to_ghf(mf)
-    pt = GMP2(mf)
-    print(pt.kernel()[0] - -0.371240143556976)
+del (WITH_T2)

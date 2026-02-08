@@ -18,6 +18,10 @@
 
 import numpy
 
+
+# C2x, C2y, C2z are rotation axis parallel to x, y, z axes
+# sx, sy, sz are mirrors perpendicular to x, y, z axes
+#
 # D2h   C2h   C2v   D2   Cs   Ci   C2   C1
 # E     E     E     E    E    E    E    E
 # C2x               C2x
@@ -264,7 +268,7 @@ SUBGROUP = {
     'D2h': ('D2h', 'C2v', 'C2h', 'C2', 'Cs', 'Ci', 'C1'),
     'D2' : ('D2' , 'C2' , 'Ci' , 'C1'),
     'C2v': ('C2v', 'C2' , 'Cs' , 'C1'),
-    'C2h': ('C2h', 'C2' , 'Cs' , 'C1'),
+    'C2h': ('C2h', 'C2' , 'Cs' , 'Ci', 'C1'),
     'Cs' : ('Cs' , 'C1'),
     'Ci' : ('Ci' , 'C1'),
     'C2' : ('C2' , 'C1'),

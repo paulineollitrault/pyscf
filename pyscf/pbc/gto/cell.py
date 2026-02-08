@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright 2014-2021 The PySCF Developers. All Rights Reserved.
+# Copyright 2014-2024 The PySCF Developers. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,33 +17,24 @@
 #         Timothy Berkelbach <tim.berkelbach@gmail.com>
 #
 
+import os
 import sys
 import json
 import ctypes
 import warnings
 import numpy as np
 import scipy.linalg
-try:
-    from scipy.special import factorial2
-except ImportError:
-    from scipy.misc import factorial2
 from scipy.special import erf, erfc
-import scipy.optimize
 import pyscf.lib.parameters as param
 from pyscf import lib
 from pyscf.dft import radi
 from pyscf.lib import logger
 from pyscf.gto import mole
 from pyscf.gto import moleintor
-from pyscf.gto.mole import (_symbol, _rm_digit, _atom_symbol, _std_symbol,
-                            _std_symbol_without_ghost, charge, is_ghost_atom) # noqa
-from pyscf.gto.mole import conc_env, uncontract
-from pyscf.pbc.gto import basis
-from pyscf.pbc.gto import pseudo
+from pyscf.gto.mole import conc_env, is_au # noqa
 from pyscf.pbc.gto import _pbcintor
 from pyscf.pbc.gto.eval_gto import eval_gto as pbc_eval_gto
 from pyscf.pbc.tools import pbc as pbctools
-from pyscf.gto.basis import ALIAS as MOLE_ALIAS
 from pyscf import __config__
 
 INTEGRAL_PRECISION = getattr(__config__, 'pbc_gto_cell_Cell_precision', 1e-8)
@@ -51,18 +42,13 @@ WRAP_AROUND = getattr(__config__, 'pbc_gto_cell_make_kpts_wrap_around', False)
 WITH_GAMMA = getattr(__config__, 'pbc_gto_cell_make_kpts_with_gamma', True)
 EXP_DELIMITER = getattr(__config__, 'pbc_gto_cell_split_basis_exp_delimiter',
                         [1.0, 0.5, 0.25, 0.1, 0])
-# cutoff penalty due to lattice summation
-LATTICE_SUM_PENALTY = 1e-1
-
-
-# For code compatiblity in python-2 and python-3
-if sys.version_info >= (3,):
-    unicode = str
-    long = int
+# defined in lib/pbc/cell.h
+RCUT_EPS = 1e-3
+RCUT_MAX_CYCLE = 10
 
 libpbc = _pbcintor.libpbc
 
-def M(**kwargs):
+def M(*args, **kwargs):
     r'''This is a shortcut to build up Cell object.
 
     Examples:
@@ -71,114 +57,9 @@ def M(**kwargs):
     >>> cell = gto.M(a=numpy.eye(3)*4, atom='He 1 1 1', basis='6-31g')
     '''
     cell = Cell()
-    cell.build(**kwargs)
+    cell.build(*args, **kwargs)
     return cell
 C = M
-
-
-def format_pseudo(pseudo_tab):
-    r'''Convert the input :attr:`Cell.pseudo` (dict) to the internal data format::
-
-       { atom: ( (nelec_s, nele_p, nelec_d, ...),
-                rloc, nexp, (cexp_1, cexp_2, ..., cexp_nexp),
-                nproj_types,
-                (r1, nproj1, ( (hproj1[1,1], hproj1[1,2], ..., hproj1[1,nproj1]),
-                               (hproj1[2,1], hproj1[2,2], ..., hproj1[2,nproj1]),
-                               ...
-                               (hproj1[nproj1,1], hproj1[nproj1,2], ...        ) )),
-                (r2, nproj2, ( (hproj2[1,1], hproj2[1,2], ..., hproj2[1,nproj1]),
-                ... ) )
-                )
-        ... }
-
-    Args:
-        pseudo_tab : dict
-            Similar to :attr:`Cell.pseudo` (a dict), it **cannot** be a str
-
-    Returns:
-        Formatted :attr:`~Cell.pseudo`
-
-    Examples:
-
-    >>> pbc.format_pseudo({'H':'gth-blyp', 'He': 'gth-pade'})
-    {'H': [[1],
-        0.2, 2, [-4.19596147, 0.73049821], 0],
-     'He': [[2],
-        0.2, 2, [-9.1120234, 1.69836797], 0]}
-    '''
-    fmt_pseudo = {}
-    for atom, atom_pp in pseudo_tab.items():
-        symb = _symbol(atom)
-
-        if isinstance(atom_pp, (str, unicode)):
-            stdsymb = _std_symbol_without_ghost(symb)
-            fmt_pseudo[symb] = pseudo.load(str(atom_pp), stdsymb)
-        else:
-            fmt_pseudo[symb] = atom_pp
-    return fmt_pseudo
-
-def make_pseudo_env(cell, _atm, _pseudo, pre_env=[]):
-    for ia, atom in enumerate(cell._atom):
-        symb = atom[0]
-        if symb in _pseudo and _atm[ia,0] != 0:  # pass ghost atoms.
-            _atm[ia,0] = sum(_pseudo[symb][0])
-    _pseudobas = None
-    return _atm, _pseudobas, pre_env
-
-def format_basis(basis_tab):
-    '''Convert the input :attr:`Cell.basis` to the internal data format::
-
-      { atom: (l, kappa, ((-exp, c_1, c_2, ..), nprim, nctr, ptr-exps, ptr-contraction-coeff)), ... }
-
-    Args:
-        basis_tab : dict
-            Similar to :attr:`Cell.basis`, it **cannot** be a str
-
-    Returns:
-        Formated :attr:`~Cell.basis`
-
-    Examples:
-
-    >>> pbc.format_basis({'H':'gth-szv'})
-    {'H': [[0,
-        (8.3744350009, -0.0283380461),
-        (1.8058681460, -0.1333810052),
-        (0.4852528328, -0.3995676063),
-        (0.1658236932, -0.5531027541)]]}
-    '''
-    def convert(basis_name, symb):
-        if basis_name.lower().startswith('unc'):
-            return uncontract(basis.load(basis_name[3:], symb))
-        else:
-            return basis.load(basis_name, symb)
-
-    fmt_basis = {}
-    for atom, atom_basis in basis_tab.items():
-        symb = _atom_symbol(atom)
-        stdsymb = _std_symbol_without_ghost(symb)
-
-        if isinstance(atom_basis, (str, unicode)):
-            if 'gth' in atom_basis:
-                bset = convert(str(atom_basis), stdsymb)
-            else:
-                bset = atom_basis
-        else:
-            bset = []
-            for rawb in atom_basis:
-                if isinstance(rawb, (str, unicode)) and 'gth' in rawb:
-                    bset.append(convert(str(rawb), stdsymb))
-                else:
-                    bset.append(rawb)
-        fmt_basis[symb] = bset
-    return mole.format_basis(fmt_basis)
-
-def copy(cell):
-    '''Deepcopy of the given :class:`Cell` object
-    '''
-    import copy
-    newcell = mole.copy(cell)
-    newcell._pseudo = copy.deepcopy(cell._pseudo)
-    return newcell
 
 def pack(cell):
     '''Pack the input args of :class:`Cell` to a dict, which can be serialized
@@ -186,8 +67,8 @@ def pack(cell):
     '''
     cldic = mole.pack(cell)
     cldic['a'] = cell.a
+    cldic['fractional'] = cell.fractional
     cldic['precision'] = cell.precision
-    cldic['pseudo'] = cell.pseudo
     cldic['ke_cutoff'] = cell.ke_cutoff
     cldic['exp_to_discard'] = cell.exp_to_discard
     cldic['_mesh'] = cell._mesh
@@ -208,14 +89,15 @@ def unpack(celldic):
 def dumps(cell):
     '''Serialize Cell object to a JSON formatted str.
     '''
-    exclude_keys = set(('output', 'stdout', '_keys'))
+    exclude_keys = {'output', 'stdout', '_keys', '_ctx_lock',
+                    'symm_orb', 'irrep_id', 'irrep_name', 'lattice_symmetry'}
 
     celldic = dict(cell.__dict__)
     for k in exclude_keys:
         if k in celldic:
-            del(celldic[k])
+            del (celldic[k])
     for k in celldic:
-        if isinstance(celldic[k], np.ndarray):
+        if isinstance(celldic[k], (np.ndarray, np.generic)):
             celldic[k] = celldic[k].tolist()
     celldic['atom'] = repr(cell.atom)
     celldic['basis']= repr(cell.basis)
@@ -229,7 +111,7 @@ def dumps(cell):
             dic1 = {}
             for k,v in dic.items():
                 if (v is None or
-                    isinstance(v, (str, unicode, bool, int, long, float))):
+                    isinstance(v, (str, bool, int, float))):
                     dic1[k] = v
                 elif isinstance(v, (list, tuple)):
                     dic1[k] = v   # Should I recursively skip_vaule?
@@ -237,6 +119,8 @@ def dumps(cell):
                     dic1[k] = list(v)
                 elif isinstance(v, dict):
                     dic1[k] = skip_value(v)
+                elif isinstance(v, np.generic):
+                    dic1[k] = v.tolist()
                 else:
                     msg =('Function cell.dumps drops attribute %s because '
                           'it is not JSON-serializable' % k)
@@ -249,18 +133,6 @@ def loads(cellstr):
     '''
     from numpy import array  # noqa
     celldic = json.loads(cellstr)
-    if sys.version_info < (3,):
-        # Convert to utf8 because JSON loads fucntion returns unicode.
-        def byteify(inp):
-            if isinstance(inp, dict):
-                return dict([(byteify(k), byteify(v)) for k, v in inp.iteritems()])
-            elif isinstance(inp, (tuple, list)):
-                return [byteify(x) for x in inp]
-            elif isinstance(inp, unicode):
-                return inp.encode('utf-8')
-            else:
-                return inp
-        celldic = byteify(celldic)
     cell = Cell()
     cell.__dict__.update(celldic)
     cell.atom = eval(cell.atom)
@@ -271,42 +143,24 @@ def loads(cellstr):
     cell._bas = np.array(cell._bas, dtype=np.int32)
     cell._env = np.array(cell._env, dtype=np.double)
     cell._ecpbas = np.array(cell._ecpbas, dtype=np.int32)
+    cell._mesh = np.array(cell._mesh)
+
+    # Symmetry class cannot be serialized by dumps function.
+    # Recreate it manually
+    if cell.natm > 0 and cell.space_group_symmetry:
+        cell.build_lattice_symmetry()
 
     return cell
 
 def conc_cell(cell1, cell2):
     '''Concatenate two Cell objects.
     '''
+    mol3 = mole.conc_mol(cell1, cell2)
     cell3 = Cell()
-    cell3._atm, cell3._bas, cell3._env = \
-            conc_env(cell1._atm, cell1._bas, cell1._env,
-                     cell2._atm, cell2._bas, cell2._env)
-    off = len(cell1._env)
-    natm_off = len(cell1._atm)
-    if len(cell2._ecpbas) == 0:
-        cell3._ecpbas = cell1._ecpbas
-    else:
-        ecpbas2 = np.copy(cell2._ecpbas)
-        ecpbas2[:,mole.ATOM_OF  ] += natm_off
-        ecpbas2[:,mole.PTR_EXP  ] += off
-        ecpbas2[:,mole.PTR_COEFF] += off
-        if len(cell1._ecpbas) == 0:
-            cell3._ecpbas = ecpbas2
-        else:
-            cell3._ecpbas = np.vstack((cell1._ecpbas, ecpbas2))
+    cell3.__dict__.update(mol3.__dict__)
 
-    cell3.verbose = cell1.verbose
-    cell3.output = cell1.output
-    cell3.max_memory = cell1.max_memory
-    cell3.charge = cell1.charge + cell2.charge
-    cell3.spin = cell1.spin + cell2.spin
-    cell3.cart = cell1.cart and cell2.cart
-    cell3._atom = cell1._atom + cell2._atom
-    cell3.unit = cell1.unit
-    cell3._basis = dict(cell2._basis)
-    cell3._basis.update(cell1._basis)
-    # Whether to update the lattice_vectors?
-    cell3.a = cell1.a
+    # lattice_vectors needs to be consistent with cell3.unit (Bohr)
+    cell3.a = cell1.lattice_vectors()
     cell3.mesh = np.max((cell1.mesh, cell2.mesh), axis=0)
 
     ke_cutoff1 = cell1.ke_cutoff
@@ -324,20 +178,6 @@ def conc_cell(cell1, cell2):
     cell3.dimension = max(cell1.dimension, cell2.dimension)
     cell3.low_dim_ft_type = cell1.low_dim_ft_type or cell2.low_dim_ft_type
     cell3.rcut = max(cell1.rcut, cell2.rcut)
-
-    cell3._pseudo.update(cell1._pseudo)
-    cell3._pseudo.update(cell2._pseudo)
-    cell3._ecp.update(cell1._ecp)
-    cell3._ecp.update(cell2._ecp)
-
-    cell3.nucprop.update(cell1.nucprop)
-    cell3.nucprop.update(cell2.nucprop)
-
-    if not cell1._built:
-        logger.warn(cell1, 'Warning: intor envs of %s not initialized.', cell1)
-    if not cell2._built:
-        logger.warn(cell2, 'Warning: intor envs of %s not initialized.', cell2)
-    cell3._built = cell1._built or cell2._built
     return cell3
 
 def intor_cross(intor, cell1, cell2, comp=None, hermi=0, kpts=None, kpt=None,
@@ -348,7 +188,6 @@ def intor_cross(intor, cell1, cell2, comp=None, hermi=0, kpts=None, kpt=None,
 
         \langle \mu | intor | \nu \rangle, \mu \in cell1, \nu \in cell2
     '''
-    import copy
     intor, comp = moleintor._get_intor_and_comp(cell1._add_suffix(intor), comp)
 
     if kpts is None:
@@ -360,7 +199,7 @@ def intor_cross(intor, cell1, cell2, comp=None, hermi=0, kpts=None, kpt=None,
         kpts_lst = np.reshape(kpts, (-1,3))
     nkpts = len(kpts_lst)
 
-    pcell = copy.copy(cell1)
+    pcell = cell1.copy(deep=False)
     pcell.precision = min(cell1.precision, cell2.precision)
     pcell._atm, pcell._bas, pcell._env = \
             atm, bas, env = conc_env(cell1._atm, cell1._bas, cell1._env,
@@ -382,15 +221,9 @@ def intor_cross(intor, cell1, cell2, comp=None, hermi=0, kpts=None, kpt=None,
     fill = getattr(libpbc, 'PBCnr2c_fill_k'+aosym)
     fintor = getattr(moleintor.libcgto, intor)
     cintopt = lib.c_null_ptr()
-    pbcopt = kwargs.get('pbcopt', None)
-    if pbcopt is None:
-        pbcopt = _pbcintor.PBCOpt(pcell).init_rcut_cond(pcell)
-    if isinstance(pbcopt, _pbcintor.PBCOpt):
-        cpbcopt = pbcopt._this
-    else:
-        cpbcopt = lib.c_null_ptr()
 
-    Ls = cell1.get_lattice_Ls(rcut=max(cell1.rcut, cell2.rcut))
+    rcut = max(cell1.rcut, cell2.rcut)
+    Ls = cell1.get_lattice_Ls(rcut=rcut)
     expkL = np.asarray(np.exp(1j*np.dot(kpts_lst, Ls.T)), order='C')
     drv = libpbc.PBCnr2c_drv
 
@@ -413,7 +246,7 @@ def intor_cross(intor, cell1, cell2, comp=None, hermi=0, kpts=None, kpt=None,
                 Ls.ctypes.data_as(ctypes.c_void_p),
                 facx.ctypes.data_as(ctypes.c_void_p),
                 (ctypes.c_int*4)(i0, i1, j0, j1),
-                ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt, cpbcopt,
+                ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt,
                 atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(pcell.natm),
                 bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(pcell.nbas),
                 env.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(env.size))
@@ -431,7 +264,7 @@ def intor_cross(intor, cell1, cell2, comp=None, hermi=0, kpts=None, kpt=None,
         Ls.ctypes.data_as(ctypes.c_void_p),
         expkL.ctypes.data_as(ctypes.c_void_p),
         (ctypes.c_int*4)(i0, i1, j0, j1),
-        ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt, cpbcopt,
+        ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt,
         atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(pcell.natm),
         bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(pcell.nbas),
         env.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(env.size))
@@ -452,6 +285,89 @@ def intor_cross(intor, cell1, cell2, comp=None, hermi=0, kpts=None, kpt=None,
         mat = mat[0]
     return mat
 
+def _intor_cross_screened(
+        intor, cell1, cell2, comp=None, hermi=0, kpts=None, kpt=None,
+        shls_slice=None, **kwargs):
+    '''`intor_cross` with prescreening.
+
+    Notes:
+         This function may be subject to change.
+    '''
+    from pyscf.pbc.gto.neighborlist import NeighborListOpt
+    intor, comp = moleintor._get_intor_and_comp(cell1._add_suffix(intor), comp)
+
+    if kpts is None:
+        if kpt is not None:
+            kpts_lst = np.reshape(kpt, (1,3))
+        else:
+            kpts_lst = np.zeros((1,3))
+    else:
+        kpts_lst = np.reshape(kpts, (-1,3))
+    nkpts = len(kpts_lst)
+
+    pcell = cell1.copy(deep=False)
+    pcell.precision = min(cell1.precision, cell2.precision)
+    pcell._atm, pcell._bas, pcell._env = \
+            atm, bas, env = conc_env(cell1._atm, cell1._bas, cell1._env,
+                                     cell2._atm, cell2._bas, cell2._env)
+    if shls_slice is None:
+        shls_slice = (0, cell1.nbas, 0, cell2.nbas)
+    i0, i1, j0, j1 = shls_slice[:4]
+    j0 += cell1.nbas
+    j1 += cell1.nbas
+    ao_loc = moleintor.make_loc(bas, intor)
+    ni = ao_loc[i1] - ao_loc[i0]
+    nj = ao_loc[j1] - ao_loc[j0]
+    out = np.empty((nkpts,comp,ni,nj), dtype=np.complex128)
+
+    if hermi == 0:
+        aosym = 's1'
+    else:
+        aosym = 's2'
+    fill = getattr(libpbc, 'PBCnr2c_screened_fill_k'+aosym)
+    fintor = getattr(moleintor.libcgto, intor)
+    drv = libpbc.PBCnr2c_screened_drv
+
+    rcut = max(cell1.rcut, cell2.rcut)
+    Ls = cell1.get_lattice_Ls(rcut=rcut)
+    expkL = np.asarray(np.exp(1j*np.dot(kpts_lst, Ls.T)), order='C')
+
+    neighbor_list = kwargs.get('neighbor_list', None)
+    if neighbor_list is None:
+        nlopt = NeighborListOpt(cell1)
+        nlopt.build(cell1, cell2, Ls, set_optimizer=False)
+        neighbor_list = nlopt.nl
+
+    cintopt = lib.c_null_ptr()
+
+    drv(fintor, fill, out.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(nkpts), ctypes.c_int(comp), ctypes.c_int(len(Ls)),
+        Ls.ctypes.data_as(ctypes.c_void_p),
+        expkL.ctypes.data_as(ctypes.c_void_p),
+        (ctypes.c_int*4)(i0, i1, j0, j1),
+        ao_loc.ctypes.data_as(ctypes.c_void_p), cintopt,
+        atm.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(pcell.natm),
+        bas.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(pcell.nbas),
+        env.ctypes.data_as(ctypes.c_void_p), ctypes.c_int(env.size),
+        ctypes.byref(neighbor_list))
+
+    nlopt = None
+
+    mat = []
+    for k, kpt in enumerate(kpts_lst):
+        v = out[k]
+        if hermi != 0:
+            for ic in range(comp):
+                lib.hermi_triu(v[ic], hermi=hermi, inplace=True)
+        if comp == 1:
+            v = v[0]
+        if abs(kpt).sum() < 1e-9:  # gamma_point
+            v = v.real
+        mat.append(v)
+
+    if kpts is None or np.shape(kpts) == (3,):  # A single k-point
+        mat = mat[0]
+    return mat
 
 def get_nimgs(cell, precision=None):
     r'''Choose number of basis function images in lattice sums
@@ -467,9 +383,8 @@ def get_nimgs(cell, precision=None):
     if precision is None:
         precision = cell.precision
 
-    rcut = max([cell.bas_rcut(ib, precision) for ib in range(cell.nbas)])
-
     # nimgs determines the supercell size
+    rcut = estimate_rcut(cell, precision)
     nimgs = cell.get_bounding_sphere(rcut)
     return nimgs
 
@@ -477,88 +392,113 @@ def _estimate_rcut(alpha, l, c, precision=INTEGRAL_PRECISION):
     '''rcut based on the overlap integrals. This estimation is too conservative
     in many cases. A possible replacement can be the value of the basis
     function at rcut ~ c*r^(l+2)*exp(-alpha*r^2) < precision'''
-    C = (c**2)*(2*l+1) / (precision * LATTICE_SUM_PENALTY)
+    theta = alpha * .5
+    a1 = (alpha * 2)**-.5
+    norm_ang = (2*l+1)/(4*np.pi)
+    fac = 2*np.pi*c**2*norm_ang / theta / precision
     r0 = 20
-    # +1. to ensure np.log returning positive value
-    r0 = np.sqrt(2.*np.log(C*(r0**2*alpha)**(l+1)+1.) / alpha)
-    rcut = np.sqrt(2.*np.log(C*(r0**2*alpha)**(l+1)+1.) / alpha)
-    return rcut
+    # The estimation is enough for overlap. Errors are slightly larger for
+    # kinetic operator. The error in kinetic integrals may be dominant.
+    # For kinetic operator, basis becomes 2*a*r*|orig-basis>.
+    # A penalty term 4*a^2*r^2 is included in the estimation.
+    fac *= 4*alpha**2
+    r0 = (np.log(fac * r0 * (r0*.5+a1)**(2*l+2) + 1.) / theta)**.5
+    r0 = (np.log(fac * r0 * (r0*.5+a1)**(2*l+2) + 1.) / theta)**.5
+    return r0
 
-def bas_rcut(cell, bas_id, precision=INTEGRAL_PRECISION):
+def bas_rcut(cell, bas_id, precision=None):
     r'''Estimate the largest distance between the function and its image to
     reach the precision in overlap
 
     precision ~ \int g(r-0) g(r-Rcut)
     '''
+    if precision is None:
+        precision = cell.precision
     l = cell.bas_angular(bas_id)
     es = cell.bas_exp(bas_id)
-    cs = abs(cell.bas_ctr_coeff(bas_id)).max(axis=1)
+    cs = abs(cell._libcint_ctr_coeff(bas_id)).max(axis=1)
     rcut = _estimate_rcut(es, l, cs, precision)
     return rcut.max()
 
-def _estimate_ke_cutoff(alpha, l, c, precision=INTEGRAL_PRECISION, weight=1.):
-    '''Energy cutoff estimation based on cubic lattice'''
-    # This function estimates the energy cutoff for (ii|ii) type of electron
-    # repulsion integrals. The energy cutoff for nuclear attraction is larger
-    # than the energy cutoff for ERIs.  The estimated error is roughly
-    #     error ~ 64 pi^3 c^2 /((2l+1)!!(4a)^l) (2Ecut)^{l+.5} e^{-Ecut/4a}
-    # log_k0 = 3 + np.log(alpha) / 2
-    # l2fac2 = factorial2(l*2+1)
-    # log_rest = np.log(precision*l2fac2*(4*alpha)**l / (16*np.pi**2*c**2))
-    # Enuc_cut = 4*alpha * (log_k0*(2*l+1) - log_rest)
-    # Enuc_cut[Enuc_cut <= 0] = .5
-    # log_k0 = .5 * np.log(Ecut*2)
-    # Enuc_cut = 4*alpha * (log_k0*(2*l+1) - log_rest)
-    # Enuc_cut[Enuc_cut <= 0] = .5
-    #
-    # However, nuclear attraction can be evaluated with the trick of Ewald
-    # summation which largely reduces the requirements to the energy cutoff.
-    # In practice, the cutoff estimation for ERIs as below should be enough.
-    log_k0 = 3 + np.log(alpha) / 2
-    l2fac2 = factorial2(l*2+1)
-    log_rest = np.log(precision*l2fac2**2*(4*alpha)**(l*2+1) / (128*np.pi**4*c**4))
-    Ecut = 2*alpha * (log_k0*(4*l+3) - log_rest)
-    Ecut[Ecut <= 0] = .5
-    log_k0 = .5 * np.log(Ecut*2)
-    Ecut = 2*alpha * (log_k0*(4*l+3) - log_rest)
-    Ecut[Ecut <= 0] = .5
+def estimate_rcut(cell, precision=None):
+    '''Lattice-sum cutoff for the entire system'''
+    if cell.nbas == 0:
+        return 0.01
+    if precision is None:
+        precision = cell.precision
+    if cell.use_loose_rcut:
+        return cell.rcut_by_shells(precision).max()
+
+    exps, cs = _extract_pgto_params(cell, 'min')
+    ls = cell._bas[:,mole.ANG_OF]
+    rcut = _estimate_rcut(exps, ls, cs, precision)
+    return rcut.max()
+
+def _estimate_ke_cutoff(alpha, l, c, precision=INTEGRAL_PRECISION, omega=0):
+    '''Energy cutoff estimation for nuclear attraction integrals'''
+    norm_ang = (2*l+1)/(4*np.pi)
+    fac = 32*np.pi**2*(2*np.pi)**1.5 * c**2*norm_ang / (2*alpha)**(2*l+.5) / precision
+    Ecut = 20.
+    if omega <= 0:
+        Ecut = np.log(fac * (Ecut*2)**(l-.5) + 1.) * 4*alpha
+        Ecut = np.log(fac * (Ecut*2)**(l-.5) + 1.) * 4*alpha
+    else:
+        theta = 1./(1./(4*alpha) + 1./(2*omega**2))
+        Ecut = np.log(fac * (Ecut*2)**(l-.5) + 1.) * theta
+        Ecut = np.log(fac * (Ecut*2)**(l-.5) + 1.) * theta
     return Ecut
 
-def estimate_ke_cutoff(cell, precision=INTEGRAL_PRECISION):
-    '''Energy cutoff estimation'''
-    Ecut_max = 0
-    for i in range(cell.nbas):
-        l = cell.bas_angular(i)
-        es = cell.bas_exp(i)
-        cs = abs(cell.bas_ctr_coeff(i)).max(axis=1)
-        ke_guess = _estimate_ke_cutoff(es, l, cs, precision)
-        Ecut_max = max(Ecut_max, ke_guess.max())
-    return Ecut_max
+def estimate_ke_cutoff(cell, precision=None):
+    '''Energy cutoff estimation for nuclear attraction integrals'''
+    if cell.nbas == 0:
+        return 0.
+    if precision is None:
+        precision = cell.precision
+    #precision /= cell.atom_charges().sum()
+    exps, cs = _extract_pgto_params(cell, 'max')
+    ls = cell._bas[:,mole.ANG_OF]
+    Ecut = _estimate_ke_cutoff(exps, ls, cs, precision, cell.omega)
+    return Ecut.max()
 
-def error_for_ke_cutoff(cell, ke_cutoff):
-    kmax = np.sqrt(ke_cutoff*2)
-    errmax = 0
-    for i in range(cell.nbas):
-        l = cell.bas_angular(i)
-        es = cell.bas_exp(i)
-        cs = abs(cell.bas_ctr_coeff(i)).max(axis=1)
-        fac = (256*np.pi**4*cs**4 * factorial2(l*4+3)
-               / factorial2(l*2+1)**2)
-        efac = np.exp(-ke_cutoff/(2*es))
-        err1 = .5*fac/(4*es)**(2*l+1) * kmax**(4*l+3) * efac
-        errmax = max(errmax, err1.max())
-        if np.any(ke_cutoff < 5*es):
-            err2 = (1.41*efac+2.51)*fac/(4*es)**(2*l+2) * kmax**(4*l+5)
-            errmax = max(errmax, err2[ke_cutoff<5*es].max())
-        if np.any(ke_cutoff < es):
-            err2 = (1.41*efac+2.51)*fac/2**(2*l+2) * np.sqrt(2*es)
-            errmax = max(errmax, err2[ke_cutoff<es].max())
-    return errmax
+def _extract_pgto_params(cell, op='min'):
+    '''A helper function for estimate_xxx function'''
+    es = []
+    cs = []
+    if op == 'min':
+        for i in range(cell.nbas):
+            e = cell.bas_exp(i)
+            c = cell._libcint_ctr_coeff(i)
+            idx = e.argmin()
+            es.append(e[idx])
+            cs.append(abs(c[idx]).max())
+    else:
+        for i in range(cell.nbas):
+            e = cell.bas_exp(i)
+            c = cell._libcint_ctr_coeff(i)
+            idx = e.argmax()
+            es.append(e[idx])
+            cs.append(abs(c[idx]).max())
+    return np.array(es), np.array(cs)
+
+def error_for_ke_cutoff(cell, ke_cutoff, omega=None):
+    '''Error estimation based on nuclear attraction integrals'''
+    if omega is None:
+        omega = cell.omega
+    exps, cs = _extract_pgto_params(cell, 'max')
+    ls = cell._bas[:,mole.ANG_OF]
+    norm_ang = (2*ls+1)/(4*np.pi)
+    fac = 32*np.pi**2*(2*np.pi)**1.5 * cs**2*norm_ang / (2*exps)**(2*ls+.5)
+    if omega <= 0:
+        err = fac * (2*ke_cutoff)**(ls-.5) * np.exp(-ke_cutoff/(4*exps))
+    else:
+        theta = 1./(1./(4*exps) + 1./(2*omega**2))
+        err = fac * (2*ke_cutoff)**(ls-.5) * np.exp(-ke_cutoff/theta)
+    return err.max()
 
 def get_bounding_sphere(cell, rcut):
     '''Finds all the lattice points within a sphere of radius rcut.
 
-    Defines a parallelipiped given by -N_x <= n_x <= N_x, with x in [1,3]
+    Defines a parallelepiped given by -N_x <= n_x <= N_x, with x in [1,3]
     See Martin p. 85
 
     Args:
@@ -578,7 +518,7 @@ def get_bounding_sphere(cell, rcut):
     nimgs = np.ceil(rcut*heights_inv).astype(int)
 
     for i in range(cell.dimension, 3):
-        nimgs[i] = 1
+        nimgs[i] = 0
     return nimgs
 
 def get_Gv(cell, mesh=None, **kwargs):
@@ -616,8 +556,7 @@ def get_Gv_weights(cell, mesh=None, **kwargs):
     b = cell.reciprocal_vectors()
     weights = abs(np.linalg.det(b))
 
-    if (cell.dimension < 2 or
-        (cell.dimension == 2 and cell.low_dim_ft_type == 'inf_vacuum')):
+    if cell.dimension <= 2 and cell.low_dim_ft_type == 'inf_vacuum':
         if cell.dimension == 0:
             rx, wx = _non_uniform_Gv_base(mesh[0]//2)
             ry, wy = _non_uniform_Gv_base(mesh[1]//2)
@@ -641,7 +580,25 @@ def get_Gv_weights(cell, mesh=None, **kwargs):
             weights = np.einsum('i,k->ik', wxy, wz).reshape(-1)
 
     Gvbase = (rx, ry, rz)
-    Gv = np.dot(lib.cartesian_prod(Gvbase), b)
+
+    #:Gv = np.dot(lib.cartesian_prod(Gvbase), b)
+    # NOTE mesh can be different from the input mesh
+    mesh = np.asarray((len(rx),len(ry),len(rz)), dtype=np.int32)
+    Gv = np.empty((*mesh,3), order='C', dtype=float)
+    b = np.asarray(b, order='C')
+    rx = np.asarray(rx, order='C')
+    ry = np.asarray(ry, order='C')
+    rz = np.asarray(rz, order='C')
+    libpbc.get_Gv(
+        Gv.ctypes.data_as(ctypes.c_void_p),
+        rx.ctypes.data_as(ctypes.c_void_p),
+        ry.ctypes.data_as(ctypes.c_void_p),
+        rz.ctypes.data_as(ctypes.c_void_p),
+        mesh.ctypes.data_as(ctypes.c_void_p),
+        b.ctypes.data_as(ctypes.c_void_p),
+    )
+    Gv = Gv.reshape(-1, 3)
+
     # 1/cell.vol == det(b)/(2pi)^3
     weights *= 1/(2*np.pi)**3
     return Gv, Gvbase, weights
@@ -654,7 +611,7 @@ def _non_uniform_Gv_base(n):
     #return np.hstack((0,rs,-rs[::-1])), np.hstack((0,ws,ws[::-1]))
     return np.hstack((rs,-rs[::-1])), np.hstack((ws,ws[::-1]))
 
-def get_SI(cell, Gv=None):
+def get_SI(cell, Gv=None, mesh=None, atmlst=None):
     '''Calculate the structure factor (0D, 1D, 2D, 3D) for all atoms; see MH (3.34).
 
     Args:
@@ -663,21 +620,28 @@ def get_SI(cell, Gv=None):
         Gv : (N,3) array
             G vectors
 
+        atmlst : list of ints, optional
+            Indices of atoms for which the structure factors are computed.
+
     Returns:
         SI : (natm, ngrids) ndarray, dtype=np.complex128
             The structure factor for each atom at each G-vector.
     '''
     coords = cell.atom_coords()
-    ngrids = np.prod(cell.mesh)
-    if Gv is None or Gv.shape[0] == ngrids:
-        basex, basey, basez = cell.get_Gv_weights(cell.mesh)[1]
+    if atmlst is not None:
+        coords = coords[np.asarray(atmlst)]
+    if Gv is None:
+        if mesh is None:
+            mesh = cell.mesh
+        basex, basey, basez = cell.get_Gv_weights(mesh)[1]
         b = cell.reciprocal_vectors()
         rb = np.dot(coords, b.T)
         SIx = np.exp(-1j*np.einsum('z,g->zg', rb[:,0], basex))
         SIy = np.exp(-1j*np.einsum('z,g->zg', rb[:,1], basey))
         SIz = np.exp(-1j*np.einsum('z,g->zg', rb[:,2], basez))
         SI = SIx[:,:,None,None] * SIy[:,None,:,None] * SIz[:,None,None,:]
-        SI = SI.reshape(-1,ngrids)
+        natm = coords.shape[0]
+        SI = SI.reshape(natm, -1)
     else:
         SI = np.exp(-1j*np.dot(coords, Gv.T))
     return SI
@@ -702,38 +666,31 @@ def get_ewald_params(cell, precision=None, mesh=None):
         ew_eta, ew_cut : float
             The Ewald 'eta' and 'cut' parameters.
     '''
-    if precision is None:
-        precision = cell.precision
     if cell.natm == 0:
         return 0, 0
-    elif (cell.dimension < 2 or
-          (cell.dimension == 2 and cell.low_dim_ft_type == 'inf_vacuum')):
+
+    if precision is None:
+        precision = cell.precision
+
+    if (cell.dimension == 3 or
+        (cell.dimension == 0 and cell.low_dim_ft_type != 'inf_vacuum')):
+        ew_eta = 1./cell.vol**(1./6)
+        ew_cut = _estimate_rcut(ew_eta**2, 0, 1., precision)
+    elif cell.dimension <= 2 and cell.low_dim_ft_type == 'inf_vacuum':
         # Non-uniform PW grids are used for low-dimensional ewald summation.  The cutoff
         # estimation for long range part based on exp(G^2/(4*eta^2)) does not work for
         # non-uniform grids.  Smooth model density is preferred.
         ew_cut = cell.rcut
         ew_eta = np.sqrt(max(np.log(4*np.pi*ew_cut**2/precision)/ew_cut**2, .1))
+    elif cell.dimension == 2:
+        a = cell.lattice_vectors()
+        ew_cut = a[2,2] / 2
+        # ewovrl ~ erfc(eta*rcut) / rcut ~ e^{(-eta**2 rcut*2)} < precision
+        log_precision = np.log(precision / (cell.atom_charges().sum()*16*np.pi**2))
+        ew_eta = (-log_precision)**.5 / ew_cut
     else:
-        if mesh is None:
-            mesh = cell.mesh
-        mesh = _cut_mesh_for_ewald(cell, mesh)
-        Gmax = min(np.asarray(mesh)//2 * lib.norm(cell.reciprocal_vectors(), axis=1))
-        log_precision = np.log(precision/(4*np.pi*(Gmax+1e-100)**2))
-        ew_eta = np.sqrt(-Gmax**2/(4*log_precision)) + 1e-100
-        ew_cut = _estimate_rcut(ew_eta**2, 0, 1., precision)
+        raise RuntimeError(f'dimension={cell.dimension} not supported')
     return ew_eta, ew_cut
-
-def _cut_mesh_for_ewald(cell, mesh):
-    mesh = np.copy(mesh)
-    mesh_max = np.asarray(np.linalg.norm(cell.lattice_vectors(), axis=1) * 2,
-                          dtype=int)  # roughly 2 grids per bohr
-    if (cell.dimension < 2 or
-        (cell.dimension == 2 and cell.low_dim_ft_type == 'inf_vacuum')):
-        mesh_max[cell.dimension:] = mesh[cell.dimension:]
-
-    mesh_max[mesh_max<80] = 80
-    mesh[mesh>mesh_max] = mesh_max[mesh>mesh_max]
-    return mesh
 
 def ewald(cell, ew_eta=None, ew_cut=None):
     '''Perform real (R) and reciprocal (G) space Ewald sum for the energy.
@@ -755,9 +712,22 @@ def ewald(cell, ew_eta=None, ew_cut=None):
     if cell.natm == 0:
         return 0
 
-    if ew_eta is None: ew_eta = cell.get_ewald_params()[0]
-    if ew_cut is None: ew_cut = cell.get_ewald_params()[1]
+    if cell.dimension == 3 and cell.use_particle_mesh_ewald:
+        from pyscf.pbc.gto import ewald_methods
+        return ewald_methods.particle_mesh_ewald(cell, ew_eta, ew_cut)
+
+    if cell.dimension == 0 and cell.low_dim_ft_type != 'inf_vacuum':
+        return mole.classical_coulomb_energy(cell)
+
     chargs = cell.atom_charges()
+
+    if ew_eta is None or ew_cut is None:
+        ew_eta, ew_cut = cell.get_ewald_params()
+    log_precision = np.log(cell.precision / (chargs.sum()*16*np.pi**2))
+    ke_cutoff = -2*ew_eta**2*log_precision
+    mesh = cell.cutoff_to_mesh(ke_cutoff)
+    logger.debug1(cell, 'mesh for ewald %s', mesh)
+
     coords = cell.atom_coords()
     Lall = cell.get_lattice_Ls(rcut=ew_cut)
 
@@ -780,16 +750,22 @@ def ewald(cell, ew_eta=None, ew_cut=None):
     #   1/2 * 4\pi / Omega \sum_I \sum_{G\neq 0} |ZS_I(G)|^2 \exp[-|G|^2/4\eta^2]
     # where
     #   ZS_I(G) = \sum_a Z_a exp (i G.R_a)
-    # See also Eq. (32) of ewald.pdf at
-    #   http://www.fisica.uniud.it/~giannozz/public/ewald.pdf
-    mesh = _cut_mesh_for_ewald(cell, cell.mesh)
-    Gv, Gvbase, weights = cell.get_Gv_weights(mesh)
-    absG2 = np.einsum('gi,gi->g', Gv, Gv)
-    absG2[absG2==0] = 1e200
-    if cell.dimension != 2 or cell.low_dim_ft_type == 'inf_vacuum':
+
+    if cell.dimension == 3 or cell.low_dim_ft_type == 'inf_vacuum':
+        Gv, Gvbase, weights = cell.get_Gv_weights(mesh)
+        absG2 = np.einsum('gi,gi->g', Gv, Gv)
+        absG2[absG2==0] = 1e200
         coulG = 4*np.pi / absG2
         coulG *= weights
-        ZSI = np.einsum("i,ij->j", chargs, cell.get_SI(Gv))
+
+        #:ZSI = np.einsum('i,ij->j', chargs, cell.get_SI(Gv))
+        basex, basey, basez = Gvbase
+        b = cell.reciprocal_vectors()
+        rb = np.dot(coords, b.T)
+        SIx = np.exp(-1j*np.einsum('z,g->zg', rb[:,0], basex))
+        SIy = np.exp(-1j*np.einsum('z,g->zg', rb[:,1], basey))
+        SIz = np.exp(-1j*np.einsum('z,g->zg', rb[:,2], basez))
+        ZSI = np.einsum('i,ix,iy,iz->xyz', chargs, SIx, SIy, SIz).ravel()
         ZexpG2 = ZSI * np.exp(-absG2/(4*ew_eta**2))
         ewg = .5 * np.einsum('i,i,i', ZSI.conj(), ZexpG2, coulG).real
 
@@ -814,6 +790,8 @@ def ewald(cell, ew_eta=None, ew_cut=None):
         inv_area = np.linalg.norm(np.cross(b[0], b[1]))/(2*np.pi)**2
         # Perform the reciprocal space summation over  all reciprocal vectors
         # within the x,y plane.
+        Gv, Gvbase, weights = cell.get_Gv_weights(mesh)
+        absG2 = np.einsum('gi,gi->g', Gv, Gv)
         planarG2_idx = np.logical_and(Gv[:,2] == 0, absG2 > 0.0)
         Gv = Gv[planarG2_idx]
         absG2 = absG2[planarG2_idx]
@@ -827,6 +805,13 @@ def ewald(cell, ew_eta=None, ew_cut=None):
         ewg += np.einsum('i,j,ij->', chargs, chargs, gn0(ew_eta,rij[:,:,2]))
         ewg *= inv_area*0.5
 
+    elif cell.dimension == 0:
+        # The truncated Coulomb kernel 4*pi/G^2(1-cos(G*Rc)) should work for the
+        # ewg term. However, large errors may be introduced in ewovrl or ewself.
+        # For dimension=0 with truncated Coulomb, the nuclear energy can be
+        # computed directly using the mole.classical_coulomb_energy function.
+        raise RuntimeError('Ewald with truncated Coulomb')
+
     else:
         logger.warn(cell, 'No method for PBC dimension %s, dim-type %s.'
                     '  cell.low_dim_ft_type="inf_vacuum"  should be set.',
@@ -839,7 +824,9 @@ def ewald(cell, ew_eta=None, ew_cut=None):
 energy_nuc = ewald
 
 def make_kpts(cell, nks, wrap_around=WRAP_AROUND, with_gamma_point=WITH_GAMMA,
-              scaled_center=None):
+              scaled_center=None,
+              space_group_symmetry=False, time_reversal_symmetry=False,
+              **kwargs):
     '''Given number of kpoints along x,y,z , generate kpoints
 
     Args:
@@ -855,10 +842,15 @@ def make_kpts(cell, nks, wrap_around=WRAP_AROUND, with_gamma_point=WITH_GAMMA,
             scaled_center, given as the zeroth index of the returned kpts.
             Scaled meaning that the k-points are scaled to a grid from
             [-1,1] x [-1,1] x [-1,1]
+        space_group_symmetry : bool
+            Whether to consider space group symmetry
+        time_reversal_symmetry : bool
+            Whether to consider time reversal symmetry
 
     Returns:
         kpts in absolute value (unit 1/Bohr).  Gamma point is placed at the
-        first place in the k-points list
+        first place in the k-points list;
+        instance of :class:`KPoints` if k-point symmetry is considered
 
     Examples:
 
@@ -878,9 +870,19 @@ def make_kpts(cell, nks, wrap_around=WRAP_AROUND, with_gamma_point=WITH_GAMMA,
     scaled_kpts = lib.cartesian_prod(ks_each_axis)
     scaled_kpts += np.array(scaled_center)
     kpts = cell.get_abs_kpts(scaled_kpts)
+    if space_group_symmetry or time_reversal_symmetry:
+        from pyscf.pbc.lib import kpts as libkpts
+        if space_group_symmetry and not cell.space_group_symmetry:
+            raise RuntimeError('Using k-point symmetry now requires cell '
+                               'to be built with space group symmetry info:\n'
+                               'cell.space_group_symmetry = True\n'
+                               'cell.symmorphic = False\n'
+                               'cell.build()')
+        kpts = libkpts.make_kpts(cell, kpts, space_group_symmetry,
+                                 time_reversal_symmetry)
     return kpts
 
-def get_uniform_grids(cell, mesh=None, **kwargs):
+def get_uniform_grids(cell, mesh=None, wrap_around=True):
     '''Generate a uniform real-space grid consistent w/ samp thm; see MH (3.19).
 
     Args:
@@ -892,69 +894,26 @@ def get_uniform_grids(cell, mesh=None, **kwargs):
 
     '''
     if mesh is None: mesh = cell.mesh
-    if 'gs' in kwargs:
-        warnings.warn('cell.gs is deprecated.  It is replaced by cell.mesh,'
-                      'the number of PWs (=2*gs+1) along each direction.')
-        mesh = [2*n+1 for n in kwargs['gs']]
-    mesh = np.asarray(mesh, dtype=np.double)
-    qv = lib.cartesian_prod([np.arange(x) for x in mesh])
-    a_frac = np.einsum('i,ij->ij', 1./mesh, cell.lattice_vectors())
-    coords = np.dot(qv, a_frac)
+
+    if wrap_around:
+        # wrap the coordinates around the origin. If coordinates are generated
+        # inside the primitive cell without wrap-around, an extra layer would be
+        # needed in function get_lattice_Ls for 2D calculations.
+        qv = lib.cartesian_prod([np.fft.fftfreq(x) for x in mesh])
+        coords = np.dot(qv, cell.lattice_vectors())
+    else:
+        mesh = np.asarray(mesh, dtype=np.double)
+        qv = lib.cartesian_prod([np.arange(x) for x in mesh])
+        a_frac = np.einsum('i,ij->ij', 1./mesh, cell.lattice_vectors())
+        coords = np.dot(qv, a_frac)
     return coords
 gen_uniform_grids = get_uniform_grids
-
-# Check whether ecp keywords are presented in pp and whether pp keywords are
-# presented in ecp.  The return (ecp, pp) should have only the ecp keywords and
-# pp keywords in each dict.
-# The "misplaced" ecp/pp keywords have lowest priority, ie if the atom is
-# defined in ecp, the misplaced ecp atom found in pp does NOT replace the
-# definition in ecp, and versa vise.
-def classify_ecp_pseudo(cell, ecp, pp):
-    def classify(ecp, pp_alias):
-        if isinstance(ecp, (str, unicode)):
-            if pseudo._format_pseudo_name(ecp)[0] in pp_alias:
-                return {}, {'default': str(ecp)}
-        elif isinstance(ecp, dict):
-            ecp_as_pp = {}
-            for atom in ecp:
-                key = ecp[atom]
-                if (isinstance(key, (str, unicode)) and
-                    pseudo._format_pseudo_name(key)[0] in pp_alias):
-                    ecp_as_pp[atom] = str(key)
-            if ecp_as_pp:
-                ecp_left = dict(ecp)
-                for atom in ecp_as_pp:
-                    ecp_left.pop(atom)
-                return ecp_left, ecp_as_pp
-        return ecp, {}
-    ecp_left, ecp_as_pp = classify(ecp, pseudo.ALIAS)
-    pp_left , pp_as_ecp = classify(pp, MOLE_ALIAS)
-
-    # ecp = ecp_left + pp_as_ecp
-    # pp = pp_left + ecp_as_pp
-    ecp = ecp_left
-    if pp_as_ecp and not isinstance(ecp_left, (str, unicode)):
-        # If ecp is a str, all atoms have ecp definition.  The misplaced ecp has no effects.
-        logger.info(cell, 'PBC pseudo-potentials keywords for %s found in .ecp',
-                    pp_as_ecp.keys())
-        if ecp_left:
-            pp_as_ecp.update(ecp_left)
-        ecp = pp_as_ecp
-    pp = pp_left
-    if ecp_as_pp and not isinstance(pp_left, (str, unicode)):
-        logger.info(cell, 'ECP keywords for %s found in PBC .pseudo',
-                    ecp_as_pp.keys())
-        if pp_left:
-            ecp_as_pp.update(pp_left)
-        pp = ecp_as_pp
-    return ecp, pp
 
 def _split_basis(cell, delimiter=EXP_DELIMITER):
     '''
     Split the contracted basis to small segmant.  The new basis has more
     shells.  Each shell has less primitive basis and thus is more local.
     '''
-    import copy
     _bas = []
     _env = cell._env.copy()
     contr_coeff = []
@@ -989,7 +948,7 @@ def _split_basis(cell, delimiter=EXP_DELIMITER):
                 count += 1
         contr_coeff.append(np.vstack([np.eye(degen*nc)] * count))
 
-    pcell = copy.copy(cell)
+    pcell = cell.copy(deep=False)
     pcell._bas = np.asarray(np.vstack(_bas), dtype=np.int32)
     pcell._env = _env
     return pcell, scipy.linalg.block_diag(*contr_coeff)
@@ -999,7 +958,7 @@ def tot_electrons(cell, nkpts=1):
     '''
     if cell._nelectron is None:
         nelectron = cell.atom_charges().sum() * nkpts - cell.charge
-    else: # Custom cell.nelectron stands for num. electrons per unit cell
+    else: # Custom cell.nelectron stands for num. electrons per cell
         nelectron = cell._nelectron * nkpts
     # Round off to the nearest integer
     nelectron = int(nelectron+0.5)
@@ -1011,8 +970,197 @@ def _mesh_inf_vaccum(cell):
     # meshz has to be even number due to the symmetry on z+ and z-
     return int(meshz*.5 + .999) * 2
 
+def pgf_rcut(l, alpha, coeff, precision=INTEGRAL_PRECISION,
+             rcut=0, max_cycle=RCUT_MAX_CYCLE, eps=RCUT_EPS):
+    '''Estimate the cutoff radii of primitive Gaussian functions
+    based on their values in real space:
+    `c*rcut^(l+2)*exp(-alpha*rcut^2) ~ precision`.
+    '''
+    c = np.log(coeff / precision)
 
-class Cell(mole.Mole):
+    rmin = np.sqrt(.5 * (l+2) / alpha) * 2
+    eps = np.minimum(rmin/10, eps)
+    rcut = np.maximum(rcut, rmin+eps)
+    for i in range(max_cycle):
+        rcut_last = rcut
+        rcut = np.sqrt(((l+2) * np.log(rcut) + c) / alpha)
+        if np.all(abs(rcut - rcut_last) < eps):
+            return rcut
+    warnings.warn(f'cell.pgf_rcut failed to converge in {max_cycle} cycles.')
+    return rcut
+
+def rcut_by_shells(cell, precision=None, rcut=0,
+                   return_pgf_radius=False):
+    '''Compute shell and primitive gaussian function radii.
+    '''
+    # TODO the internal implementation loops over all shells,
+    # which can be optimized to loop over atom types.
+    if precision is None:
+        precision = cell.precision
+
+    bas = np.asarray(cell._bas, order='C')
+    env = np.asarray(cell._env, order='C')
+    nbas = len(bas)
+    shell_radius = np.empty((nbas,), order='C', dtype=float)
+    if return_pgf_radius:
+        nprim = bas[:,mole.NPRIM_OF].max()
+        # be careful that the unused memory blocks are not initialized
+        pgf_radius = np.empty((nbas,nprim), order='C', dtype=np.double)
+        ptr_pgf_radius = lib.ndarray_pointer_2d(pgf_radius).ctypes
+    else:
+        ptr_pgf_radius = lib.c_null_ptr()
+    libpbc.rcut_by_shells(
+        shell_radius.ctypes.data_as(ctypes.c_void_p),
+        ptr_pgf_radius,
+        bas.ctypes.data_as(ctypes.c_void_p),
+        env.ctypes.data_as(ctypes.c_void_p),
+        ctypes.c_int(nbas),
+        ctypes.c_double(rcut),
+        ctypes.c_double(precision),
+    )
+    if return_pgf_radius:
+        return shell_radius, pgf_radius
+    return shell_radius
+
+def tostring(cell, format='poscar'):
+    '''Convert cell geometry to a string of the required format.
+
+    Supported output formats:
+        | poscar: VASP POSCAR
+        | xyz: Extended XYZ with Lattice information
+    '''
+    format = format.lower()
+    output = []
+    atmfmt = '%17.8f %17.8f %17.8f'
+    if format == 'poscar' or format == 'vasp' or format == 'xyz':
+        lattice_vectors = cell.lattice_vectors() * param.BOHR
+        coords = cell.atom_coords() * param.BOHR
+        if format == 'poscar' or format == 'vasp':
+            output.append('Written by PySCF, units are A')
+            output.append('1.0')
+            for lattice_vector in lattice_vectors:
+                ax, ay, az = lattice_vector
+                output.append(atmfmt % (ax, ay, az))
+            unique_atoms = dict()
+            for atom in cell.elements:
+                if atom not in unique_atoms:
+                    unique_atoms[atom] = 1
+                else:
+                    unique_atoms[atom] += 1
+            output.append(' '.join(unique_atoms))
+            output.append(' '.join(str(count) for count in unique_atoms.values()))
+            output.append('Cartesian')
+            for atom_type in unique_atoms:
+                for atom, coord in zip(cell.elements, coords):
+                    if atom == atom_type:
+                        x, y, z = coord
+                        output.append(atmfmt % (x, y, z))
+            return '\n'.join(output)
+        elif format == 'xyz':
+            output.append('%d' % cell.natm)
+            output.append('Lattice="'+' '.join(f'{ax:17.8f}' for ax in lattice_vectors.ravel())
+                +'" Properties=species:S:1:pos:R:3')
+            for i in range(cell.natm):
+                symb = cell.atom_pure_symbol(i)
+                x, y, z = coords[i]
+                output.append(('%-4s ' + atmfmt) %
+                              (symb, x, y, z))
+            return '\n'.join(output)
+    else:
+        raise NotImplementedError(f'format={format}')
+
+def tofile(cell, filename, format=None):
+    if format is None:  # Guess format based on filename
+        if filename.lower() == 'poscar':
+            format = 'poscar'
+        else:
+            format = os.path.splitext(filename)[1][1:]
+    string = tostring(cell, format)
+    with open(filename,  'w', encoding='utf-8') as f:
+        f.write(string)
+        f.write('\n')
+    return string
+
+def fromfile(filename, format=None):
+    '''Read cell geometry from a file
+    (in testing)
+
+    Supported formats:
+        | poscar: VASP POSCAR file format
+        | xyz: Extended XYZ with Lattice information
+    '''
+    if format is None:  # Guess format based on filename
+        if filename.lower() == 'poscar':
+            format = 'poscar'
+        else:
+            format = os.path.splitext(filename)[1][1:].lower()
+        if format not in ('poscar', 'vasp', 'xyz'):
+            format = 'raw'
+    with open(filename, 'r') as f:
+        return fromstring(f.read(), format)
+
+def fromstring(string, format='poscar'):
+    '''Convert the string of the specified format to internal format
+    (in testing)
+
+    Supported formats:
+        | poscar: VASP POSCAR file format
+        | xyz: Extended XYZ with Lattice information
+
+    Returns:
+        a: Lattice vectors
+        atom: Atomic elements and xyz coordinates
+    '''
+    format = format.lower()
+    if format == 'poscar' or format == 'vasp':
+        lines = string.splitlines()
+        scale = float(lines[1])
+        a = lines[2:5]
+        lattice_vectors = np.array([np.fromstring(ax, sep=' ') for ax in a])
+        lattice_vectors *= scale
+        a = []
+        for i in range(3):
+            a.append(' '.join(str(ax) for ax in lattice_vectors[i]))
+        atom_position_type = lines[7].strip()
+        unique_atoms = dict()
+        natm = 0
+        for atom, count in zip(lines[5].split(), lines[6].split()):
+            unique_atoms[atom] = int(count)
+            natm += int(count)
+        atoms = []
+        start = 8
+        for atom_type in unique_atoms:
+            end = start + unique_atoms[atom_type]
+            for line in lines[start:end]:
+                coords = np.fromstring(line, sep=' ')
+                if atom_position_type.lower() == 'cartesian':
+                    x, y, z = coords * scale
+                elif atom_position_type.lower() == 'direct':
+                    x, y, z = np.dot(coords, lattice_vectors)
+                else:
+                    raise RuntimeError('Error reading VASP geometry due to '
+                        f'atom position type "{atom_position_type}". Atom '
+                        'positions must be Direct or Cartesian.')
+                atoms.append('%s %17.8f %17.8f %17.8f'
+                    % (atom_type, x, y, z))
+            start = end
+        return '\n'.join(a), '\n'.join(atoms)
+    elif format == 'xyz':
+        lines = string.splitlines()
+        natm = int(lines[0])
+        lattice_vectors = lines[1].split('Lattice=')[1].split('"')[1].split()
+        a = []
+        for i in range(3):
+            a.append(" ".join(lattice_vectors[3*i:3*i+3]))
+        return '\n'.join(a), '\n'.join(lines[2:natm+2])
+    elif format == 'raw':
+        lines = string.splitlines()
+        return '\n'.join(lines[:3]), '\n'.join(lines[4:])
+    else:
+        raise NotImplementedError
+
+
+class Cell(mole.MoleBase):
     '''A Cell object holds the basic information of a crystal.
 
     Attributes:
@@ -1040,6 +1188,23 @@ class Cell(mole.Mole):
             infinity vacuum (inf_vacuum) or truncated Coulomb potential
             (analytic_2d_1). Unless explicitly specified, analytic_2d_1 is
             used for 2D system and inf_vacuum is assumed for 1D and 0D.
+        use_loose_rcut : bool
+            If set to True, a loose `rcut` determined by shell radius is used,
+            which is usually accurate enough for pure DFT calculations;
+            otherwise, a tight `rcut` determined by overlap integral is used.
+            Default value is False. Has no effect if `rcut` is set manually.
+        use_particle_mesh_ewald : bool
+            If set to True, use particle-mesh Ewald to compute the nuclear repulsion.
+            Default value is False, meaning to use classical Ewald summation.
+        space_group_symmetry : bool
+            Whether to consider space group symmetry. Default is False.
+        symmorphic : bool
+            Whether the lattice is symmorphic. If set to True, even if the
+            lattice is non-symmorphic, only symmorphic space group symmetry
+            will be considered. Default is False, meaning the space group is
+            determined by the lattice symmetry to be symmorphic or non-symmorphic.
+        lattice_symmetry : None or :class:`pbc.symm.Symmetry` instance
+            The object containing the lattice symmetry information. Default is None.
 
     (See other attributes in :class:`Mole`)
 
@@ -1055,30 +1220,55 @@ class Cell(mole.Mole):
     precision = getattr(__config__, 'pbc_gto_cell_Cell_precision', 1e-8)
     exp_to_discard = getattr(__config__, 'pbc_gto_cell_Cell_exp_to_discard', None)
 
+    fractional = False
+    dimension = 3
+    # TODO: Simple hack for now; the implementation of ewald depends on the
+    #       density-fitting class.  This determines how the ewald produces
+    #       its energy.
+    low_dim_ft_type = None
+    use_loose_rcut = False
+    use_particle_mesh_ewald = False
+    space_group_symmetry = False
+    symmorphic = False
+    lattice_symmetry = None
+
+    _keys = {
+        'precision', 'exp_to_discard',
+        'a', 'ke_cutoff', 'pseudo', 'fractional', 'dimension', 'low_dim_ft_type',
+        'space_group_symmetry', 'symmorphic', 'lattice_symmetry', 'mesh', 'rcut',
+        'use_loose_rcut', 'use_particle_mesh_ewald',
+    }
+
+    tostring = tostring
+    tofile = tofile
+
     def __init__(self, **kwargs):
-        mole.Mole.__init__(self, **kwargs)
+        mole.MoleBase.__init__(self)
         self.a = None # lattice vectors, (a1,a2,a3)
         # if set, defines a spherical cutoff
         # of fourier components, with .5 * G**2 < ke_cutoff
         self.ke_cutoff = None
 
-        self.pseudo = None
-        self.dimension = 3
-        # TODO: Simple hack for now; the implementation of ewald depends on the
-        #       density-fitting class.  This determines how the ewald produces
-        #       its energy.
-        self.low_dim_ft_type = None
-
 ##################################################
-# These attributes are initialized by build function if not given
+# These attributes are initialized by build function if not specified
         self.mesh = None
         self.rcut = None
+        for key, val in kwargs.items():
+            setattr(self, key, val)
 
-##################################################
-# don't modify the following variables, they are not input arguments
-        keys = ('precision', 'exp_to_discard')
-        self._keys = self._keys.union(self.__dict__).union(keys)
-        self.__dict__.update(kwargs)
+    def fromstring(self, string, format='poscar'):
+        '''Update the Cell object based on the input geometry string'''
+        a, atom = fromstring(string, format)
+        self.a = a
+        self.set_geom_(atom, unit='Angstrom', inplace=True)
+        return self
+
+    def fromfile(self, filename, format=None):
+        '''Update the Cell object based on the input geometry file'''
+        a, atom = fromfile(filename, format)
+        self.a = a
+        self.set_geom_(atom, unit='Angstrom', inplace=True)
+        return self
 
     @property
     def mesh(self):
@@ -1114,92 +1304,223 @@ class Cell(mole.Mole):
     def ew_cut(self, val):
         warnings.warn("ew_cut is no longer stored in the cell object. Setting it has no effect")
 
-    if not getattr(__config__, 'pbc_gto_cell_Cell_verify_nelec', False):
+    @property
+    def nelec(self):
+        ne = self.nelectron
+        nalpha = (ne + self.spin) // 2
+        nbeta = nalpha - self.spin
         # nelec method defined in Mole class raises error when the attributes .spin
         # and .nelectron are inconsistent.  In PBC, when the system has even number of
         # k-points, it is valid that .spin is odd while .nelectron is even.
-        # Overwriting nelec method to avoid this check.
-        @property
-        def nelec(self):
-            ne = self.nelectron
-            nalpha = (ne + self.spin) // 2
-            nbeta = nalpha - self.spin
-            if nalpha + nbeta != ne:
-                warnings.warn('Electron number %d and spin %d are not consistent '
-                              'in unit cell\n' % (ne, self.spin))
-            return nalpha, nbeta
+        if nalpha + nbeta != ne:
+            warnings.warn('Electron number %d and spin %d are not consistent '
+                          'in cell\n' % (ne, self.spin))
+        return nalpha, nbeta
 
     def __getattr__(self, key):
         '''To support accessing methods (cell.HF, cell.KKS, cell.KUCCSD, ...)
         from Cell object.
         '''
-        if key[:2] == '__':  # Skip Python builtins
-            raise AttributeError('Cell object has no attribute %s' % key)
-        elif key in ('_ipython_canary_method_should_not_exist_',
-                     '_repr_mimebundle_'):
-            # https://github.com/mewwts/addict/issues/26
-            # https://github.com/jupyter/notebook/issues/2014
-            raise AttributeError
+        if key[0] == '_':  # Skip private attributes and Python builtins
+            # https://bugs.python.org/issue45985
+            # https://github.com/python/cpython/issues/103936
+            # @property and __getattr__ conflicts. As a temporary fix, call
+            # object.__getattribute__ method to re-raise AttributeError
+            return object.__getattribute__(self, key)
 
         # Import all available modules. Some methods are registered to other
         # classes/modules when importing modules in __all__.
         from pyscf.pbc import __all__  # noqa
         from pyscf.pbc import scf, dft
         from pyscf.dft import XC
-        for mod in (scf, dft):
-            method = getattr(mod, key, None)
-            if callable(method):
-                return method(self)
 
-        if key[0] == 'K':  # with k-point sampling
-            if 'TD' in key[:4]:
-                if key in ('KTDHF', 'KTDA'):
-                    mf = scf.KHF(self)
-                else:
-                    mf = dft.KKS(self)
-                    xc = key.split('TD', 1)[1]
-                    if xc in XC:
-                        mf.xc = xc
-                        key = 'KTDDFT'
-            else:
-                mf = scf.KHF(self)
-            # Remove prefix 'K' because methods are registered without the leading 'K'
-            key = key[1:]
+        attr_name = key
+        mf_xc = None
+        for mod in (dft, scf):
+            mf_method = getattr(mod, key, None)
+            if callable(mf_method):
+                key = None
+                break
         else:
-            if 'TD' in key[:3]:
-                if key in ('TDHF', 'TDA'):
-                    mf = scf.HF(self)
+            if key[0] == 'K':  # with k-point sampling
+                if 'TD' in key[:4]:
+                    if 'KTDA' in key:
+                        mf_method = 'KSCF_TO_BE_DETERMINED'
+                    elif 'KTDHF' in key:
+                        mf_method = scf.KHF
+                    else:
+                        mf_method = dft.KKS
+                        xc = key.split('TD', 1)[1]
+                        if xc in XC:
+                            mf_xc = xc
+                            key = 'KTDDFT'
+                        elif 'TDDFT' not in key:
+                            raise AttributeError(f'method {key} not supported')
+                elif 'CI' in key or 'CC' in key or 'MP' in key:
+                    mf_method = scf.KHF
                 else:
-                    mf = dft.KS(self)
-                    xc = key.split('TD', 1)[1]
-                    if xc in XC:
-                        mf.xc = xc
-                        key = 'TDDFT'
+                    return object.__getattribute__(self, key)
+                # Remove prefix 'K' because methods are registered without the leading 'K'
+                key = key[1:]
             else:
-                mf = scf.HF(self)
+                if 'TD' in key[:3]:
+                    if 'TDA' in key:
+                        mf_method = 'SCF_TO_BE_DETERMINED'
+                    elif 'TDHF' in key:
+                        mf_method = scf.HF
+                    else:
+                        mf_method = dft.KS
+                        xc = key.split('TD', 1)[1]
+                        if xc in XC:
+                            mf_xc = xc
+                            key = 'TDDFT'
+                        elif 'TDDFT' not in key:
+                            raise AttributeError(f'method {key} not supported')
+                elif 'CI' in key or 'CC' in key or 'MP' in key:
+                    mf_method = scf.HF
+                else:
+                    return object.__getattribute__(self, key)
 
-        method = getattr(mf, key, None)
-        if method is None:
-            raise AttributeError('Cell object has no attribute %s' % key)
+        post_mf_key = key
+        SCF_KW = {'kpt', 'kpts', 'xc', 'exxdiv',
+                  'U_idx', 'U_val', 'C_ao_lo', 'minao_ref'}
 
-        mf.run()
-        return method
+        def fn(*args, **kwargs):
+            if mf_xc is not None:
+                assert 'xc' not in kwargs
+                kwargs['xc'] = mf_xc
+
+            mf_kw = {}
+            remaining_kw = {}
+            for k, v in kwargs.items():
+                if k in SCF_KW:
+                    mf_kw[k] = v
+                else:
+                    remaining_kw[k] = v
+
+            if mf_method == 'SCF_TO_BE_DETERMINED':
+                if 'xc' in mf_kw:
+                    mf = dft.KS(self, **mf_kw)
+                else:
+                    mf = scf.HF(self, **mf_kw)
+            elif mf_method == 'KSCF_TO_BE_DETERMINED':
+                if 'xc' in mf_kw:
+                    mf = dft.KKS(self, **mf_kw)
+                else:
+                    mf = scf.KHF(self, **mf_kw)
+            else:
+                mf = mf_method(self, **mf_kw)
+
+            if post_mf_key is None:
+                if args:
+                    raise AttributeError(
+                        f'cell.{attr_name} function does not support positional arguments')
+                return mf.set(**remaining_kw)
+
+            post_mf = getattr(mf, post_mf_key)
+            if self.nelectron != 0:
+                mf.run()
+            return post_mf(*args, **remaining_kw)
+        return mole._MoleLazyCallAdapter(fn, attr_name)
 
     tot_electrons = tot_electrons
 
+    def _build_symmetry(self, kpts=None, **kwargs):
+        '''Construct symmetry adapted crystalline atomic orbitals
+        '''
+        from pyscf.pbc.lib.kpts import KPoints
+        from pyscf.pbc.symm.basis import symm_adapted_basis
+        if kpts is None:
+            return mole.Mole._build_symmetry(self)
+        elif isinstance(kpts, KPoints):
+            self.symm_orb, self.irrep_id = symm_adapted_basis(self, kpts)
+            return self
+        else:
+            raise RuntimeError('Symmetry information not found in kpts. '
+                               'kpts needs to be initialized as a KPoints object.')
+
+    def symmetrize_mesh(self, mesh=None):
+        if mesh is None:
+            mesh = self.mesh
+        if not self.space_group_symmetry:
+            return mesh
+
+        _, mesh1 = self.lattice_symmetry.check_mesh_symmetry(
+            cell=self, mesh=mesh, return_mesh=True)
+        if np.prod(mesh1) != np.prod(mesh):
+            logger.debug(self, 'mesh %s is symmetrized as %s', mesh, mesh1)
+        m1size = np.prod(mesh1)
+        msize = np.prod(mesh)
+        if m1size > 8 * msize and m1size > 1000 + msize:
+            wstr = ('''WARNING!
+  Symmetrization significantly increased the mesh size,
+  from {} to {}. This might indicate a nearly symmetric input
+  structure, and it might cause memory issues. Consider symmetrizing your
+  structure, increasing the symmetry tolerance `pbc_symm_space_group_symprec`,
+  or turning off symmetry.\n\n''')
+            wstr = wstr.format(mesh, mesh1)
+            sys.stderr.write(wstr)
+        return mesh1
+
+    def build_lattice_symmetry(self, check_mesh_symmetry=True):
+        '''Build cell.lattice_symmetry object.
+
+        Kwargs:
+            check_mesh_symmetry : bool
+                For nonsymmorphic symmetry groups, `cell.mesh` may have
+                lower symmetry than the lattice. In this case, if
+                `check_mesh_symmetry` is `True`, the lower symmetry group will
+                be used. Otherwise, if `check_mesh_symmetry` is `False`,
+                the mesh grid will be modified to satisfy the higher symmetry.
+                Default value is `True`.
+
+        Note:
+            This function modifies the attributes of `cell`.
+        '''
+        from pyscf.pbc.symm import Symmetry
+        self.lattice_symmetry = Symmetry(self).build(
+                                    space_group_symmetry=True,
+                                    symmorphic=self.symmorphic,
+                                    check_mesh_symmetry=check_mesh_symmetry)
+        if not check_mesh_symmetry:
+            _mesh_from_build = self._mesh_from_build
+            self.mesh = self.symmetrize_mesh()
+            self._mesh_from_build = _mesh_from_build
+        # lattice_symmetry introduces circular dependency to cell
+        del self.lattice_symmetry.cell
+        if self.lattice_symmetry.spacegroup is not None:
+            del self.lattice_symmetry.spacegroup.cell
+        return self
+
+    @lib.with_doc(mole.format_atom.__doc__)
+    def format_atom(self, atoms, origin=0, axes=None,
+                    unit=getattr(__config__, 'UNIT', 'Ang')):
+        if not self.fractional:
+            return mole.format_atom(atoms, origin, axes, unit)
+        _atoms = mole.format_atom(atoms, origin, axes, unit=1.)
+        _a = self.lattice_vectors()
+        c = np.array([a[1] for a in _atoms]).dot(_a)
+        return [(a[0], r) for a, r in zip(_atoms, c.tolist())]
+
 #Note: Exculde dump_input, parse_arg, basis from kwargs to avoid parsing twice
-    def build(self, dump_input=True, parse_arg=True,
+    def build(self, dump_input=True, parse_arg=mole.ARGPARSE,
               a=None, mesh=None, ke_cutoff=None, precision=None, nimgs=None,
-              pseudo=None, basis=None, h=None, dimension=None, rcut= None,
-              ecp=None, low_dim_ft_type=None, *args, **kwargs):
+              h=None, dimension=None, rcut= None, low_dim_ft_type=None,
+              space_group_symmetry=None, symmorphic=None,
+              use_loose_rcut=None, use_particle_mesh_ewald=None,
+              fractional=None, *args, **kwargs):
         '''Setup Mole molecule and Cell and initialize some control parameters.
         Whenever you change the value of the attributes of :class:`Cell`,
         you need call this function to refresh the internal data of Cell.
 
         Kwargs:
             a : (3,3) ndarray
-                The real-space unit cell lattice vectors. Each row represents
+                The real-space cell lattice vectors. Each row represents
                 a lattice vector.
+            fractional : bool
+                Whether the atom postions are specified in fractional coordinates.
+                The default value is False, which means the coordinates are
+                interpreted as Cartesian coordinate.
             mesh : (3,) ndarray of ints
                 The number of *positive* G-vectors along each direction.
             ke_cutoff : float
@@ -1215,10 +1536,6 @@ class Cell(mole.Mole):
                 Cutoff radius (unit Bohr) in lattice summation to produce
                 periodicity. The value can be estimated based on the required
                 precision.  It's recommended NOT making changes to this value.
-            pseudo : dict or str
-                To define pseudopotential.
-            ecp : dict or str
-                To define ECP type pseudopotential.
             h : (3,3) ndarray
                 a.T. Deprecated
             dimension : int
@@ -1229,69 +1546,50 @@ class Cell(mole.Mole):
                 infinity vacuum (inf_vacuum) or truncated Coulomb potential
                 (analytic_2d_1). Unless explicitly specified, analytic_2d_1 is
                 used for 2D system and inf_vacuum is assumed for 1D and 0D.
+            space_group_symmetry : bool
+                Whether to consider space group symmetry. Default is False.
+            symmorphic : bool
+                Whether the lattice is symmorphic. If set to True, even if the
+                lattice is non-symmorphic, only symmorphic space group symmetry
+                will be considered. Default is False, meaning the space group is
+                determined by the lattice symmetry to be symmorphic or non-symmorphic.
         '''
         if h is not None: self.h = h
         if a is not None: self.a = a
         if mesh is not None: self.mesh = mesh
         if nimgs is not None: self.nimgs = nimgs
-        if pseudo is not None: self.pseudo = pseudo
-        if basis is not None: self.basis = basis
         if dimension is not None: self.dimension = dimension
+        if fractional is not None: self.fractional = fractional
         if precision is not None: self.precision = precision
         if rcut is not None: self.rcut = rcut
-        if ecp is not None: self.ecp = ecp
         if ke_cutoff is not None: self.ke_cutoff = ke_cutoff
         if low_dim_ft_type is not None: self.low_dim_ft_type = low_dim_ft_type
+        if use_loose_rcut is not None:
+            self.use_loose_rcut = use_loose_rcut
+        if use_particle_mesh_ewald is not None:
+            self.use_particle_mesh_ewald = use_particle_mesh_ewald
+        if space_group_symmetry is not None:
+            self.space_group_symmetry = space_group_symmetry
+        if symmorphic is not None:
+            self.symmorphic = symmorphic
 
-        if 'unit' in kwargs:
-            self.unit = kwargs['unit']
+        if self.a is None:
+            raise RuntimeError('Lattice parameters not specified')
 
-        if 'atom' in kwargs:
-            self.atom = kwargs['atom']
+        if self.dimension == 1 and self.low_dim_ft_type != 'inf_vacuum':
+            raise RuntimeError('Uniform grids for dimension=1 not supported')
 
-        if 'gs' in kwargs:
-            self.gs = kwargs['gs']
-
-        # Set-up pseudopotential if it exists
-        # This must be done before build() because it affects
-        # tot_electrons() via the call to .atom_charge()
-
-        self.ecp, self.pseudo = classify_ecp_pseudo(self, self.ecp, self.pseudo)
-        if self.pseudo is not None:
-            _atom = self.format_atom(self.atom)
-            # Unless explicitly input, ECP should not be assigned to ghost atoms
-            uniq_atoms = set([a[0] for a in _atom if not is_ghost_atom(a[0])])
-            if isinstance(self.pseudo, (str, unicode)):
-                # specify global pseudo for whole molecule
-                _pseudo = dict([(a, str(self.pseudo)) for a in uniq_atoms])
-            elif 'default' in self.pseudo:
-                default_pseudo = self.pseudo['default']
-                _pseudo = dict(((a, default_pseudo) for a in uniq_atoms))
-                _pseudo.update(self.pseudo)
-                del(_pseudo['default'])
-            else:
-                _pseudo = self.pseudo
-            self._pseudo = self.format_pseudo(_pseudo)
-
-        # Do regular Mole.build
         _built = self._built
-        mole.Mole.build(self, False, parse_arg, *args, **kwargs)
+        mole.MoleBase.build(self, False, parse_arg, *args, **kwargs)
 
-        exp_min = np.array([self.bas_exp(ib).min() for ib in range(self.nbas)])
-        if self.exp_to_discard is None:
-            if np.any(exp_min < 0.1):
-                sys.stderr.write('''WARNING!
-  Very diffused basis functions are found in the basis set. They may lead to severe
-  linear dependence and numerical instability.  You can set  cell.exp_to_discard=0.1
-  to remove the diffused Gaussians whose exponents are less than 0.1.\n\n''')
-        elif np.any(exp_min < self.exp_to_discard):
+        if self.exp_to_discard is not None:
             # Discard functions of small exponents in basis
             _basis = {}
             for symb, basis_now in self._basis.items():
                 basis_add = []
                 for b in basis_now:
                     l = b[0]
-                    if isinstance(b[1], int):
+                    if isinstance(b[1], (int, np.integer)):
                         kappa = b[1]
                         b_coeff = np.array(b[2:])
                     else:
@@ -1352,16 +1650,8 @@ class Cell(mole.Mole):
                         '%d contracted functions', nprim_drop, nctr_drop)
             #logger.debug1(self, 'Old shells %s', steep_shls)
 
-        # The rest initialization requires lattice parameters.  If .a is not
-        # set, pass the rest initialization.
-        if self.a is None:
-            if dump_input and not _built and self.verbose > logger.NOTE:
-                self.dump_input()
-            return self
-
         if self.rcut is None or self._rcut_from_build:
-            self._rcut = max([self.bas_rcut(ib, self.precision)
-                              for ib in range(self.nbas)] + [0])
+            self._rcut = estimate_rcut(self, self.precision)
             self._rcut_from_build = True
 
         _a = self.lattice_vectors()
@@ -1370,7 +1660,7 @@ class Cell(mole.Mole):
   Lattice are not in right-handed coordinate system. This can cause wrong value for some integrals.
   It's recommended to resort the lattice vectors to\na = %s\n\n''' % _a[[0,2,1]])
 
-        if self.dimension == 2 and self.low_dim_ft_type != 'inf_vacuum':
+        if self.dimension <= 2 and self.low_dim_ft_type != 'inf_vacuum':
             # check vacuum size. See Fig 1 of PRB, 73, 2015119
             #Lz_guess = self.rcut*(1+np.sqrt(2))
             Lz_guess = self.rcut * 2
@@ -1386,15 +1676,13 @@ class Cell(mole.Mole):
                 ke_cutoff = self.ke_cutoff
             self._mesh = pbctools.cutoff_to_mesh(_a, ke_cutoff)
 
-            if (self.dimension < 2 or
-                (self.dimension == 2 and self.low_dim_ft_type == 'inf_vacuum')):
+            if self.dimension <= 2 and self.low_dim_ft_type == 'inf_vacuum':
                 self._mesh[self.dimension:] = _mesh_inf_vaccum(self)
             self._mesh_from_build = True
 
-            # Set minimal mesh grids to handle the case mesh==0. since Madelung
-            # constant may be computed even if the unit cell has 0 atoms. In this
-            # system, cell.mesh was initialized to 0.
-            self._mesh[self._mesh == 0] = 30
+        if self.space_group_symmetry:
+            _check_mesh_symm = not self._mesh_from_build
+            self.build_lattice_symmetry(check_mesh_symmetry=_check_mesh_symm)
 
         if dump_input and not _built and self.verbose > logger.NOTE:
             self.dump_input()
@@ -1404,10 +1692,18 @@ class Cell(mole.Mole):
             logger.info(self, 'dimension = %s', self.dimension)
             logger.info(self, 'low_dim_ft_type = %s', self.low_dim_ft_type)
             logger.info(self, 'Cell volume = %g', self.vol)
+            # Check atoms coordinates
+            if self.dimension > 0 and self.natm > 0:
+                scaled_atom_coords = self.get_scaled_atom_coords(_a)
+                atom_boundary_max = scaled_atom_coords[:,:self.dimension].max(axis=0)
+                atom_boundary_min = scaled_atom_coords[:,:self.dimension].min(axis=0)
+                if (np.any(atom_boundary_max > 1) or np.any(atom_boundary_min < -1)):
+                    logger.warn(self, 'Atoms found out of the primitive cell.')
+
             if self.exp_to_discard is not None:
                 logger.info(self, 'exp_to_discard = %s', self.exp_to_discard)
             logger.info(self, 'rcut = %s (nimgs = %s)', self.rcut, self.nimgs)
-            logger.info(self, 'lattice sum = %d cells', len(self.get_lattice_Ls()))
+            #logger.info(self, 'lattice sum = %d cells', len(self.get_lattice_Ls()))
             logger.info(self, 'precision = %g', self.precision)
             logger.info(self, 'pseudo = %s', self.pseudo)
             if ke_cutoff is not None:
@@ -1419,6 +1715,8 @@ class Cell(mole.Mole):
                             self.mesh, np.prod(self.mesh))
                 Ecut = pbctools.mesh_to_cutoff(self.lattice_vectors(), self.mesh)
                 logger.info(self, '    = ke_cutoff %s', Ecut)
+            if self.space_group_symmetry:
+                self.lattice_symmetry.dump_info()
         return self
     kernel = build
 
@@ -1429,7 +1727,7 @@ class Cell(mole.Mole):
     def h(self, x):
         warnings.warn('cell.h is deprecated.  It is replaced by the '
                       '(row-based) lattice vectors cell.a:  cell.a = cell.h.T\n')
-        if isinstance(x, (str, unicode)):
+        if isinstance(x, str):
             x = x.replace(';',' ').replace(',',' ').replace('\n',' ')
             self.a = np.asarray([float(z) for z in x.split()]).reshape(3,3).T
         else:
@@ -1446,14 +1744,6 @@ class Cell(mole.Mole):
     @property
     def Gv(self):
         return self.get_Gv()
-
-    @lib.with_doc(format_pseudo.__doc__)
-    def format_pseudo(self, pseudo_tab):
-        return format_pseudo(pseudo_tab)
-
-    @lib.with_doc(format_basis.__doc__)
-    def format_basis(self, basis_tab):
-        return format_basis(basis_tab)
 
     @property
     def gs(self):
@@ -1479,32 +1769,13 @@ class Cell(mole.Mole):
         b = self.reciprocal_vectors(norm_to=1)
         heights_inv = lib.norm(b, axis=1)
         self.rcut = max(np.asarray(x) / heights_inv)
-
-        if self.nbas == 0:
-            rcut_guess = _estimate_rcut(.05, 0, 1, 1e-8)
-        else:
-            rcut_guess = max([self.bas_rcut(ib, self.precision)
-                              for ib in range(self.nbas)])
+        rcut_guess = estimate_rcut(self, self.precision)
         if self.rcut > rcut_guess*1.5:
             msg = ('.nimgs is a deprecated attribute.  It is replaced by .rcut '
-                   'attribute for lattic sum cutoff radius.  The given nimgs '
+                   'attribute for lattice sum cutoff radius.  The given nimgs '
                    '%s is far over the estimated cutoff radius %s. ' %
                    (x, rcut_guess))
             warnings.warn(msg)
-
-    def make_ecp_env(self, _atm, _ecp, pre_env=[]):
-        if _ecp and self._pseudo:
-            conflicts = set(self._pseudo.keys()).intersection(set(_ecp.keys()))
-            if conflicts:
-                raise RuntimeError('Pseudo potential for atoms %s are defined '
-                                   'in both .ecp and .pseudo.' % list(conflicts))
-
-        _ecpbas, _env = np.zeros((0,8)), pre_env
-        if _ecp:
-            _atm, _ecpbas, _env = mole.make_ecp_env(self, _atm, _ecp, _env)
-        if self._pseudo:
-            _atm, _, _env = make_pseudo_env(self, _atm, self._pseudo, _env)
-        return _atm, _ecpbas, _env
 
     def lattice_vectors(self):
         '''Convert the primitive lattice vectors.
@@ -1512,18 +1783,25 @@ class Cell(mole.Mole):
         Return 3x3 array in which each row represents one direction of the
         lattice vectors (unit in Bohr)
         '''
-        if isinstance(self.a, (str, unicode)):
+        if isinstance(self.a, str):
             a = self.a.replace(';',' ').replace(',',' ').replace('\n',' ')
             a = np.asarray([float(x) for x in a.split()]).reshape(3,3)
         else:
-            a = np.asarray(self.a, dtype=np.double)
-        if isinstance(self.unit, (str, unicode)):
-            if self.unit.startswith(('B','b','au','AU')):
+            a = np.asarray(self.a, dtype=np.double).reshape(3,3)
+        if isinstance(self.unit, str):
+            if is_au(self.unit):
                 return a
             else:
                 return a/param.BOHR
         else:
             return a/self.unit
+
+    def get_scaled_atom_coords(self, a=None):
+        ''' Get scaled atomic coordinates.
+        '''
+        if a is None:
+            a = self.lattice_vectors()
+        return np.dot(self.atom_coords(), np.linalg.inv(a))
 
     def reciprocal_vectors(self, norm_to=2*np.pi):
         r'''
@@ -1538,11 +1816,11 @@ class Cell(mole.Mole):
         '''  # noqa: E501
         a = self.lattice_vectors()
         if self.dimension == 1:
-            assert(abs(np.dot(a[0], a[1])) < 1e-9 and
+            assert (abs(np.dot(a[0], a[1])) < 1e-9 and
                    abs(np.dot(a[0], a[2])) < 1e-9 and
                    abs(np.dot(a[1], a[2])) < 1e-9)
         elif self.dimension == 2:
-            assert(abs(np.dot(a[0], a[2])) < 1e-9 and
+            assert (abs(np.dot(a[0], a[2])) < 1e-9 and
                    abs(np.dot(a[1], a[2])) < 1e-9)
         b = np.linalg.inv(a.T)
         return norm_to * b
@@ -1559,21 +1837,46 @@ class Cell(mole.Mole):
         '''
         return np.dot(scaled_kpts, self.reciprocal_vectors())
 
-    def get_scaled_kpts(self, abs_kpts):
+    def get_scaled_kpts(self, abs_kpts, kpts_in_ibz=True):
         '''Get scaled k-points, given absolute k-points in 1/Bohr.
 
         Args:
-            abs_kpts : (nkpts, 3) ndarray of floats
+            abs_kpts : (nkpts, 3) ndarray of floats or :class:`KPoints` object
+
+            kpts_in_ibz : bool
+                If True, return k-points in IBZ; otherwise, return k-points in BZ.
+                Default value is True. This has effects only if abs_kpts is a
+                :class:`KPoints` object
 
         Returns:
             scaled_kpts : (nkpts, 3) ndarray of floats
         '''
+        from pyscf.pbc.lib.kpts import KPoints
+        if isinstance(abs_kpts, KPoints):
+            if kpts_in_ibz:
+                return abs_kpts.kpts_scaled_ibz
+            else:
+                return abs_kpts.kpts_scaled
         return 1./(2*np.pi)*np.dot(abs_kpts, self.lattice_vectors().T)
 
-    make_kpts = get_kpts = make_kpts
+    def cutoff_to_mesh(self, ke_cutoff):
+        '''Convert KE cutoff to FFT-mesh
 
-    def copy(self):
-        return copy(self)
+        Args:
+            ke_cutoff : float
+                KE energy cutoff in a.u.
+
+        Returns:
+            mesh : (3,) array
+        '''
+        a = self.lattice_vectors()
+        dim = self.dimension
+        mesh = pbctools.cutoff_to_mesh(a, ke_cutoff)
+        if dim < 2 or (dim == 2 and self.low_dim_ft_type == 'inf_vacuum'):
+            mesh[dim:] = self.mesh[dim:]
+        return mesh
+
+    make_kpts = get_kpts = make_kpts
 
     pack = pack
 
@@ -1600,6 +1903,7 @@ class Cell(mole.Mole):
         return self
 
     bas_rcut = bas_rcut
+    rcut_by_shells = rcut_by_shells
 
     get_lattice_Ls = pbctools.get_lattice_Ls
 
@@ -1615,7 +1919,7 @@ class Cell(mole.Mole):
     get_SI = get_SI
 
     ewald = ewald
-    energy_nuc = ewald
+    energy_nuc = get_enuc = ewald
 
     gen_uniform_grids = get_uniform_grids = get_uniform_grids
 
@@ -1636,25 +1940,25 @@ class Cell(mole.Mole):
             # FIXME: Whether to check _built and call build?  ._bas and .basis
             # may not be consistent. calling .build() may leads to wrong intor env.
             #self.build(False, False)
+        if self.use_loose_rcut:
+            return _intor_cross_screened(
+                            intor, self, self, comp, hermi, kpts, kpt,
+                            shls_slice, **kwargs)
         return intor_cross(intor, self, self, comp, hermi, kpts, kpt,
                            shls_slice, **kwargs)
 
-    @lib.with_doc(pbc_eval_gto.__doc__)
-    def pbc_eval_gto(self, eval_name, coords, comp=None, kpts=None, kpt=None,
-                     shls_slice=None, non0tab=None, ao_loc=None, out=None):
-        return pbc_eval_gto(self, eval_name, coords, comp, kpts, kpt,
-                            shls_slice, non0tab, ao_loc, out)
-    pbc_eval_ao = pbc_eval_gto
+    pbc_eval_ao = pbc_eval_gto = pbc_eval_gto
 
     @lib.with_doc(pbc_eval_gto.__doc__)
     def eval_gto(self, eval_name, coords, comp=None, kpts=None, kpt=None,
-                 shls_slice=None, non0tab=None, ao_loc=None, out=None):
+                 shls_slice=None, non0tab=None, ao_loc=None, cutoff=None,
+                 out=None):
         if eval_name[:3] == 'PBC':
             return self.pbc_eval_gto(eval_name, coords, comp, kpts, kpt,
-                                     shls_slice, non0tab, ao_loc, out)
+                                     shls_slice, non0tab, ao_loc, cutoff, out)
         else:
             return mole.eval_gto(self, eval_name, coords, comp,
-                                 shls_slice, non0tab, ao_loc, out)
+                                 shls_slice, non0tab, ao_loc, cutoff, out)
     eval_ao = eval_gto
 
     def from_ase(self, ase_atom):
@@ -1674,22 +1978,75 @@ class Cell(mole.Mole):
         '''Return a Mole object using the same atoms and basis functions as
         the Cell object.
         '''
-        #FIXME: should cell be converted to mole object?  If cell is converted
-        # and a mole object is returned, many attributes (e.g. the GTH basis,
-        # gth-PP) will not be recognized by mole.build function.
         mol = self.view(mole.Mole)
-        delattr(mol, 'a')
-        delattr(mol, '_mesh')
+        del mol.a
+        mol.__dict__.pop('fractional', None)
+        mol.__dict__.pop('ke_cutoff', None)
+        mol.__dict__.pop('_mesh', None)
+        mol.__dict__.pop('_rcut', None)
+        mol.__dict__.pop('dimension', None)
+        mol.__dict__.pop('low_dim_ft_type', None)
+        mol.enuc = None #reset nuclear energy
         if mol.symmetry:
             mol._build_symmetry()
         return mol
 
-    def has_ecp(self):
-        '''Whether pseudo potential is used in the system.'''
-        return self.pseudo or self._pseudo or (len(self._ecpbas) > 0)
+    def to_gpu(self):
+        from gpu4pyscf.gto.mole import Cell
+        return Cell.from_cpu(self)
 
-    def ao2mo(self, mo_coeffs, intor='int2e', erifile=None, dataname='eri_mo',
-              **kwargs):
-        raise NotImplementedError
+    def set_geom_(self, atoms_or_coords=None, unit=None, symmetry=None,
+                  a=None, inplace=True):
+        '''Update geometry and lattice parameters
 
-del(INTEGRAL_PRECISION, WRAP_AROUND, WITH_GAMMA, EXP_DELIMITER)
+        Kwargs:
+            atoms_or_coords : list, str, or numpy.ndarray
+                When specified in list or str, it is processed as the Mole.atom
+                attribute. If inputing a (N, 3) numpy array, this array
+                represents the coordinates of the atoms in the molecule.
+            a : list, str, or numpy.ndarray
+                If specified, it is assigned to the cell.a attribute. Its data
+                format should be the same to cell.a
+            unit : str
+                The unit for the input `atoms_or_coords` and `a`. If specified,
+                cell.unit will be updated to this value. If not provided, the
+                current cell.unit will be used for the two inputs.
+            symmetry : bool
+                Whether to enable space_group_symmetry. It is a reserved input
+                argument. This functionality is not supported yet.
+            inplace : bool
+                Whether to overwrite the existing Mole object.
+        '''
+        if inplace:
+            cell = self
+        else:
+            cell = self.copy(deep=False)
+            cell._env = cell._env.copy()
+
+        if unit is not None:
+            _unit = mole._length_in_au(unit)
+            if _unit != mole._length_in_au(cell.unit):
+                if a is None:
+                    a = self.lattice_vectors() / _unit
+                if atoms_or_coords is None:
+                    atoms_or_coords = self.atom_coords() / _unit
+
+        if a is not None:
+            logger.info(self, 'Set new lattice vectors')
+            logger.info(self, '%s', a)
+            cell.a = a
+            if self._mesh_from_build:
+                cell.mesh = None
+            if self._rcut_from_build:
+                cell.rcut = None
+            cell._built = False
+        cell.enuc = None
+
+        if atoms_or_coords is not None:
+            cell = mole.MoleBase.set_geom_(cell, atoms_or_coords, unit, symmetry)
+
+        if not cell._built:
+            cell.build(False, False)
+        return cell
+
+del (INTEGRAL_PRECISION, WRAP_AROUND, WITH_GAMMA, EXP_DELIMITER)

@@ -28,7 +28,7 @@ from pyscf.cc import gccsd
 # spin-orbital formula
 # JCP 98, 8718 (1993); DOI:10.1063/1.464480
 def kernel(cc, eris, t1=None, t2=None, verbose=logger.INFO):
-    assert(isinstance(eris, gccsd._PhysicistsERIs))
+    assert (isinstance(eris, gccsd._PhysicistsERIs))
     if t1 is None or t2 is None:
         t1, t2 = cc.t1, cc.t2
     nocc, nvir = t1.shape
@@ -85,13 +85,13 @@ if __name__ == '__main__':
     mycc = cc.CCSD(mf).set(conv_tol=1e-11).run()
     et = mycc.ccsd_t()
 
-    mycc = cc.GCCSD(scf.addons.convert_to_ghf(mf)).set(conv_tol=1e-11).run()
+    mycc = cc.GCCSD(mf.to_ghf()).set(conv_tol=1e-11).run()
     eris = mycc.ao2mo()
     print(kernel(mycc, eris) - et)
 
     numpy.random.seed(1)
     mf.mo_coeff = numpy.random.random(mf.mo_coeff.shape) - .9
-    mycc = cc.GCCSD(scf.addons.convert_to_ghf(mf))
+    mycc = cc.GCCSD(mf.to_ghf())
     eris = mycc.ao2mo()
     nocc = 10
     nvir = mol.nao_nr() * 2 - nocc

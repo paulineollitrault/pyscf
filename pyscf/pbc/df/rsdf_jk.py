@@ -17,7 +17,6 @@
 #
 
 import numpy
-import copy
 
 def density_fit(mf, auxbasis=None, mesh=None, with_df=None):
     '''Generate density-fitting SCF object
@@ -32,12 +31,14 @@ def density_fit(mf, auxbasis=None, mesh=None, with_df=None):
         with_df : DF object
     '''
     from pyscf.pbc.df import rsdf
+    from pyscf.pbc.scf.khf import KSCF
     if with_df is None:
-        if getattr(mf, 'kpts', None) is not None:
+        if isinstance(mf, KSCF):
             kpts = mf.kpts
         else:
             kpts = numpy.reshape(mf.kpt, (1,3))
 
+        kpts = getattr(kpts, 'kpts', kpts)
         with_df = rsdf.RSDF(mf.cell, kpts)
         with_df.max_memory = mf.max_memory
         with_df.stdout = mf.stdout
@@ -46,7 +47,7 @@ def density_fit(mf, auxbasis=None, mesh=None, with_df=None):
         if mesh is not None:
             with_df.mesh = mesh
 
-    mf = copy.copy(mf)
+    mf = mf.copy()
     mf.with_df = with_df
     mf._eri = None
     return mf

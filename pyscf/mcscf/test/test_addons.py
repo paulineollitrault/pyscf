@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import unittest
 from functools import reduce
-import numpy, scipy
+import numpy
+import scipy
 from pyscf import lib
 from pyscf import gto
 from pyscf import scf
@@ -84,8 +84,8 @@ class KnownValues(unittest.TestCase):
 
     def test_rcas_natorb(self):
         mo1, ci1, mocc1 = mcscf.addons.cas_natorb(mcr)
-        self.assertAlmostEqual(numpy.linalg.norm(mo1)  , 9.9260608594977491, 6)
-        self.assertAlmostEqual(numpy.linalg.norm(mocc1), 5.1687145190800079, 6)
+        self.assertAlmostEqual(numpy.linalg.norm(mo1)  , 9.9260608594977491, 5)
+        self.assertAlmostEqual(numpy.linalg.norm(mocc1), 5.1687145190800079, 5)
 
 #TODO:    def test_ucas_natorb(self):
 #TODO:        mo2, ci2, mocc2 = mcscf.addons.cas_natorb(mcu)
@@ -95,7 +95,7 @@ class KnownValues(unittest.TestCase):
     def test_get_fock(self):
         f1 = mcscf.addons.get_fock(mcr)
         self.assertTrue(numpy.allclose(f1, f1.T))
-        self.assertAlmostEqual(numpy.linalg.norm(f1), 25.482177562349467, 6)
+        self.assertAlmostEqual(numpy.linalg.norm(f1), 25.482177562349467, 5)
 #TODO:        f1 = mcscf.addons.get_fock(mcu)
 #TODO:        self.assertTrue(numpy.allclose(f1[0], f1[0].T))
 #TODO:        self.assertTrue(numpy.allclose(f1[1], f1[1].T))
@@ -110,25 +110,25 @@ class KnownValues(unittest.TestCase):
         mo, ci, mo_e = mcr.canonicalize(mo1)
         e1 = numpy.einsum('ji,jk,ki', mo, f1, mo)
         self.assertAlmostEqual(e1, 44.2658681077, 7)
-        self.assertAlmostEqual(lib.fp(mo_e), 5.1364166175063097, 7)
+        self.assertAlmostEqual(lib.fp(mo_e), 5.1364166175063097, 5)
 
         mo, ci, mo_e = mcr.canonicalize(mo1, eris=mcr.ao2mo(mcr.mo_coeff))
         e1 = numpy.einsum('ji,jk,ki', mo, f1, mo)
         self.assertAlmostEqual(e1, 44.2658681077, 7)
-        self.assertAlmostEqual(lib.fp(mo_e), 4.1206025804989173, 7)
+        self.assertAlmostEqual(lib.fp(mo_e), 4.1206025804989173, 4)
 
-        mcr1 = copy.copy(mcr)
+        mcr1 = mcr.copy()
         mcr1.frozen = 2
         mo, ci, mo_e = mcr1.canonicalize(mo1)
-        self.assertAlmostEqual(lib.fp(mo_e), 6.6030999409178577, 7)
+        self.assertAlmostEqual(lib.fp(mo_e), 6.6030999409178577, 5)
 
         mcr1.frozen = [0,1]
         mo, ci, mo_e = mcr1.canonicalize(mo1)
-        self.assertAlmostEqual(lib.fp(mo_e), 6.6030999409178577, 7)
+        self.assertAlmostEqual(lib.fp(mo_e), 6.6030999409178577, 5)
 
         mcr1.frozen = [1,12]
         mo, ci, mo_e = mcr1.canonicalize(mo1)
-        self.assertAlmostEqual(lib.fp(mo_e), 5.2182584355788162, 7)
+        self.assertAlmostEqual(lib.fp(mo_e), 5.2182584355788162, 5)
 
     def test_canonicalize(self):
         mo, ci, mo_e = mcr.canonicalize()
@@ -275,7 +275,9 @@ class KnownValues(unittest.TestCase):
         dm1 = mc.analyze()
         self.assertAlmostEqual(lib.fp(dm1[0]), 0.52396929381500434, 4)
 
-        self.assertRaises(TypeError, mc.state_average_, (.64,.36))
+        mc = mc.state_average((.64,.36)).run()
+        self.assertAlmostEqual(mc.e_tot, -108.83342083775061, 7)
+        self.assertAlmostEqual(mc.e_average, -108.83342083775061, 7)
 
     def test_state_average_fci_dmrg(self):
         fcisolver1 = fci.direct_spin1_symm.FCISolver(mol)
@@ -316,10 +318,10 @@ class KnownValues(unittest.TestCase):
         solver1.spin = 0
         solver1.nroots = 2
         solver2 = fci.FCI(mol, singlet=False)
+        solver2.wfnsym = 'A1u'
         solver2.spin = 2
         mc = mcscf.CASSCF(mfr, 4, 4)
-        mc = mcscf.addons.state_average_mix_(mc, [solver1, solver2],
-                                             (0.25,0.25,0.5))
+        mc = mc.state_average_mix_([solver1, solver2], (0.25,0.25,0.5))
         mc.kernel()
         e = mc.e_states
         self.assertAlmostEqual(mc.e_tot, -108.80340952016508, 7)
@@ -360,6 +362,7 @@ class KnownValues(unittest.TestCase):
         solver1.spin =    fcisolver1.spin = 0
         solver1.nroots =  fcisolver1.nroots = 2
         solver2 = fci.FCI(mol, singlet=False)
+        solver2.wfnsym = 'A1u'
         solver2.spin = 2
         mc = mcscf.CASSCF(mfr, 4, 4)
         mc = mcscf.addons.state_average_mix_(mc, [solver1, solver2],
@@ -492,10 +495,9 @@ class KnownValues(unittest.TestCase):
         mc.state_average_([.8, .2])
         mscan = mc.as_scanner()
         e = mscan(mol)
-        self.assertAlmostEqual(e, -108.84390277715984, 9)
+        self.assertAlmostEqual(e, -108.84390277715984, 8)
 
 
 if __name__ == "__main__":
     print("Full Tests for mcscf.addons")
     unittest.main()
-

@@ -38,15 +38,16 @@ LINDEP_THRESHOLD = 1e-7
 
 
 def harmonic_analysis(mol, hess, exclude_trans=True, exclude_rot=True,
-                      imaginary_freq=True):
+                      imaginary_freq=True, mass=None):
     '''Each column is one mode
 
     imaginary_freq (boolean): save imaginary_freq as complex number (if True)
     or negative real number (if False)
     '''
+    if mass is None:
+        mass = mol.atom_mass_list(isotope_avg=True)
     results = {}
     atom_coords = mol.atom_coords()
-    mass = mol.atom_mass_list(isotope_avg=True)
     mass_center = numpy.einsum('z,zx->x', mass, atom_coords) / mass.sum()
     atom_coords = atom_coords - mass_center
     natm = atom_coords.shape[0]
@@ -344,7 +345,10 @@ def dump_thermo(mol, results):
 def dump_normal_mode(mol, results):
     dump = mol.stdout.write
     freq_wn = results['freq_wavenumber']
-    idx = freq_wn.real > 0
+    if numpy.iscomplexobj(freq_wn):
+        assert numpy.all(numpy.logical_or(abs(freq_wn.real) < 1e-10, abs(freq_wn.imag) < 1e-10))
+        freq_wn = freq_wn.real - abs(freq_wn.imag)
+    idx = range(len(freq_wn)) # freq_wn.real > 0
     freq_wn = freq_wn.real[idx]
     nfreq = freq_wn.size
 

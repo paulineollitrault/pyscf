@@ -18,70 +18,96 @@
 
 '''Density expansion on plane waves'''
 
-import copy
 import numpy
 from pyscf import lib
+from pyscf import gto
 from pyscf.lib import logger
 from pyscf.pbc import tools
-from pyscf.pbc.gto import pseudo, estimate_ke_cutoff, error_for_ke_cutoff
+from pyscf.pbc import gto as pbcgto
+from pyscf.pbc.gto import pseudo, error_for_ke_cutoff, estimate_ke_cutoff
 from pyscf.pbc.df import ft_ao
 from pyscf.pbc.df import fft_ao2mo
-from pyscf.pbc.df.aft import _sub_df_jk_
-from pyscf.pbc.lib.kpts_helper import gamma_point
+from pyscf.pbc.df import fft_jk
+from pyscf.pbc.df import aft
+from pyscf.pbc.df.aft import _check_kpts
+from pyscf.pbc.lib.kpts import KPoints
+from pyscf.pbc.lib.kpts_helper import is_zero
 from pyscf import __config__
 
 KE_SCALING = getattr(__config__, 'pbc_df_aft_ke_cutoff_scaling', 0.75)
 
 
 def get_nuc(mydf, kpts=None):
-    if kpts is None:
-        kpts_lst = numpy.zeros((1,3))
-    else:
-        kpts_lst = numpy.reshape(kpts, (-1,3))
+    r'''
+    Compute integrals for the nuclear attraction term.
 
+    The output of this function depends on the input `kpts`. Generally, the
+    output is a (Nk, Nao, Nao) array, where Nk is the number of k-points in the
+    provided `kpts`. If `kpts` is a (3,) array, corresponding to a single
+    k-point, the output will be a (Nao, Nao) matrix. If the optional input
+    `kpts` is not specified, this function will read the FFTDF.kpts for the
+    k-mesh and return a (Nk, Nao, Nao) array.
+
+    Note: This API has changed since PySCF-2.10. In PySCF 2.9 (or older), if
+    `kpts` is not specified, this function may return a (Nao, Nao) matrix for
+    the gamma point and a (Nk, Nao, Nao) array for other k-points.
+    '''
+    from pyscf.pbc.dft import gen_grid
+    kpts, is_single_kpt = _check_kpts(mydf, kpts)
     cell = mydf.cell
+    assert cell.low_dim_ft_type != 'inf_vacuum'
+    assert cell.dimension != 1
     mesh = mydf.mesh
     charge = -cell.atom_charges()
     Gv = cell.get_Gv(mesh)
-    SI = cell.get_SI(Gv)
+    SI = cell.get_SI(mesh=mesh)
     rhoG = numpy.dot(charge, SI)
 
     coulG = tools.get_coulG(cell, mesh=mesh, Gv=Gv)
     vneG = rhoG * coulG
     vneR = tools.ifft(vneG, mesh).real
 
-    vne = [0] * len(kpts_lst)
-    for ao_ks_etc, p0, p1 in mydf.aoR_loop(mydf.grids, kpts_lst):
+    vne = [0] * len(kpts)
+    for ao_ks_etc, p0, p1 in mydf.aoR_loop(mydf.grids, kpts):
         ao_ks = ao_ks_etc[0]
         for k, ao in enumerate(ao_ks):
             vne[k] += lib.dot(ao.T.conj()*vneR[p0:p1], ao)
         ao = ao_ks = None
 
-    if kpts is None or numpy.shape(kpts) == (3,):
+    if is_single_kpt:
         vne = vne[0]
     return numpy.asarray(vne)
 
 def get_pp(mydf, kpts=None):
-    '''Get the periodic pseudotential nuc-el AO matrix, with G=0 removed.
-    '''
-    from pyscf import gto
-    cell = mydf.cell
-    if kpts is None:
-        kpts_lst = numpy.zeros((1,3))
-    else:
-        kpts_lst = numpy.reshape(kpts, (-1,3))
+    '''Get the periodic pseudopotential nuc-el AO matrix, with G=0 removed.
 
+    The output of this function depends on the input `kpts`. Generally, the
+    output is a (Nk, Nao, Nao) array, where Nk is the number of k-points in the
+    provided `kpts`. If `kpts` is a (3,) array, corresponding to a single
+    k-point, the output will be a (Nao, Nao) matrix. If the optional input
+    `kpts` is not specified, this function will read the FFTDF.kpts for the
+    k-mesh and return a (Nk, Nao, Nao) array.
+
+    Note: This API has changed since PySCF-2.10. In PySCF 2.9 (or older), if
+    `kpts` is not specified, this function may return a (Nao, Nao) matrix for
+    the gamma point and a (Nk, Nao, Nao) array for other k-points.
+    '''
+    from pyscf.pbc.dft import gen_grid
+    kpts, is_single_kpt = _check_kpts(mydf, kpts)
+    cell = mydf.cell
+    assert cell.low_dim_ft_type != 'inf_vacuum'
+    assert cell.dimension != 1
     mesh = mydf.mesh
-    SI = cell.get_SI()
     Gv = cell.get_Gv(mesh)
+    SI = cell.get_SI(mesh=mesh)
     vpplocG = pseudo.get_vlocG(cell, Gv)
     vpplocG = -numpy.einsum('ij,ij->j', SI, vpplocG)
     ngrids = len(vpplocG)
 
     # vpploc evaluated in real-space
     vpplocR = tools.ifft(vpplocG, mesh).real
-    vpp = [0] * len(kpts_lst)
-    for ao_ks_etc, p0, p1 in mydf.aoR_loop(mydf.grids, kpts_lst):
+    vpp = [0] * len(kpts)
+    for ao_ks_etc, p0, p1 in mydf.aoR_loop(mydf.grids, kpts):
         ao_ks = ao_ks_etc[0]
         for k, ao in enumerate(ao_ks):
             vpp[k] += lib.dot(ao.T.conj()*vpplocR[p0:p1], ao)
@@ -144,14 +170,14 @@ def get_pp(mydf, kpts=None):
                         vppnl += numpy.einsum('imp,imq->pq', SPG_lm_aoG.conj(), tmp)
         return vppnl * (1./cell.vol)
 
-    for k, kpt in enumerate(kpts_lst):
+    for k, kpt in enumerate(kpts):
         vppnl = vppnl_by_k(kpt)
-        if gamma_point(kpt):
+        if is_zero(kpt):
             vpp[k] = vpp[k].real + vppnl.real
         else:
             vpp[k] += vppnl
 
-    if kpts is None or numpy.shape(kpts) == (3,):
+    if is_single_kpt:
         vpp = vpp[0]
     return numpy.asarray(vpp)
 
@@ -159,8 +185,15 @@ def get_pp(mydf, kpts=None):
 class FFTDF(lib.StreamObject):
     '''Density expansion on plane waves
     '''
-    def __init__(self, cell, kpts=numpy.zeros((1,3))):
-        from pyscf.pbc.dft import gen_grid
+
+    # to mimic molecular DF object
+    blockdim = getattr(__config__, 'pbc_df_df_DF_blockdim', 240)
+
+    _keys = {
+        'cell', 'kpts', 'mesh', 'blockdim', 'exxdiv',
+    }
+
+    def __init__(self, cell, kpts=None):
         from pyscf.pbc.dft import numint
         self.cell = cell
         self.stdout = cell.stdout
@@ -168,10 +201,12 @@ class FFTDF(lib.StreamObject):
         self.max_memory = cell.max_memory
 
         self.kpts = kpts
-        self.grids = gen_grid.UniformGrids(cell)
-
-        # to mimic molecular DF object
-        self.blockdim = getattr(__config__, 'pbc_df_df_DF_blockdim', 240)
+        # FFT from real space density distributes error to every rho_ij(G) than
+        # the one with largest Gaussian exponent. Therefore the error for FFT-ERI
+        # ~ Nele * error[rho(Ecut)] while in AFT the error is ~ error[rho(Ecut)]^2.
+        # This is a first order error, same to the error estimation for nuclear
+        # attraction.
+        self.mesh = cell.mesh
 
         # The following attributes are not input options.
         # self.exxdiv has no effects. It was set in the get_k_kpts function to
@@ -179,28 +214,51 @@ class FFTDF(lib.StreamObject):
         self.exxdiv = None
         self._numint = numint.KNumInt()
         self._rsh_df = {}  # Range separated Coulomb DF objects
-        self._keys = set(self.__dict__.keys())
 
     @property
-    def mesh(self):
-        return self.grids.mesh
-    @mesh.setter
-    def mesh(self, mesh):
-        self.grids.mesh = mesh
+    def grids(self):
+        from pyscf.pbc.dft import gen_grid
+        grids = gen_grid.UniformGrids(self.cell)
+        grids.mesh = self.mesh
+        return grids
+    @grids.setter
+    def grids(self, val):
+        self.mesh = val.mesh
+
+    @property
+    def kpts(self):
+        if isinstance(self._kpts, KPoints):
+            return self._kpts.kpts
+        else:
+            return self.cell.get_abs_kpts(self._kpts)
+
+    @kpts.setter
+    def kpts(self, val):
+        if val is None:
+            self._kpts = numpy.zeros((1, 3))
+        elif isinstance(val, KPoints):
+            self._kpts = val
+        else:
+            self._kpts = self.cell.get_scaled_kpts(val)
 
     def reset(self, cell=None):
         if cell is not None:
+            if isinstance(self._kpts, KPoints):
+                self._kpts.reset(cell)
             self.cell = cell
-        self.grids.reset(cell)
         self._rsh_df = {}
         return self
 
     def dump_flags(self, verbose=None):
-        logger.info(self, '\n')
-        logger.info(self, '******** %s ********', self.__class__)
-        logger.info(self, 'mesh = %s (%d PWs)', self.mesh, numpy.prod(self.mesh))
-        logger.info(self, 'len(kpts) = %d', len(self.kpts))
-        logger.debug1(self, '    kpts = %s', self.kpts)
+        log = logger.new_logger(self, verbose)
+        if log.verbose < logger.INFO:
+            return self
+        log.info('\n')
+        log.info('******** %s ********', self.__class__)
+        log.info('mesh = %s (%d PWs)', self.mesh, numpy.prod(self.mesh))
+        kpts = self.kpts
+        log.info('len(kpts) = %d', len(kpts))
+        log.debug1('    kpts = %s', kpts)
         return self
 
     def check_sanity(self):
@@ -225,13 +283,16 @@ class FFTDF(lib.StreamObject):
             ke_cutoff = numpy.min(cell.ke_cutoff)
         ke_guess = estimate_ke_cutoff(cell, cell.precision)
         if ke_cutoff < ke_guess * KE_SCALING:
-            mesh_guess = tools.cutoff_to_mesh(cell.lattice_vectors(), ke_guess)
+            mesh_guess = cell.cutoff_to_mesh(ke_guess)
             logger.warn(self, 'ke_cutoff/mesh (%g / %s) is not enough for FFTDF '
                         'to get integral accuracy %g.\nCoulomb integral error '
                         'is ~ %.2g Eh.\nRecommended ke_cutoff/mesh are %g / %s.',
                         ke_cutoff, self.mesh, cell.precision,
                         error_for_ke_cutoff(cell, ke_cutoff), ke_guess, mesh_guess)
         return self
+
+    def build(self):
+        return self.check_sanity()
 
     def aoR_loop(self, grids=None, kpts=None, deriv=0):
         if grids is None:
@@ -242,11 +303,7 @@ class FFTDF(lib.StreamObject):
         if grids.non0tab is None:
             grids.build(with_non0tab=True)
 
-        if kpts is None: kpts = self.kpts
-        kpts = numpy.asarray(kpts)
-
-        if (cell.dimension < 2 or
-            (cell.dimension == 2 and cell.low_dim_ft_type == 'inf_vacuum')):
+        if cell.dimension <= 2 and cell.low_dim_ft_type == 'inf_vacuum':
             raise RuntimeError('FFTDF method does not support low-dimension '
                                'PBC system.  DF, MDF or AFTDF methods should '
                                'be used.\nSee also examples/pbc/31-low_dimensional_pbc.py')
@@ -265,42 +322,18 @@ class FFTDF(lib.StreamObject):
     get_nuc = get_nuc
 
     def get_jk_e1(self, dm, kpts=None, kpts_band=None, exxdiv=None):
-        from pyscf.pbc.df import fft_jk
-        if kpts is None:
-            if numpy.all(self.kpts == 0): # Gamma-point J/K by default
-                kpts = numpy.zeros(3)
-            else:
-                kpts = self.kpts
-        else:
-            kpts = numpy.asarray(kpts)
-
+        kpts = _check_kpts(self, kpts)[0]
         vj = fft_jk.get_j_e1_kpts(self, dm, kpts, kpts_band)
         vk = fft_jk.get_k_e1_kpts(self, dm, kpts, kpts_band, exxdiv)
         return vj, vk
 
     def get_j_e1(self, dm, kpts=None, kpts_band=None):
-        from pyscf.pbc.df import fft_jk
-        if kpts is None:
-            if numpy.all(self.kpts == 0): # Gamma-point J/K by default
-                kpts = numpy.zeros(3)
-            else:
-                kpts = self.kpts
-        else:
-            kpts = numpy.asarray(kpts)
-
+        kpts = _check_kpts(self, kpts)[0]
         vj = fft_jk.get_j_e1_kpts(self, dm, kpts, kpts_band)
         return vj
 
     def get_k_e1(self, dm, kpts=None, kpts_band=None, exxdiv=None):
-        from pyscf.pbc.df import fft_jk
-        if kpts is None:
-            if numpy.all(self.kpts == 0): # Gamma-point J/K by default
-                kpts = numpy.zeros(3)
-            else:
-                kpts = self.kpts
-        else:
-            kpts = numpy.asarray(kpts)
-
+        kpts = _check_kpts(self, kpts)[0]
         vk = fft_jk.get_k_e1_kpts(self, dm, kpts, kpts_band, exxdiv)
         return vk
 
@@ -311,24 +344,17 @@ class FFTDF(lib.StreamObject):
     # post-HF methods.
     def get_jk(self, dm, hermi=1, kpts=None, kpts_band=None,
                with_j=True, with_k=True, omega=None, exxdiv=None):
-        from pyscf.pbc.df import fft_jk
         if omega is not None:  # J/K for RSH functionals
-            return _sub_df_jk_(self, dm, hermi, kpts, kpts_band,
-                               with_j, with_k, omega, exxdiv)
+            with self.range_coulomb(omega) as rsh_df:
+                return rsh_df.get_jk(dm, hermi, kpts, kpts_band, with_j, with_k,
+                                     omega=None, exxdiv=exxdiv)
 
-        if kpts is None:
-            if numpy.all(self.kpts == 0): # Gamma-point J/K by default
-                kpts = numpy.zeros(3)
-            else:
-                kpts = self.kpts
-        else:
-            kpts = numpy.asarray(kpts)
-
-        vj = vk = None
-        if kpts.shape == (3,):
-            vj, vk = fft_jk.get_jk(self, dm, hermi, kpts, kpts_band,
+        kpts, is_single_kpt = _check_kpts(self, kpts)
+        if is_single_kpt:
+            vj, vk = fft_jk.get_jk(self, dm, hermi, kpts[0], kpts_band,
                                    with_j, with_k, exxdiv)
         else:
+            vj = vk = None
             if with_k:
                 vk = fft_jk.get_k_kpts(self, dm, hermi, kpts, kpts_band, exxdiv)
             if with_j:
@@ -342,7 +368,7 @@ class FFTDF(lib.StreamObject):
     get_mo_pairs_G = get_mo_pairs = fft_ao2mo.get_mo_pairs_G
 
     def update_mf(self, mf):
-        mf = copy.copy(mf)
+        mf = mf.copy()
         mf.with_df = self
         return mf
 
@@ -352,7 +378,7 @@ class FFTDF(lib.StreamObject):
     def loop(self, blksize=None):
         if self.cell.dimension < 3:
             raise RuntimeError('ERIs of 1D and 2D systems are not positive '
-                               'definite. Current API only supports postive '
+                               'definite. Current API only supports positive '
                                'definite ERIs.')
 
         if blksize is None:
@@ -375,20 +401,6 @@ class FFTDF(lib.StreamObject):
         ngrids = numpy.prod(mesh)
         return ngrids * 2
 
+    range_coulomb = aft.AFTDF.range_coulomb
 
-if __name__ == '__main__':
-    from pyscf.pbc import gto as pbcgto
-    cell = pbcgto.Cell()
-    cell.verbose = 0
-    cell.atom = 'C 0 0 0; C 1 1 1; C 0 2 2; C 2 0 2'
-    cell.a = numpy.diag([4, 4, 4])
-    cell.basis = 'gth-szv'
-    cell.pseudo = 'gth-pade'
-    cell.mesh = [20]*3
-    cell.build()
-    k = numpy.ones(3)*.25
-    df = FFTDF(cell)
-    v1 = get_pp(df, k)
-    print(lib.finger(v1) - (1.8428463642697195-0.10478381725330854j))
-    v1 = get_nuc(df, k)
-    print(lib.finger(v1) - (2.3454744614944714-0.12528407127454744j))
+    to_gpu = lib.to_gpu

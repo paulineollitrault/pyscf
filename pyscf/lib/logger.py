@@ -189,7 +189,7 @@ def timer_debug1(rec, msg, cpu0=None, wall0=None):
         rec._t0 = process_clock()
         return rec._t0
 
-class Logger(object):
+class Logger:
     '''
     Attributes:
         stdout : file object or sys.stdout
@@ -230,11 +230,11 @@ def new_logger(rec=None, verbose=None):
     if isinstance(verbose, Logger):
         log = verbose
     elif isinstance(verbose, int):
+        from pyscf.lib.misc import StreamObject
         if getattr(rec, 'stdout', None):
             log = Logger(rec.stdout, verbose)
         else:
-            log = Logger(sys.stdout, verbose)
+            log = Logger(StreamObject.stdout, verbose)
     else:
         log = Logger(rec.stdout, rec.verbose)
     return log
-

@@ -44,24 +44,23 @@ def get_veff(ks_grad, dm=None, kpts=None):
     if grids.coords is None:
         grids.build(with_non0tab=True)
 
-    omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=cell.spin)
-
     mem_now = lib.current_memory()[0]
     max_memory = max(2000, ks_grad.max_memory*.9-mem_now)
     if ks_grad.grid_response:
         raise NotImplementedError
     else:
         vxc =  get_vxc(ni, cell, grids, mf.xc, dm, kpts,
-                           max_memory=max_memory, verbose=ks_grad.verbose)
+                       max_memory=max_memory, verbose=ks_grad.verbose)
     t0 = logger.timer(ks_grad, 'vxc', *t0)
 
-    if abs(hyb) < 1e-10 and abs(alpha) < 1e-10:
+    if not ni.libxc.is_hybrid_xc(mf.xc):
         vj = ks_grad.get_j(dm, kpts)
         vxc += vj[:,0][:,None] + vj[:,1][:,None]
     else:
+        omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf.xc, spin=cell.spin)
         vj, vk = ks_grad.get_jk(dm, kpts)
         vk *= hyb
-        if abs(omega) > 1e-10:  # For range separated Coulomb operator
+        if omega != 0:
             with cell.with_range_coulomb(omega):
                 vk += ks_grad.get_k(dm, kpts) * (alpha - hyb)
         vxc += vj[:,0][:,None] + vj[:,1][:,None] - vk
@@ -83,15 +82,18 @@ def get_vxc(ni, cell, grids, xc_code, dms, kpts, kpts_band=None, relativity=0, h
             ao_k2 = np.asarray(ao_k2)
             rho_a = make_rho(0, ao_k2[:,0], mask, xctype)
             rho_b = make_rho(1, ao_k2[:,0], mask, xctype)
-            vxc = ni.eval_xc(xc_code, (rho_a, rho_b), 1, relativity, 1)[1]
-            vrho = vxc[0]
-            aowa = np.einsum('xpi,p->xpi', ao_k1[:,0], weight*vrho[:,0])
-            aowb = np.einsum('xpi,p->xpi', ao_k1[:,0], weight*vrho[:,1])
+            vxc = ni.eval_xc_eff(xc_code, (rho_a, rho_b), deriv=1, xctype=xctype)[1]
+            wv = vxc[:,0] * weight
+            aowa = np.einsum('xpi,p->xpi', ao_k1[:,0], wv[0])
+            aowb = np.einsum('xpi,p->xpi', ao_k1[:,0], wv[1])
             ao_k2 = rho_a = rho_b = vxc = None
             for kn in range(nkpts):
                 rks_grad._d1_dot_(vmat[:,0,kn], cell, ao_k1[kn,1:4], aowa[kn], mask, ao_loc, True)
                 rks_grad._d1_dot_(vmat[:,1,kn], cell, ao_k1[kn,1:4], aowb[kn], mask, ao_loc, True)
             ao_k1 = aowa = aowb = None
+
+    elif xctype == 'HF':
+        pass
 
     elif xctype=='GGA':
         ao_deriv = 2
@@ -101,13 +103,14 @@ def get_vxc(ni, cell, grids, xc_code, dms, kpts, kpts_band=None, relativity=0, h
             ao_k2 = np.asarray(ao_k2)
             rho_a = make_rho(0, ao_k2[:,:4], mask, xctype)
             rho_b = make_rho(1, ao_k2[:,:4], mask, xctype)
-            vxc = ni.eval_xc(xc_code, (rho_a, rho_b), 1, relativity, 1)[1]
-            wva, wvb = numint._uks_gga_wv0((rho_a, rho_b), vxc, weight)
+            vxc = ni.eval_xc_eff(xc_code, (rho_a, rho_b), deriv=1, xctype=xctype)[1]
+            wv = vxc * weight
+            wv[:,0] *= .5
             ao_k2 = rho_a = rho_b = vxc = None
             for kn in range(nkpts):
-                rks_grad._gga_grad_sum_(vmat[:,0,kn], cell, ao_k1[kn], wva, mask, ao_loc)
-                rks_grad._gga_grad_sum_(vmat[:,1,kn], cell, ao_k1[kn], wvb, mask, ao_loc)
-            ao_k1 = wva = wvb = None
+                rks_grad._gga_grad_sum_(vmat[:,0,kn], cell, ao_k1[kn], wv[0], mask, ao_loc)
+                rks_grad._gga_grad_sum_(vmat[:,1,kn], cell, ao_k1[kn], wv[1], mask, ao_loc)
+            ao_k1 = None
 
     elif xctype=='NLC':
         raise NotImplementedError("NLC")
@@ -118,31 +121,15 @@ def get_vxc(ni, cell, grids, xc_code, dms, kpts, kpts_band=None, relativity=0, h
 
 class Gradients(uhf_grad.Gradients):
     '''Non-relativistic restricted Hartree-Fock gradients'''
+    _keys = {'grid_response', 'grids'}
+
     def __init__(self, mf):
         uhf_grad.Gradients.__init__(self, mf)
         self.grids = None
         self.grid_response = False
-        self._keys = self._keys.union(['grid_response', 'grids'])
 
     get_veff = get_veff
 
-if __name__=='__main__':
-    from pyscf.pbc import dft
-    cell = gto.Cell()
-    cell.atom = [['He', [0.0, 0.0, 0.0]], ['He', [1, 1.1, 1.2]]]
-    cell.basis = 'gth-dzv'
-    cell.a = np.eye(3) * 3
-    cell.mesh = [19,19,19]
-    cell.unit='bohr'
-    cell.pseudo='gth-pade'
-    cell.verbose=5
-    cell.build()
-
-    nmp = [1,1,5]
-    kpts = cell.make_kpts(nmp)
-    kmf = dft.KUKS(cell, kpts)
-    kmf.exxdiv = None
-    kmf.xc = 'b3lyp'
-    kmf.kernel()
-    mygrad = Gradients(kmf)
-    mygrad.kernel()
+    def get_stress(self):
+        from pyscf.pbc.grad import kuks_stress
+        return kuks_stress.kernel(self)

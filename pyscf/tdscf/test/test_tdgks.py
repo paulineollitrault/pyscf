@@ -19,7 +19,6 @@
 import unittest
 import tempfile
 import numpy
-import copy
 from pyscf import lib, gto, scf, dft
 from pyscf import tdscf
 try:
@@ -78,6 +77,15 @@ def diagonalize(a, b, nroots=4):
     return lowest_e
 
 class KnownValues(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.original_grids = dft.radi.ATOM_SPECIFIC_TREUTLER_GRIDS
+        dft.radi.ATOM_SPECIFIC_TREUTLER_GRIDS = False
+
+    @classmethod
+    def tearDownClass(cls):
+        dft.radi.ATOM_SPECIFIC_TREUTLER_GRIDS = cls.original_grids
+
     def test_tddft_lda(self):
         td = mf_lda.TDDFT()
         es = td.kernel(nstates=4)[0]
@@ -104,7 +112,7 @@ class KnownValues(unittest.TestCase):
         self._check_against_ab_ks_real(tdscf.gks.TDDFT(mf_lda), -0.5233726312108345, 0.07876886521779444)
 
     def test_col_gga_ab_ks(self):
-        mf_b3lyp = dft.GKS(mol).set(xc='b3lyp')
+        mf_b3lyp = dft.GKS(mol).set(xc='b3lyp5')
         mf_b3lyp.__dict__.update(scf.chkfile.load(mf_lda.chkfile, 'scf'))
         self._check_against_ab_ks_real(mf_b3lyp.TDDFT(), -0.47606715615564554, 0.1771403691719411)
 
@@ -119,7 +127,7 @@ class KnownValues(unittest.TestCase):
 
     @unittest.skipIf(mcfun is None, "mcfun library not found.")
     def test_mcol_gga_ab_ks(self):
-        mcol_b3lyp = dft.GKS(mol).set(xc='b3lyp', collinear='mcol')
+        mcol_b3lyp = dft.GKS(mol).set(xc='b3lyp5', collinear='mcol')
         mcol_b3lyp._numint.spin_samples = 6
         mcol_b3lyp.__dict__.update(scf.chkfile.load(mf_lda.chkfile, 'scf'))
         self._check_against_ab_ks_complex(mcol_b3lyp.TDDFT(), -0.49573245956851275, 0.4808293930369838)
@@ -178,24 +186,36 @@ class KnownValues(unittest.TestCase):
 
     def test_tda_with_wfnsym(self):
         td = mf_bp86.TDA()
-        td.wfnsym = 'B1'
+        td.wfnsym = 'B2'
         es = td.kernel(nstates=3)[0]
         self.assertAlmostEqual(lib.fp(es), 0.4523465502706356, 6)
 
     def test_tdhf_with_wfnsym(self):
         mf_ghf = scf.GHF(molsym).run()
         td = mf_ghf.TDHF()
-        td.wfnsym = 'B1'
+        td.wfnsym = 'B2'
         td.nroots = 3
         es = td.kernel()[0]
         self.assertAlmostEqual(lib.fp(es), 0.48380638923581476, 6)
 
     def test_tddft_with_wfnsym(self):
         td = mf_bp86.CasidaTDDFT()
-        td.wfnsym = 'B1'
+        td.wfnsym = 'B2'
         td.nroots = 3
         es = td.kernel()[0]
         self.assertAlmostEqual(lib.fp(es), 0.45050838461527387, 6)
+
+    def test_set_frozen(self):
+        td = mf_bp86.TDA()
+        td.frozen = 4
+        mask = td.get_frozen_mask()
+        self.assertEqual(mask.sum(), 22)
+        td.set_frozen()
+        mask = td.get_frozen_mask()
+        self.assertEqual(mask.sum(), 24)
+        td.frozen = [0,1]
+        mask = td.get_frozen_mask()
+        self.assertEqual(mask.sum(), 24)
 
 
 if __name__ == "__main__":

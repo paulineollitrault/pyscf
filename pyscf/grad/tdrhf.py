@@ -22,6 +22,7 @@
 
 from functools import reduce
 import numpy
+from pyscf import gto
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf.grad import rhf as rhf_grad
@@ -43,6 +44,8 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None,
     '''
     log = logger.new_logger(td_grad, verbose)
     time0 = logger.process_clock(), logger.perf_counter()
+
+    assert td_grad.base.frozen is None
 
     mol = td_grad.mol
     mf = td_grad.base._scf
@@ -81,7 +84,8 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None,
     wvo += numpy.einsum('ac,ai->ci', veff0mom[nocc:,nocc:], xmy) * 2
 
     # set singlet=None, generate function for CPHF type response kernel
-    vresp = mf.gen_response(singlet=None, hermi=1)
+    vresp = mf.gen_response(singlet=None, hermi=1,
+                            with_nlc=not td_grad.base.exclude_nlc)
     def fvind(x):  # For singlet, closed shell ground state
         dm = reduce(numpy.dot, (orbv, x.reshape(nvir,nocc)*2, orbo.T))
         v1ao = vresp(dm+dm.T)
@@ -126,10 +130,11 @@ def grad_elec(td_grad, x_y, singlet=True, atmlst=None,
                                   dmxmy-dmxmy.T))
     vj = vj.reshape(-1,3,nao,nao)
     vk = vk.reshape(-1,3,nao,nao)
+    vhf1 = -vk
     if singlet:
-        vhf1 = vj * 2 - vk
+        vhf1 += vj * 2
     else:
-        vhf1 = numpy.vstack((vj[:2]*2-vk[:2], -vk[2:]))
+        vhf1[:2] += vj[:2]*2
     time1 = log.timer('2e AO integral derivatives', *time1)
 
     if atmlst is None:
@@ -188,42 +193,59 @@ def as_scanner(td_grad, state=1):
     if isinstance(td_grad, lib.GradScanner):
         return td_grad
 
-    logger.info(td_grad, 'Create scanner for %s', td_grad.__class__)
-
-    class TDSCF_GradScanner(td_grad.__class__, lib.GradScanner):
-        def __init__(self, g):
-            lib.GradScanner.__init__(self, g)
-            self._keys = self._keys.union(['e_tot'])
-        def __call__(self, mol_or_geom, state=state, **kwargs):
-            if isinstance(mol_or_geom, gto.Mole):
-                mol = mol_or_geom
-            else:
-                mol = self.mol.set_geom_(mol_or_geom, inplace=False)
-
-            td_scanner = self.base
-            td_scanner(mol)
-            self.mol = mol
-# TODO: Check root flip.  Maybe avoid the initial guess in TDHF otherwise
-# large error may be found in the excited states amplitudes
-            de = self.kernel(state=state, **kwargs)
-            e_tot = self.e_tot[state-1]
-            return e_tot, de
-        @property
-        def converged(self):
-            td_scanner = self.base
-            return all((td_scanner._scf.converged,
-                        td_scanner.converged[self.state]))
-
     if state == 0:
         return td_grad.base._scf.nuc_grad_method().as_scanner()
-    else:
-        return TDSCF_GradScanner(td_grad)
+
+    logger.info(td_grad, 'Create scanner for %s', td_grad.__class__)
+    name = td_grad.__class__.__name__ + TDSCF_GradScanner.__name_mixin__
+    return lib.set_class(TDSCF_GradScanner(td_grad, state),
+                         (TDSCF_GradScanner, td_grad.__class__), name)
+
+class TDSCF_GradScanner(lib.GradScanner):
+    _keys = {'e_tot'}
+
+    def __init__(self, g, state):
+        lib.GradScanner.__init__(self, g)
+        if state is not None:
+            self.state = state
+
+    def __call__(self, mol_or_geom, state=None, **kwargs):
+        if isinstance(mol_or_geom, gto.MoleBase):
+            assert mol_or_geom.__class__ == gto.Mole
+            mol = mol_or_geom
+        else:
+            mol = self.mol.set_geom_(mol_or_geom, inplace=False)
+        self.reset(mol)
+
+        if state is None:
+            state = self.state
+        else:
+            self.state = state
+
+        td_scanner = self.base
+        td_scanner(mol)
+# TODO: Check root flip.  Maybe avoid the initial guess in TDHF otherwise
+# large error may be found in the excited states amplitudes
+        de = self.kernel(state=state, **kwargs)
+        e_tot = self.e_tot[state-1]
+        return e_tot, de
+
+    @property
+    def converged(self):
+        td_scanner = self.base
+        return all((td_scanner._scf.converged,
+                    td_scanner.converged[self.state]))
 
 
-class Gradients(rhf_grad.GradientsMixin):
+class Gradients(rhf_grad.GradientsBase):
 
     cphf_max_cycle = getattr(__config__, 'grad_tdrhf_Gradients_cphf_max_cycle', 20)
     cphf_conv_tol = getattr(__config__, 'grad_tdrhf_Gradients_cphf_conv_tol', 1e-8)
+
+    _keys = {
+        'cphf_max_cycle', 'cphf_conv_tol',
+        'mol', 'base', 'chkfile', 'state', 'atmlst', 'de',
+    }
 
     def __init__(self, td):
         self.verbose = td.verbose
@@ -235,8 +257,9 @@ class Gradients(rhf_grad.GradientsMixin):
         self.state = 1  # of which the gradients to be computed.
         self.atmlst = None
         self.de = None
-        keys = set(('cphf_max_cycle', 'cphf_conv_tol'))
-        self._keys = set(self.__dict__.keys()).union(keys)
+
+        if getattr(td._scf, 'with_df', None):
+            raise NotImplementedError('Nuclear Gradients for DF-TDDFT')
 
     def dump_flags(self, verbose=None):
         log = logger.new_logger(self, verbose)
@@ -273,6 +296,8 @@ class Gradients(rhf_grad.GradientsMixin):
                             'Gradients of ground state is computed.')
                 return self.base._scf.nuc_grad_method().kernel(atmlst=atmlst)
 
+            if self.base.xy is None:
+                self.base.run()
             xy = self.base.xy[state-1]
 
         if singlet is None: singlet = self.base.singlet
@@ -308,87 +333,6 @@ class Gradients(rhf_grad.GradientsMixin):
 
     as_scanner = as_scanner
 
+    to_gpu = lib.to_gpu
+
 Grad = Gradients
-
-from pyscf import tdscf
-tdscf.rhf.TDA.Gradients = tdscf.rhf.TDHF.Gradients = lib.class_as_method(Gradients)
-
-
-if __name__ == '__main__':
-    from pyscf import gto
-    from pyscf import scf
-    from pyscf import tddft
-    mol = gto.Mole()
-    mol.verbose = 0
-    mol.output = None
-
-    mol.atom = [
-        ['H' , (0. , 0. , 1.804)],
-        ['F' , (0. , 0. , 0.)], ]
-    mol.unit = 'B'
-    mol.basis = '631g'
-    mol.build()
-
-    mf = scf.RHF(mol).run(conv_tol=1e-14)
-    td = tddft.TDA(mf)
-    td.nstates = 3
-    e, z = td.kernel()
-    tdg = td.Gradients()
-    #tdg.verbose = 5
-    g1 = tdg.kernel(z[0])
-    print(g1)
-    print(lib.fp(g1) - 0.18686561181358813)
-#[[ 0  0  -2.67023832e-01]
-# [ 0  0   2.67023832e-01]]
-    td_solver = td.as_scanner()
-    e1 = td_solver(mol.set_geom_('H 0 0 1.805; F 0 0 0', unit='B'))
-    e2 = td_solver(mol.set_geom_('H 0 0 1.803; F 0 0 0', unit='B'))
-    print(abs((e1[0]-e2[0])/.002 - g1[0,2]).max())
-
-    mol.set_geom_('H 0 0 1.804; F 0 0 0', unit='B')
-    td = tddft.TDDFT(mf)
-    td.nstates = 3
-    e, z = td.kernel()
-    tdg = td.Gradients()
-    g1 = tdg.kernel(state=1)
-    print(g1)
-    print(lib.fp(g1) - 0.18967687762609461)
-# [[ 0  0  -2.71041021e-01]
-#  [ 0  0   2.71041021e-01]]
-    td_solver = td.as_scanner()
-    e1 = td_solver(mol.set_geom_('H 0 0 1.805; F 0 0 0', unit='B'))
-    e2 = td_solver(mol.set_geom_('H 0 0 1.803; F 0 0 0', unit='B'))
-    print(abs((e1[0]-e2[0])/.002 - g1[0,2]).max())
-
-    mol.set_geom_('H 0 0 1.804; F 0 0 0', unit='B')
-    td = tddft.TDA(mf)
-    td.nstates = 3
-    td.singlet = False
-    e, z = td.kernel()
-    tdg = Gradients(td)
-    g1 = tdg.kernel(state=1)
-    print(g1)
-    print(lib.fp(g1) - 0.19667995802487931)
-# [[ 0  0  -2.81048403e-01]
-#  [ 0  0   2.81048403e-01]]
-    td_solver = td.as_scanner()
-    e1 = td_solver(mol.set_geom_('H 0 0 1.805; F 0 0 0', unit='B'))
-    e2 = td_solver(mol.set_geom_('H 0 0 1.803; F 0 0 0', unit='B'))
-    print(abs((e1[0]-e2[0])/.002 - g1[0,2]).max())
-
-    mol.set_geom_('H 0 0 1.804; F 0 0 0', unit='B')
-    td = tddft.TDDFT(mf)
-    td.nstates = 3
-    td.singlet = False
-    e, z = td.kernel()
-    tdg = Gradients(td)
-    g1 = tdg.kernel(state=1)
-    print(g1)
-    print(lib.fp(g1) - 0.20032088639558535)
-# [[ 0  0  -2.86250870e-01]
-#  [ 0  0   2.86250870e-01]]
-    td_solver = td.as_scanner()
-    e1 = td_solver(mol.set_geom_('H 0 0 1.805; F 0 0 0', unit='B'))
-    e2 = td_solver(mol.set_geom_('H 0 0 1.803; F 0 0 0', unit='B'))
-    print(abs((e1[0]-e2[0])/.002 - g1[0,2]).max())
-

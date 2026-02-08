@@ -25,25 +25,20 @@ from pyscf.pbc.tdscf.uhf import TDHF as TDDFT
 RPA = TDUKS = TDDFT
 
 
-class CasidaTDDFT(uks.CasidaTDDFT):
-    def gen_vind(self, mf):
-        vind, hdiag = uks.CasidaTDDFT.gen_vind(self, mf)
-        def vindp(x):
-            with lib.temporary_env(mf, exxdiv=None):
-                return vind(x)
-        return vindp, hdiag
-
-    def nuc_grad_method(self):
-        raise NotImplementedError
+class CasidaTDDFT(TDDFT):
+    get_init_guess = TDA.get_init_guess
+    _gen_vind = uks.TDDFTNoHybrid.gen_vind
+    gen_vind = TDA.gen_vind
+    kernel = uks.TDDFTNoHybrid.kernel
 
 TDDFTNoHybrid = CasidaTDDFT
 
-def tddft(mf):
+def tddft(mf, frozen=None):
     '''Driver to create TDDFT or CasidaTDDFT object'''
     if mf._numint.libxc.is_hybrid_xc(mf.xc):
-        return TDDFT(mf)
+        return TDDFT(mf, frozen)
     else:
-        return CasidaTDDFT(mf)
+        return CasidaTDDFT(mf, frozen)
 
 dft.uks.UKS.TDA           = lib.class_as_method(TDA)
 dft.uks.UKS.TDHF          = None
@@ -52,4 +47,3 @@ dft.uks.UKS.CasidaTDDFT   = lib.class_as_method(CasidaTDDFT)
 dft.uks.UKS.TDDFT         = tddft
 #dft.rks.RKS.dTDA          = lib.class_as_method(dTDA)
 #dft.rks.RKS.dRPA          = lib.class_as_method(dRPA)
-

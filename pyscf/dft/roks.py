@@ -30,12 +30,18 @@ from pyscf.dft import uks
 
 @lib.with_doc(uks.get_veff.__doc__)
 def get_veff(ks, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
-    if getattr(dm, 'mo_coeff', None) is not None:
+    if dm is None:
+        dm = ks.make_rdm1()
+    elif getattr(dm, 'mo_coeff', None) is not None:
         mo_coeff = dm.mo_coeff
         mo_occ_a = (dm.mo_occ > 0).astype(numpy.double)
         mo_occ_b = (dm.mo_occ ==2).astype(numpy.double)
+        if dm.ndim == 2:  # RHF DM
+            dm = numpy.repeat(dm[None]*.5, 2, axis=0)
         dm = lib.tag_array(dm, mo_coeff=(mo_coeff,mo_coeff),
                            mo_occ=(mo_occ_a,mo_occ_b))
+    elif dm.ndim == 2:  # RHF DM
+        dm = numpy.repeat(dm[None]*.5, 2, axis=0)
     return uks.get_veff(ks, mol, dm, dm_last, vhf_last, hermi)
 
 
@@ -61,6 +67,12 @@ class ROKS(rks.KohnShamDFT, rohf.ROHF):
         from pyscf.grad import roks
         return roks.Gradients(self)
 
+    def to_hf(self):
+        '''Convert to ROHF object.'''
+        return self._transfer_attrs_(self.mol.ROHF())
+
+    to_gpu = lib.to_gpu
+
 
 if __name__ == '__main__':
     from pyscf import gto
@@ -82,4 +94,3 @@ if __name__ == '__main__':
     m._numint.libxc = xcfun
     m.xc = 'b88,lyp'
     print(m.scf())  # -2.8978518405
-

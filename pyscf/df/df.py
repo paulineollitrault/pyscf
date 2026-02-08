@@ -21,8 +21,8 @@ J-metric density fitting
 '''
 
 
-import copy
 import tempfile
+import contextlib
 import numpy
 import h5py
 from pyscf import lib
@@ -42,41 +42,64 @@ class DF(lib.StreamObject):
     r'''
     Object to hold 3-index tensor
 
-    Attributes:
+    Input Attributes:
         auxbasis : str or dict
-            Same input format as :attr:`Mole.basis`
-
-        auxmol : Mole object
-            Read only Mole object to hold the auxiliary basis.  auxmol is
-            generated automatically in the initialization step based on the
-            given auxbasis.  It is used in the rest part of the code to
-            determine the problem size, the integral batches etc.  This object
-            should NOT be modified.
+            Same format as the input attribute mol.basis. If auxbasis is set to
+            None, an optimal auxiliary basis set will be selected based on the
+            AO basis set, according to the records in the basis set exchange
+            database and the predefined mappings in `pyscf.df.addons.DEFAULT_AUXBASIS`.
+            For DFT methods, the selection of auxiliary basis sets is also
+            influenced by the xc functional. The J-FIT basis set will be used for
+            local and semi-local functionals (LDA, GGA, and meta-GGA). JK-FIT
+            basis set will be employed for hybrid and RSH functionals.
+            If optimal auxiliary basis sets are not available, the PySCF built-in
+            even-tempered Gaussian basis set will be used.
         _cderi_to_save : str
             If _cderi_to_save is specified, the DF integral tensor will be
             saved in this file.
         _cderi : str or numpy array
             If _cderi is specified, the DF integral tensor will be read from
             this HDF5 file (or numpy array). When the DF integral tensor is
-            provided from the HDF5 file, it has to be stored under the dataset
-            'j3c'.
+            provided from the HDF5 file, its dataset name should be consistent
+            with DF._dataname, which is 'j3c' by default.
             The DF integral tensor :math:`V_{x,ij}` should be a 2D array in C
             (row-major) convention, where x corresponds to index of auxiliary
-            basis, and the combined index ij is the orbital pair index. The
-            hermitian symmetry is assumed for the combined ij index, ie
+            basis, and the composite index ij is the orbital pair index. The
+            hermitian symmetry is assumed for the composite ij index, ie
             the elements of :math:`V_{x,i,j}` with :math:`i\geq j` are existed
             in the DF integral tensor.  Thus the shape of DF integral tensor
             is (M,N*(N+1)/2), where M is the number of auxbasis functions and
             N is the number of basis functions of the orbital basis.
+            This attribute is not compatible between the CPU and GPU implementations.
+            It will not be transferred during the to_cpu() and to_gpu() calls.
         blockdim : int
             When reading DF integrals from disk the chunk size to load.  It is
             used to improve IO performance.
+
+    Intermediate Attributes (These attributes are generated during calculations
+    and should not be modified. Additionally, they may not be compatible between
+    GPU and CPU implementations.)
+        auxmol : Mole object
+            Read only Mole object to hold the auxiliary basis.  auxmol is
+            generated automatically in the initialization step based on the
+            given auxbasis.  It is used in the rest part of the code to
+            determine the problem size, the integral batches etc.  This object
+            should NOT be modified.
+        _vjopt : _VHFOpt instance
+            An instance that caches precomputation variables to optimize the
+            computation of the Coulomb matrix.
+        _rsh_df : dict
+            For range-separated DFT functionals, this object stores the density fitting
+            instances for long-range or short-range Coulomb integrals.
     '''
 
     blockdim = getattr(__config__, 'df_df_DF_blockdim', 240)
 
     # Store DF tensor in a format compatible to pyscf-1.1 - pyscf-1.6
     _compatible_format = getattr(__config__, 'df_df_DF_compatible_format', False)
+    _dataname = 'j3c'
+
+    _keys = {'mol', 'auxmol'}
 
     def __init__(self, mol, auxbasis=None):
         self.mol = mol
@@ -89,12 +112,15 @@ class DF(lib.StreamObject):
 # Following are not input options
         self.auxmol = None
 # If _cderi_to_save is specified, the 3C-integral tensor will be saved in this file.
-        self._cderi_to_save = tempfile.NamedTemporaryFile(dir=lib.param.TMPDIR)
+        self._cderi_to_save = None
 # If _cderi is specified, the 3C-integral tensor will be read from this file
         self._cderi = None
         self._vjopt = None
         self._rsh_df = {}  # Range separated Coulomb DF objects
-        self._keys = set(self.__dict__.keys())
+
+    __getstate__, __setstate__ = lib.generate_pickle_methods(
+            excludes=('_cderi_to_save', '_cderi', '_vjopt', '_rsh_df'),
+            reset_state=True)
 
     @property
     def auxbasis(self):
@@ -116,10 +142,6 @@ class DF(lib.StreamObject):
         if isinstance(self._cderi, str):
             log.info('_cderi = %s  where DF integrals are loaded (readonly).',
                      self._cderi)
-        if isinstance(self._cderi_to_save, str):
-            log.info('_cderi_to_save = %s', self._cderi_to_save)
-        else:
-            log.info('_cderi_to_save = %s', self._cderi_to_save.name)
         return self
 
     def build(self):
@@ -128,6 +150,9 @@ class DF(lib.StreamObject):
 
         self.check_sanity()
         self.dump_flags()
+        if self._cderi is not None and self.auxmol is None:
+            log.info('Skip DF.build(). Tensor _cderi will be used.')
+            return self
 
         mol = self.mol
         auxmol = self.auxmol = addons.make_auxmol(self.mol, self.auxbasis)
@@ -135,33 +160,38 @@ class DF(lib.StreamObject):
         naux = auxmol.nao_nr()
         nao_pair = nao*(nao+1)//2
 
+        is_custom_storage = isinstance(self._cderi_to_save, str)
         max_memory = self.max_memory - lib.current_memory()[0]
         int3c = mol._add_suffix('int3c2e')
         int2c = mol._add_suffix('int2c2e')
-        if (nao_pair*naux*8/1e6 < .9*max_memory and
-            not isinstance(self._cderi_to_save, str)):
+        if (nao_pair*naux*8/1e6 < .9*max_memory and not is_custom_storage):
             self._cderi = incore.cholesky_eri(mol, int3c=int3c, int2c=int2c,
                                               auxmol=auxmol,
                                               max_memory=max_memory, verbose=log)
         else:
-            if isinstance(self._cderi_to_save, str):
-                cderi = self._cderi_to_save
-            else:
-                cderi = self._cderi_to_save.name
+            if self._cderi_to_save is None:
+                self._cderi_to_save = tempfile.NamedTemporaryFile(dir=lib.param.TMPDIR)
+            cderi = self._cderi_to_save
 
-            if isinstance(self._cderi, str):
+            if is_custom_storage:
+                cderi_name = cderi
+            else:
+                cderi_name = cderi.name
+            if self._cderi is None:
+                log.info('_cderi_to_save = %s', cderi_name)
+            else:
                 # If cderi needs to be saved in
                 log.warn('Value of _cderi is ignored. DF integrals will be '
-                         'saved in file %s .', cderi)
+                         'saved in file %s .', cderi_name)
 
-            if self._compatible_format or isinstance(self._cderi_to_save, str):
-                outcore.cholesky_eri(mol, cderi, dataname='j3c',
+            if self._compatible_format:
+                outcore.cholesky_eri(mol, cderi, dataname=self._dataname,
                                      int3c=int3c, int2c=int2c, auxmol=auxmol,
                                      max_memory=max_memory, verbose=log)
             else:
                 # Store DF tensor in blocks. This is to reduce the
-                # initiailzation overhead
-                outcore.cholesky_eri_b(mol, cderi, dataname='j3c',
+                # initialization overhead
+                outcore.cholesky_eri_b(mol, cderi, dataname=self._dataname,
                                        int3c=int3c, int2c=int2c, auxmol=auxmol,
                                        max_memory=max_memory, verbose=log)
             self._cderi = cderi
@@ -175,10 +205,8 @@ class DF(lib.StreamObject):
         '''Reset mol and clean up relevant attributes for scanner mode'''
         if mol is not None:
             self.mol = mol
-        self.auxmol = None
+            self.auxmol = None
         self._cderi = None
-        if not isinstance(self._cderi_to_save, str):
-            self._cderi_to_save = tempfile.NamedTemporaryFile(dir=lib.param.TMPDIR)
         self._vjopt = None
         self._rsh_df = {}
         return self
@@ -189,7 +217,7 @@ class DF(lib.StreamObject):
         if blksize is None:
             blksize = self.blockdim
 
-        with addons.load(self._cderi, 'j3c') as feri:
+        with addons.load(self._cderi, self._dataname) as feri:
             if isinstance(feri, numpy.ndarray):
                 naoaux = feri.shape[0]
                 for b0, b1 in self.prange(0, naoaux, blksize):
@@ -222,7 +250,7 @@ class DF(lib.StreamObject):
         # object when self._cderi is provided.
         if self._cderi is None:
             self.build()
-        with addons.load(self._cderi, 'j3c') as feri:
+        with addons.load(self._cderi, self._dataname) as feri:
             if isinstance(feri, h5py.Group):
                 return feri['0'].shape[0]
             else:
@@ -235,14 +263,7 @@ class DF(lib.StreamObject):
             return df_jk.get_jk(self, dm, hermi, with_j, with_k, direct_scf_tol)
 
         # A temporary treatment for RSH-DF integrals
-        key = '%.6f' % omega
-        if key in self._rsh_df:
-            rsh_df = self._rsh_df[key]
-        else:
-            rsh_df = self._rsh_df[key] = copy.copy(self).reset()
-            logger.info(self, 'Create RSH-DF object %s for omega=%s', rsh_df, omega)
-
-        with rsh_df.mol.with_range_coulomb(omega):
+        with self.range_coulomb(omega) as rsh_df:
             return df_jk.get_jk(rsh_df, dm, hermi, with_j, with_k, direct_scf_tol)
 
     def get_eri(self):
@@ -274,6 +295,45 @@ class DF(lib.StreamObject):
         return mo_eri
     get_mo_eri = ao2mo
 
+    @contextlib.contextmanager
+    def range_coulomb(self, omega):
+        '''Creates a temporary density fitting object for RSH-DF integrals.
+        In this context, only LR or SR integrals for mol and auxmol are computed.
+        '''
+        if omega is None:
+            omega = 0
+        key = '%.6f' % omega
+        if key in self._rsh_df:
+            rsh_df = self._rsh_df[key]
+        else:
+            rsh_df = self._rsh_df[key] = self.copy().reset()
+            if hasattr(self, '_dataname'):
+                rsh_df._dataname = f'{self._dataname}-lr/{key}'
+            logger.info(self, 'Create RSH-DF object %s for omega=%s', rsh_df, omega)
+
+        mol = self.mol
+        auxmol = self.auxmol
+
+        mol_omega = mol.omega
+        mol.omega = omega
+        auxmol_omega = None
+        if auxmol is not None:
+            auxmol_omega = auxmol.omega
+            auxmol.omega = omega
+
+        assert rsh_df.mol.omega == omega
+        if rsh_df.auxmol is not None:
+            assert rsh_df.auxmol.omega == omega
+
+        try:
+            yield rsh_df
+        finally:
+            mol.omega = mol_omega
+            if auxmol_omega is not None:
+                auxmol.omega = auxmol_omega
+
+    to_gpu = lib.to_gpu
+
 GDF = DF
 
 
@@ -302,9 +362,9 @@ class DF4C(DF):
             self.build()
         if blksize is None:
             blksize = self.blockdim
-        with addons.load(self._cderi[0], 'j3c') as ferill:
+        with addons.load(self._cderi[0], self._dataname) as ferill:
             naoaux = ferill.shape[0]
-            with addons.load(self._cderi[1], 'j3c') as feriss: # python2.6 not support multiple with
+            with addons.load(self._cderi[1], self._dataname) as feriss: # python2.6 not support multiple with
                 for b0, b1 in self.prange(0, naoaux, blksize):
                     erill = numpy.asarray(ferill[b0:b1], order='C')
                     eriss = numpy.asarray(feriss[b0:b1], order='C')
@@ -316,18 +376,15 @@ class DF4C(DF):
         if omega is None:
             return df_jk.r_get_jk(self, dm, hermi, with_j, with_k)
 
-        # A temporary treatment for RSH-DF integrals
-        key = '%.6f' % omega
-        if key in self._rsh_df:
-            rsh_df = self._rsh_df[key]
-        else:
-            rsh_df = self._rsh_df[key] = copy.copy(self).reset()
-            logger.info(self, 'Create RSH-DF object %s for omega=%s', rsh_df, omega)
-
-        with rsh_df.mol.with_range_coulomb(omega):
+        with self.range_coulomb(omega) as rsh_df:
             return df_jk.r_get_jk(rsh_df, dm, hermi, with_j, with_k)
+
+    def get_eri(self):
+        raise NotImplementedError
+    get_ao_eri = get_eri
 
     def ao2mo(self, mo_coeffs):
         raise NotImplementedError
+    get_mo_eri = ao2mo
 
 GDF4C = DF4C

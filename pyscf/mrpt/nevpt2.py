@@ -26,7 +26,7 @@ import h5py
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf import fci
-from pyscf.mcscf import mc_ao2mo
+from pyscf.mcscf import casci, mc1step, mc_ao2mo
 from pyscf import ao2mo
 from pyscf.ao2mo import _ao2mo
 
@@ -615,12 +615,18 @@ class NEVPT(lib.StreamObject):
     >>> NEVPT(mc).kernel()
     -0.14058324991532101
     '''
-    def __init__(self, mc, root=0):
+
+    _keys = {
+        'ncore', 'root', 'compressed_mps', 'e_corr', 'canonicalized', 'onerdm',
+    }.union(casci.CASBase._keys, mc1step.CASSCF._keys)
+
+    def __init__(self, mc, root=0, density_fit=True):
         self.__dict__.update(mc.__dict__)
         self.ncore = mc.ncore
         self._mc = mc
         self.root = root
         self.compressed_mps = False
+        self.density_fit = density_fit
 
 ##################################################
 # don't modify the following attributes, they are not input options
@@ -628,7 +634,6 @@ class NEVPT(lib.StreamObject):
         self.canonicalized = False
         nao, nmo = mc.mo_coeff.shape
         self.onerdm = numpy.zeros((nao,nao))
-        self._keys = set(self.__dict__.keys())
 
     def reset(self, mol=None):
         if mol is not None:
@@ -707,9 +712,20 @@ example examples/dmrg/32-dmrg_casscf_nevpt2_for_FeS.py''')
         self.for_dmrg()
         return self
 
+    def dump_flags(self, verbose=None):
+        log = logger.new_logger(self, verbose)
+        log.info('')
+        log.info('******** %s ********', self.__class__)
+        ncore = self.ncore
+        ncas = self.ncas
+        nvir = self.mo_coeff.shape[1] - ncore - ncas
+        log.info('NEVPT2 (%de+%de, %do), ncore = %d, nvir = %d',
+                 self.nelecas[0], self.nelecas[1], ncas, ncore, nvir)
+        log.info('root = %d', self.root)
 
 
     def kernel(self):
+        self.dump_flags()
         from pyscf.mcscf.addons import StateAverageFCISolver
         if isinstance(self.fcisolver, StateAverageFCISolver):
             raise RuntimeError('State-average FCI solver object cannot be used '
@@ -755,7 +771,22 @@ example examples/dmrg/32-dmrg_casscf_nevpt2_for_FeS.py''')
         }
         time1 = log.timer('3pdm, 4pdm', *time0)
 
-        eris = _ERIS(self, self.mo_coeff)
+        from pyscf.mcscf.df import _DFCAS
+        from pyscf.mrpt import dfnevpt2
+        _DF_ERIS = dfnevpt2._ERIS
+        _mem_usage = dfnevpt2._mem_usage
+        mem_incore, mem_outcore = _mem_usage(ncore, ncas, nocc)
+        mem_now = lib.current_memory()[0]
+        if (isinstance(self._mc, _DFCAS)
+            and (self._mc._scf.with_df is not None)
+            and ((mem_incore < 0.9*mem_now) or (mem_outcore < 0.9*mem_now))
+            and self.density_fit):
+            logger.info(self, 'Using density fitting integrals for NEVPT2')
+            with_df = self._mc._scf.with_df
+            eris = _DF_ERIS(self._mc, self.mo_coeff, with_df)
+        else:
+            eris = _ERIS(self, self.mo_coeff)
+
         time1 = log.timer('integral transformation', *time1)
 
         if not getattr(self.fcisolver, 'nevpt_intermediate', None):  # regular FCI solver
@@ -845,8 +876,7 @@ def sc_nevpt(mc, ci=None, verbose=None):
 
 
 # register NEVPT2 in MCSCF
-from pyscf.mcscf import casci
-casci.CASCI.NEVPT2 = NEVPT
+casci.CASBase.NEVPT2 = NEVPT
 
 
 
@@ -987,7 +1017,7 @@ def trans_e1_outcore(mc, mo, max_memory=None, ioblk_size=256, tmpdir=None,
     time1 = [logger.process_clock(), logger.perf_counter()]
     ao_loc = numpy.array(mol.ao_loc_nr(), dtype=numpy.int32)
     cvcvfile = tempfile.NamedTemporaryFile(dir=tmpdir)
-    with h5py.File(cvcvfile.name, 'w') as f5:
+    with lib.H5TmpFile(cvcvfile.name, 'w') as f5:
         cvcv = f5.create_dataset('eri_mo', (ncore*nvir,ncore*nvir), 'f8')
         ppaa, papa, pacv = _trans(mo, ncore, ncas, load_buf, cvcv, ao_loc)[:3]
     time0 = logger.timer(mol, 'trans_cvcv', *time0)

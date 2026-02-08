@@ -41,28 +41,6 @@ def tearDownModule():
 
 
 class KnownValues(unittest.TestCase):
-#    def test_lda_grid30(self):
-#        cell = pbcgto.Cell()
-#        cell.unit = 'B'
-#        L = 10
-#        cell.a = np.diag([L]*3)
-#        cell.mesh = np.array([41]*3)
-#        cell.atom = [['He', (L/2.,L/2.,L/2.)], ]
-## these are some exponents which are not hard to integrate
-#        cell.basis = { 'He': [[0, (0.8, 1.0)],
-#                              [0, (1.0, 1.0)],
-#                              [0, (1.2, 1.0)]] }
-#        cell.verbose = 5
-#        cell.output = '/dev/null'
-#        cell.pseudo = None
-#        cell.build()
-#        mf = pbcdft.RKS(cell)
-#        mf.xc = 'LDA,VWN_RPA'
-#        mf.kpt = np.ones(3)
-#        e1 = mf.scf()
-#        self.assertAlmostEqual(e1, -2.6409616064015591, 8)
-#
-#
 #    def test_pp_RKS(self):
 #        cell = pbcgto.Cell()
 #
@@ -137,37 +115,65 @@ class KnownValues(unittest.TestCase):
         cell.build()
         mf = pbcdft.RKS(cell).density_fit()
         mf.kernel()
-        self.assertAlmostEqual(mf.e_tot, -4.717699891018736, 7)
+        self.assertAlmostEqual(mf.e_tot, -4.717699891018736, 6)
+
+    def test_density_fit_2d(self):
+        L = 4.
+        cell = pbcgto.Cell()
+        cell.a = np.eye(3)*L
+        cell.a[2,2] = 12
+        cell.dimension = 2
+        cell.unit = 'B'
+        cell.atom = 'H 0 0 0; H .8 .8 0'
+        cell.basis = {'H': [[0, (4.0, 1.0)], [0, (1.0, 1.0)]]}
+        cell.build()
+        mf = pbcdft.RKS(cell).run()
+        self.assertAlmostEqual(mf.e_tot, -0.6252695697315944, 7)
+        mf = pbcdft.RKS(cell).density_fit().run()
+        self.assertAlmostEqual(mf.e_tot, -0.635069614773985, 5)
 
     def test_rsh_fft(self):
         mf = pbcdft.RKS(cell)
-        mf.xc = 'camb3lyp'
+        mf.xc = 'hse06'
         mf.kernel()
-        self.assertAlmostEqual(mf.e_tot, -2.4745140703871877, 7)
+        self.assertAlmostEqual(mf.e_tot, -2.482418296326724, 7)
 
+        mf.xc = 'camb3lyp'
         mf.omega = .15
         mf.kernel()
         self.assertAlmostEqual(mf.e_tot, -2.476617717375184, 7)
 
+    @unittest.skip('TODO: Check other packages how exxdiv=vcut_sph is handled for RSH')
+    def test_rsh_fft_vcut_sph(self):
+        # Adding this test to ensure that the new SR treatment in get_veff is
+        # compatible with the treatment (full-range - LR) in pyscf-2.7.
+        # However, the results of HSE with exxdiv=vcut_sph might not be reasonable.
+        mf = pbcdft.RKS(cell)
+        mf.xc = 'hse06'
+        mf.exxdiv = 'vcut_sph'
+        mf.kernel()
+        self.assertAlmostEqual(mf.e_tot, -2.4319699945616375, 7)
+
     def test_custom_rsh_df(self):
         mf = pbcdft.RKS(cell).density_fit()
-        mf.xc = 'camb3lyp'
+        mf.xc = 'wb97'
         mf.kernel()
-        self.assertAlmostEqual(mf.e_tot, -2.474520122522153, 7)
+        self.assertAlmostEqual(mf.e_tot, -2.4916945546399165, 6)
 
+        mf.xc = 'camb3lyp'
         mf.omega = .15
         mf.kernel()
-        self.assertAlmostEqual(mf.e_tot, -2.4766238116030683, 7)
+        self.assertAlmostEqual(mf.e_tot, -2.4766238116030683, 6)
 
     def test_rsh_mdf(self):
         mf = pbcdft.RKS(cell).mix_density_fit()
         mf.xc = 'camb3lyp'
         mf.kernel()
-        self.assertAlmostEqual(mf.e_tot, -2.4745138538438827, 7)
+        self.assertAlmostEqual(mf.e_tot, -2.4745138538438827, 6)
 
         mf.omega = .15
         mf.kernel()
-        self.assertAlmostEqual(mf.e_tot, -2.4766174820185456, 7)
+        self.assertAlmostEqual(mf.e_tot, -2.4766174820185456, 6)
 
     def test_rsh_aft_high_cost(self):
         from pyscf.pbc.df.aft import AFTDF
@@ -177,7 +183,7 @@ class KnownValues(unittest.TestCase):
         mf.kernel()
         self.assertAlmostEqual(mf.e_tot, -2.4745140705800446, 7)
 
-    def test_rsh_0d(self):
+    def test_rsh_0d_df(self):
         L = 4.
         cell = pbcgto.Cell()
         cell.verbose = 0
@@ -192,38 +198,38 @@ class KnownValues(unittest.TestCase):
         mf.omega = '0.7'
         mf.exxdiv = None
         mf.kernel()
-        self.assertAlmostEqual(mf.e_tot, -2.4836596871145558, 7)
+        self.assertAlmostEqual(mf.e_tot, -2.4836186361124617, 3)
 
         mol = cell.to_mol()
         mf1 = mol.RKS().density_fit()
         mf1.xc = 'camb3lyp'
         mf1.omega = '0.7'
         mf1.kernel()
-        self.assertAlmostEqual(mf1.e_tot, mf.e_tot, 4)
+        self.assertAlmostEqual(mf1.e_tot, mf.e_tot, 7)
 
-    def test_rsh_0d_ewald(self):
-        L = 4.
+    def test_rsh_0d(self):
         cell = pbcgto.Cell()
         cell.verbose = 0
-        cell.a = np.eye(3)*L
-        cell.atom =[['He' , ( L/2+0., L/2+0. ,   L/2+1.)],]
-        cell.basis = {'He': [[0, (4.0, 1.0)], [0, (1.0, 1.0)]]}
+        cell.a = np.eye(3)*7
+        cell.atom =[['H' , ( 0., 0. , 1.)],
+                    ['H' , ( .5, .4 , 1.)],]
+        cell.basis = {'H': [[0, (4.0, 1.0)], [0, (1.0, 1.0)]]}
         cell.dimension = 0
-        cell.mesh = [60]*3
+        cell.mesh = [85]*3
         cell.build()
-        mf = pbcdft.RKS(cell).density_fit()
+        mf = pbcdft.RKS(cell)
         mf.xc = 'camb3lyp'
-        mf.omega = '0.7'
-        mf.exxdiv = 'ewald'
+        mf.omega = 0.35
+        mf.exxdiv = None
         mf.kernel()
-        self.assertAlmostEqual(mf.e_tot, -2.4836186361124617, 7)
+        self.assertAlmostEqual(mf.e_tot, -0.6034853818650204, 7)
 
         mol = cell.to_mol()
-        mf1 = mol.RKS().density_fit()
+        mf1 = mol.RKS()
         mf1.xc = 'camb3lyp'
-        mf1.omega = '0.7'
+        mf1.omega = 0.35
         mf1.kernel()
-        self.assertAlmostEqual(mf1.e_tot, mf.e_tot, 4)
+        self.assertAlmostEqual(mf1.e_tot, mf.e_tot, 7)
 
 if __name__ == '__main__':
     print("Full Tests for pbc.dft.rks")

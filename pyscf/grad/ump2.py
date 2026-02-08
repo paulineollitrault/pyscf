@@ -30,7 +30,7 @@ from pyscf.ao2mo import _ao2mo
 from pyscf.mp import ump2
 from pyscf.grad import rhf as rhf_grad
 from pyscf.grad import mp2 as mp2_grad
-
+from pyscf.grad.mp2 import has_frozen_orbitals
 
 def grad_elec(mp_grad, t2, atmlst=None, verbose=logger.INFO):
     mp = mp_grad.base
@@ -43,9 +43,7 @@ def grad_elec(mp_grad, t2, atmlst=None, verbose=logger.INFO):
     log.debug('Build ump2 rdm2 intermediates')
 
     mol = mp_grad.mol
-    with_frozen = not ((mp.frozen is None)
-                       or (isinstance(mp.frozen, (int, numpy.integer)) and mp.frozen == 0)
-                       or (len(mp.frozen) == 0))
+    with_frozen = has_frozen_orbitals(mp)
     moidx = mp.get_frozen_mask()
     OA_a, VA_a, OF_a, VF_a = mp2_grad._index_frozen_active(moidx[0], mp.mo_occ[0])
     OA_b, VA_b, OF_b, VF_b = mp2_grad._index_frozen_active(moidx[1], mp.mo_occ[1])
@@ -290,45 +288,3 @@ class Gradients(mp2_grad.Gradients):
 Grad = Gradients
 
 ump2.UMP2.Gradients = lib.class_as_method(Gradients)
-
-
-if __name__ == '__main__':
-    from pyscf import gto
-    from pyscf import scf
-
-    mol = gto.M(
-        atom = [
-            ["O" , (0. , 0.     , 0.)],
-            [1   , (0. ,-0.757  , 0.587)],
-            [1   , (0. , 0.757  , 0.587)]],
-        basis = '631g',
-        spin = 2,
-    )
-    mf = scf.UHF(mol).run()
-    mp = ump2.UMP2(mf).run()
-    g1 = mp.Gradients().kernel()
-# O     0.0000000000    -0.0000000000     0.1436990190
-# H    -0.0000000000     0.1097329294    -0.0718495095
-# H    -0.0000000000    -0.1097329294    -0.0718495095
-    print(lib.finger(g1) - -0.22418090721297307)
-
-    print('-----------------------------------')
-    mol = gto.M(
-        atom = [
-            ["O" , (0. , 0.     , 0.)],
-            [1   , (0. ,-0.757  , 0.587)],
-            [1   , (0. , 0.757  , 0.587)]],
-        basis = '631g',
-        spin = 2,
-    )
-    mf = scf.UHF(mol).run()
-    mp = ump2.UMP2(mf)
-    mp.frozen = [0,1,10,11,12]
-    mp.max_memory = 1
-    mp.kernel()
-    g1 = Gradients(mp).kernel()
-# O    -0.0000000000    -0.0000000000     0.1454782514
-# H     0.0000000000     0.1092558730    -0.0727391257
-# H    -0.0000000000    -0.1092558730    -0.0727391257
-    print(lib.finger(g1) - -0.22437276158813313)
-

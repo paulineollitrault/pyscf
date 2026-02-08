@@ -236,8 +236,8 @@ def update_amps(cc, t1, t2, eris):
     u1a -= np.einsum('imea,me->ia', t2aa, Fova)
     u1a += np.einsum('iMaE,ME->ia', t2ab, Fovb)
     u1b += fovb.conj()
-    u1b += np.einsum('ie,ae->ia',t1b,Fvvb)
-    u1b -= np.einsum('ma,mi->ia',t1b,Foob)
+    u1b += np.einsum('ie,ae->ia', t1b, Fvvb)
+    u1b -= np.einsum('ma,mi->ia', t1b, Foob)
     u1b -= np.einsum('imea,me->ia', t2bb, Fovb)
     u1b += np.einsum('mIeA,me->IA', t2ab, Fova)
 
@@ -246,8 +246,8 @@ def update_amps(cc, t1, t2, eris):
     wovvo -= eris_oovv.transpose(0,2,3,1)
     wovvo += eris_ovvo.transpose(0,2,1,3)
     oovv = eris_oovv - eris_ovvo.transpose(0,3,2,1)
-    u1a-= np.einsum('nf,niaf->ia', t1a,      oovv)
-    tmp1aa = lib.einsum('ie,mjbe->mbij', t1a,      oovv)
+    u1a-= np.einsum('nf,niaf->ia', t1a, oovv)
+    tmp1aa = lib.einsum('ie,mjbe->mbij', t1a, oovv)
     u2aa += 2*lib.einsum('ma,mbij->ijab', t1a, tmp1aa)
     eris_ovvo = eris_oovv = oovv = tmp1aa = None
 
@@ -256,8 +256,8 @@ def update_amps(cc, t1, t2, eris):
     wOVVO -= eris_OOVV.transpose(0,2,3,1)
     wOVVO += eris_OVVO.transpose(0,2,1,3)
     OOVV = eris_OOVV - eris_OVVO.transpose(0,3,2,1)
-    u1b-= np.einsum('nf,niaf->ia', t1b,      OOVV)
-    tmp1bb = lib.einsum('ie,mjbe->mbij', t1b,      OOVV)
+    u1b-= np.einsum('nf,niaf->ia', t1b, OOVV)
+    tmp1bb = lib.einsum('ie,mjbe->mbij', t1b, OOVV)
     u2bb += 2*lib.einsum('ma,mbij->ijab', t1b, tmp1bb)
     eris_OVVO = eris_OOVV = OOVV = None
 
@@ -356,16 +356,16 @@ def energy(cc, t1=None, t2=None, eris=None):
     fovb = eris.fockb[:noccb,noccb:]
     e  = np.einsum('ia,ia', fova, t1a)
     e += np.einsum('ia,ia', fovb, t1b)
-    e += 0.25*np.einsum('ijab,iajb',t2aa,eris_ovov)
-    e -= 0.25*np.einsum('ijab,ibja',t2aa,eris_ovov)
-    e += 0.25*np.einsum('ijab,iajb',t2bb,eris_OVOV)
-    e -= 0.25*np.einsum('ijab,ibja',t2bb,eris_OVOV)
-    e +=      np.einsum('iJaB,iaJB',t2ab,eris_ovOV)
-    e += 0.5*np.einsum('ia,jb,iajb',t1a,t1a,eris_ovov)
-    e -= 0.5*np.einsum('ia,jb,ibja',t1a,t1a,eris_ovov)
-    e += 0.5*np.einsum('ia,jb,iajb',t1b,t1b,eris_OVOV)
-    e -= 0.5*np.einsum('ia,jb,ibja',t1b,t1b,eris_OVOV)
-    e +=     np.einsum('ia,jb,iajb',t1a,t1b,eris_ovOV)
+    e += 0.25*np.einsum('ijab,iajb',t2aa, eris_ovov)
+    e -= 0.25*np.einsum('ijab,ibja',t2aa, eris_ovov)
+    e += 0.25*np.einsum('ijab,iajb',t2bb, eris_OVOV)
+    e -= 0.25*np.einsum('ijab,ibja',t2bb, eris_OVOV)
+    e +=      np.einsum('iJaB,iaJB',t2ab, eris_ovOV)
+    e += 0.5*lib.einsum('ia,jb,iajb',t1a, t1a, eris_ovov)
+    e -= 0.5*lib.einsum('ia,jb,ibja',t1a, t1a, eris_ovov)
+    e += 0.5*lib.einsum('ia,jb,iajb',t1b, t1b, eris_OVOV)
+    e -= 0.5*lib.einsum('ia,jb,ibja',t1b, t1b, eris_OVOV)
+    e +=     lib.einsum('ia,jb,iajb',t1a, t1b, eris_ovOV)
     if abs(e.imag) > 1e-4:
         logger.warn(cc, 'Non-zero imaginary part found in UCCSD energy %s', e)
     return e.real
@@ -396,12 +396,12 @@ def vector_to_amplitudes(vector, nmo, nocc):
     nvir = nvira + nvirb
     nov = nocc * nvir
     size = nov + nocc*(nocc-1)//2*nvir*(nvir-1)//2
-    if vector.size == size:
+    sizea = nocca * nvira + nocca*(nocca-1)//2*nvira*(nvira-1)//2
+    sizeb = noccb * nvirb + noccb*(noccb-1)//2*nvirb*(nvirb-1)//2
+    if vector.size == size and sizea > 0 and sizeb > 0:
         #return ccsd.vector_to_amplitudes_s4(vector, nmo, nocc)
-        raise RuntimeError('Input vector is GCCSD vecotr')
+        raise RuntimeError('Input vector is GCCSD vector')
     else:
-        sizea = nocca * nvira + nocca*(nocca-1)//2*nvira*(nvira-1)//2
-        sizeb = noccb * nvirb + noccb*(noccb-1)//2*nvirb*(nvirb-1)//2
         sections = np.cumsum([sizea, sizeb])
         veca, vecb, t2ab = np.split(vector, sections)
         t1a, t2aa = ccsd.vector_to_amplitudes_s4(veca, nmoa, nocca)
@@ -462,7 +462,7 @@ def _add_vvvv(mycc, t1, t2, eris, out=None, with_ovvv=False, t2sym=None):
     noccb, nvirb = t2bb.shape[1:3]
 
     if mycc.direct:
-        assert(t2sym is None)
+        assert (t2sym is None)
         if with_ovvv:
             raise NotImplementedError
         if getattr(eris, 'mo_coeff', None) is not None:
@@ -511,12 +511,15 @@ def _add_vvvv(mycc, t1, t2, eris, out=None, with_ovvv=False, t2sym=None):
             u2bb[otrilb[1],otrilb[0]] = u2tril.transpose(0,2,1)
             u2bb[otrilb] = u2tril
 
-        u2ab = _ao2mo.nr_e2(buf[-nocca*noccb:].reshape(nocca*noccb,nao**2), mo,
-                            (0,nvira,nvira,nvira+nvirb), 's1', 's1')
-        u2ab = u2ab.reshape(t2ab.shape)
+        if nocca*noccb > 0:
+            u2ab = _ao2mo.nr_e2(buf[-nocca*noccb:].reshape(nocca*noccb,nao**2), mo,
+                                (0,nvira,nvira,nvira+nvirb), 's1', 's1')
+            u2ab = u2ab.reshape(t2ab.shape)
+        else:
+            u2ab = np.zeros_like(t2ab)
 
     else:
-        assert(not with_ovvv)
+        assert (not with_ovvv)
         if t2sym is None:
             tmp = eris._contract_vvvv_t2(mycc, t2aa[np.tril_indices(nocca)],
                                          mycc.direct, None)
@@ -533,7 +536,7 @@ def _add_vvvv(mycc, t1, t2, eris, out=None, with_ovvv=False, t2sym=None):
     return u2aa,u2ab,u2bb
 
 
-class UCCSD(ccsd.CCSD):
+class UCCSD(ccsd.CCSDBase):
 
     conv_tol = getattr(__config__, 'cc_uccsd_UCCSD_conv_tol', 1e-7)
     conv_tol_normt = getattr(__config__, 'cc_uccsd_UCCSD_conv_tol_normt', 1e-6)
@@ -544,8 +547,7 @@ class UCCSD(ccsd.CCSD):
 # * A pair of list : First list is the orbital indices to be frozen for alpha
 #       orbitals, second list is for beta orbitals
     def __init__(self, mf, frozen=None, mo_coeff=None, mo_occ=None):
-        assert isinstance(mf, scf.uhf.UHF)
-        ccsd.CCSD.__init__(self, mf, frozen, mo_coeff, mo_occ)
+        ccsd.CCSDBase.__init__(self, mf, frozen, mo_coeff, mo_occ)
 
     get_nocc = get_nocc
     get_nmo = get_nmo
@@ -572,9 +574,9 @@ class UCCSD(ccsd.CCSD):
         eris_ovov = np.asarray(eris.ovov)
         eris_OVOV = np.asarray(eris.OVOV)
         eris_ovOV = np.asarray(eris.ovOV)
-        t2aa = eris_ovov.transpose(0,2,1,3) / lib.direct_sum('ia+jb->ijab', eia_a, eia_a)
-        t2ab = eris_ovOV.transpose(0,2,1,3) / lib.direct_sum('ia+jb->ijab', eia_a, eia_b)
-        t2bb = eris_OVOV.transpose(0,2,1,3) / lib.direct_sum('ia+jb->ijab', eia_b, eia_b)
+        t2aa = eris_ovov.transpose(0,2,1,3).conj() / lib.direct_sum('ia+jb->ijab', eia_a, eia_a)
+        t2ab = eris_ovOV.transpose(0,2,1,3).conj() / lib.direct_sum('ia+jb->ijab', eia_a, eia_b)
+        t2bb = eris_OVOV.transpose(0,2,1,3).conj() / lib.direct_sum('ia+jb->ijab', eia_b, eia_b)
         t2aa = t2aa - t2aa.transpose(0,1,3,2)
         t2bb = t2bb - t2bb.transpose(0,1,3,2)
         e  =      np.einsum('iJaB,iaJB', t2ab, eris_ovOV)
@@ -609,7 +611,7 @@ class UCCSD(ccsd.CCSD):
             self.t1 = (np.zeros((nocca,nvira)), np.zeros((noccb,nvirb)))
             return self.e_corr, self.t1, self.t2
 
-        return ccsd.CCSD.ccsd(self, t1, t2, eris)
+        return ccsd.CCSDBase.ccsd(self, t1, t2, eris)
 
     def solve_lambda(self, t1=None, t2=None, l1=None, l2=None,
                      eris=None):
@@ -632,7 +634,8 @@ class UCCSD(ccsd.CCSD):
         return uccsd_t.kernel(self, eris, t1, t2, self.verbose)
     uccsd_t = ccsd_t
 
-    def make_rdm1(self, t1=None, t2=None, l1=None, l2=None, ao_repr=False):
+    def make_rdm1(self, t1=None, t2=None, l1=None, l2=None, ao_repr=False,
+                  with_frozen=True, with_mf=True):
         '''Un-relaxed 1-particle density matrix in MO space
 
         Returns:
@@ -644,9 +647,11 @@ class UCCSD(ccsd.CCSD):
         if l1 is None: l1 = self.l1
         if l2 is None: l2 = self.l2
         if l1 is None: l1, l2 = self.solve_lambda(t1, t2)
-        return uccsd_rdm.make_rdm1(self, t1, t2, l1, l2, ao_repr=ao_repr)
+        return uccsd_rdm.make_rdm1(self, t1, t2, l1, l2, ao_repr=ao_repr,
+                                   with_frozen=with_frozen, with_mf=with_mf)
 
-    def make_rdm2(self, t1=None, t2=None, l1=None, l2=None, ao_repr=False):
+    def make_rdm2(self, t1=None, t2=None, l1=None, l2=None, ao_repr=False,
+                  with_frozen=True, with_dm1=True):
         '''2-particle density matrix in spin-orbital basis.
         '''
         from pyscf.cc import uccsd_rdm
@@ -655,7 +660,8 @@ class UCCSD(ccsd.CCSD):
         if l1 is None: l1 = self.l1
         if l2 is None: l2 = self.l2
         if l1 is None: l1, l2 = self.solve_lambda(t1, t2)
-        return uccsd_rdm.make_rdm2(self, t1, t2, l1, l2, ao_repr=ao_repr)
+        return uccsd_rdm.make_rdm2(self, t1, t2, l1, l2, ao_repr=ao_repr,
+                                   with_frozen=with_frozen, with_dm1=with_dm1)
 
     def spin_square(self, mo_coeff=None, s=None):
         from pyscf.fci.spin_op import spin_square_general
@@ -681,11 +687,10 @@ class UCCSD(ccsd.CCSD):
             return _make_eris_incore(self, mo_coeff)
 
         elif getattr(self._scf, 'with_df', None):
-            # TODO: Uncomment once there is an unrestricted DF-CCSD implementation
-            #logger.warn(self, 'UCCSD detected DF being used in the HF object. '
-            #            'MO integrals are computed based on the DF 3-index tensors.\n'
-            #            'It\'s recommended to use dfccsd.CCSD for the '
-            #            'DF-CCSD calculations')
+            logger.warn(self, 'UCCSD detected DF being used in the HF object. '
+                       'MO integrals are computed based on the DF 3-index tensors.\n'
+                       'It\'s recommended to use dfuccsd.UCCSD for the '
+                       'DF-UCCSD calculations')
             return _make_df_eris_outcore(self, mo_coeff)
         else:
             return _make_eris_outcore(self, mo_coeff)
@@ -726,8 +731,15 @@ class UCCSD(ccsd.CCSD):
         from pyscf.cc import eom_uccsd
         return eom_uccsd.EOMEE(self)
 
-    def density_fit(self):
-        raise NotImplementedError
+    def density_fit(self, auxbasis=None, with_df=None):
+        from pyscf.cc import dfuccsd
+        mycc = dfuccsd.UCCSD(self._scf, self.frozen, self.mo_coeff, self.mo_occ)
+        if with_df is not None:
+            mycc.with_df = with_df
+        if mycc.with_df.auxbasis != auxbasis:
+            mycc.with_df = mycc.with_df.copy()
+            mycc.with_df.auxbasis = auxbasis
+        return mycc
 
     def nuc_grad_method(self):
         from pyscf.grad import uccsd
@@ -754,21 +766,6 @@ class UCCSD(ccsd.CCSD):
 
     def amplitudes_from_rccsd(self, t1, t2):
         return amplitudes_from_rccsd(t1, t2)
-
-    def get_t1_diagnostic(self, t1=None):
-        if t1 is None: t1 = self.t1
-        raise NotImplementedError
-        #return get_t1_diagnostic(t1)
-
-    def get_d1_diagnostic(self, t1=None):
-        if t1 is None: t1 = self.t1
-        raise NotImplementedError
-        #return get_d1_diagnostic(t1)
-
-    def get_d2_diagnostic(self, t2=None):
-        if t2 is None: t2 = self.t2
-        raise NotImplementedError
-        #return get_d2_diagnostic(t2)
 
 CCSD = UCCSD
 
@@ -809,7 +806,7 @@ class _ChemistsERIs(ccsd._ChemistsERIs):
         self.focka = reduce(np.dot, (mo_coeff[0].conj().T, fockao[0], mo_coeff[0]))
         self.fockb = reduce(np.dot, (mo_coeff[1].conj().T, fockao[1], mo_coeff[1]))
         self.fock = (self.focka, self.fockb)
-        self.e_hf = mycc._scf.energy_tot(dm=dm, vhf=vhf)
+
         nocca, noccb = self.nocc = mycc.nocc
         self.mol = mycc.mol
 
@@ -953,6 +950,7 @@ def _make_eris_incore(mycc, mo_coeff=None, ao2mofn=None):
     return eris
 
 def _make_df_eris_outcore(mycc, mo_coeff=None):
+    assert mycc._scf.istype('UHF')
     cput0 = (logger.process_clock(), logger.perf_counter())
     log = logger.Logger(mycc.stdout, mycc.verbose)
     eris = _ChemistsERIs()
@@ -1070,6 +1068,8 @@ def _make_df_eris_outcore(mycc, mo_coeff=None):
     return eris
 
 def _make_eris_outcore(mycc, mo_coeff=None):
+    from pyscf.scf.uhf import UHF
+    assert isinstance(mycc._scf, UHF)
     eris = _ChemistsERIs()
     eris._common_init_(mycc, mo_coeff)
 
@@ -1128,7 +1128,7 @@ def _make_eris_outcore(mycc, mo_coeff=None):
             eris.oovv[i] = buf[:nocca,nocca:,nocca:]
             eris.ovvo[i] = buf[nocca:,nocca:,:nocca]
             eris.ovvv[i] = lib.pack_tril(buf[nocca:,nocca:,nocca:])
-        del(tmpf['aa'])
+        del (tmpf['aa'])
 
     if noccb > 0:
         buf = np.empty((nmob,nmob,nmob))
@@ -1141,7 +1141,7 @@ def _make_eris_outcore(mycc, mo_coeff=None):
             eris.OOVV[i] = buf[:noccb,noccb:,noccb:]
             eris.OVVO[i] = buf[noccb:,noccb:,:noccb]
             eris.OVVV[i] = lib.pack_tril(buf[noccb:,noccb:,noccb:])
-        del(tmpf['bb'])
+        del (tmpf['bb'])
 
     if nocca > 0:
         buf = np.empty((nmoa,nmob,nmob))
@@ -1154,7 +1154,7 @@ def _make_eris_outcore(mycc, mo_coeff=None):
             eris.ooVV[i] = buf[:nocca,noccb:,noccb:]
             eris.ovVO[i] = buf[nocca:,noccb:,:noccb]
             eris.ovVV[i] = lib.pack_tril(buf[nocca:,noccb:,noccb:])
-        del(tmpf['ab'])
+        del (tmpf['ab'])
 
     if noccb > 0:
         buf = np.empty((nmob,nmoa,nmoa))
@@ -1165,7 +1165,7 @@ def _make_eris_outcore(mycc, mo_coeff=None):
             eris.OOvv[i] = buf[:noccb,nocca:,nocca:]
             eris.OVvo[i] = buf[noccb:,nocca:,:nocca]
             eris.OVvv[i] = lib.pack_tril(buf[noccb:,nocca:,nocca:])
-        del(tmpf['ba'])
+        del (tmpf['ba'])
     buf = None
     cput1 = logger.timer_debug1(mycc, 'transforming oopq, ovpq', *cput1)
 

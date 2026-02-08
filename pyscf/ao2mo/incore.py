@@ -80,7 +80,7 @@ def general(eri_ao, mo_coeffs, verbose=0, compact=True, **kwargs):
         verbose : int
             Print level
         compact : bool
-            When compact is True, depending on the four oribital sets, the
+            When compact is True, depending on the four orbital sets, the
             returned MO integrals has (up to 4-fold) permutation symmetry.
             If it's False, the function will abandon any permutation symmetry,
             and return the "plain" MO integrals
@@ -202,6 +202,9 @@ def half_e1(eri_ao, mo_coeffs, compact=True):
     if nij_pair == 0:
         return eri1
 
+    if eri_ao.dtype != numpy.double:
+        raise TypeError('ao2mo.incore.half_e1 is for double precision only')
+
     if eri_ao.size == nao_pair**2: # 4-fold symmetry
         # half_e1 first transforms the indices which are contiguous in memory
         # transpose the 4-fold integrals to make ij the contiguous indices
@@ -278,4 +281,3 @@ if __name__ == '__main__':
     eri0 = general(rhf._eri, (rhf.mo_coeff,)*4)
     print(abs(eri0).sum()-5384.460843787659)
     print(logger.process_clock())
-

@@ -67,7 +67,7 @@ INQUIRY = 50050
 TASK = 50051
 def work_share_partition(tasks, interval=.02, loadmin=1):
     loadmin = max(loadmin, len(tasks)//50//pool.size)
-    rest_tasks = [x for x in tasks[loadmin*pool.size:]]
+    rest_tasks = list(tasks[loadmin*pool.size:])
     tasks = tasks[loadmin*rank:loadmin*rank+loadmin]
     def distribute_task():
         while True:
@@ -251,7 +251,7 @@ def alltoall(sendbuf, split_recvbuf=False):
         sdispls[sdispls>sendbuf.size] = sendbuf.size
         scounts = numpy.append(sdispls[1:]-sdispls[:-1], sendbuf.size-sdispls[-1])
     else:
-        assert(len(sendbuf) == pool.size)
+        assert (len(sendbuf) == pool.size)
         mpi_dtype = comm.bcast(sendbuf[0].dtype.char)
         sendbuf = [numpy.asarray(x, mpi_dtype).ravel() for x in sendbuf]
         scounts = numpy.asarray([x.size for x in sendbuf])
@@ -290,7 +290,6 @@ def _assert(condition):
         comm.Abort()
 
 def register_for(obj):
-    global _registry
     key = id(obj)
     # Keep track of the object in a global registry.  On slave nodes, the
     # object can be accessed from global registry.

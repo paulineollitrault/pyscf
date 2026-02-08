@@ -222,7 +222,7 @@ def general(mydf, mo_coeffs, kpts=None,
 
 def get_ao_pairs_G(mydf, kpts=numpy.zeros((2,3)), q=None, shls_slice=None,
                    compact=getattr(__config__, 'pbc_df_ao_pairs_compact', False)):
-    '''Calculate forward Fourier tranform (G|ij) of all AO pairs.
+    '''Calculate forward Fourier transform (G|ij) of all AO pairs.
 
     Returns:
         ao_pairs_G : 2D complex array
@@ -316,7 +316,7 @@ def ao2mo_7d(mydf, mo_coeff_kpts, kpts=None, factor=1, out=None):
     if out is None:
         out = numpy.empty(eri_shape, dtype=dtype)
     else:
-        assert(out.shape == eri_shape)
+        assert (out.shape == eri_shape)
 
     kptij_lst = numpy.array([(ki, kj) for ki in kpts for kj in kpts])
     kptis_lst = kptij_lst[:,0]
@@ -392,8 +392,8 @@ def ao2mo_7d(mydf, mo_coeff_kpts, kpts=None, factor=1, out=None):
                 if dtype == numpy.double:
                     tmp = tmp.real
                 out[ki,kj,kk] = tmp.reshape(eri_shape[3:])
-        del(fswap['zij'])
-        del(fswap['zkl'])
+        del (fswap['zij'])
+        del (fswap['zkl'])
 
     return out
 

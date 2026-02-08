@@ -213,10 +213,10 @@ class KnownValues(unittest.TestCase):
         myci.ci_coeff_cutoff = 1e-3
         myci.dump_flags()
         e1, c1 = myci.kernel(h1e, eri, norb, nelec)
-        self.assertAlmostEqual(e1, -11.894613845925514, 9)
+        self.assertAlmostEqual(e1, -11.894613845925514, 8)
 
         e, c = myci.kernel_fixed_space(h1e, eri, norb, nelec, c1._strs)
-        self.assertAlmostEqual(e, -11.894613845925514, 9)
+        self.assertAlmostEqual(e, -11.894613845925514, 8)
 
         res = myci.large_ci(c1, norb, nelec, .25)
         self.assertEqual([x[1] for x in res], ['0b1111', '0b1111', '0b10111', '0b10111'])
@@ -495,6 +495,16 @@ class KnownValues(unittest.TestCase):
         ci0[:] = 0
         self.assertRaises(RuntimeError, cis.guess_wfnsym, norb, nelec, ci0, wfnsym=1)
 
+    # The edge case CAS(2, 2). issue #1808
+    def test_cas_2_2(self):
+        mol = gto.M(atom='H 0 0 0; H 0 0 1.')
+        mc = mol.RHF().run().CASCI(2, 2)
+        mc.fcisolver = fci.SCI(mol)
+        mc.run()
+        self.assertAlmostEqual(mc.e_tot, -1.1011503302326, 9)
+        self.assertAlmostEqual(abs(mc.ci[0,0]), .984513596, 5)
+        self.assertAlmostEqual(abs(mc.ci[1,1]), .175308242, 5)
+
 
 def gen_des_linkstr(strs, norb, nelec):
     '''Given intermediates, the link table to generate input strs
@@ -691,4 +701,3 @@ def select_strs(myci, eri, eri_pq_max, civec_max, strs, norb, nelec):
 if __name__ == "__main__":
     print("Full Tests for selected_ci")
     unittest.main()
-

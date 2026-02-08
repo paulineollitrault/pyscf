@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import unittest
 import tempfile
 from functools import reduce
 import numpy
+import numpy as np
 import scipy.linalg
 from pyscf import gto
 from pyscf import lib
@@ -258,14 +258,21 @@ C    SP
 
     def test_atom_as_file(self):
         ftmp = tempfile.NamedTemporaryFile('w')
-        # file in xyz format
+        # file in raw format
         ftmp.write('He 0 0 0\nHe 0 0 1\n')
         ftmp.flush()
         mol1 = gto.M(atom=ftmp.name)
         self.assertEqual(mol1.natm, 2)
 
+        # file in xyz format
+        ftmp = tempfile.NamedTemporaryFile('w', suffix='.xyz')
+        ftmp.write('2\n\nHe 0 0 0\nHe 0 0 1\n')
+        ftmp.flush()
+        mol1 = gto.M(atom=ftmp.name)
+        self.assertEqual(mol1.natm, 2)
+
         # file in zmatrix format
-        ftmp = tempfile.NamedTemporaryFile('w')
+        ftmp = tempfile.NamedTemporaryFile('w', suffix='.zmat')
         ftmp.write('He\nHe 1 1.5\n')
         ftmp.flush()
         mol1 = gto.M(atom=ftmp.name)
@@ -287,6 +294,10 @@ C    SP
     def test_format_basis(self):
         mol = gto.M(atom = '''O 0 0 0; 1 0 1 0; H 0 0 1''',
                     basis = {8: 'ccpvdz'})
+        self.assertEqual(mol.nao_nr(), 14)
+
+        mol = gto.M(atom = '''O 0 0 0; 1 0 1 0; H 0 0 1''',
+                    basis = {8: 'def2-SVP'})
         self.assertEqual(mol.nao_nr(), 14)
 
         mol = gto.M(atom = '''O 0 0 0; H:1 0 1 0; H@2 0 0 1''',
@@ -555,13 +566,13 @@ O    SP
         self.assertRaises(RuntimeError, lambda *args: mol0.nelec)
         mol0.spin = 1
 
-        mol1 = copy.copy(mol0)
+        mol1 = mol0.copy()
         self.assertEqual(mol1.nelec, (5, 4))
         mol1.nelec = (3, 6)
         self.assertEqual(mol1.nelec, (3, 6))
 
     def test_multiplicity(self):
-        mol1 = copy.copy(mol0)
+        mol1 = mol0.copy()
         self.assertEqual(mol1.multiplicity, 2)
         mol1.multiplicity = 5
         self.assertEqual(mol1.multiplicity, 5)
@@ -569,7 +580,7 @@ O    SP
         self.assertRaises(RuntimeError, lambda:mol1.nelec)
 
     def test_ms(self):
-        mol1 = copy.copy(mol0)
+        mol1 = mol0.copy()
         self.assertEqual(mol1.ms, 0.5)
         mol1.ms = 1
         self.assertEqual(mol1.multiplicity, 3)
@@ -632,6 +643,10 @@ O    SP
         mol1.set_geom_(mol0.atom_coords(), inplace=False)
         mol1.set_geom_(mol0.atom_coords(), unit=1.)
         mol1.set_geom_(mol0.atom_coords(), unit='Ang', inplace=False)
+
+        r = mol1.atom_coords(unit='Ang')
+        mol1.set_geom_(r, unit='Ang')
+        assert np.array_equal(mol1.atom_coords(unit='Ang'), r)
 
     def test_apply(self):
         from pyscf import scf, mp
@@ -736,6 +751,13 @@ O    SP
         mol1.symmetry = 'Dooh'
         mol1.build()
         self.assertAlmostEqual(abs(mol1._symm_axes - numpy.eye(3)[[1,2,0]]).max(), 0, 9)
+
+        mol1 = gto.M(
+            atom='He 0 0 0',
+            basis='aug-cc-pvdz',
+            symmetry='SO3'
+        )
+        self.assertEqual(mol1.groupname, 'SO3')
 
     def test_symm_orb(self):
         rs = numpy.array([[.1, -.3, -.2],
@@ -916,26 +938,35 @@ O    SP
         s = reduce(numpy.dot, (c.T, pmol.intor('int1e_ovlp'), c))
         self.assertAlmostEqual(abs(s-mol0.intor('int1e_ovlp')).max(), 0, 9)
 
-        mol0.cart = True
-        pmol, ctr_coeff = mol0.to_uncontracted_cartesian_basis()
-        c = scipy.linalg.block_diag(*ctr_coeff)
-        s = reduce(numpy.dot, (c.T, pmol.intor('int1e_ovlp'), c))
-        self.assertAlmostEqual(abs(s-mol0.intor('int1e_ovlp')).max(), 0, 9)
-        mol0.cart = False
+        with lib.temporary_env(mol0, cart=True):
+            pmol, ctr_coeff = mol0.to_uncontracted_cartesian_basis()
+            c = scipy.linalg.block_diag(*ctr_coeff)
+            s = reduce(numpy.dot, (c.T, pmol.intor('int1e_ovlp'), c))
+            self.assertAlmostEqual(abs(s-mol0.intor('int1e_ovlp')).max(), 0, 9)
 
     def test_getattr(self):
         from pyscf import scf, dft, ci, tdscf
         mol = gto.M(atom='He')
         self.assertEqual(mol.HF().__class__, scf.HF(mol).__class__)
-        self.assertEqual(mol.KS().__class__, dft.KS(mol).__class__)
-        self.assertEqual(mol.UKS().__class__, dft.UKS(mol).__class__)
+        self.assertEqual(mol.KS(xc='pbe').__class__, dft.KS(mol, xc='pbe').__class__)
+        self.assertEqual(mol.KS(xc='pbe').xc, dft.KS(mol, xc='pbe').xc)
+        self.assertEqual(mol.UKS(xc='pbe').__class__, dft.UKS(mol, xc='pbe').__class__)
+        self.assertEqual(mol.UKS(xc='pbe').xc, dft.UKS(mol, xc='pbe').xc)
         self.assertEqual(mol.CISD().__class__, ci.cisd.RCISD)
         self.assertEqual(mol.TDA().__class__, tdscf.rhf.TDA)
+        self.assertEqual(mol.TDA(xc='pbe0').__class__, tdscf.rks.TDA)
         self.assertEqual(mol.dTDA().__class__, tdscf.rks.dTDA)
         self.assertEqual(mol.TDBP86().__class__, tdscf.rks.TDDFTNoHybrid)
         self.assertEqual(mol.TDB3LYP().__class__, tdscf.rks.TDDFT)
         self.assertRaises(AttributeError, lambda: mol.xyz)
-        self.assertRaises(AttributeError, lambda: mol.TDxyz)
+        self.assertRaises(AttributeError, lambda: mol.TDxyz())
+
+        mol = gto.M(atom='He', symmetry=True)
+        self.assertEqual(mol.HF().__class__, scf.HF(mol).__class__)
+        self.assertEqual(mol.KS().__class__, dft.KS(mol).__class__)
+        self.assertEqual(mol.UKS().__class__, dft.UKS(mol).__class__)
+        self.assertEqual(mol.RKSpU(U_idx=['2p'], U_val=[1.]).__class__,
+                         dft.RKSpU(mol, U_idx=['2p'], U_val=[1.]).__class__)
 
     def test_ao2mo(self):
         mol = gto.M(atom='He')
@@ -951,9 +982,9 @@ O    SP
         out1 = mol.tofile(tmpfile.name, format='xyz')
         ref = '''3
 XYZ from PySCF
-H           0.00000        1.00000        1.00000
-O           0.00000        0.00000        0.00000
-H           1.00000        1.00000        0.00000
+H           0.00000000        1.00000000        1.00000000
+O           0.00000000        0.00000000        0.00000000
+H           1.00000000        1.00000000        0.00000000
 '''
         with open(tmpfile.name, 'r') as f:
             self.assertEqual(f.read(), ref)
@@ -1027,6 +1058,67 @@ H    P
         #basis = [[1, [0.9, .7], [0.5, .7]], [1, -2, [0.5, .8], [0.3, .6]], [1, [0.3, 1]]]
         #serl.assertEqual(gto.uncontract(basis),
         #                 [[1, [0.9, 1]], [1, [0.5, 1]], [1, [0.3, 1]]])
+
+    def test_decontract_basis(self):
+        mol = gto.M(atom='N 0 0 0; N 0 0 01', basis='ccpvdz')
+        pmol, ctr_coeff = mol.decontract_basis(atoms=[1], to_cart=True)
+        ctr_coeff = scipy.linalg.block_diag(*ctr_coeff)
+        s = ctr_coeff.T.dot(pmol.intor('int1e_ovlp')).dot(ctr_coeff)
+        self.assertAlmostEqual(abs(s - mol.intor('int1e_ovlp')).max(), 0, 12)
+
+        # discard basis on atom 2. (related to issue #1711)
+        mol._bas = mol._bas[:5]
+        pmol, c = mol.decontract_basis()
+        self.assertEqual(pmol.nbas, 14)
+        self.assertEqual(len(c), 5)
+
+        mol = gto.M(atom='He',
+                    basis=('ccpvdz', [[0, [5, 1]], [1, [3, 1]]]))
+        pmol, contr_coeff = mol.decontract_basis()
+        self.assertEqual(len(contr_coeff), 5)
+        contr_coeff = scipy.linalg.block_diag(*contr_coeff)
+        s = contr_coeff.T.dot(pmol.intor('int1e_ovlp')).dot(contr_coeff)
+        self.assertAlmostEqual(abs(s - mol.intor('int1e_ovlp')).max(), 0, 12)
+
+        mol = gto.M(atom='H 0 0 0; F 0 0 1', basis=[[0, (2, .5), (1, .5)],
+                                                    [0, (2, .1), (1, .9)],
+                                                    [0, (4., 1)]])
+        with self.assertRaises(RuntimeError):
+            mol.decontract_basis(aggregate=False)
+        pmol, c = mol.decontract_basis(aggregate=True)
+        self.assertEqual(pmol.nbas, 6)
+        self.assertEqual(c.shape, (6, 6))
+        s = c.T.dot(pmol.intor('int1e_ovlp')).dot(c)
+        self.assertAlmostEqual(abs(s - mol.intor('int1e_ovlp')).max(), 0, 12)
+
+    def test_ao_rotation_matrix(self):
+        mol = gto.M(atom='O 0 0 0.2; H1 0 -.8 -.5; H2 0 .8 -.5', basis='ccpvdz')
+        numpy.random.seed(1)
+        axes = numpy.linalg.svd(numpy.random.rand(3,3))[0]
+        mol1 = gto.M(atom=list(zip(['O', 'H', 'H'], mol.atom_coords().dot(axes.T))),
+                     basis='ccpvdz', unit='Bohr')
+        u = mol.ao_rotation_matrix(axes)
+        v0 = u.T.dot(mol.intor('int1e_nuc')).dot(u)
+        v1 = mol1.intor('int1e_nuc')
+        self.assertAlmostEqual(abs(v0 - v1).max(), 0, 12)
+
+    def test_to_cell(self):
+        from pyscf.dft import numint
+        mol = gto.M(atom='''
+            O   0.   0.       0.
+            H   0.   -0.757   0.587
+            H   0.   0.757    0.587''', basis='ccpvdz')
+        cell = mol.to_cell()
+        mf = mol.RHF().run()
+        dm = mf.make_rdm1()
+        a = cell.lattice_vectors()
+        edge_grids = np.vstack([
+            a * -.5,
+            a * .5,
+        ])
+        ao = numint.eval_ao(mol, edge_grids)
+        rho = numint.eval_rho(mol, ao, dm)
+        self.assertTrue(all(abs(rho) < 1e-7))
 
 if __name__ == "__main__":
     print("test mole.py")

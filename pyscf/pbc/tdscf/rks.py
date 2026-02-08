@@ -19,36 +19,34 @@
 from pyscf import lib
 from pyscf.pbc import dft
 from pyscf.tdscf import rks
-from pyscf.pbc.tdscf.rhf import TDA
-from pyscf.pbc.tdscf.rhf import TDHF as TDDFT
+from pyscf.pbc.tdscf import rhf
+from pyscf.pbc.lib.kpts_helper import gamma_point
 
-RPA = TDRKS = TDDFT
+class TDA(rhf.TDA):
+    pass
 
-class CasidaTDDFT(rks.CasidaTDDFT):
-    def gen_vind(self, mf):
-        vind, hdiag = rks.TDDFTNoHybrid.gen_vind(self, mf)
-        def vindp(x):
-            with lib.temporary_env(mf, exxdiv=None):
-                return vind(x)
-        return vindp, hdiag
+RPA = TDRKS = TDDFT = rhf.TDHF
 
-    def nuc_grad_method(self):
-        raise NotImplementedError
+class CasidaTDDFT(TDDFT):
+    get_init_guess = rhf.TDA.get_init_guess
+    _gen_vind = rks.TDDFTNoHybrid.gen_vind
+    gen_vind = rhf.TDA.gen_vind
+    kernel = rks.TDDFTNoHybrid.kernel
 
 TDDFTNoHybrid = CasidaTDDFT
 
-def tddft(mf):
+def tddft(mf, frozen=None):
     '''Driver to create TDDFT or CasidaTDDFT object'''
-    if mf._numint.libxc.is_hybrid_xc(mf.xc):
-        return TDDFT(mf)
+    kpt = getattr(mf, 'kpt', None)
+    if not mf._numint.libxc.is_hybrid_xc(mf.xc) and gamma_point(kpt):
+        return CasidaTDDFT(mf, frozen)
     else:
-        return CasidaTDDFT(mf)
+        return TDDFT(mf, frozen)
 
 dft.rks.RKS.TDA           = lib.class_as_method(TDA)
 dft.rks.RKS.TDHF          = None
-dft.rks.RKS.TDDFTNoHybrid = lib.class_as_method(TDDFTNoHybrid)
+dft.rks.RKS.TDDFTNoHybrid = tddft
 dft.rks.RKS.CasidaTDDFT   = lib.class_as_method(CasidaTDDFT)
 dft.rks.RKS.TDDFT         = tddft
 #dft.rks.RKS.dTDA          = lib.class_as_method(dTDA)
 #dft.rks.RKS.dRPA          = lib.class_as_method(dRPA)
-

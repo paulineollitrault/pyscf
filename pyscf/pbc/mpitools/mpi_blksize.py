@@ -55,7 +55,7 @@ def get_max_blocksize_from_mem(array_size, mem_per_block, mem, priority_list=Non
     iprior = 0
     chunksize = []
     loop = True
-    while( loop ):
+    while (loop):
         ib = _priority_list[iprior]
         len_b = 1
         for jprior in range(iprior+1,nindices):
@@ -77,4 +77,3 @@ def get_max_blocksize_from_mem(array_size, mem_per_block, mem, priority_list=Non
     #print("chunks = ", chunksize)
     #print("mem_per_chunk = %.8e" % (numpy.prod(numpy.asarray(chunksize))*mem_per_block))
     return tuple(chunksize)
-

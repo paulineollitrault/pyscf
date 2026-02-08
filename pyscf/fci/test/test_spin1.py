@@ -78,6 +78,12 @@ class KnownValues(unittest.TestCase):
         ci3 = fci.direct_spin1.contract_2e(g2e, ci2, norb, neleci)
         self.assertAlmostEqual(numpy.linalg.norm(ci3), 127.49780293866368, 6)
 
+    def test_contract_complex(self):
+        ciref = fci.direct_spin1.contract_2e(g2e, ci0, norb, nelec).astype(complex)
+        ciref += 1j * fci.direct_spin1.contract_2e(g2e, ci1, norb, nelec)
+        result = fci.direct_spin1.contract_2e(g2e, ci0 + 1j * ci1, norb, nelec)
+        numpy.testing.assert_allclose(result, ciref)
+
     def test_kernel(self):
         eref, cref = fci.direct_spin0.kernel(h1e, g2e, norb, mol.nelectron)
         e, c = fci.direct_spin1.kernel(h1e, g2e, norb, nelec)
@@ -198,8 +204,18 @@ class KnownValues(unittest.TestCase):
         h = fci.direct_spin1.pspace(h1e, g2e, norb, nelec)[1]
         self.assertAlmostEqual(abs(h-h.T).max(), 0, 12)
 
+    def test_many_roots(self):
+        norb = 4
+        nelec = (2, 2)
+        nroots = 36
+        h1 = numpy.eye(norb) * -.5
+        h2 = numpy.zeros((norb, norb, norb, norb))
+        for i in range(norb):
+            h2[i,i,i,i] = .1
+        e, fcivec = fci.direct_spin1.kernel(h1, h2, norb, nelec, nroots=nroots, davidson_only=True)
+        self.assertAlmostEqual(e[0], -2, 9)
+
 
 if __name__ == "__main__":
     print("Full Tests for spin1")
     unittest.main()
-

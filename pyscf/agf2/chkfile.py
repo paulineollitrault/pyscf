@@ -86,7 +86,7 @@ def load_agf2(chkfile):
         gfa, gfb = dic['gfa'], dic['gfb']
         dic['gf'] = (GreensFunction(gfa['energy'], gfa['coupling'], chempot=gfa['chempot']),
                      GreensFunction(gfb['energy'], gfb['coupling'], chempot=gfb['chempot']))
-        del(dic['gfa'], dic['gfb'])
+        del (dic['gfa'], dic['gfb'])
 
     if 'se' in dic:
         se = dic['se']
@@ -95,15 +95,15 @@ def load_agf2(chkfile):
         sea, seb = dic['sea'], dic['seb']
         dic['se'] = (SelfEnergy(sea['energy'], sea['coupling'], chempot=sea['chempot']),
                      SelfEnergy(seb['energy'], seb['coupling'], chempot=seb['chempot']))
-        del(dic['sea'], dic['seb'])
+        del (dic['sea'], dic['seb'])
 
     if 'ngf' in dic:
         dic['nmom'] = (dic.get('ngf', None), dic.get('nse', None))
-        del(dic['ngf'], dic['nse'])
+        del (dic['ngf'], dic['nse'])
 
     if 'frozena' in dic:
         dic['frozen'] = (dic['frozena'], dic['frozenb'])
-        del(dic['frozena'], dic['frozenb'])
+        del (dic['frozena'], dic['frozenb'])
 
     return load_mol(chkfile), dic
 
@@ -111,7 +111,7 @@ def load_agf2(chkfile):
 def dump_agf2(agf2, chkfile=None, key='agf2',
               gf=None, se=None, frozen=None, nmom=None,
               mo_energy=None, mo_coeff=None, mo_occ=None):
-    ''' Save the AGF2 calculatuion to a chkfile.
+    ''' Save the AGF2 calculation to a chkfile.
     '''
 
     if mpi_helper.rank != 0:
@@ -129,13 +129,14 @@ def dump_agf2(agf2, chkfile=None, key='agf2',
 
     if isinstance(gf, (tuple, list)):
         if frozen is not None:
-            if isinstance(frozen, int) or isinstance(frozen[0], int):
+            if (isinstance(frozen, (int, np.integer)) or
+                isinstance(frozen[0], (int, np.integer))):
                 frozen = [frozen, frozen]
 
     if h5py.is_hdf5(chkfile):
         fh5 = h5py.File(chkfile, 'a')
         if key in fh5:
-            del(fh5[key])
+            del (fh5[key])
     else:
         fh5 = h5py.File(chkfile, 'w')
 

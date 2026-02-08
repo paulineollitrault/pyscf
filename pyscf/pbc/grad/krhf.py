@@ -27,6 +27,7 @@ from pyscf.pbc.gto.pseudo.pp import get_vlocG, get_alphas, get_projG, projG_li, 
 from pyscf.pbc.dft.numint import eval_ao_kpts
 from pyscf.pbc import gto, tools
 from pyscf.gto import mole
+from pyscf.pbc.gto.pseudo import pp_int
 import scipy
 
 
@@ -65,10 +66,11 @@ def grad_elec(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         de[x] -= np.einsum('kxij,kji->x', s1[:,:,p0:p1], dme0[:,:,p0:p1]).real * 2
         de[x] /= nkpts
         de[x] += mf_grad.extra_force(ia, locals())
+    de += pp_int.vppnl_nuc_grad(cell, dm0, kpts) / nkpts
 
     if log.verbose > logger.DEBUG:
         log.debug('gradients of electronic part')
-        mf_grad._write(log, cell, de, atmlst)
+        mf_grad._write(cell, de, atmlst)
     return de
 
 def _make_fakemol():
@@ -84,56 +86,27 @@ def _make_fakemol():
     return fakemol
 
 def get_hcore(cell, kpts):
-    '''Part of the nuclear gradients of core Hamiltonian'''
+    '''
+        Part of the nuclear gradients of core Hamiltonian
+        If pseudo potential is turned on, the local term is included,
+        but the nonlocal term is not included.
+    '''
     h1 = np.asarray(cell.pbc_intor('int1e_ipkin', kpts=kpts))
     dtype = h1.dtype
     if cell._pseudo:
         SI=cell.get_SI()
-        Gv = cell.Gv
-        natom = cell.natm
         coords = cell.get_uniform_grids()
-        ngrids = len(coords)
         vlocG = get_vlocG(cell)
         vpplocG = -np.einsum('ij,ij->j', SI, vlocG)
         vpplocG[0] = np.sum(get_alphas(cell))
         vpplocR = tools.ifft(vpplocG, cell.mesh).real
-        fakemol = _make_fakemol()
-        ptr = mole.PTR_ENV_START
         for kn, kpt in enumerate(kpts):
             aos = eval_ao_kpts(cell, coords, kpt, deriv=1)[0]
             vloc = np.einsum('agi,g,gj->aij', aos[1:].conj(), vpplocR, aos[0])
-            expir = np.exp(-1j*np.dot(coords, kpt))
-            aokG = np.asarray([tools.fftk(np.asarray(ao.T, order='C'),
-                              cell.mesh, expir).T for ao in aos])
-            Gk = Gv + kpt
-            G_rad = lib.norm(Gk, axis=1)
-            vnl = np.zeros(vloc.shape, dtype=np.complex128)
-            for ia in range(natom):
-                symb = cell.atom_symbol(ia)
-                if symb not in cell._pseudo:
-                    continue
-                pp = cell._pseudo[symb]
-                for l, proj in enumerate(pp[5:]):
-                    rl, nl, hl = proj
-                    if nl >0:
-                        hl = np.asarray(hl)
-                        fakemol._bas[0,mole.ANG_OF] = l
-                        fakemol._env[ptr+3] = .5*rl**2
-                        fakemol._env[ptr+4] = rl**(l+1.5)*np.pi**1.25
-                        pYlm_part = fakemol.eval_gto('GTOval', Gk)
-                        pYlm = np.empty((nl,l*2+1,ngrids))
-                        for k in range(nl):
-                            qkl = _qli(G_rad*rl, l, k)
-                            pYlm[k] = pYlm_part.T * qkl
-                        SPG_lmi = np.einsum('g,nmg->nmg', SI[ia].conj(), pYlm)
-                        SPG_lm_aoG = np.einsum('nmg,agp->anmp', SPG_lmi, aokG)
-                        tmp = np.einsum('ij,ajmp->aimp', hl, SPG_lm_aoG[1:])
-                        vnl += np.einsum('aimp,imq->apq', tmp.conj(), SPG_lm_aoG[0])
-            vnl  *= (1./ngrids**2)
             if dtype == np.float64:
-                h1[kn,:] += vloc.real + vnl.real
+                h1[kn,:] += vloc.real
             else:
-                h1[kn,:] += vloc + vnl
+                h1[kn,:] += vloc
     else:
         raise NotImplementedError
     return h1
@@ -141,68 +114,33 @@ def get_hcore(cell, kpts):
 def get_ovlp(cell, kpts):
     return -np.asarray(cell.pbc_intor('int1e_ipovlp', kpts=kpts))
 
-def hcore_generator(mf, cell=None, kpts=None):
-    if cell is None: cell = mf.cell
-    if kpts is None: kpts = mf.kpts
-    h1 = get_hcore(cell, kpts)
-    dtype = h1.dtype
+def hcore_generator(mf_grad, cell=None, kpts=None):
+    '''
+        If pseudo potential is turned on, the local term is included,
+        but the nonlocal term is not included.
+    '''
+    if cell is None: cell = mf_grad.cell
+    if kpts is None: kpts = mf_grad.kpts
+    h1 = mf_grad.get_hcore(cell, kpts)
 
     aoslices = cell.aoslice_by_atom()
     SI=cell.get_SI()  ##[natom ,grid]
     mesh = cell.mesh
     Gv = cell.Gv    ##[grid, 3]
-    ngrids = len(Gv)
     coords = cell.get_uniform_grids()
     vlocG = get_vlocG(cell)  ###[natom, grid]
-    ptr = mole.PTR_ENV_START
     def hcore_deriv(atm_id):
         shl0, shl1, p0, p1 = aoslices[atm_id]
-        symb = cell.atom_symbol(atm_id)
-        fakemol = _make_fakemol()
         vloc_g = 1j * np.einsum('ga,g->ag', Gv, SI[atm_id]*vlocG[atm_id])
         nkpts, nao = h1.shape[0], h1.shape[2]
         hcore = np.zeros([3,nkpts,nao,nao], dtype=h1.dtype)
         for kn, kpt in enumerate(kpts):
-
             ao = eval_ao_kpts(cell, coords, kpt)[0]
-            rho = np.einsum('gi,gj->gij',ao.conj(),ao)
             for ax in range(3):
                 vloc_R = tools.ifft(vloc_g[ax], mesh).real
-                vloc = np.einsum('gij,g->ij', rho, vloc_R)
+                vloc = np.einsum('gi,gj,g->ij', ao.conj(), ao, vloc_R, optimize=True)
                 hcore[ax,kn] += vloc
-            rho = None
-            aokG= tools.fftk(np.asarray(ao.T, order='C'),
-                              mesh, np.exp(-1j*np.dot(coords, kpt))).T
             ao = None
-            Gk = Gv + kpt
-            G_rad = lib.norm(Gk, axis=1)
-            if symb not in cell._pseudo: continue
-            pp = cell._pseudo[symb]
-            for l, proj in enumerate(pp[5:]):
-                rl, nl, hl = proj
-                if nl >0:
-                    hl = np.asarray(hl)
-                    fakemol._bas[0,mole.ANG_OF] = l
-                    fakemol._env[ptr+3] = .5*rl**2
-                    fakemol._env[ptr+4] = rl**(l+1.5)*np.pi**1.25
-                    pYlm_part = fakemol.eval_gto('GTOval', Gk)
-                    pYlm = np.empty((nl,l*2+1,ngrids))
-                    for k in range(nl):
-                        qkl = _qli(G_rad*rl, l, k)
-                        pYlm[k] = pYlm_part.T * qkl
-                    SPG_lmi = np.einsum('g,nmg->nmg', SI[atm_id].conj(), pYlm)
-                    SPG_lm_aoG = np.einsum('nmg,gp->nmp', SPG_lmi, aokG)
-                    SPG_lmi_G = 1j * np.einsum('nmg, ga->anmg', SPG_lmi, Gv)
-                    SPG_lm_G_aoG = np.einsum('anmg, gp->anmp', SPG_lmi_G, aokG)
-                    tmp_1 = np.einsum('ij,ajmp->aimp', hl, SPG_lm_G_aoG)
-                    tmp_2 = np.einsum('ij,jmp->imp', hl, SPG_lm_aoG)
-                    vppnl = (np.einsum('imp,aimq->apq', SPG_lm_aoG.conj(), tmp_1) +
-                             np.einsum('aimp,imq->apq', SPG_lm_G_aoG.conj(), tmp_2))
-                    vppnl *=(1./ngrids**2)
-                    if dtype==np.float64:
-                        hcore[:,kn] += vppnl.real
-                    else:
-                        hcore[:,kn] += vppnl
             hcore[:,kn,p0:p1] -= h1[kn,:,p0:p1]
             hcore[:,kn,:,p0:p1] -= h1[kn,:,p0:p1].transpose(0,2,1).conj()
         return hcore
@@ -211,9 +149,18 @@ def hcore_generator(mf, cell=None, kpts=None):
 def grad_nuc(cell, atmlst):
     '''
     Derivatives of nuclear repulsion energy wrt nuclear coordinates
+
+    Notes:
+        An optimized version of this function is available in
+        `pbc.gto.ewald_methods.ewald_nuc_grad`
     '''
-    ew_eta = cell.get_ewald_params()[0]
     chargs = cell.atom_charges()
+    ew_eta, ew_cut = cell.get_ewald_params()
+    log_precision = np.log(cell.precision / (chargs.sum()*16*np.pi**2))
+    ke_cutoff = -2*ew_eta**2*log_precision
+    mesh = cell.cutoff_to_mesh(ke_cutoff)
+    logger.debug1(cell, 'mesh for ewald %s', mesh)
+
     coords = cell.atom_coords()
     Lall = cell.get_lattice_Ls()
     natom = len(chargs)
@@ -234,18 +181,19 @@ def grad_nuc(cell, atmlst):
             ewovrl_grad[i] += np.sum(- qi * qj / r ** 2 * r1 * 2 * ew_eta / np.sqrt(np.pi) *
                                      np.exp(-ew_eta**2 * r ** 2).reshape(len(r),1), axis = 0)
 
-    mesh = gto.cell._cut_mesh_for_ewald(cell, cell.mesh)
     Gv, Gvbase, weights = cell.get_Gv_weights(mesh)
     absG2 = np.einsum('gi,gi->g', Gv, Gv)
     absG2[absG2==0] = 1e200
     ewg_grad = np.zeros([natom,3])
     SI = cell.get_SI(Gv)
-    if cell.low_dim_ft_type is None or cell.dimension == 3:
+    if cell.dimension != 2 or cell.low_dim_ft_type == 'inf_vacuum':
         coulG = 4*np.pi / absG2
         coulG *= weights
         ZSI = np.einsum("i,ij->j", chargs, SI)
         ZexpG2 = coulG * np.exp(-absG2/(4*ew_eta**2))
         ZexpG2_mod = ZexpG2.reshape(len(ZexpG2),1) * Gv
+    else:
+        raise NotImplementedError
     for i, qi in enumerate(chargs):
         Zfac = np.imag(ZSI * SI[i].conj()) * qi
         ewg_grad[i] = - np.sum(Zfac.reshape((len(Zfac),1)) * ZexpG2_mod, axis = 0)
@@ -279,14 +227,23 @@ def make_rdm1e(mo_energy, mo_coeff, mo_occ):
     dm1e = [molgrad.make_rdm1e(mo_energy[k], mo_coeff[k], mo_occ[k]) for k in range(nkpts)]
     return np.asarray(dm1e)
 
-class GradientsMixin(molgrad.GradientsMixin):
+class GradientsBase(molgrad.GradientsBase):
     '''
     Basic nuclear gradient functions for non-relativistic methods
     '''
     def __init__(self, method):
         self.cell = method.cell
-        self.kpts = method.kpts
-        molgrad.GradientsMixin.__init__(self, method)
+        molgrad.GradientsBase.__init__(self, method)
+
+    @property
+    def kpts(self):
+        return self.base.kpts
+
+    def reset(self, cell=None):
+        if cell is not None:
+            self.cell = cell
+        self.base.reset(cell)
+        return self
 
     def get_hcore(self, cell=None, kpts=None):
         if cell is None: cell = self.cell
@@ -330,6 +287,16 @@ class GradientsMixin(molgrad.GradientsMixin):
         if cell is None: cell = self.cell
         return grad_nuc(cell, atmlst)
 
+    def optimizer(self, solver='ase'):
+        '''Geometry optimization solver
+        '''
+        solver = solver.lower()
+        if solver == 'ase':
+            from pyscf.geomopt import ase_solver
+            return ase_solver.GeometryOptimizer(self.base)
+        else:
+            raise RuntimeError(f'Optimization solver {solver} not supported')
+
 def as_scanner(mf_grad):
     '''Generating a nuclear gradients scanner/solver (for geometry optimizer).
 
@@ -348,31 +315,34 @@ def as_scanner(mf_grad):
         return mf_grad
 
     logger.info(mf_grad, 'Create scanner for %s', mf_grad.__class__)
+    name = mf_grad.__class__.__name__ + SCF_GradScanner.__name_mixin__
+    return lib.set_class(SCF_GradScanner(mf_grad),
+                         (SCF_GradScanner, mf_grad.__class__), name)
 
-    class SCF_GradScanner(mf_grad.__class__, lib.GradScanner):
-        def __init__(self, g):
-            lib.GradScanner.__init__(self, g)
-        def __call__(self, cell_or_geom, **kwargs):
-            if isinstance(cell_or_geom, gto.Cell):
-                cell = cell_or_geom
-            else:
-                cell = self.cell.set_geom_(cell_or_geom, inplace=False)
+class SCF_GradScanner(lib.GradScanner):
+    def __init__(self, g):
+        lib.GradScanner.__init__(self, g)
 
-            mf_scanner = self.base
-            e_tot = mf_scanner(cell)
-            self.cell = cell
+    def __call__(self, cell_or_geom, **kwargs):
+        if isinstance(cell_or_geom, gto.Cell):
+            cell = cell_or_geom
+        else:
+            cell = self.cell.set_geom_(cell_or_geom, inplace=False)
 
-            # If second integration grids are created for RKS and UKS
-            # gradients
-            if getattr(self, 'grids', None):
-                self.grids.reset(cell)
+        mf_scanner = self.base
+        e_tot = mf_scanner(cell)
+        self.cell = cell
 
-            de = self.kernel(**kwargs)
-            return e_tot, de
-    return SCF_GradScanner(mf_grad)
+        # If second integration grids are created for RKS and UKS
+        # gradients
+        if getattr(self, 'grids', None):
+            self.grids.reset(cell)
+
+        de = self.kernel(**kwargs)
+        return e_tot, de
 
 
-class Gradients(GradientsMixin):
+class Gradients(GradientsBase):
     '''Non-relativistic restricted Hartree-Fock gradients'''
 
     def get_veff(self, dm=None, kpts=None):

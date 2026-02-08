@@ -34,7 +34,7 @@ def setUpModule():
     cell.build()
 
     kpts = cell.make_kpts([1,1,3])
-    disp = 1e-5
+    disp = 1e-3
 
 def tearDownModule():
     global cell
@@ -73,7 +73,7 @@ class KnownValues(unittest.TestCase):
 
     def test_hybrid_grad(self):
         mf = dft.KRKS(cell, kpts)
-        mf.xc = 'b3lyp'
+        mf.xc = 'b3lyp5'
         mf.exxdiv = None
         mf.conv_tol = 1e-10
         mf.conv_tol_grad = 1e-6

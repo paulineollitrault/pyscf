@@ -71,14 +71,7 @@ def ddpcm_for_post_scf(method, solvent_obj=None, dm=None):
             solvent_obj = DDPCM(method.mol)
     return _attach_solvent._for_post_scf(method, solvent_obj, dm)
 
-@lib.with_doc(_attach_solvent._for_tdscf.__doc__)
-def ddpcm_for_tdscf(method, solvent_obj=None, dm=None):
-    scf_solvent = getattr(method._scf, 'with_solvent', None)
-    assert scf_solvent is None or isinstance(scf_solvent, DDPCM)
-
-    if solvent_obj is None:
-        solvent_obj = DDPCM(method.mol)
-    return _attach_solvent._for_tdscf(method, solvent_obj, dm)
+ddpcm_for_tdscf = _attach_solvent._for_tdscf
 
 
 # Inject ddPCM to other methods
@@ -89,8 +82,8 @@ from pyscf import tdscf
 scf.hf.SCF.ddPCM    = scf.hf.SCF.DDPCM    = ddpcm_for_scf
 mp.mp2.MP2.ddPCM    = mp.mp2.MP2.DDPCM    = ddpcm_for_post_scf
 ci.cisd.CISD.ddPCM  = ci.cisd.CISD.DDPCM  = ddpcm_for_post_scf
-cc.ccsd.CCSD.ddPCM  = cc.ccsd.CCSD.DDPCM  = ddpcm_for_post_scf
-tdscf.rhf.TDMixin.ddPCM = tdscf.rhf.TDMixin.DDPCM = ddpcm_for_tdscf
+cc.ccsd.CCSDBase.ddPCM  = cc.ccsd.CCSDBase.DDPCM  = ddpcm_for_post_scf
+tdscf.rhf.TDBase.ddPCM = tdscf.rhf.TDBase.DDPCM = ddpcm_for_tdscf
 mcscf.casci.CASCI.ddPCM = mcscf.casci.CASCI.DDPCM = ddpcm_for_casci
 mcscf.mc1step.CASSCF.ddPCM = mcscf.mc1step.CASSCF.DDPCM = ddpcm_for_casscf
 
@@ -149,8 +142,7 @@ def energy(pcmobj, dm):
     epcm = gen_ddpcm_solver(pcmobj, pcmobj.verbose)(dm)[0]
     return epcm
 
-def regularize_xt(t, eta, scale=1):
-    eta *= scale
+def regularize_xt(t, eta):
     xt = numpy.zeros_like(t)
     inner = t <= 1-eta
     on_shell = (1-eta < t) & (t < 1)
@@ -197,9 +189,10 @@ def make_A(pcmobj, r_vdw, ylm_1sph, ui):
                 Amat[ja,:,ka,p0:p1] += -fac * a
     return Amat
 
-class DDPCM(ddcosmo.DDCOSMO):
+class ddPCM(ddcosmo.DDCOSMO):
     def __init__(self, mol):
         ddcosmo.DDCOSMO.__init__(self, mol)
+        self.method = 'ddPCM'
 
     def dump_flags(self, verbose=None):
         logger.info(self, '******** %s (In testing) ********', self.__class__)
@@ -330,11 +323,12 @@ class DDPCM(ddcosmo.DDCOSMO):
     gen_solver = as_solver = gen_ddpcm_solver
 
     def regularize_xt(self, t, eta, scale=1):
-        return regularize_xt(t, eta, scale)
+        return regularize_xt(t, eta)
 
     def nuc_grad_method(self, grad_method):
         raise NotImplementedError
 
+DDPCM = ddPCM
 
 if __name__ == '__main__':
     from pyscf import scf

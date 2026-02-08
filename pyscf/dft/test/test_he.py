@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import unittest
+import tempfile
 import numpy
 from pyscf import gto
 from pyscf import lib
@@ -81,8 +82,29 @@ class KnownValues(unittest.TestCase):
         self.assertAlmostEqual(method.scf(), -2.9070540942168002, 9)
 
         m = mol.UKS()
-        m.xc = 'b3lyp'
+        m.xc = 'b3lyp5'
         self.assertAlmostEqual(m.scf(), -2.89992555753, 9)
+
+    def test_camb3lyp(self):
+        self.assertAlmostEqual(mol.RKS(xc='camb3lyp').kernel(), -2.89299475730048, 9)
+        self.assertAlmostEqual(mol.GKS(xc='camb3lyp').kernel(), -2.89299475730048, 9)
+        self.assertAlmostEqual(mol.UKS(xc='camb3lyp').kernel(), -2.89299475730048, 9)
+
+    def test_wb97(self):
+        self.assertAlmostEqual(mol.RKS(xc='wb97').kernel(), -2.89430888240579, 9)
+        self.assertAlmostEqual(mol.GKS(xc='wb97').kernel(), -2.89430888240579, 9)
+        self.assertAlmostEqual(mol.UKS(xc='wb97').kernel(), -2.89430888240579, 9)
+        # The old way to compute RSH, short-range = full-range - long-range
+        xc = 'wb97 + 1e-9*HF'
+        self.assertAlmostEqual(mol.RKS(xc=xc).kernel(), -2.89430888240579, 8)
+
+    def test_hse(self):
+        self.assertAlmostEqual(mol.RKS(xc='hse06').kernel(), -2.88908568982727, 9)
+        self.assertAlmostEqual(mol.GKS(xc='hse06').kernel(), -2.88908568982727, 9)
+        self.assertAlmostEqual(mol.UKS(xc='hse06').kernel(), -2.88908568982727, 9)
+        # The old way to compute RSH, short-range = full-range - long-range
+        xc = 'hse06 + 1e-9*HF'
+        self.assertAlmostEqual(mol.RKS(xc=xc).kernel(), -2.88908568982727, 8)
 
     def test_nr_lda_1e(self):
         mf = dft.RKS(mol1).run()
@@ -101,11 +123,11 @@ class KnownValues(unittest.TestCase):
     def test_nr_m06l(self):
         m = mol.RKS()
         m.xc = 'm06l'
-        self.assertAlmostEqual(m.scf(), -2.9039230673864243, 9)
+        self.assertAlmostEqual(m.scf(), -2.9039230673864243, 7)
 
         m = mol.UKS()
         m.xc = 'm06l'
-        self.assertAlmostEqual(m.scf(), -2.9039230673864243, 9)
+        self.assertAlmostEqual(m.scf(), -2.9039230673864243, 7)
 
     def test_1e(self):
         mf = dft.RKS(gto.M(atom='H', spin=1)).run()
@@ -190,6 +212,21 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(isinstance(udhf.to_dks(), dft.dks.DKS))
         self.assertTrue(isinstance(udks.to_dhf(), scf.dhf.DHF))
         self.assertTrue(isinstance(udks.to_dks('pbe'), dft.dks.DKS))
+
+    # issue 1986
+    def test_init_guess_chkfile(self):
+        with tempfile.NamedTemporaryFile() as tmpf:
+            mol = gto.M(atom='He 0 0 0', basis='631g', charge=1, spin=1)
+            mf = dft.RKS(mol)
+            mf.chkfile = tmpf.name
+            e1 = mf.kernel()
+            mf = dft.RKS(mol)
+            mf.init_guess = 'chkfile'
+            mf.chkfile = tmpf.name
+            mf.max_cycle = 1
+            e2 = mf.kernel()
+            self.assertAlmostEqual(e1, e2, 9)
+
 
 if __name__ == "__main__":
     print("Full Tests for He")

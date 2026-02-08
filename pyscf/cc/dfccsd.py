@@ -27,6 +27,8 @@ from pyscf import __config__
 MEMORYMIN = getattr(__config__, 'cc_ccsd_memorymin', 2000)
 
 class RCCSD(ccsd.CCSD):
+    _keys = {'with_df'}
+
     def __init__(self, mf, frozen=None, mo_coeff=None, mo_occ=None):
         ccsd.CCSD.__init__(self, mf, frozen, mo_coeff, mo_occ)
         if getattr(mf, 'with_df', None):
@@ -34,7 +36,6 @@ class RCCSD(ccsd.CCSD):
         else:
             self.with_df = df.DF(mf.mol)
             self.with_df.auxbasis = df.make_auxbasis(mf.mol, mp2fit=True)
-        self._keys.update(['with_df'])
 
     def reset(self, mol=None):
         self.with_df.reset(mol)
@@ -44,11 +45,16 @@ class RCCSD(ccsd.CCSD):
         return _make_df_eris(self, mo_coeff)
 
     def _add_vvvv(self, t1, t2, eris, out=None, with_ovvv=False, t2sym=None):
-        assert(not self.direct)
+        assert (not self.direct)
         return ccsd.CCSD._add_vvvv(self, t1, t2, eris, out, with_ovvv, t2sym)
 
+DFCCSD = DFRCCSD = RCCSD
 
-def _contract_vvvv_t2(mycc, mol, vvL, t2, out=None, verbose=None):
+from pyscf import scf
+scf.hf.RHF.DFCCSD = lib.class_as_method(DFCCSD)
+scf.rohf.ROHF.DFCCSD = NotImplemented
+
+def _contract_vvvv_t2(mycc, mol, vvL, VVL, t2, out=None, verbose=None):
     '''Ht2 = numpy.einsum('ijcd,acdb->ijab', t2, vvvv)
 
     Args:
@@ -100,7 +106,7 @@ def _contract_vvvv_t2(mycc, mol, vvL, t2, out=None, verbose=None):
             ijL = vvL0[tril2sq[i0:i1,j0:j1] - off0].reshape(-1,naux)
             eri = numpy.ndarray(((i1-i0)*(j1-j0),nvir_pair), buffer=eribuf)
             for p0, p1 in lib.prange(0, nvir_pair, vvblk):
-                vvL1 = _cp(vvL[p0:p1])
+                vvL1 = _cp(VVL[p0:p1])
                 eri[:,p0:p1] = lib.ddot(ijL, vvL1.T)
                 vvL1 = None
 
@@ -116,10 +122,11 @@ def _contract_vvvv_t2(mycc, mol, vvL, t2, out=None, verbose=None):
 
 class _ChemistsERIs(ccsd._ChemistsERIs):
     def _contract_vvvv_t2(self, mycc, t2, direct=False, out=None, verbose=None):
-        assert(not direct)
-        return _contract_vvvv_t2(mycc, self.mol, self.vvL, t2, out, verbose)
+        assert (not direct)
+        return _contract_vvvv_t2(mycc, self.mol, self.vvL, self.vvL, t2, out, verbose)
 
 def _make_df_eris(cc, mo_coeff=None):
+    assert cc._scf.istype('RHF')
     eris = _ChemistsERIs()
     eris._common_init_(cc, mo_coeff)
     nocc = eris.nocc
@@ -187,7 +194,7 @@ def _make_df_eris(cc, mo_coeff=None):
     return eris
 
 def _cp(a):
-    return numpy.array(a, copy=False, order='C')
+    return numpy.asarray(a, order='C')
 
 if __name__ == '__main__':
     from pyscf import gto

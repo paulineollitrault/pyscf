@@ -20,3 +20,12 @@ class BasisNotFoundError(RuntimeError):
 
 class PointGroupSymmetryError(RuntimeError):
     pass
+
+class WfnSymmetryError(RuntimeError):
+    pass
+
+class LinearDependencyError(RuntimeError):
+    pass
+
+class DeprecationWarning(UserWarning):
+    pass

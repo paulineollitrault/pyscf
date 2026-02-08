@@ -20,6 +20,7 @@ FCIDUMP functions (write, read) for real Hamiltonian
 import re
 from functools import reduce
 import numpy
+from pyscf import lib
 from pyscf import gto
 from pyscf import scf
 from pyscf import ao2mo
@@ -84,7 +85,7 @@ def write_eri(fout, eri, nmo, tol=TOL, float_format=DEFAULT_FLOAT_FORMAT):
         eri = ao2mo.restore(8, eri, nmo)
 
     if eri.ndim == 2: # 4-fold symmetry
-        assert(eri.size == npair**2)
+        assert (eri.size == npair**2)
         ij = 0
         for i in range(nmo):
             for j in range(0, i+1):
@@ -96,7 +97,7 @@ def write_eri(fout, eri, nmo, tol=TOL, float_format=DEFAULT_FLOAT_FORMAT):
                         kl += 1
                 ij += 1
     else:  # 8-fold symmetry
-        assert(eri.size == npair*(npair+1)//2)
+        assert (eri.size == npair*(npair+1)//2)
         ij = 0
         ijkl = 0
         for i in range(nmo):
@@ -160,7 +161,7 @@ def from_integrals(filename, h1e, h2e, nmo, nelec, nuc=0, ms=0, orbsym=None,
 def from_mo(mol, filename, mo_coeff, orbsym=None,
             tol=TOL, float_format=DEFAULT_FLOAT_FORMAT,
             molpro_orbsym=MOLPRO_ORBSYM, ms=0):
-    '''Use the given MOs to transfrom the 1-electron and 2-electron integrals
+    '''Use the given MOs to transform the 1-electron and 2-electron integrals
     then dump them to FCIDUMP.
 
     Kwargs:
@@ -173,8 +174,7 @@ def from_mo(mol, filename, mo_coeff, orbsym=None,
 
     if orbsym is None:
         orbsym = getattr(mo_coeff, 'orbsym', None)
-        if molpro_orbsym and orbsym is not None:
-            orbsym = [ORBSYM_MAP[mol.groupname][i] for i in orbsym]
+        orbsym = _convert_orbsym(mol, orbsym, molpro_orbsym)
     h1ao = scf.hf.get_hcore(mol)
     h1e = reduce(numpy.dot, (mo_coeff.T, h1ao, mo_coeff))
     eri = ao2mo.full(mol, mo_coeff, verbose=0)
@@ -184,7 +184,7 @@ def from_mo(mol, filename, mo_coeff, orbsym=None,
 
 def from_scf(mf, filename, tol=TOL, float_format=DEFAULT_FLOAT_FORMAT,
              molpro_orbsym=MOLPRO_ORBSYM):
-    '''Use the given SCF object to transfrom the 1-electron and 2-electron
+    '''Use the given SCF object to transform the 1-electron and 2-electron
     integrals then dump them to FCIDUMP.
 
     Kwargs:
@@ -205,37 +205,67 @@ def from_scf(mf, filename, tol=TOL, float_format=DEFAULT_FLOAT_FORMAT,
     else:  # Handle cached integrals or customized systems
         eri = ao2mo.full(mf._eri, mo_coeff)
     orbsym = getattr(mo_coeff, 'orbsym', None)
-    if molpro_orbsym and orbsym is not None:
-        orbsym = [ORBSYM_MAP[mol.groupname][i] for i in orbsym]
+    orbsym = _convert_orbsym(mol, orbsym, molpro_orbsym)
     nuc = mf.energy_nuc()
     from_integrals(filename, h1e, eri, h1e.shape[0], mf.mol.nelec, nuc, 0, orbsym,
                    tol, float_format)
 
+def from_mcscf(mc, filename, tol=TOL, float_format=DEFAULT_FLOAT_FORMAT,
+               molpro_orbsym=MOLPRO_ORBSYM):
+    '''Use the given MCSCF object to obtain the CAS 1-electron and 2-electron
+    integrals and dump them to FCIDUMP.
 
-def read(filename, molpro_orbsym=MOLPRO_ORBSYM):
+    Kwargs:
+        tol (float): Threshold for writing elements to FCIDUMP
+        float_format (str): Float format for writing elements to FCIDUMP
+        molpro_orbsym (bool): Whether to dump the orbsym in Molpro orbsym
+            convention as documented in
+            https://www.molpro.net/manual/doku.php?id=general_program_structure#symmetry
+    '''
+    mol = mc.mol
+    mo_coeff = mc.mo_coeff
+    assert mo_coeff.dtype == numpy.double
+
+    h1eff, ecore = mc.get_h1eff()
+    h2eff = mc.get_h2eff()
+    orbsym = getattr(mo_coeff, 'orbsym', None)
+    if orbsym is not None:
+        orbsym = orbsym[mc.ncore:mc.ncore + mc.ncas]
+        orbsym = _convert_orbsym(mol, orbsym, molpro_orbsym)
+    nelecas = mc.nelecas[0] + mc.nelecas[1]
+    ms = abs(mc.nelecas[0] - mc.nelecas[1])
+    from_integrals(filename, h1eff, h2eff, mc.ncas, nelecas, nuc=ecore, ms=ms,
+                   orbsym=orbsym, tol=tol, float_format=float_format)
+
+def read(filename, molpro_orbsym=MOLPRO_ORBSYM, verbose=True):
     '''Parse FCIDUMP.  Return a dictionary to hold the integrals and
     parameters with keys:  H1, H2, ECORE, NORB, NELEC, MS, ORBSYM, ISYM
 
     Kwargs:
         molpro_orbsym (bool): Whether the orbsym in the FCIDUMP file is in
-            Molpro orbsym convention as documented in
-            https://www.molpro.net/info/current/doc/manual/node36.html
+            Molpro orbsym convention as documented in::
+
+                https://www.molpro.net/info/current/doc/manual/node36.html
+
             In return, orbsym is converted to pyscf symmetry convention
+        verbose (bool): Whether to print debugging information
+
     '''
-    print('Parsing %s' % filename)
+    if verbose:
+        print('Parsing %s' % filename)
     finp = open(filename, 'r')
 
     data = []
     for i in range(10):
         line = finp.readline().upper()
         data.append(line)
-        if '&END' in line:
+        if '&END' in line or '/' in line:
             break
     else:
         raise RuntimeError('Problematic FCIDUMP header')
 
     result = {}
-    tokens = ','.join(data).replace('&FCI', '').replace('&END', '')
+    tokens = ','.join(data).replace('&FCI', '').replace('&END', '').replace('/', '')
     tokens = tokens.replace(' ', '').replace('\n', '').replace(',,', ',')
     for token in re.split(',(?=[a-zA-Z])', tokens):
         key, val = token.split('=')
@@ -246,7 +276,7 @@ def read(filename, molpro_orbsym=MOLPRO_ORBSYM):
         else:
             result[key] = val
 
-    # Convert to molpr orbsym convert_orbsym
+    # Convert to Molpro orbsym convert_orbsym
     if 'ORBSYM' in result:
         if molpro_orbsym:
             # Guess which point group the orbsym belongs to. FCIDUMP does not
@@ -265,7 +295,7 @@ def read(filename, molpro_orbsym=MOLPRO_ORBSYM):
                 result['ORBSYM'] = [0] * len(orbsym)
             else:
                 raise RuntimeError('Unknown orbsym')
-        elif max(result['ORBSYM']) >= 8:
+        elif min(result['ORBSYM']) < 0:
             raise RuntimeError('Unknown orbsym convention')
 
     norb = result['NORB']
@@ -318,8 +348,18 @@ def to_scf(filename, molpro_orbsym=MOLPRO_ORBSYM, mf=None, **kwargs):
 
     if 'ORBSYM' in ctx:
         mol.symmetry = True
-        mol.groupname = 'N/A'
         orbsym = numpy.asarray(ctx['ORBSYM'])
+        # Guess the point group symmetry. See issue 2586.
+        # These guesses may be different to the symmetry of the molecule for FCIDUMP.
+        # They are created to guarantee the symmetry-adapted methods working.
+        if orbsym.max() >= 4:
+            mol.groupname = 'D2h'
+        elif orbsym.max() >= 2:
+            mol.groupname = 'C2v'
+        elif orbsym.max() >= 1:
+            mol.groupname = 'C2'
+        else:
+            mol.groupname = 'C1'
         mol.irrep_id = list(set(orbsym))
         mol.irrep_name = [('IR%d' % ir) for ir in mol.irrep_id]
         so = numpy.eye(norb)
@@ -340,6 +380,9 @@ def to_scf(filename, molpro_orbsym=MOLPRO_ORBSYM, mf=None, **kwargs):
     mf.get_hcore = lambda *args: h1
     mf.get_ovlp = lambda *args: numpy.eye(norb)
     mf._eri = ctx['H2']
+    intor_symmetric = mf.mol.intor_symmetric
+    mf.mol.intor_symmetric = lambda intor, **kwargs: numpy.eye(norb) \
+        if intor == 'int1e_ovlp' else intor_symmetric(intor, **kwargs)
 
     return mf
 
@@ -348,6 +391,25 @@ def scf_from_fcidump(mf, filename, molpro_orbsym=MOLPRO_ORBSYM):
     return to_scf(filename, molpro_orbsym, mf)
 
 scf.hf.SCF.from_fcidump = scf_from_fcidump
+
+def _convert_orbsym(mol, orbsym, molpro_orbsym):
+    if orbsym is None:
+        return orbsym
+
+    groupname = mol.groupname
+    if groupname not in ORBSYM_MAP:
+        if groupname == 'Dooh':
+            groupname = 'D2h'
+        elif groupname == 'Coov':
+            groupname = 'D2h'
+        else:
+            raise RuntimeError(f'Unsupported point group symmetry {mol.groupname}')
+        lib.logger.warn(mol, 'FCIDUMP does not support point group symmetry %s. '
+                        'Converting to its subgroup %s.', mol.groupname, groupname)
+        orbsym = orbsym % 10
+    if molpro_orbsym:
+        orbsym = [ORBSYM_MAP[groupname][i] for i in orbsym]
+    return orbsym
 
 if __name__ == '__main__':
     import argparse

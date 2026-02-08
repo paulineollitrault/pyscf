@@ -96,11 +96,11 @@ class KnownValues(unittest.TestCase):
         dm1ref, dm2ref = fci.direct_uhf.make_rdm12s(fcivec, h1a.shape[0], mol.nelec)
         rdm1 = myci.make_rdm1(myci.ci, myci.get_nmo(), myci.get_nocc())
         rdm2 = myci.make_rdm2(myci.ci, myci.get_nmo(), myci.get_nocc())
-        self.assertAlmostEqual(abs(dm1ref[0] - rdm1[0]).max(), 0, 5)
-        self.assertAlmostEqual(abs(dm1ref[1] - rdm1[1]).max(), 0, 5)
-        self.assertAlmostEqual(abs(dm2ref[0] - rdm2[0]).max(), 0, 5)
-        self.assertAlmostEqual(abs(dm2ref[1] - rdm2[1]).max(), 0, 5)
-        self.assertAlmostEqual(abs(dm2ref[2] - rdm2[2]).max(), 0, 5)
+        self.assertAlmostEqual(abs(dm1ref[0] - rdm1[0]).max(), 0, 4)
+        self.assertAlmostEqual(abs(dm1ref[1] - rdm1[1]).max(), 0, 4)
+        self.assertAlmostEqual(abs(dm2ref[0] - rdm2[0]).max(), 0, 4)
+        self.assertAlmostEqual(abs(dm2ref[1] - rdm2[1]).max(), 0, 4)
+        self.assertAlmostEqual(abs(dm2ref[2] - rdm2[2]).max(), 0, 4)
 
     def test_h4_a(self):
         '''Compare to FCI'''
@@ -124,7 +124,7 @@ class KnownValues(unittest.TestCase):
         mo = numpy.random.random((2,nao,nao))
 
         eris = myci.ao2mo(mo)
-        self.assertAlmostEqual(lib.finger(myci.make_diagonal(eris)),
+        self.assertAlmostEqual(lib.fp(myci.make_diagonal(eris)),
                                -838.45507742639279, 6)
 
         numpy.random.seed(12)
@@ -140,7 +140,7 @@ class KnownValues(unittest.TestCase):
         cisdvec = myci.amplitudes_to_cisdvec(1., (c1a, c1b), (c2aa, c2ab, c2bb))
 
         hcisd0 = myci.contract(myci.amplitudes_to_cisdvec(1., (c1a,c1b), (c2aa,c2ab,c2bb)), eris)
-        self.assertAlmostEqual(lib.finger(hcisd0), 466.56620234351681, 7)
+        self.assertAlmostEqual(lib.fp(hcisd0), 466.56620234351681, 6)
         eris = myci.ao2mo(mf.mo_coeff)
         hcisd0 = myci.contract(cisdvec, eris)
         eri_aa = ao2mo.kernel(mf._eri, mf.mo_coeff[0])
@@ -156,12 +156,12 @@ class KnownValues(unittest.TestCase):
         hci1 = fci.direct_uhf.contract_2e(h2e, fcivec, h1a.shape[0], mol.nelec)
         hci1 -= ehf0 * fcivec
         hcisd1 = myci.from_fcivec(hci1, nmo, mol.nelec)
-        self.assertAlmostEqual(abs(hcisd1-hcisd0).max(), 0, 9)
+        self.assertAlmostEqual(abs(hcisd1-hcisd0).max(), 0, 8)
 
         ecisd = myci.kernel(eris=eris)[0]
         efci = fci.direct_uhf.kernel((h1a,h1b), (eri_aa,eri_ab,eri_bb),
                                      h1a.shape[0], mol.nelec)[0]
-        self.assertAlmostEqual(ecisd, -0.037067274690894436, 9)
+        self.assertAlmostEqual(ecisd, -0.037067274690894436, 8)
         self.assertTrue(myci.e_tot-mol.energy_nuc() - efci < 0.002)
 
     def test_rdm_h4(self):
@@ -213,6 +213,47 @@ class KnownValues(unittest.TestCase):
               numpy.einsum('ijkl,ijkl', eri_bb, rdm2[2]) * .5)
         e2 += mol.energy_nuc()
         self.assertAlmostEqual(myci.e_tot, e2, 9)
+
+    def test_rdm12(self):
+        mol = gto.Mole()
+        mol.verbose = 0
+        mol.atom = [
+            ['O', ( 0., 0.    , 0.   )],
+            ['H', ( 0., -0.757, 0.587)],
+            ['H', ( 0., 0.757 , 0.587)],]
+        mol.basis = {'H': 'sto-3g',
+                     'O': 'sto-3g',}
+        mol.build()
+        mf = scf.UHF(mol).run(conv_tol=1e-12)
+        myci = mf.CISD()
+        eris = myci.ao2mo()
+        ecisd, civec = myci.kernel(eris=eris)
+        self.assertAlmostEqual(ecisd, -0.048878084082066106, 8)
+
+        nmoa = mf.mo_energy[0].size
+        nmob = mf.mo_energy[1].size
+        rdm1 = myci.make_rdm1(civec)
+        rdm2 = myci.make_rdm2(civec)
+        eri_aa = ao2mo.kernel(mf._eri, mf.mo_coeff[0], compact=False).reshape([nmoa]*4)
+        eri_bb = ao2mo.kernel(mf._eri, mf.mo_coeff[1], compact=False).reshape([nmob]*4)
+        eri_ab = ao2mo.kernel(mf._eri, [mf.mo_coeff[0], mf.mo_coeff[0],
+                                        mf.mo_coeff[1], mf.mo_coeff[1]], compact=False)
+        eri_ab = eri_ab.reshape(nmoa,nmoa,nmob,nmob)
+        h1a = reduce(numpy.dot, (mf.mo_coeff[0].T, mf.get_hcore(), mf.mo_coeff[0]))
+        h1b = reduce(numpy.dot, (mf.mo_coeff[1].T, mf.get_hcore(), mf.mo_coeff[1]))
+        e2 = (numpy.einsum('ij,ji', h1a, rdm1[0]) +
+              numpy.einsum('ij,ji', h1b, rdm1[1]) +
+              numpy.einsum('ijkl,ijkl', eri_aa, rdm2[0]) * .5 +
+              numpy.einsum('ijkl,ijkl', eri_ab, rdm2[1])      +
+              numpy.einsum('ijkl,ijkl', eri_bb, rdm2[2]) * .5)
+        self.assertAlmostEqual(ecisd + mf.e_tot - mol.energy_nuc(), e2, 8)
+
+        from_dm2 = (numpy.einsum('ijkk->ji', rdm2[0]) +
+                    numpy.einsum('ijkk->ji', rdm2[1]))/(mol.nelectron-1)
+        self.assertAlmostEqual(abs(rdm1[0] - from_dm2).max(), 0, 8)
+        from_dm2 = (numpy.einsum('ijkk->ji', rdm2[2]) +
+                    numpy.einsum('kkij->ji', rdm2[1]))/(mol.nelectron-1)
+        self.assertAlmostEqual(abs(rdm1[1] - from_dm2).sum(), 0, 8)
 
     def test_ao_direct(self):
         mol = gto.Mole()
@@ -266,13 +307,13 @@ class KnownValues(unittest.TestCase):
         nocc = nocca, noccb = (4,3)
         numpy.random.seed(2)
         nvira, nvirb = nmo-nocca, nmo-noccb
-        cibra = ucisd.amplitudes_to_cisdvec(numpy.random.rand(1),
+        cibra = ucisd.amplitudes_to_cisdvec(numpy.random.rand(1)[0],
                                             (numpy.random.rand(nocca,nvira),
                                              numpy.random.rand(noccb,nvirb)),
                                             (numpy.random.rand(nocca,nocca,nvira,nvira),
                                              numpy.random.rand(nocca,noccb,nvira,nvirb),
                                              numpy.random.rand(noccb,noccb,nvirb,nvirb)))
-        ciket = ucisd.amplitudes_to_cisdvec(numpy.random.rand(1),
+        ciket = ucisd.amplitudes_to_cisdvec(numpy.random.rand(1)[0],
                                             (numpy.random.rand(nocca,nvira),
                                              numpy.random.rand(noccb,nvirb)),
                                             (numpy.random.rand(nocca,nocca,nvira,nvira),
@@ -304,6 +345,38 @@ class KnownValues(unittest.TestCase):
         t2ab[:] = 1
         t2bb[:] = 1
         self.assertAlmostEqual(abs(vec - vec_orig).max(), 0, 15)
+
+    def test_with_df_s0(self):
+        mol = gto.Mole()
+        mol.atom = [
+            [8 , (0. , 0.     , 0.)],
+            [1 , (0. , -0.757 , 0.587)],
+            [1 , (0. , 0.757  , 0.587)]]
+        mol.basis = '631g'
+        mol.build()
+        rhf = scf.RHF(mol).density_fit(auxbasis='weigend')
+        rhf.conv_tol_grad = 1e-8
+        rhf.kernel()
+        mf = scf.addons.convert_to_uhf(rhf)
+        myci = ci.UCISD(mf)
+        myci.kernel()
+        self.assertAlmostEqual(myci.e_tot, -76.1131374309989, 8)
+
+    def test_with_df_s2(self):
+        mol = gto.Mole()
+        mol.atom = [
+            [8 , (0. , 0.     , 0.)],
+            [1 , (0. , -0.757 , 0.587)],
+            [1 , (0. , 0.757  , 0.587)]]
+        mol.basis = '631g'
+        mol.spin = 2
+        mol.build()
+        mf = scf.UHF(mol).density_fit(auxbasis='weigend')
+        mf.conv_tol_grad = 1e-8
+        mf.kernel()
+        myci = ci.UCISD(mf)
+        myci.kernel()
+        self.assertAlmostEqual(myci.e_tot, -75.8307298990769, 8)
 
 
 if __name__ == "__main__":

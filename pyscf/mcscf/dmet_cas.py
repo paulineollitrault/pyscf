@@ -50,7 +50,7 @@ def kernel(mf, dm, aolabels_or_baslst, threshold=THRESHOLD,
         threshold : float
             Entanglement threshold of DMET bath.  If the occupancy of an
             orbital is less than threshold, the orbital is considered as bath
-            orbtial.  If occ is greater than (1-threshold), the orbitals are
+            orbital.  If occ is greater than (1-threshold), the orbitals are
             taken for core determinant.
         base : int
             0-based (C-style) or 1-based (Fortran-style) for baslst if baslst
@@ -58,7 +58,7 @@ def kernel(mf, dm, aolabels_or_baslst, threshold=THRESHOLD,
         orth_method : str
             It can be one of 'lowdin' and 'meta_lowdin'
         s : 2D array
-            AO overlap matrix.  This option is mainly used for custom Hamilatonian.
+            AO overlap matrix.  This option is mainly used for custom Hamiltonian.
         canonicalize : bool
             Orbitals defined in AVAS method are local orbitals.  Symmetrizing
             the core, active and virtual space.
@@ -225,11 +225,11 @@ def symmetrize(mol, e, c, s, log):
                 cs.append(numpy.dot(mol.symm_orb[i], u[:,idx]))
             es = numpy.hstack(es)
             idx = numpy.argsort(es, kind='mergesort')
-            assert(numpy.allclose(es[idx], esub, rtol=1e-3, atol=1e-4))
+            assert (numpy.allclose(es[idx], esub, rtol=1e-3, atol=1e-4))
             c[:,degidx] = numpy.hstack(cs)[:,idx]
     return c
 
-del(THRESHOLD, OCC_CUTOFF, BASE, ORTH_METHOD, CANONICALIZE, FREEZE_IMP)
+del (THRESHOLD, OCC_CUTOFF, BASE, ORTH_METHOD, CANONICALIZE, FREEZE_IMP)
 
 if __name__ == '__main__':
     from pyscf import mcscf
@@ -253,4 +253,3 @@ if __name__ == '__main__':
     mc = mcscf.CASSCF(mf, ncas, nelecas).set(verbose=4)
     emc = mc.kernel(mo)[0]
     print(emc,)
-

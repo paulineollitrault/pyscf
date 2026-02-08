@@ -27,7 +27,7 @@ from pyscf.lib import logger
 from pyscf.pbc import tools
 from pyscf.pbc.df.df_jk import _format_dms, _format_kpts_band, _format_jks
 from pyscf.pbc.df.df_jk import _ewald_exxdiv_for_G0
-from pyscf.pbc.lib.kpts_helper import is_zero, gamma_point
+from pyscf.pbc.lib.kpts_helper import is_zero
 
 
 def get_j_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None):
@@ -41,7 +41,7 @@ def get_j_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None):
         kpts : (nkpts, 3) ndarray
 
     Kwargs:
-        kpts_band : (3,) ndarray or (*,3) ndarray
+        kpts_band : ``(3,)`` ndarray or ``(*,3)`` ndarray
             A list of arbitrary "band" k-points at which to evalute the matrix.
 
     Returns:
@@ -50,17 +50,19 @@ def get_j_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None):
     '''
     cell = mydf.cell
     mesh = mydf.mesh
+    assert cell.low_dim_ft_type != 'inf_vacuum'
+    assert cell.dimension != 1
 
     ni = mydf._numint
-    make_rho, nset, nao = ni._gen_rho_evaluator(cell, dm_kpts, hermi)
     dm_kpts = lib.asarray(dm_kpts, order='C')
     dms = _format_dms(dm_kpts, kpts)
     nset, nkpts, nao = dms.shape[:3]
+    make_rho, nset, nao = ni._gen_rho_evaluator(cell, dms, hermi)
 
     coulG = tools.get_coulG(cell, mesh=mesh)
     ngrids = len(coulG)
 
-    if hermi == 1 or gamma_point(kpts):
+    if hermi == 1 or is_zero(kpts):
         vR = rhoR = np.zeros((nset,ngrids))
         for ao_ks_etc, p0, p1 in mydf.aoR_loop(mydf.grids, kpts):
             ao_ks, mask = ao_ks_etc[0], ao_ks_etc[2]
@@ -92,7 +94,7 @@ def get_j_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None):
     nband = len(kpts_band)
     weight = cell.vol / ngrids
     vR *= weight
-    if gamma_point(kpts_band):
+    if is_zero(kpts_band):
         vj_kpts = np.zeros((nset,nband,nao,nao))
     else:
         vj_kpts = np.zeros((nset,nband,nao,nao), dtype=np.complex128)
@@ -114,17 +116,19 @@ def get_j_e1_kpts(mydf, dm_kpts, kpts=np.zeros((1,3)), kpts_band=None):
 
     cell = mydf.cell
     mesh = mydf.mesh
+    assert cell.low_dim_ft_type != 'inf_vacuum'
+    assert cell.dimension != 1
 
     ni = mydf._numint
-    make_rho, nset, nao = ni._gen_rho_evaluator(cell, dm_kpts, hermi=1)
     dm_kpts = lib.asarray(dm_kpts, order='C')
     dms = _format_dms(dm_kpts, kpts)
     nset, nkpts, nao = dms.shape[:3]
+    make_rho, nset, nao = ni._gen_rho_evaluator(cell, dms, hermi=1)
 
     coulG = tools.get_coulG(cell, mesh=mesh)
     ngrids = len(coulG)
 
-    if gamma_point(kpts):
+    if is_zero(kpts):
         vR = rhoR = np.zeros((nset,ngrids))
         for ao_ks_etc, p0, p1 in mydf.aoR_loop(mydf.grids, kpts):
             ao_ks, mask = ao_ks_etc[0], ao_ks_etc[2]
@@ -156,7 +160,7 @@ def get_j_e1_kpts(mydf, dm_kpts, kpts=np.zeros((1,3)), kpts_band=None):
     nband = len(kpts_band)
     weight = cell.vol / ngrids
     vR *= weight
-    if gamma_point(kpts_band):
+    if is_zero(kpts_band):
         vj_kpts = np.zeros((3,nset,nband,nao,nao))
     else:
         vj_kpts = np.zeros((3,nset,nband,nao,nao), dtype=np.complex128)
@@ -190,7 +194,7 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None,
             | 0 : not hermitian and not symmetric
             | 1 : hermitian
 
-        kpts_band : (3,) ndarray or (*,3) ndarray
+        kpts_band : ``(3,)`` ndarray or ``(*,3)`` ndarray
             A list of arbitrary "band" k-points at which to evalute the matrix.
 
     Returns:
@@ -200,6 +204,8 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None,
     '''
     cell = mydf.cell
     mesh = mydf.mesh
+    assert cell.low_dim_ft_type != 'inf_vacuum'
+    assert cell.dimension != 1
     coords = cell.gen_uniform_grids(mesh)
     ngrids = coords.shape[0]
 
@@ -219,7 +225,7 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None,
     kpts_band, input_band = _format_kpts_band(kpts_band, kpts), kpts_band
     nband = len(kpts_band)
 
-    if gamma_point(kpts_band) and gamma_point(kpts):
+    if is_zero(kpts_band) and is_zero(kpts):
         vk_kpts = np.zeros((nset,nband,nao,nao), dtype=dms.dtype)
     else:
         vk_kpts = np.zeros((nset,nband,nao,nao), dtype=np.complex128)
@@ -264,7 +270,7 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None,
             # If we have an ewald exxdiv, we add the G=0 correction near the
             # end of the function to bypass any discretization errors
             # that arise from the FFT.
-            if exxdiv == 'ewald' or exxdiv is None:
+            if exxdiv == 'ewald':
                 coulG = tools.get_coulG(cell, kpt2-kpt1, False, mydf, mesh)
             else:
                 coulG = tools.get_coulG(cell, kpt2-kpt1, exxdiv, mydf, mesh)
@@ -296,7 +302,7 @@ def get_k_kpts(mydf, dm_kpts, hermi=1, kpts=np.zeros((1,3)), kpts_band=None,
     # different for 1D/2D and 3D systems.  The special treatments for 1D and 2D
     # can only be used with AFTDF/GDF/MDF method.  In the FFTDF method, 1D, 2D
     # and 3D should use the ewald probe charge correction.
-    if exxdiv == 'ewald':
+    if exxdiv == 'ewald' and cell.dimension != 0:
         _ewald_exxdiv_for_G0(cell, kpts, dms, vk_kpts, kpts_band=kpts_band)
 
     return _format_jks(vk_kpts, dm_kpts, input_band, kpts)
@@ -308,6 +314,8 @@ def get_k_e1_kpts(mydf, dm_kpts, kpts=np.zeros((1,3)), kpts_band=None,
 
     cell = mydf.cell
     mesh = mydf.mesh
+    assert cell.low_dim_ft_type != 'inf_vacuum'
+    assert cell.dimension != 1
     coords = cell.gen_uniform_grids(mesh)
     ngrids = coords.shape[0]
 
@@ -327,7 +335,7 @@ def get_k_e1_kpts(mydf, dm_kpts, kpts=np.zeros((1,3)), kpts_band=None,
     kpts_band, input_band = _format_kpts_band(kpts_band, kpts), kpts_band
     nband = len(kpts_band)
 
-    if gamma_point(kpts_band) and gamma_point(kpts):
+    if is_zero(kpts_band) and is_zero(kpts):
         vk_kpts = np.zeros((3,nset,nband,nao,nao), dtype=dms.dtype)
     else:
         vk_kpts = np.zeros((3,nset,nband,nao,nao), dtype=np.complex128)
@@ -373,13 +381,7 @@ def get_k_e1_kpts(mydf, dm_kpts, kpts=np.zeros((1,3)), kpts_band=None,
         for k1, ao1T in enumerate(ao1_kpts):
             kpt1 = kpts_band[k1]
 
-            # If we have an ewald exxdiv, we add the G=0 correction near the
-            # end of the function to bypass any discretization errors
-            # that arise from the FFT.
-            if exxdiv == 'ewald' or exxdiv is None:
-                coulG = tools.get_coulG(cell, kpt2-kpt1, False, mydf, mesh)
-            else:
-                coulG = tools.get_coulG(cell, kpt2-kpt1, exxdiv, mydf, mesh)
+            coulG = tools.get_coulG(cell, kpt2-kpt1, exxdiv, mydf, mesh)
             if is_zero(kpt1-kpt2):
                 expmikr = np.array(1.)
             else:
@@ -403,11 +405,6 @@ def get_k_e1_kpts(mydf, dm_kpts, kpts=np.zeros((1,3)), kpts_band=None,
                 vk_kpts[:,i,k1] -= weight * np.einsum('aig,jg->aij', vR_dm[:,i], ao1T[0])
         t1 = logger.timer_debug1(mydf, 'get_k_kpts: make_kpt (%d,*)'%k2, *t1)
 
-    # Ewald correction has no contribution to nuclear gradient unless range separted Coulomb is used
-    # The gradient correction part is not added in the vk matrix
-    if exxdiv == 'ewald' and cell.omega!=0:
-        raise NotImplementedError("Range Separated Coulomb")
-        # when cell.omega !=0: madelung constant will have a non-zero derivative
     vk_kpts = np.asarray([_format_jks(vk, dm_kpts, input_band, kpts) for vk in vk_kpts])
     return vk_kpts
 
@@ -428,14 +425,18 @@ def get_jk(mydf, dm, hermi=1, kpt=np.zeros(3), kpts_band=None,
         kpt : (3,) ndarray
             The "inner" dummy k-point at which the DM was evaluated (or
             sampled).
-        kpts_band : (3,) ndarray or (*,3) ndarray
+        kpts_band : ``(3,)`` ndarray or ``(*,3)`` ndarray
             The "outer" primary k-point at which J and K are evaluated.
 
     Returns:
         The function returns one J and one K matrix, corresponding to the input
         density matrix (both order and shape).
     '''
-    dm = np.asarray(dm, order='C')
+    if getattr(dm, "mo_coeff", None) is not None:
+        dm = lib.tag_array(np.asarray(dm, order='C'), mo_coeff=dm.mo_coeff,
+                           mo_occ=dm.mo_occ)
+    else:
+        dm = np.asarray(dm, order='C')
     vj = vk = None
     if with_j:
         vj = get_j(mydf, dm, hermi, kpt, kpts_band)
@@ -459,7 +460,7 @@ def get_j(mydf, dm, hermi=1, kpt=np.zeros(3), kpts_band=None):
         kpt : (3,) ndarray
             The "inner" dummy k-point at which the DM was evaluated (or
             sampled).
-        kpts_band : (3,) ndarray or (*,3) ndarray
+        kpts_band : ``(3,)`` ndarray or ``(*,3)`` ndarray
             The "outer" primary k-point at which J and K are evaluated.
 
     Returns:
@@ -493,16 +494,24 @@ def get_k(mydf, dm, hermi=1, kpt=np.zeros(3), kpts_band=None, exxdiv=None):
         kpt : (3,) ndarray
             The "inner" dummy k-point at which the DM was evaluated (or
             sampled).
-        kpts_band : (3,) ndarray or (*,3) ndarray
+        kpts_band : ``(3,)`` ndarray or ``(*,3)`` ndarray
             The "outer" primary k-point at which J and K are evaluated.
 
     Returns:
         The function returns one J and one K matrix, corresponding to the input
         density matrix (both order and shape).
     '''
+    if getattr(dm, "mo_coeff", None) is not None:
+        mo_coeff = dm.mo_coeff
+        mo_occ = dm.mo_occ
+    else:
+        mo_coeff = None
+        mo_occ = None
+
     dm = np.asarray(dm, order='C')
     nao = dm.shape[-1]
     dm_kpts = dm.reshape(-1,1,nao,nao)
+    dm_kpts = lib.tag_array(dm_kpts, mo_coeff=mo_coeff, mo_occ=mo_occ)
     vk = get_k_kpts(mydf, dm_kpts, hermi, kpt.reshape(1,3), kpts_band, exxdiv)
     if kpts_band is None:
         vk = vk[:,0,:,:]

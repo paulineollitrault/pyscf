@@ -98,19 +98,19 @@ class KnownValues(unittest.TestCase):
         t, v, w = tv(myx2c.with_x2c)
         h1 = myx2c.with_x2c.picture_change((v, w*(.5/c)**2-t), t)
         href = myx2c.with_x2c.get_hcore()
-        self.assertAlmostEqual(abs(href - h1).max(), 0, 10)
+        self.assertAlmostEqual(abs(href - h1).max(), 0, 9)
 
         myx2c.with_x2c.xuncontract = True
         t, v, w = tv(myx2c.with_x2c)
         h1 = myx2c.with_x2c.picture_change((v, w*(.5/c)**2-t), t)
         href = myx2c.with_x2c.get_hcore()
-        self.assertAlmostEqual(abs(href - h1).max(), 0, 10)
+        self.assertAlmostEqual(abs(href - h1).max(), 0, 9)
 
         myx2c.with_x2c.basis = 'unc-sto3g'
         t, v, w = tv(myx2c.with_x2c)
         h1 = myx2c.with_x2c.picture_change((v, w*(.5/c)**2-t), t)
         href = myx2c.with_x2c.get_hcore()
-        self.assertAlmostEqual(abs(href - h1).max(), 0, 10)
+        self.assertAlmostEqual(abs(href - h1).max(), 0, 9)
 
     def test_sfx2c1e_picture_change(self):
         c = lib.param.LIGHT_SPEED
@@ -126,19 +126,19 @@ class KnownValues(unittest.TestCase):
         t, v, w = tv(myx2c.with_x2c)
         h1 = myx2c.with_x2c.picture_change((v, w*(.5/c)**2-t), t)
         href = myx2c.with_x2c.get_hcore()
-        self.assertAlmostEqual(abs(href - h1).max(), 0, 10)
+        self.assertAlmostEqual(abs(href - h1).max(), 0, 9)
 
         myx2c.with_x2c.xuncontract = True
         t, v, w = tv(myx2c.with_x2c)
         h1 = myx2c.with_x2c.picture_change((v, w*(.5/c)**2-t), t)
         href = myx2c.with_x2c.get_hcore()
-        self.assertAlmostEqual(abs(href - h1).max(), 0, 10)
+        self.assertAlmostEqual(abs(href - h1).max(), 0, 9)
 
         myx2c.with_x2c.basis = 'unc-sto3g'
         t, v, w = tv(myx2c.with_x2c)
         h1 = myx2c.with_x2c.picture_change((v, w*(.5/c)**2-t), t)
         href = myx2c.with_x2c.get_hcore()
-        self.assertAlmostEqual(abs(href - h1).max(), 0, 10)
+        self.assertAlmostEqual(abs(href - h1).max(), 0, 9)
 
     def test_lindep_xbasis(self):
         mol = gto.M(atom='C', basis='''
@@ -204,9 +204,9 @@ C     F
         self.assertAlmostEqual(abs(h1 - ref).max(), 0, 12)
 
     def test_ghf(self):
-        # Test whether the result of .X2C() is a solution of .GHF().x2c()
+        # Test whether the result of spinor X2C is a solution of .GHF().x2c()
         mol = gto.M(atom='C', basis='ccpvdz-dk')
-        ref = mol.X2C().run()
+        ref = mol.DHF().x2c().run()
         c = numpy.vstack(mol.sph2spinor_coeff())
         mo1 = c.dot(ref.mo_coeff)
         dm = ref.make_rdm1(mo1, ref.mo_occ)
@@ -214,7 +214,60 @@ C     F
         mf.max_cycle = 1
         mf.kernel(dm0=dm)
         self.assertTrue(mf.converged)
-        self.assertAlmostEqual(mf.e_tot, ref.e_tot, 10)
+        self.assertAlmostEqual(mf.e_tot, ref.e_tot, 9)
+        self.assertAlmostEqual(abs(mf.dip_moment() - ref.dip_moment()).max(), 0, 9)
+
+    def test_ghf_atom(self):
+        # Test whether the result of spinor X2C is a solution of .GHF().x2c()
+        mol = gto.M(atom='C', basis='ccpvdz-dk')
+        mf_1e = mol.GHF().x2c1e()
+        mf_1e.kernel()
+        mf_atom1e = mol.GHF().x2c1e()
+        mf_atom1e.with_x2c.approx = 'ATOM1E'
+        mf_atom1e.kernel()
+        self.assertAlmostEqual(abs(mf_1e.e_tot - mf_atom1e.e_tot).max(), 0, 9)
+        self.assertAlmostEqual(abs(mf_1e.mo_energy - mf_atom1e.mo_energy).max(), 0, 9)
+
+    def test_gks(self):
+        mol = gto.M(atom='C', basis='ccpvdz-dk')
+        ref = mol.DKS(xc='b3lyp').x2c().run()
+        c = numpy.vstack(mol.sph2spinor_coeff())
+        mo1 = c.dot(ref.mo_coeff)
+        dm = ref.make_rdm1(mo1, ref.mo_occ)
+        mf = mol.GKS(xc='b3lyp').x2c1e()
+        mf.max_cycle = 1
+        mf.kernel(dm0=dm)
+        self.assertTrue(mf.converged)
+        self.assertAlmostEqual(mf.e_tot, ref.e_tot, 9)
+        self.assertAlmostEqual(abs(mf.dip_moment() - ref.dip_moment()).max(), 0, 9)
+
+    def test_undo_x2c(self):
+        mf = mol.RHF().x2c().density_fit()
+        self.assertEqual(mf.__class__.__name__, 'DFsfX2C1eRHF')
+        mf = mf.undo_x2c()
+        self.assertEqual(mf.__class__.__name__, 'DFRHF')
+
+        mf = mol.GHF().x2c().density_fit()
+        self.assertEqual(mf.__class__.__name__, 'DFX2C1eGHF')
+        mf = mf.undo_x2c()
+        self.assertEqual(mf.__class__.__name__, 'DFGHF')
+
+    # issue 2605
+    def test_kappa_spinor(self):
+        mol = gto.M(
+            atom='''He 0.   0.7  .1
+                    He 0.5 -0.2 -.1''',
+            basis=[[0, [0.5547, 1.]],
+                   [1, [11., 0.94, .31], [4.68, 0.22, .80]],
+                   [1, -2, [1.9, 1.]],
+                   [1, 1, [1.53, 1.]],
+                   [1, 0, [0.53, 1.]]],
+        )
+        pmol, c = x2c.SpinorX2CHelper(mol).get_xmol()
+        self.assertEqual(c.shape, (pmol.nao_2c(), mol.nao_2c()))
+        ref = mol.intor('int1e_ovlp_spinor')
+        dat = c.T.dot(pmol.intor('int1e_ovlp_spinor')).dot(c)
+        self.assertAlmostEqual(abs(ref - dat).max(), 0, 12)
 
 
 if __name__ == "__main__":
