@@ -69,7 +69,18 @@ def kernel(mp, mo_energy, mo_coeff, verbose=logger.NOTE, with_t2=WITH_T2):
     with_df_ints = mp.with_df_ints and isinstance(mp._scf.with_df, df.GDF)
 
     mem_avail = mp.max_memory - lib.current_memory()[0]
-    mem_usage = (nkpts * (nocc * nvir)**2) * 16 / 1e6
+    # Peak memory note:
+    # The original implementation allocated a large buffer
+    #   oovv_ij[nkpts,nocc,nocc,nvir,nvir]
+    # which scales as O(nkpts * nocc^2 * nvir^2) and can easily exceed RAM at
+    # dense k-point meshes.
+    #
+    # We avoid that buffer by computing the required (ij|ab) blocks on the fly.
+    # The peak memory is then dominated by a few (nocc,nocc,nvir,nvir) blocks
+    # (and eijab/t2_ijab intermediates), which scales as O(nocc^2 * nvir^2).
+    # Rough estimate (bytes): 2 complex ERI blocks + 1 complex t2_ijab + 1 real eijab
+    # -> (2*16 + 16 + 8) = 56 bytes per element.
+    mem_usage = ((nocc * nvir) ** 2) * 56 / 1e6
     if with_df_ints:
         mydf = mp._scf.with_df
         if mydf.auxcell is None:
@@ -88,9 +99,8 @@ def kernel(mp, mo_energy, mo_coeff, verbose=logger.NOTE, with_t2=WITH_T2):
     eia = np.zeros((nocc,nvir))
     eijab = np.zeros((nocc,nocc,nvir,nvir))
 
-    fao2mo = mp._scf.with_df.ao2mo
     kconserv = mp.khelper.kconserv
-    oovv_ij = np.zeros((nkpts,nocc,nocc,nvir,nvir), dtype=mo_coeff[0].dtype)
+    fao2mo = mp._scf.with_df.ao2mo
 
     mo_e_o = [mo_energy[k][:nocc] for k in range(nkpts)]
     mo_e_v = [mo_energy[k][nocc:] for k in range(nkpts)]
@@ -103,28 +113,46 @@ def kernel(mp, mo_energy, mo_coeff, verbose=logger.NOTE, with_t2=WITH_T2):
     else:
         t2 = None
 
-    # Build 3-index DF tensor Lov
+    # Build 3-index DF tensor Lov (GDF only)
     if with_df_ints:
         Lov = _init_mp_df_eris(mp)
 
     emp2_ss = emp2_os = 0.
     for ki in range(nkpts):
+        orbo_i = mo_coeff[ki][:, :nocc]
         for kj in range(nkpts):
+            orbo_j = mo_coeff[kj][:, :nocc]
             for ka in range(nkpts):
                 kb = kconserv[ki,ka,kj]
-                # (ia|jb)
+                kpt_ki = mp.kpts[ki]
+                kpt_kj = mp.kpts[kj]
+                kpt_ka = mp.kpts[ka]
+                kpt_kb = mp.kpts[kb]
+
+                # (ia|jb) block for this (ki,kj,ka,kb)
                 if with_df_ints:
-                    oovv_ij[ka] = (1./nkpts) * einsum("Lia,Ljb->iajb", Lov[ki, ka], Lov[kj, kb]).transpose(0,2,1,3)
+                    # g_ab corresponds to old oovv_ij[ka]
+                    g_ab = (1./nkpts) * einsum(
+                        "Lia,Ljb->iajb", Lov[ki, ka], Lov[kj, kb]
+                    ).transpose(0, 2, 1, 3)
+                    # g_ba corresponds to old oovv_ij[kb] (i@kb, j@ka)
+                    g_ba = (1./nkpts) * einsum(
+                        "Lia,Ljb->iajb", Lov[ki, kb], Lov[kj, ka]
+                    ).transpose(0, 2, 1, 3)
                 else:
-                    orbo_i = mo_coeff[ki][:,:nocc]
-                    orbo_j = mo_coeff[kj][:,:nocc]
-                    orbv_a = mo_coeff[ka][:,nocc:]
-                    orbv_b = mo_coeff[kb][:,nocc:]
-                    oovv_ij[ka] = fao2mo((orbo_i,orbv_a,orbo_j,orbv_b),
-                                         (mp.kpts[ki],mp.kpts[ka],mp.kpts[kj],mp.kpts[kb]),
-                                         compact=False).reshape(nocc,nvir,nocc,nvir).transpose(0,2,1,3) / nkpts
-            for ka in range(nkpts):
-                kb = kconserv[ki,ka,kj]
+                    orbv_a = mo_coeff[ka][:, nocc:]
+                    orbv_b = mo_coeff[kb][:, nocc:]
+                    g_ab = fao2mo(
+                        (orbo_i, orbv_a, orbo_j, orbv_b),
+                        (kpt_ki, kpt_ka, kpt_kj, kpt_kb),
+                        compact=False,
+                    ).reshape(nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3) / nkpts
+                    # Need the swapped virtual k-points for the exchange term
+                    g_ba = fao2mo(
+                        (orbo_i, orbv_b, orbo_j, orbv_a),
+                        (kpt_ki, kpt_kb, kpt_kj, kpt_ka),
+                        compact=False,
+                    ).reshape(nocc, nvir, nocc, nvir).transpose(0, 2, 1, 3) / nkpts
 
                 # Remove zero/padded elements from denominator
                 eia = LARGE_DENOM * np.ones((nocc, nvir), dtype=mo_energy[0].dtype)
@@ -136,11 +164,11 @@ def kernel(mp, mo_energy, mo_coeff, verbose=logger.NOTE, with_t2=WITH_T2):
                 ejb[n0_ovp_jb] = (mo_e_o[kj][:,None] - mo_e_v[kb])[n0_ovp_jb]
 
                 eijab = lib.direct_sum('ia,jb->ijab',eia,ejb)
-                t2_ijab = np.conj(oovv_ij[ka]/eijab)
+                t2_ijab = np.conj(g_ab/eijab)
                 if with_t2:
                     t2[ki, kj, ka] = t2_ijab
-                edi = einsum('ijab,ijab', t2_ijab, oovv_ij[ka]).real * 2
-                exi = -einsum('ijab,ijba', t2_ijab, oovv_ij[kb]).real
+                edi = einsum('ijab,ijab', t2_ijab, g_ab).real * 2
+                exi = -einsum('ijab,ijba', t2_ijab, g_ba).real
                 emp2_ss += edi*0.5 + exi
                 emp2_os += edi*0.5
 
