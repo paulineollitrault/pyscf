@@ -385,12 +385,68 @@ def _zero_cas_t2_amplitudes(t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir,
     return t2_zeroed
 
 
+def _process_one_triple(i, j, k,
+                        pno_spaces, t2_for_T,
+                        with_df, C_lmo, fock_ao, F_lmo, s1e):
+    """Compute (T) energy contribution for one triple (i,j,k). Thread-safe.
+
+    All inputs are read-only.  DF integral builds (C extensions) and all BLAS
+    calls release the GIL, so concurrent threads make real progress.
+
+    Returns et_ijk (float), or 0.0 if the triple should be skipped.
+    """
+    ij = (min(i, j), max(i, j))
+    ik = (min(i, k), max(i, k))
+    jk = (min(j, k), max(j, k))
+
+    if (ij not in pno_spaces or ik not in pno_spaces or jk not in pno_spaces):
+        return 0.0
+    if (ij not in t2_for_T or ik not in t2_for_T or jk not in t2_for_T):
+        return 0.0
+
+    C_tno, n_tno = _triple_pno_union(pno_spaces, i, j, k, s1e)
+    if n_tno == 0:
+        return 0.0
+
+    F_tno_full = reduce(np.dot, (C_tno.T, fock_ao, C_tno))
+    eps_tno_sc, V_sc = np.linalg.eigh(F_tno_full)
+    C_tno_sc = np.dot(C_tno, V_sc)
+
+    def _map_t2(pk):
+        C_p = pno_spaces[pk]['C_pno']
+        U = reduce(np.dot, (C_p.T, s1e, C_tno_sc))
+        return reduce(np.dot, (U.T, t2_for_T[pk], U))
+
+    t2_ij_sc = _map_t2(ij)
+    t2_ik_sc = _map_t2(ik)
+    t2_jk_sc = _map_t2(jk)
+
+    ovL_ijk    = _build_ovL_tno(with_df, C_lmo, C_tno_sc, [i, j, k])
+    vvL_sc     = _build_vvL_tno(with_df, C_tno_sc)
+    triple_lmo = [i, j, k]
+    F_occ_3x3  = F_lmo[np.ix_(triple_lmo, triple_lmo)]
+    eps_occ_sc, V_occ_sc = np.linalg.eigh(F_occ_3x3)
+    ovL_sc_occ = np.einsum('nm,naL->maL', V_occ_sc, ovL_ijk)
+    ooL_lmo    = _build_ooL_triple(with_df, C_lmo, triple_lmo)
+    ooL_sc     = np.einsum('pm,qn,pqL->mnL', V_occ_sc, V_occ_sc, ooL_lmo)
+
+    t2_lmo_block = np.zeros((3, 3, n_tno, n_tno))
+    t2_lmo_block[0, 1] = t2_ij_sc;  t2_lmo_block[1, 0] = t2_ij_sc.T
+    t2_lmo_block[0, 2] = t2_ik_sc;  t2_lmo_block[2, 0] = t2_ik_sc.T
+    t2_lmo_block[1, 2] = t2_jk_sc;  t2_lmo_block[2, 1] = t2_jk_sc.T
+    t2_sc_block = np.einsum('pm,qn,pqAB->mnAB', V_occ_sc, V_occ_sc, t2_lmo_block)
+
+    return _w3_intermediate(t2_sc_block, ovL_sc_occ, ooL_sc, vvL_sc,
+                            eps_occ_sc, eps_tno_sc)
+
+
 def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                     t2_pno_all, occ_cas_idx,
                     C_cas_vir=None,
                     vir_cas_idx=None,
                     cas_proj_thresh=0.5,
                     T_CutTNO=1e-9,
+                    ncores=1,
                     verbose=None):
     """Compute external-space (T) energy correction for DLPNO-TCCSD(T).
 
@@ -443,101 +499,36 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
 
     occ_list = list(range(nocc_lmo))
 
-    e_t = 0.0
-    n_triples = 0
     n_cas_skip = 0
 
-    # Loop over all triples i <= j <= k from the strong pair occupied set
-    for idx_i, i in enumerate(occ_list):
-        for idx_j, j in enumerate(occ_list[idx_i:], idx_i):
-            for idx_k, k in enumerate(occ_list[idx_j:], idx_j):
-
-                # CAS exclusion: skip pure-CAS triples
+    # Enumerate all valid non-CAS triples upfront
+    valid_triples = []
+    for i in occ_list:
+        for j in occ_list[occ_list.index(i):]:
+            for k in occ_list[occ_list.index(j):]:
                 if (i in occ_cas_set) and (j in occ_cas_set) and (k in occ_cas_set):
                     n_cas_skip += 1
-                    continue
+                else:
+                    valid_triples.append((i, j, k))
 
-                # Check that all three pair PNO spaces exist
-                ij = (min(i,j), max(i,j))
-                ik = (min(i,k), max(i,k))
-                jk = (min(j,k), max(j,k))
+    triple_kwargs = dict(
+        pno_spaces=pno_spaces, t2_for_T=t2_for_T,
+        with_df=mf.with_df, C_lmo=C_lmo,
+        fock_ao=fock_ao, F_lmo=F_lmo, s1e=s1e,
+    )
 
-                if (ij not in pno_spaces or ik not in pno_spaces
-                        or jk not in pno_spaces):
-                    continue
+    if ncores > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=ncores) as pool:
+            futures = [pool.submit(_process_one_triple, i, j, k, **triple_kwargs)
+                       for i, j, k in valid_triples]
+            et_values = [f.result() for f in as_completed(futures)]
+    else:
+        et_values = [_process_one_triple(i, j, k, **triple_kwargs)
+                     for i, j, k in valid_triples]
 
-                if (ij not in t2_for_T or ik not in t2_for_T
-                        or jk not in t2_for_T):
-                    continue
-
-                # Build triple PNO space as union of three pair PNO spaces
-                C_tno, n_tno = _triple_pno_union(pno_spaces, i, j, k, s1e)
-                if n_tno == 0:
-                    continue
-
-                # Semi-canonical transformation: diagonalise F in TNO subspace.
-                # The diagonal of F_tno is NOT the correct virtual energy (TNOs are
-                # not eigenstates of F); use eigenvalues instead so the denominator
-                # D = eps_i + eps_j + eps_k - eps_a - eps_b - eps_c is correct.
-                F_tno_full = reduce(np.dot, (C_tno.T, fock_ao, C_tno))
-                eps_tno_sc, V_sc = np.linalg.eigh(F_tno_full)
-
-                # Rotate TNO coefficients to semi-canonical basis.
-                # C_tno_sc[:,m] are eigenvectors of F; still S-orthonormal.
-                C_tno_sc = np.dot(C_tno, V_sc)   # (nao, n_tno)
-
-                # Map each pair T2 to the semi-canonical TNO basis:
-                #   U = C_pair.T @ S @ C_tno_sc   (PNO → SC-TNO overlap)
-                #   t2_sc = U.T @ t2_pair @ U
-                def _map_t2_to_sc(pair_key):
-                    C_pair = pno_spaces[pair_key]['C_pno']               # (nao, n_pair)
-                    U = reduce(np.dot, (C_pair.T, s1e, C_tno_sc))        # (n_pair, n_tno)
-                    t2 = t2_for_T[pair_key]                               # (n_pair, n_pair)
-                    return reduce(np.dot, (U.T, t2, U))                  # (n_tno, n_tno)
-
-                t2_ij_sc = _map_t2_to_sc(ij)
-                t2_ik_sc = _map_t2_to_sc(ik)
-                t2_jk_sc = _map_t2_to_sc(jk)
-
-                # Build DF integrals directly in the semi-canonical TNO basis
-                ovL_ijk = _build_ovL_tno(mf.with_df, C_lmo, C_tno_sc, [i, j, k])
-                vvL_sc = _build_vvL_tno(mf.with_df, C_tno_sc)
-
-                # Semi-canonical occupied transformation for this triple.
-                # Diagonalise the 3×3 LMO Fock block to get proper triple energies.
-                # Off-diagonal F_LMO elements (e.g. 0.27 Eh for H2O bonds) make the
-                # diagonal approximation fail; eigenvalues give the correct denominator.
-                triple_lmo = [i, j, k]
-                F_occ_3x3 = F_lmo[np.ix_(triple_lmo, triple_lmo)]
-                eps_occ_sc, V_occ_sc = np.linalg.eigh(F_occ_3x3)
-
-                # Rotate ovL to SC occupied basis:
-                #   ovL_sc[m,a,L] = sum_n V_occ_sc[n,m] * ovL_ijk[n,a,L]
-                ovL_sc_occ = np.einsum('nm,naL->maL', V_occ_sc, ovL_ijk)
-
-                # Build occ-occ DF integrals for the 3 LMOs, then rotate to SC basis.
-                # DLPNO approximation: vooo sum restricted to these 3 LMOs.
-                ooL_lmo = _build_ooL_triple(mf.with_df, C_lmo, triple_lmo)
-                ooL_sc = np.einsum('pm,qn,pqL->mnL', V_occ_sc, V_occ_sc, ooL_lmo)
-
-                # Build T2 in SC occupied × SC virtual basis.
-                # Use exchange symmetry T2[q,p,b,a] = T2[p,q,a,b] (pyscf RHF convention).
-                t2_lmo_block = np.zeros((3, 3, n_tno, n_tno))
-                t2_lmo_block[0, 1] = t2_ij_sc;  t2_lmo_block[1, 0] = t2_ij_sc.T
-                t2_lmo_block[0, 2] = t2_ik_sc;  t2_lmo_block[2, 0] = t2_ik_sc.T
-                t2_lmo_block[1, 2] = t2_jk_sc;  t2_lmo_block[2, 1] = t2_jk_sc.T
-
-                # T2_sc[m,n] = sum_{pq} V[p,m]*V[q,n] * T2_lmo[p,q]
-                t2_sc_block = np.einsum('pm,qn,pqAB->mnAB', V_occ_sc, V_occ_sc,
-                                        t2_lmo_block)
-
-                # (T) energy in SC occupied × SC virtual basis (returns contribution × 2)
-                et_ijk = _w3_intermediate(
-                    t2_sc_block, ovL_sc_occ, ooL_sc, vvL_sc,
-                    eps_occ_sc, eps_tno_sc)
-
-                e_t += et_ijk
-                n_triples += 1
+    e_t = sum(et_values)
+    n_triples = sum(1 for v in et_values if v != 0.0)
 
     log.info('(T) correction: %d triples computed, %d CAS triples skipped',
              n_triples, n_cas_skip)

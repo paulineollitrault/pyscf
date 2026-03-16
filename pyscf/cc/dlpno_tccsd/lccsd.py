@@ -228,13 +228,120 @@ def _fragment_energy(oovv, t2, uocc_loc):
 
 
 # ---------------------------------------------------------------------------
+# Per-pair worker (extracted for parallel execution)
+# ---------------------------------------------------------------------------
+
+def _process_one_pair(pair, pno_spaces, C_lmo, mol, with_df, e_tot_hf,
+                      fock_ao, eps_lmo, occ_cas_idx, cas_pairs,
+                      t2_cas, vir_cas_idx, mo_coeff_cas, s1e,
+                      conv_tol, max_cycle):
+    """Compute T2 and energy contribution for one pair. Thread-safe.
+
+    All input arrays are read-only shared state; each call allocates its own
+    output arrays.  The DF integral build (with_df.ao2mo) and all BLAS calls
+    release the GIL, so concurrent threads make real progress.
+
+    Returns:
+        (i, j, t2_pno, e_ij, kind)
+        kind ∈ {'cas', 'ccsd', 'skip'}
+    """
+    (i, j) = pair
+
+    if (i, j) not in pno_spaces:
+        return i, j, None, 0.0, 'skip'
+
+    data       = pno_spaces[(i, j)]
+    C_pno_ij   = data['C_pno']
+    K_pno      = data['K_pno']
+    T2_mp2     = data['T2_pno']
+    e_pno      = data['e_pno']
+    n_pno      = C_pno_ij.shape[1]
+
+    # -- CAS pair: use DMRG amplitude directly --
+    if (i, j) in cas_pairs:
+        i_cas = int(np.where(occ_cas_idx == i)[0][0])
+        j_cas = int(np.where(occ_cas_idx == j)[0][0])
+        if len(vir_cas_idx) > 0 and n_pno > 0:
+            C_cas_vir  = mo_coeff_cas[:, vir_cas_idx]
+            SC_pno     = np.dot(s1e, C_pno_ij)
+            U_cas_pno  = np.dot(C_cas_vir.T, SC_pno)
+            t2_cas_ij  = t2_cas[i_cas, j_cas]
+            t2_pno_ij  = reduce(np.dot, (U_cas_pno.T, t2_cas_ij, U_cas_pno))
+        else:
+            t2_pno_ij = np.zeros((n_pno, n_pno))
+        Tt = 2.0 * t2_pno_ij - t2_pno_ij.T
+        e_ij = np.einsum('ab,ab->', K_pno, Tt)
+        return i, j, t2_pno_ij, e_ij, 'cas'
+
+    # -- External pair: CCSD in PNO basis --
+    nocc_pair  = 2
+    nmo_pair   = nocc_pair + n_pno
+    C_lmo_ij   = C_lmo[:, [i, j]]
+    mo_coeff_pair = np.hstack((C_lmo_ij, C_pno_ij))
+
+    mo_energy_pair          = np.zeros(nmo_pair)
+    mo_energy_pair[0]       = eps_lmo[i]
+    mo_energy_pair[1]       = eps_lmo[j]
+    mo_energy_pair[2:]      = e_pno
+    mo_occ_pair             = np.zeros(nmo_pair)
+    mo_occ_pair[:nocc_pair] = 2.0
+
+    # DF integral build (C extension, releases GIL)
+    eri_pair = with_df.ao2mo(mo_coeff_pair, compact=False).reshape(
+        nmo_pair, nmo_pair, nmo_pair, nmo_pair)
+
+    fock_pair_mo   = reduce(np.dot, (mo_coeff_pair.T, fock_ao, mo_coeff_pair))
+    o, v           = slice(0, nocc_pair), slice(nocc_pair, nmo_pair)
+    n_vir          = nmo_pair - nocc_pair
+    nvir_tril      = n_vir * (n_vir + 1) // 2
+
+    eris_pair          = _ChemistsERIs()
+    eris_pair.nocc     = nocc_pair
+    eris_pair.fock     = fock_pair_mo
+    eris_pair.mo_energy = np.diag(fock_pair_mo).real
+    eris_pair.ovov     = eri_pair[o, v, o, v]
+    eris_pair.oovv     = eri_pair[o, o, v, v]
+    eris_pair.ovvo     = eri_pair[o, v, v, o]
+    eris_pair.ovoo     = eri_pair[o, v, o, o]
+    eris_pair.oooo     = eri_pair[o, o, o, o]
+    eris_pair.ovvv     = lib.pack_tril(
+        eri_pair[o, v, v, v].reshape(-1, n_vir, n_vir)
+    ).reshape(nocc_pair, n_vir, nvir_tril)
+    eris_pair.vvvv     = ao2mo.restore(4, eri_pair[v, v, v, v], n_vir)
+
+    fake_mf = _FakeMF(mol=mol, mo_coeff_pair=mo_coeff_pair,
+                      mo_energy_pair=mo_energy_pair, mo_occ_pair=mo_occ_pair,
+                      e_tot=e_tot_hf, fock_ao=fock_ao, _eri=None, verbose=0)
+
+    t1_init = np.zeros((nocc_pair, n_pno))
+    t2_init = np.zeros((nocc_pair, nocc_pair, n_pno, n_pno))
+    if n_pno > 0 and T2_mp2 is not None and T2_mp2.shape == (n_pno, n_pno):
+        t2_init[0, 1] = T2_mp2
+        t2_init[1, 0] = T2_mp2.T
+
+    mycc_pair           = ccsd.CCSD(fake_mf)
+    mycc_pair.verbose   = 0
+    mycc_pair.conv_tol  = conv_tol
+    mycc_pair.max_cycle = max_cycle
+    try:
+        _, _, t2_conv_full = mycc_pair.ccsd(t1_init, t2_init, eris=eris_pair)
+    except Exception:
+        t2_conv_full = t2_init.copy()
+
+    t2_conv = t2_conv_full[0, 1]
+    Tt = 2.0 * t2_conv - t2_conv.T
+    e_ij = np.einsum('ab,ab->', K_pno, Tt)
+    return i, j, t2_conv, e_ij, 'ccsd'
+
+
+# ---------------------------------------------------------------------------
 # Main LCCSD runner
 # ---------------------------------------------------------------------------
 
 def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
               t1_cas, t2_cas, occ_cas_idx, vir_cas_idx,
               mo_coeff_cas, s1e=None,
-              conv_tol=1e-7, max_cycle=50, verbose=None):
+              conv_tol=1e-7, max_cycle=50, ncores=1, verbose=None):
     """Run pair-local CCSD over all strong pairs, injecting CAS amplitudes.
 
     For each strong pair (i,j):
@@ -285,151 +392,41 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
 
     e_tccsd = 0.0
     t2_pno_all = {}
+    n_cas = n_ccsd = n_skip = 0
 
-    n_cas = 0
-    n_ccsd = 0
-    n_skip = 0
+    # Common arguments for _process_one_pair
+    pair_kwargs = dict(
+        pno_spaces=pno_spaces, C_lmo=C_lmo,
+        mol=mol, with_df=mf.with_df, e_tot_hf=mf.e_tot,
+        fock_ao=fock_ao, eps_lmo=eps_lmo,
+        occ_cas_idx=occ_cas_idx, cas_pairs=cas_pairs,
+        t2_cas=t2_cas, vir_cas_idx=vir_cas_idx,
+        mo_coeff_cas=mo_coeff_cas, s1e=s1e,
+        conv_tol=conv_tol, max_cycle=max_cycle,
+    )
 
-    for (i, j) in strong_pairs:
-        if (i, j) not in pno_spaces:
+    if ncores > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=ncores) as pool:
+            futures = {pool.submit(_process_one_pair, pair, **pair_kwargs): pair
+                       for pair in strong_pairs}
+            results = [f.result() for f in as_completed(futures)]
+    else:
+        results = [_process_one_pair(pair, **pair_kwargs) for pair in strong_pairs]
+
+    for (i, j, t2, e_ij, kind) in results:
+        if kind == 'skip':
             n_skip += 1
-            continue
-
-        data = pno_spaces[(i, j)]
-        C_pno_ij = data['C_pno']       # (nao, n_pno)
-        K_pno = data['K_pno']           # (n_pno, n_pno)
-        T2_mp2 = data['T2_pno']         # (n_pno, n_pno) semicanonical MP2
-        e_pno = data['e_pno']           # (n_pno,) PNO orbital energies
-        n_pno = C_pno_ij.shape[1]
-
-        # --- CAS pair: inject DMRG amplitudes directly ---
-        if (i, j) in cas_pairs:
-            # Map CAS amplitude t2_cas[i_cas, j_cas, a_cas, b_cas] to PNO basis
-            # The PNO coefficients C_pno_ij are in AO basis; we need to project
-            # the CAS virtual MOs (mo_coeff[:,vir_cas_idx]) onto the PNO basis.
-            i_cas = int(np.where(occ_cas_idx == i)[0][0])
-            j_cas = int(np.where(occ_cas_idx == j)[0][0])
-
-            if len(vir_cas_idx) > 0 and n_pno > 0:
-                # Overlap of CAS virtual MOs with PNOs in S-metric:
-                # U[a_cas, k_pno] = C_cas_vir[:,a]^T @ S @ C_pno[:,k]
-                C_cas_vir = mo_coeff_cas[:, vir_cas_idx]   # (nao, nvir_cas)
-                SC_pno = np.dot(s1e, C_pno_ij)              # (nao, n_pno)
-                U_cas_pno = np.dot(C_cas_vir.T, SC_pno)    # (nvir_cas, n_pno)
-
-                # Project t2_cas[i_cas, j_cas, :, :] from CAS vir → PNO basis
-                t2_cas_ij = t2_cas[i_cas, j_cas, :, :]     # (nvir_cas, nvir_cas)
-                t2_pno_ij = reduce(np.dot, (U_cas_pno.T, t2_cas_ij, U_cas_pno))
-            else:
-                t2_pno_ij = np.zeros((n_pno, n_pno))
-
-            t2_pno_all[(i, j)] = t2_pno_ij
-
-            # Fragment energy for CAS pair using DMRG amplitudes
-            # For a pair (i,j): e_ij = K_ij * (2*t2 - t2.T)
-            Tt_ij = 2.0 * t2_pno_ij - t2_pno_ij.T
-            e_ij = np.einsum('ab,ab->', K_pno, Tt_ij)
-            e_tccsd += e_ij if i == j else 2.0 * e_ij  # factor 2 for i<j
-
+        elif kind == 'cas':
+            t2_pno_all[(i, j)] = t2
+            e_tccsd += e_ij if i == j else 2.0 * e_ij
             n_cas += 1
             log.debug('Pair (%d,%d): CAS pair, e_ij = %.10g', i, j, e_ij)
-            continue
-
-        # --- External pair: run full CCSD in PNO basis via PySCF ---
-        nocc_pair = 2
-        nmo_pair = nocc_pair + n_pno
-
-        # MO coefficients: [LMO_i, LMO_j, PNO_0, ..., PNO_{n_pno-1}]
-        C_lmo_ij = C_lmo[:, [i, j]]
-        mo_coeff_pair = np.hstack((C_lmo_ij, C_pno_ij))   # (nao, nmo_pair)
-
-        # Fock diagonal in pair MO basis (diagonal approximation: off-diagonal
-        # occ-occ terms included via the full AO Fock passed to CCSD)
-        mo_energy_pair = np.zeros(nmo_pair)
-        mo_energy_pair[0] = eps_lmo[i]
-        mo_energy_pair[1] = eps_lmo[j]
-        mo_energy_pair[2:] = e_pno
-
-        mo_occ_pair = np.zeros(nmo_pair)
-        mo_occ_pair[:nocc_pair] = 2.0
-
-        # Build 4-index ERIs in pair MO basis from DF (all CCSD diagrams included)
-        # Use the DF object's ao2mo method for the transformation
-        eri_pair_flat = mf.with_df.ao2mo(mo_coeff_pair, compact=False)
-        eri_pair = eri_pair_flat.reshape(nmo_pair, nmo_pair, nmo_pair, nmo_pair)
-
-        # Build Fock in pair MO basis (includes off-diagonal occ-occ terms)
-        fock_pair_mo = reduce(np.dot, (mo_coeff_pair.T, fock_ao, mo_coeff_pair))
-
-        # Build a _ChemistsERIs container with all ERI blocks pre-computed.
-        # Must be an actual _ChemistsERIs instance (update_amps checks isinstance).
-        o = slice(0, nocc_pair)
-        v = slice(nocc_pair, nmo_pair)
-        eris_pair = _ChemistsERIs()
-        eris_pair.nocc = nocc_pair
-        eris_pair.fock = fock_pair_mo
-        eris_pair.mo_energy = np.diag(fock_pair_mo).real
-        n_vir_pair_mo = nmo_pair - nocc_pair
-        nvir_pair_tril = n_vir_pair_mo * (n_vir_pair_mo + 1) // 2
-        eris_pair.ovov = eri_pair[o, v, o, v]   # (ia|jb)
-        eris_pair.oovv = eri_pair[o, o, v, v]   # (ij|ab)
-        eris_pair.ovvo = eri_pair[o, v, v, o]   # (ia|bj)
-        eris_pair.ovoo = eri_pair[o, v, o, o]   # (ia|jk)
-        eris_pair.oooo = eri_pair[o, o, o, o]   # (ij|kl)
-        # ovvv: PySCF stores as (nocc, nvir, nvir_pair) packed triangular
-        ovvv_full = eri_pair[o, v, v, v]  # (nocc, nvir, nvir, nvir)
-        eris_pair.ovvv = lib.pack_tril(
-            ovvv_full.reshape(-1, n_vir_pair_mo, n_vir_pair_mo)
-        ).reshape(nocc_pair, n_vir_pair_mo, nvir_pair_tril)
-        # vvvv: PySCF stores as (nvir_pair, nvir_pair) 4-fold symmetry
-        vvvv_full = eri_pair[v, v, v, v]  # (nvir, nvir, nvir, nvir)
-        eris_pair.vvvv = ao2mo.restore(4, vvvv_full, n_vir_pair_mo)
-
-        # Build minimal fake_mf (needed only for ccsd.CCSD initialization)
-        fake_mf = _FakeMF(
-            mol=mol,
-            mo_coeff_pair=mo_coeff_pair,
-            mo_energy_pair=mo_energy_pair,
-            mo_occ_pair=mo_occ_pair,
-            e_tot=mf.e_tot,
-            fock_ao=fock_ao,
-            _eri=None,
-            verbose=0,
-        )
-
-        # Initialize from MP2 amplitudes for faster convergence
-        t1_init = np.zeros((nocc_pair, n_pno))
-        t2_init = np.zeros((nocc_pair, nocc_pair, n_pno, n_pno))
-        if n_pno > 0 and T2_mp2 is not None and T2_mp2.shape == (n_pno, n_pno):
-            t2_init[0, 1, :, :] = T2_mp2
-            t2_init[1, 0, :, :] = T2_mp2.T
-
-        # Call CCSD directly with pre-computed ERIs (bypasses ao2mo step)
-        mycc_pair = ccsd.CCSD(fake_mf)
-        mycc_pair.verbose = 0
-        mycc_pair.conv_tol = conv_tol
-        mycc_pair.max_cycle = max_cycle
-
-        try:
-            e_pair, t1_conv, t2_conv_full = mycc_pair.ccsd(
-                t1_init, t2_init, eris=eris_pair)
-        except Exception as e_err:
-            import traceback
-            log.warn('Pair (%d,%d) CCSD failed: %s\n%s',
-                     i, j, e_err, traceback.format_exc())
-            t2_conv_full = t2_init.copy()
-
-        # Extract pair t2[0,1,:,:] (the unique (i,j) block in PNO basis)
-        t2_conv = t2_conv_full[0, 1, :, :]   # (n_pno, n_pno)
-        t2_pno_all[(i, j)] = t2_conv
-
-        # Fragment energy for pair (i,j): e = K_ij * (2*t2 - t2.T)
-        Tt_conv = 2.0 * t2_conv - t2_conv.T
-        e_ij = np.einsum('ab,ab->', K_pno, Tt_conv)
-        e_tccsd += e_ij if i == j else 2.0 * e_ij  # factor 2 for i<j
-
-        n_ccsd += 1
-        log.debug('Pair (%d,%d): CCSD  n_pno=%d  e_ij = %.10g', i, j, n_pno, e_ij)
+        else:  # 'ccsd'
+            t2_pno_all[(i, j)] = t2
+            e_tccsd += e_ij if i == j else 2.0 * e_ij
+            n_ccsd += 1
+            log.debug('Pair (%d,%d): CCSD  e_ij = %.10g', i, j, e_ij)
 
     log.info('LCCSD: %d CAS pairs, %d CCSD pairs, %d skipped', n_cas, n_ccsd, n_skip)
     log.info('E_TCCSD (strong pairs) = %.15g', e_tccsd)
