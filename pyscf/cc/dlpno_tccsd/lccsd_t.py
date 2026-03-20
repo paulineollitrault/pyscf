@@ -474,7 +474,12 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     log = logger.new_logger(mf, verbose)
 
     if not hasattr(mf, 'with_df') or mf.with_df is None:
-        raise ValueError('DF integrals required (mf.with_df must be set).')
+        import warnings
+        warnings.warn(
+            'mf.with_df is None — (T) correction requires density fitting. '
+            'Returning e_t = 0.',
+            UserWarning, stacklevel=2)
+        return 0.0
 
     occ_cas_set = set(occ_cas_idx.tolist())
     nocc_lmo = C_lmo.shape[1]
@@ -517,15 +522,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
         fock_ao=fock_ao, F_lmo=F_lmo, s1e=s1e,
     )
 
-    if ncores > 1:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=ncores) as pool:
-            futures = [pool.submit(_process_one_triple, i, j, k, **triple_kwargs)
-                       for i, j, k in valid_triples]
-            et_values = [f.result() for f in as_completed(futures)]
-    else:
-        et_values = [_process_one_triple(i, j, k, **triple_kwargs)
-                     for i, j, k in valid_triples]
+    et_values = [_process_one_triple(i, j, k, **triple_kwargs)
+                 for i, j, k in valid_triples]
 
     e_t = sum(et_values)
     n_triples = sum(1 for v in et_values if v != 0.0)

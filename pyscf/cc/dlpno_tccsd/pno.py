@@ -97,6 +97,7 @@ def _pair_K_iajb(ovL_i, ovL_j):
 
 def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
               T_CutPNO=1e-7, T_CutPairs=1e-4, S_cut_domain=1e-6,
+              occ_cas_idx=None, C_cas_vir=None, nvir_cas=0, s1e=None,
               verbose=None):
     """Construct PNO spaces for all LMO pairs and compute LMP2 energies.
 
@@ -145,12 +146,22 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     # This allows us to extract pair domains by slicing columns.
     # Memory: nocc_lmo * nao * naux doubles — may be large. For large systems,
     # implement blocked (occ,domain) approach. Here we use the simple incore path.
-    if not hasattr(mf, 'with_df') or mf.with_df is None:
-        raise ValueError('DF integrals required. Use mf = scf.RHF(mol).density_fit()')
-
-    log.info('Building LMO/PAO DF 3-index integrals...')
-    ovL = _build_ovL(mf.with_df, C_lmo, C_pao, max_memory=mf.max_memory)
-    # ovL[i, a, L]: i = LMO index, a = PAO index (global), L = aux index
+    if hasattr(mf, 'with_df') and mf.with_df is not None:
+        log.info('Building LMO/PAO DF 3-index integrals...')
+        ovL = _build_ovL(mf.with_df, C_lmo, C_pao, max_memory=mf.max_memory)
+        # ovL[i, a, L]: i = LMO index, a = PAO index (global), L = aux index
+        use_df = True
+    else:
+        log.info('Building LMO/PAO exact 4-index integrals (no density fitting)...')
+        from pyscf import ao2mo as _ao2mo_mod
+        nocc_lmo_tmp, npao_tmp = C_lmo.shape[1], C_pao.shape[1]
+        nmo_tmp = nocc_lmo_tmp + npao_tmp
+        mo_tmp = np.hstack((C_lmo, C_pao))
+        eri_tmp = _ao2mo_mod.kernel(
+            mf.mol, mo_tmp, compact=False).reshape(nmo_tmp, nmo_tmp, nmo_tmp, nmo_tmp)
+        # K_iajb_exact[i, a, j, b] = (ia|jb)
+        K_iajb_exact = eri_tmp[:nocc_lmo_tmp, nocc_lmo_tmp:, :nocc_lmo_tmp, nocc_lmo_tmp:]
+        use_df = False
 
     # Fock matrix diagonal in LMO basis (needed for denominator)
     fock_ao = mf.get_fock()
@@ -164,6 +175,8 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
 
     n_pairs_strong = 0
     n_pairs_weak = 0
+
+    occ_cas_set = set(occ_cas_idx.tolist()) if occ_cas_idx is not None else set()
 
     for i in range(nocc_lmo):
         for j in range(i, nocc_lmo):
@@ -187,16 +200,18 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             F_dom = F_pao[np.ix_(domain_ij, domain_ij)]  # (n_dom, n_dom)
             F_orth = reduce(np.dot, (X_orth_ij.T, F_dom, X_orth_ij))  # (n_orth, n_orth)
 
-            # K_iajb in orthogonal domain: (ovL_i_dom) @ X_orth, etc.
-            # ovL[i, domain_ij, :] → transform to orthogonal basis
-            ovL_i_dom = ovL[i][domain_ij, :]   # (n_dom, naux)
-            ovL_j_dom = ovL[j][domain_ij, :]   # (n_dom, naux)
-
-            # Transform to orthogonal basis: ovL_i_orth[a,L] = sum_mu X_orth[mu,a] ovL_i[mu,L]
-            ovL_i_orth = np.dot(X_orth_ij.T, ovL_i_dom)   # (n_orth, naux)
-            ovL_j_orth = np.dot(X_orth_ij.T, ovL_j_dom)   # (n_orth, naux)
-
-            K_ij = _pair_K_iajb(ovL_i_orth, ovL_j_orth)   # (n_orth, n_orth)
+            # K_iajb in orthogonal domain
+            if use_df:
+                # ovL[i, domain_ij, :] → transform to orthogonal basis
+                ovL_i_dom = ovL[i][domain_ij, :]   # (n_dom, naux)
+                ovL_j_dom = ovL[j][domain_ij, :]   # (n_dom, naux)
+                ovL_i_orth = np.dot(X_orth_ij.T, ovL_i_dom)   # (n_orth, naux)
+                ovL_j_orth = np.dot(X_orth_ij.T, ovL_j_dom)   # (n_orth, naux)
+                K_ij = _pair_K_iajb(ovL_i_orth, ovL_j_orth)   # (n_orth, n_orth)
+            else:
+                # Exact 4-index: K_iajb_exact[i, :, j, :] → slice domain → transform
+                K_dom_ij = K_iajb_exact[i, :, j, :][np.ix_(domain_ij, domain_ij)]
+                K_ij = X_orth_ij.T @ K_dom_ij @ X_orth_ij    # (n_orth, n_orth)
 
             # --- 4. Semicanonicalize: diagonalize F_orth ---
             # In semicanonical basis, F_vv is diagonal → denominators are exact
@@ -230,39 +245,101 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             pno_occ = pno_occ[order]
             U_pno = U_pno[:, order]
 
-            # --- 7. Truncate PNOs ---
-            # Use abs(occupation) for threshold: off-diagonal pairs (i≠j) have
-            # a non-PSD pair density with negative eigenvalues that still carry
-            # significant energy and must be retained.
+            # --- 7. Build PNO basis ---
+            is_cas_pair = (i in occ_cas_set and j in occ_cas_set
+                           and C_cas_vir is not None and nvir_cas > 0)
+
+            nvir_cas_local = 0
+
+            # Standard PNO truncation (used for all pairs)
             keep = np.abs(pno_occ) > T_CutPNO
             n_pno = int(np.sum(keep))
 
             if n_pno == 0:
-                # Include at least 1 PNO to avoid empty pair
                 n_pno = 1
                 keep[np.argmax(np.abs(pno_occ))] = True
 
-            U_pno_kept = U_pno[:, keep]        # (n_orth, n_pno)
-            n_pno_kept = pno_occ[keep]         # (n_pno,)
+            U_pno_kept = U_pno[:, keep]
+            n_pno_kept = pno_occ[keep]
 
-            # Canonicalize PNOs w.r.t. Fock: diagonalize F in PNO subspace
+            # Canonicalize PNOs w.r.t. Fock
             F_pno_block = reduce(np.dot, (U_pno_kept.T, F_orth, U_pno_kept))
             e_pno_sc, V_pno = np.linalg.eigh(F_pno_block)
-            U_pno_kept = np.dot(U_pno_kept, V_pno)   # (n_orth, n_pno)
+            U_pno_kept = np.dot(U_pno_kept, V_pno)
 
-            # Full transformation: PAO(domain) → semicanonical → PNO
-            # C_pno[:,k] in AO basis: C_pno = C_orth @ U_sc @ U_pno_kept
-            U_full = np.dot(U_sc, U_pno_kept)          # (n_orth, n_pno)
-            C_pno_ij = np.dot(C_orth_ij, U_full)       # (nao, n_pno)
+            if is_cas_pair:
+                # Lang et al. eq (10): S_ij = I_NCAS ⊕ d_ij
+                # The extended PNO space prepends the CAS MOs (identity block)
+                # to the *external* PNOs, which must be orthogonal to the CAS
+                # virtual block.  Without this orthogonalisation the CAS virtual
+                # MOs appear twice (once in columns 0:nvir_cas, once inside the
+                # span of the standard PNOs built from the full PAO domain),
+                # making C_pno_ij rank-deficient and the Jacobi iteration diverge.
+                nvir_cas_local = nvir_cas
 
-            # K and T2 in PNO basis (for LCCSD)
-            K_pno = reduce(np.dot, (U_pno_kept.T, K_sc, U_pno_kept))
-            T2_pno = reduce(np.dot, (U_pno_kept.T, T2_sc, U_pno_kept))
+                # External PNOs in AO basis: standard PNO path
+                U_full_ext = np.dot(U_sc, U_pno_kept)
+                C_ext_pno = np.dot(C_orth_ij, U_full_ext)  # (nao, n_pno_kept)
+
+                # ---- Project CAS virtual directions out of external PNOs ----
+                if s1e is not None and C_ext_pno.shape[1] > 0:
+                    # Gram-Schmidt: remove <cas_vir | S | ext_pno> component
+                    overlap = C_cas_vir.T @ (s1e @ C_ext_pno)   # (nvir_cas, n_ext)
+                    C_ext_pno = C_ext_pno - C_cas_vir @ overlap
+                    # Drop columns with negligible norm (were fully in CAS vir space)
+                    col_norms = np.sqrt(np.maximum(
+                        np.einsum('ip,ip->p', C_ext_pno, s1e @ C_ext_pno), 0.0))
+                    C_ext_pno = C_ext_pno[:, col_norms > 1e-8]
+                    if C_ext_pno.shape[1] > 0:
+                        # Normalize then Löwdin-orthonormalize among themselves
+                        C_ext_pno /= col_norms[col_norms > 1e-8][None, :]
+                        S_ext = C_ext_pno.T @ (s1e @ C_ext_pno)
+                        sv, Vext = np.linalg.eigh(S_ext)
+                        C_ext_pno = (C_ext_pno @ Vext[:, sv > 1e-8]
+                                     / np.sqrt(sv[sv > 1e-8])[None, :])
+
+                # Extended PNO coefficients: [CAS_vir | ext_PNO]
+                C_pno_ij = np.hstack([C_cas_vir, C_ext_pno])
+
+                # Orbital energies: CAS from Fock, ext from Fock in projected basis
+                fock_ao_local = mf.get_fock() if not hasattr(mf, '_fock_cache') else mf._fock_cache
+                F_cas_vir = reduce(np.dot, (C_cas_vir.T, fock_ao_local, C_cas_vir))
+                e_cas_vir = np.diag(F_cas_vir).real
+                if C_ext_pno.shape[1] > 0:
+                    F_ext = C_ext_pno.T @ fock_ao_local @ C_ext_pno
+                    e_ext_sc, V_ext = np.linalg.eigh(F_ext)
+                    C_ext_pno = C_ext_pno @ V_ext          # re-canonicalise
+                    C_pno_ij = np.hstack([C_cas_vir, C_ext_pno])
+                else:
+                    e_ext_sc = np.array([])
+                e_pno_sc = np.concatenate([e_cas_vir, e_ext_sc])
+                n_pno_kept = np.ones(C_pno_ij.shape[1])
+
+                # No domain-based transformations for the CAS block —
+                # K and T2 will be recomputed from DF integrals in lccsd.py
+                # (the pair integral build uses C_pno_ij directly)
+                K_pno = None  # signal to recompute in LCCSD
+                T2_pno = None
+            else:
+                # Full transformation for non-CAS pairs
+                U_full = np.dot(U_sc, U_pno_kept)
+                C_pno_ij = np.dot(C_orth_ij, U_full)
+
+                # K and T2 in PNO basis
+                K_pno = reduce(np.dot, (U_pno_kept.T, K_sc, U_pno_kept))
+                T2_pno = reduce(np.dot, (U_pno_kept.T, T2_sc, U_pno_kept))
 
             # --- 8. LMP2 pair energy ---
-            Tt_pno = 2.0 * T2_pno - T2_pno.T
-            # e_ij = sum_ab K[a,b] * (2*T2[a,b] - T2[b,a])
-            e_ij = np.einsum('ab,ab->', K_pno, Tt_pno)
+            if K_pno is not None:
+                Tt_pno = 2.0 * T2_pno - T2_pno.T
+                e_ij = np.einsum('ab,ab->', K_pno, Tt_pno)
+            else:
+                # CAS pair: compute LMP2 energy from external PNOs only
+                # (the CAS block contribution will come from DMRG)
+                K_ext = reduce(np.dot, (U_pno_kept.T, K_sc, U_pno_kept))
+                T2_ext = reduce(np.dot, (U_pno_kept.T, T2_sc, U_pno_kept))
+                Tt_ext = 2.0 * T2_ext - T2_ext.T
+                e_ij = np.einsum('ab,ab->', K_ext, Tt_ext)
 
             e_lmp2_total += e_ij * (1 if i == j else 2)
 
@@ -277,10 +354,11 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                 'T2_pno': T2_pno,
                 'e_mp2': e_ij,
                 'domain_ij': domain_ij,
-                # Store transformation info for LCCSD integral rebuild
-                'X_orth': X_orth_ij,   # (n_dom, n_orth)
-                'U_full': U_full,      # (n_orth, n_pno)
+                'X_orth': X_orth_ij,
+                'U_full': U_full if not is_cas_pair else None,
                 'domain_idx': domain_ij,
+                'is_cas_pair': is_cas_pair,
+                'nvir_cas_local': nvir_cas_local,
             }
 
             if is_strong:

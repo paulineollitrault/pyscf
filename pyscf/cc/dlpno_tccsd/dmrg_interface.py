@@ -167,6 +167,191 @@ def run_dmrg_casscf(mol, mf, ncas, nelec_cas, maxM=1000,
     return mc
 
 
+def extract_amplitudes_from_mps(driver, ket, ncas, nelec_cas, nocc_cas, nvir_cas, log):
+    """Extract exact CC amplitudes from a pyblock2 MPS via CI projection.
+
+    Uses get_csf_coefficients (SZ mode) to read determinant coefficients
+    directly from the MPS. Converts to CC amplitudes following Lang et al.
+    eq (3)-(4):
+        T_CAS^(1) = C^(1) / C0
+        T_CAS^(2) = C^(2) / C0   (αβ component)
+
+    Args:
+        driver: pyblock2 DMRGDriver (SZ symmetry) with the converged MPS.
+        ket: The converged MPS from DMRG-CI.
+        ncas: Total number of CAS orbitals.
+        nelec_cas: (nalpha, nbeta) active electrons.
+        nocc_cas: Number of CAS occupied orbitals (= nalpha).
+        nvir_cas: Number of CAS virtual orbitals (= ncas - nocc_cas).
+        log: PySCF logger.
+
+    Returns:
+        t1_cas (np.ndarray): Shape (nocc_cas, nvir_cas).
+        t2_cas (np.ndarray): Shape (nocc_cas, nocc_cas, nvir_cas, nvir_cas).
+    """
+    nalpha, nbeta = nelec_cas
+
+    # Build the HF reference determinant in block2's SZ convention:
+    # 0=empty, 1=alpha, 2=beta, 3=doubly occupied
+    ref_det = np.zeros(ncas, dtype=np.uint8)
+    ref_det[:nbeta] = 3
+    ref_det[nbeta:nalpha] = 1
+
+    # Build list of determinants to query
+    dets_list = [ref_det.copy()]
+    det_labels = [('ref', None)]
+
+    # Singles: α excitation i→a
+    for i in range(nocc_cas):
+        for a in range(nvir_cas):
+            a_orb = nocc_cas + a
+            det = ref_det.copy()
+            if det[i] == 3:
+                det[i] = 2
+            elif det[i] == 1:
+                det[i] = 0
+            else:
+                continue
+            if det[a_orb] == 0:
+                det[a_orb] = 1
+            elif det[a_orb] == 2:
+                det[a_orb] = 3
+            else:
+                continue
+            dets_list.append(det)
+            det_labels.append(('s_alpha', (i, a)))
+
+    # Singles: β excitation i→a
+    for i in range(nocc_cas):
+        for a in range(nvir_cas):
+            a_orb = nocc_cas + a
+            det = ref_det.copy()
+            if det[i] == 3:
+                det[i] = 1
+            elif det[i] == 2:
+                det[i] = 0
+            else:
+                continue
+            if det[a_orb] == 0:
+                det[a_orb] = 2
+            elif det[a_orb] == 1:
+                det[a_orb] = 3
+            else:
+                continue
+            dets_list.append(det)
+            det_labels.append(('s_beta', (i, a)))
+
+    # Doubles: αβ excitation i(α)→a(α), j(β)→b(β)
+    for i in range(nocc_cas):
+        for a in range(nvir_cas):
+            a_orb = nocc_cas + a
+            for j in range(nocc_cas):
+                for b in range(nvir_cas):
+                    b_orb = nocc_cas + b
+                    det = ref_det.copy()
+                    # Remove alpha from i
+                    if det[i] == 3:
+                        det[i] = 2
+                    elif det[i] == 1:
+                        det[i] = 0
+                    else:
+                        continue
+                    # Remove beta from j
+                    if det[j] == 3:
+                        det[j] = 1
+                    elif det[j] == 2:
+                        det[j] = 0
+                    else:
+                        continue
+                    # Add alpha to a
+                    if det[a_orb] == 0:
+                        det[a_orb] = 1
+                    elif det[a_orb] == 2:
+                        det[a_orb] = 3
+                    else:
+                        continue
+                    # Add beta to b
+                    if det[b_orb] == 0:
+                        det[b_orb] = 2
+                    elif det[b_orb] == 1:
+                        det[b_orb] = 3
+                    else:
+                        continue
+                    dets_list.append(det)
+                    det_labels.append(('d_ab', (i, j, a, b)))
+
+    dets_array = np.array(dets_list, dtype=np.uint8)
+    n_singles = sum(1 for l, _ in det_labels if l.startswith('s_'))
+    n_doubles = sum(1 for l, _ in det_labels if l == 'd_ab')
+    log.info('Extracting %d CI coefficients from MPS '
+             '(1 ref + %d singles + %d doubles)',
+             len(dets_list), n_singles, n_doubles)
+
+    # Query all determinant coefficients at once
+    _, dvals = driver.get_csf_coefficients(
+        ket, cutoff=0.0, given_dets=dets_array, iprint=0)
+
+    # Extract C0
+    C0 = float(dvals[0])
+    log.info('C0 (HF coefficient from MPS) = %.8f  (|C0|^2 = %.6f)', C0, C0**2)
+    if abs(C0) < 1e-10:
+        raise ValueError(
+            f'Reference CI coefficient C0 ≈ 0 (got {C0:.3e}). '
+            'The HF determinant has negligible weight in the DMRG wavefunction.')
+
+    # ------------------------------------------------------------------
+    # Phase correction: block2 uses site-ordered determinants (α,β
+    # interleaved per site) while PySCF FCI uses spin-ordered (all α
+    # first, then all β).  The reordering phase (-1)^{ΔN_swap} accounts
+    # for this difference, where N_swap counts (β at k, α at k') pairs
+    # with k < k' in the site-ordered product.
+    # ------------------------------------------------------------------
+    def _n_swap(det):
+        """Count β-before-α reordering swaps for site-ordered → spin-ordered."""
+        n = 0
+        alpha_after = 0
+        for k in range(len(det) - 1, -1, -1):
+            if det[k] in (2, 3):  # β present
+                n += alpha_after
+            if det[k] in (1, 3):  # α present
+                alpha_after += 1
+        return n
+
+    n_swap_ref = _n_swap(ref_det)
+
+    # Build t1: average of α and β single excitation coefficients,
+    # with the CC excitation phase and the block2→PySCF reordering phase.
+    #   CC phase for single i→a: (-1)^i * (-1)^(nocc_cas-1)
+    t1_cas = np.zeros((nocc_cas, nvir_cas))
+    for idx, (label, data) in enumerate(det_labels):
+        if label == 's_alpha':
+            i, a = data
+            dn = _n_swap(dets_list[idx]) - n_swap_ref
+            ph_cc = (-1) ** (i + nocc_cas - 1)
+            t1_cas[i, a] += ph_cc * (-1) ** dn * dvals[idx] / C0
+        elif label == 's_beta':
+            i, a = data
+            dn = _n_swap(dets_list[idx]) - n_swap_ref
+            ph_cc = (-1) ** (i + nocc_cas - 1)
+            t1_cas[i, a] += ph_cc * (-1) ** dn * dvals[idx] / C0
+    t1_cas *= 0.5  # average α and β
+
+    # Build t2: αβ double excitation coefficients / C0.
+    # Total phase = (-1)^(i+j) [CC excitation] × (-1)^{ΔN_swap} [reordering].
+
+    t2_cas = np.zeros((nocc_cas, nocc_cas, nvir_cas, nvir_cas))
+    for idx, (label, data) in enumerate(det_labels):
+        if label == 'd_ab':
+            i, j, a, b = data
+            dn = _n_swap(dets_list[idx]) - n_swap_ref
+            phase = (-1) ** (i + j + dn)
+            t2_cas[i, j, a, b] = phase * dvals[idx] / C0
+
+    log.note('CAS amplitudes extracted from MPS via exact CI projection '
+             '(Lang et al. eq 3-4).')
+    return t1_cas, t2_cas
+
+
 def _ci_to_t2(ci, nocc_cas, ncas, nelec_cas):
     """Extract t2 amplitudes from a FCI CI vector by direct projection.
 
@@ -378,44 +563,26 @@ def get_cas_amplitudes(mc, verbose=None):
         log.debug('C0 = %.8f  (|C0|^2 = %.6f)', C0, C0**2)
 
     # ------------------------------------------------------------------
-    # Fallback: spin-free 2-RDM (DMRG without accessible CI vector)
-    # Uses the leading-order formula:
-    #   t2[i,j,a,b] ≈ (2·Γ[a,i,b,j] + Γ[b,i,a,j]) / (6·C0²)
-    # where Γ = spin-free dm2.  This is exact at linear order in t2.
-    # C0² is estimated from the 1-RDM diagonal occupancies.
+    # DMRG fallback: spin-free 2-RDM (approximate, kept for compatibility).
+    # For production use, prefer extract_amplitudes_from_mps() with pyblock2.
     # ------------------------------------------------------------------
     else:
-        log.debug('CI vector not accessible as 2-D array; using spin-free '
-                  '2-RDM formula for t2 (approximate for small active spaces).')
+        log.warn('CI vector not accessible as 2-D array. Using approximate '
+                 'spin-free 2-RDM formula for t2. For exact results, use '
+                 'extract_amplitudes_from_mps() with pyblock2.')
         dm1, dm2 = mc.fcisolver.make_rdm12(mc.ci, ncas, nelec_cas)
-
-        # Estimate C0 from occupied occupation numbers: C0² ≈ Π_i (n_i/2)
-        # This is valid when active occupied orbitals are nearly doubly occupied.
-        n_occ_diag = np.diag(dm1)[:nocc_cas] / 2.0   # ≈ 1 for doubly-occupied
-        n_vir_diag = np.diag(dm1)[nocc_cas:] / 2.0    # ≈ 0 for virtual
+        n_occ_diag = np.diag(dm1)[:nocc_cas] / 2.0
+        n_vir_diag = np.diag(dm1)[nocc_cas:] / 2.0
         C0_sq = float(np.clip(np.prod(n_occ_diag) * np.prod(1.0 - n_vir_diag),
                               1e-6, 1.0))
         C0 = np.sqrt(C0_sq)
-        log.debug('Estimated C0 = %.6f from 1-RDM occupations (C0²=%.6f)', C0, C0_sq)
-
         io = slice(0, nocc_cas)
         iv = slice(nocc_cas, ncas)
-
-        # PySCF spin-free 2-RDM: dm2[p,q,r,s] = <a†_p a†_r a_s a_q> (spin-summed)
-        # Block dm2[a,i,b,j] = Γ[vir,occ,vir,occ]
-        dm2_aibj = dm2[iv, io, iv, io]           # (nvir, nocc, nvir, nocc)
-        # Γ[b,i,a,j] = dm2_aibj with first two virtual indices swapped
-        dm2_biaj = dm2_aibj.transpose(2, 1, 0, 3)   # [a,i,b,j] → dm2[b,i,a,j]
-
-        # t2[i,j,a,b] ≈ (2·Γ[a,i,b,j] + Γ[b,i,a,j]) / (6·C0²)
-        # Derived from: Γ_sf[a,i,b,j] = 4t2[i,j,a,b] - 2t2[i,j,b,a] + O(t2²)
+        dm2_aibj = dm2[iv, io, iv, io]
+        dm2_biaj = dm2_aibj.transpose(2, 1, 0, 3)
         t2_cas = np.einsum('aibj->ijab',
                            2.0 * dm2_aibj + dm2_biaj) / (6.0 * C0_sq)
-
-        # t1 from 1-RDM off-diagonal occ-vir block (≈0 for CASSCF)
         t1_cas = dm1[:nocc_cas, nocc_cas:] / (2.0 * C0)
-        log.note('CAS t2 extracted from spin-free RDM (approximate). '
-                 'For exact results use a standard FCI solver.')
 
     log.info('CAS amplitudes: |t1|=%.4g  |t2|=%.4g',
              np.linalg.norm(t1_cas), np.linalg.norm(t2_cas))

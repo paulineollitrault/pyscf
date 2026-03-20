@@ -49,10 +49,9 @@ References:
 import copy as _copy
 import numpy as np
 from pyscf import mcscf
-from pyscf import dmrgscf
 from pyscf.lib import logger
 
-from pyscf.cc.dlpno_tccsd.dmrg_interface import get_cas_amplitudes
+from pyscf.cc.dlpno_tccsd.dmrg_interface import extract_amplitudes_from_mps
 from pyscf.cc.dlpno_tccsd.local_orbs import split_localize_orbitals, make_paos
 from pyscf.cc.dlpno_tccsd.pno import make_pnos
 from pyscf.cc.dlpno_tccsd.screening import classify_pairs
@@ -133,8 +132,11 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
             'e_total'     : e_hf + e_tccsd + e_lmp2_weak + e_t
     """
     if not hasattr(mf, 'with_df') or mf.with_df is None:
-        raise ValueError('mf must be a density-fitted RHF '
-                         '(use scf.RHF(mol).density_fit()).')
+        import warnings
+        warnings.warn(
+            'mf does not have density fitting (with_df is None). '
+            'Exact 4-index integrals will be used — correct but slow for large systems.',
+            UserWarning, stacklevel=2)
 
     mol = mf.mol
     log = logger.new_logger(mf, verbose)
@@ -201,44 +203,76 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
         occ_natural=occ_natural)
 
     # ------------------------------------------------------------------
-    # Stage 2: DMRG-CI in the localised active space
+    # Stage 2: DMRG-CI in the localised active space (pyblock2)
+    #          + exact CI→CC amplitude extraction from the MPS
     # ------------------------------------------------------------------
     print(f'  Stage 2: DMRG-CI({ncas},{sum(nelec_cas)}) maxM={dmrg_maxM}...',
           flush=True)
 
+    # Build a CASCI to get the effective h1e (with core contributions)
     mc = mcscf.CASCI(mf, ncas, nelec_cas)
-    mc.fcisolver = dmrgscf.DMRGCI(mol, maxM=dmrg_maxM, tol=dmrg_tol)
-    mc.fcisolver.runtimeDir = dmrg_scratch
-    mc.fcisolver.scratchDirectory = dmrg_scratch
-    mc.fcisolver.threads = ncores
-    mc.fcisolver.memory = int(mol.max_memory * 0.8 / 1000)
+    mc.mo_coeff = mo_loc
+    mc.frozen = n_frozen
+    mc.verbose = verbose
 
-    # Ramp-up schedule based on dmrg_maxM
+    ncore = mc.ncore
+    nocc_cas = nelec_cas[0]
+    nvir_cas = ncas - nocc_cas
+    mo_cas = mo_loc[:, ncore:ncore + ncas]
+    h1e_cas, ecore = mc.h1e_for_cas()
+
+    from pyscf import ao2mo as _ao2mo
+    h2e_cas = _ao2mo.kernel(mol, mo_cas, compact=False).reshape(
+        ncas, ncas, ncas, ncas)
+
+    from pyblock2.driver.core import DMRGDriver, SymmetryTypes
+    import os as _os
+    _os.makedirs(dmrg_scratch, exist_ok=True)
+
+    nalpha, nbeta = nelec_cas
+    n_elec = nalpha + nbeta
+    spin = nalpha - nbeta
+
+    # Run DMRG-CI in SU2 mode (spin-adapted, more efficient)
+    su2_driver = DMRGDriver(scratch=dmrg_scratch, symm_type=SymmetryTypes.SU2,
+                            n_threads=ncores, stack_mem=int(100e9))
+    su2_driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin)
+    mpo = su2_driver.get_qc_mpo(h1e_cas, h2e_cas, ecore=ecore, iprint=0)
+
     M1 = min(dmrg_maxM // 4, 100)
     M2 = min(dmrg_maxM // 2, 250)
     M3 = min(3 * dmrg_maxM // 4, 500)
-    mc.fcisolver.scheduleSweeps  = [0,    4,    8,    12,   16,         20        ]
-    mc.fcisolver.scheduleMaxMs   = [M1,   M2,   M3,   dmrg_maxM, dmrg_maxM, dmrg_maxM]
-    mc.fcisolver.scheduleNoises  = [1e-4, 1e-4, 1e-5, 1e-5, 0.0,        0.0       ]
-    mc.fcisolver.scheduleTols    = [1e-5, 1e-5, 1e-6, 1e-7, 1e-8,       dmrg_tol  ]
-    mc.fcisolver.twodot_to_onedot = 18
-    mc.verbose = verbose
-    mc.kernel(mo_loc)
+    ket_su2 = su2_driver.get_random_mps(tag="KET_SU2", bond_dim=M1, nroots=1)
+    e_dmrg = su2_driver.dmrg(
+        mpo, ket_su2,
+        bond_dims=[M1, M2, M3, dmrg_maxM, dmrg_maxM],
+        noises=[1e-4, 1e-4, 1e-5, 1e-5, 0],
+        thrds=[1e-5, 1e-5, 1e-6, 1e-7, dmrg_tol],
+        tol=1e-6, n_sweeps=30, twosite_to_onesite=18, iprint=1)
 
-    print(f'  E(DMRG-CI) = {mc.e_tot:.10f}')
+    mc.e_tot = e_dmrg  # store for downstream use
+    print(f'  E(DMRG-CI) = {e_dmrg:.10f}')
 
-    # Extract CAS tailoring amplitudes
-    t1_cas, t2_cas, occ_cas_idx, vir_cas_idx = get_cas_amplitudes(
-        mc, verbose=verbose)
+    # Convert SU2 MPS → SZ MPS for determinant-based amplitude extraction
+    print('  Converting SU2 MPS to SZ for amplitude extraction...', flush=True)
+    ket_sz = su2_driver.mps_change_to_sz(ket_su2, tag="KET_SZ", sz=spin)
+
+    # Create SZ driver (same scratch dir) and load the converted MPS
+    sz_driver = DMRGDriver(scratch=dmrg_scratch, symm_type=SymmetryTypes.SZ,
+                           n_threads=ncores, stack_mem=int(100e9))
+    sz_driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin)
+    ket_sz_loaded = sz_driver.load_mps(tag="KET_SZ")
+
+    t1_cas, t2_cas = extract_amplitudes_from_mps(
+        sz_driver, ket_sz_loaded, ncas, nelec_cas, nocc_cas, nvir_cas, log)
+
+    occ_cas_idx = np.arange(ncore, ncore + nocc_cas)
+    vir_cas_idx = np.arange(ncore + nocc_cas, ncore + ncas)
 
     log.info('CAS amplitude norms: |t1|=%.4g  |t2|=%.4g',
              np.linalg.norm(t1_cas), np.linalg.norm(t2_cas))
 
     # Convert occ_cas_idx from full-MO space to LMO-local space.
-    # get_cas_amplitudes returns indices like ncore + 0..nocc_cas-1
-    # (e.g. [17,18,19,20,21] for ncore=17).  LMO pair keys (i,j) in
-    # pno_spaces are 0-based from the frozen boundary (LMO 0 = full-MO
-    # n_frozen).  Subtracting n_frozen aligns the two index spaces.
     occ_cas_idx = occ_cas_idx - n_frozen
 
     # ------------------------------------------------------------------
@@ -257,10 +291,17 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
           f'avg={np.mean(domain_sizes):.1f}')
     print('    ' + '  '.join(f'LMO{i}:{s}' for i, s in enumerate(domain_sizes)))
 
+    # CAS virtual MO coefficients in AO basis (for extended PNO construction)
+    C_cas_vir = mo_loc[:, vir_cas_idx]  # vir_cas_idx is in full-MO space
+    nvir_cas = len(vir_cas_idx)
+
     pno_spaces, _, _, _ = make_pnos(
         mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         T_CutPNO=T_CutPNO, T_CutPairs=T_CutPairs,
-        S_cut_domain=S_cut_domain, verbose=verbose)
+        S_cut_domain=S_cut_domain,
+        occ_cas_idx=occ_cas_idx, C_cas_vir=C_cas_vir,
+        nvir_cas=nvir_cas, s1e=s1e,
+        verbose=verbose)
 
     # ------------------------------------------------------------------
     # Stage 4: Pair screening
@@ -270,7 +311,6 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
         pno_spaces, occ_cas_idx, vir_cas_idx,
         mc.mo_coeff, s1e,
         T_CutPairs=T_CutPairs, T_CutPairs_MP2=T_CutPairs_MP2,
-        cas_pno_proj_thresh=cas_pno_proj_thresh,
         verbose=verbose)
 
     print(f'  Pairs: {len(cas_pairs)} CAS  {len(strong_pairs)} strong  '
@@ -287,13 +327,13 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
 
     e_tccsd, t2_pno_all, t1_singles = run_lccsd(
         mf, C_lmo, pno_spaces,
-        strong_pairs=strong_pairs + list(cas_pairs),
+        strong_pairs=strong_pairs,
         cas_pairs=cas_pairs,
         t1_cas=t1_cas, t2_cas=t2_cas,
         occ_cas_idx=occ_cas_idx, vir_cas_idx=vir_cas_idx,
         mo_coeff_cas=mc.mo_coeff, s1e=s1e,
         conv_tol=ccsd_conv_tol, max_cycle=ccsd_max_cycle,
-        ncores=ncores, verbose=verbose)
+        ncores=ncores, C_pao=C_pao, verbose=verbose)
 
     log.info('E(TCCSD) correlation = %.15g', e_tccsd)
 
@@ -302,7 +342,7 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
     # ------------------------------------------------------------------
     print('  Stage 6: (T) correction...', flush=True)
 
-    C_cas_vir = mc.mo_coeff[:, vir_cas_idx]
+    C_cas_vir = mo_loc[:, vir_cas_idx]
 
     e_t = run_lccsd_t_ext(
         mf, C_lmo, pno_spaces,

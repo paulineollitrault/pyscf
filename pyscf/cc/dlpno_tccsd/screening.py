@@ -29,13 +29,12 @@ from pyscf.lib import logger
 def classify_pairs(pno_spaces, occ_cas_idx, vir_cas_idx,
                    mo_coeff, s1e,
                    T_CutPairs=1e-4, T_CutPairs_MP2=1e-6,
-                   cas_pno_proj_thresh=0.99,
                    verbose=None):
     """Classify all LMO pairs into CAS / strong / weak / negligible.
 
-    This routine performs the final pair classification after PNO construction.
-    The CAS pair check verifies both the occupied-index criterion and the
-    PNO-in-CAS-virtual criterion using an S-metric projection.
+    CAS pairs are identified purely by occupancy: both i,j must be in the
+    CAS occupied space. CAS pairs are also added to strong_pairs so they
+    go through tailored CCSD with extended PNOs.
 
     Args:
         pno_spaces (dict): Output of pno.make_pnos.
@@ -56,8 +55,6 @@ def classify_pairs(pno_spaces, occ_cas_idx, vir_cas_idx,
         e_lmp2_weak (float): LMP2 energy contribution from weak pairs.
         e_lmp2_strong (float): LMP2 energy from strong pairs (for delta-PT2).
     """
-    from pyscf.cc.dlpno_tccsd.pno import check_pno_in_cas_vir
-
     log = logger.new_logger(None, verbose)
 
     occ_cas_set = set(occ_cas_idx.tolist())
@@ -78,18 +75,14 @@ def classify_pairs(pno_spaces, occ_cas_idx, vir_cas_idx,
             negligible_pairs.append((i, j))
             continue
 
-        # Check CAS pair criteria
+        # CAS pair: both occupied indices in CAS occupied space
         is_cas_occ = (i in occ_cas_set) and (j in occ_cas_set)
-        if is_cas_occ and len(vir_cas_idx) > 0:
-            pno_in_cas = check_pno_in_cas_vir(
-                data['C_pno'], mo_coeff, vir_cas_idx, s1e, cas_pno_proj_thresh)
-        else:
-            pno_in_cas = False
-
-        if is_cas_occ and pno_in_cas:
+        if is_cas_occ:
             cas_pairs.add((i, j))
-            # CAS pairs still contribute their DMRG amplitude-based energy
-            # (not LMP2), but we track e_ij for bookkeeping
+            # CAS pairs are also strong pairs — they go through tailored CCSD
+            strong_pairs.append((i, j))
+            fac = 1.0 if i == j else 2.0
+            e_lmp2_strong += fac * e_ij
             continue
 
         fac = 1.0 if i == j else 2.0  # factor 2 for i<j pairs
