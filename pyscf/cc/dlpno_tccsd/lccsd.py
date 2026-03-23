@@ -676,7 +676,7 @@ def _run_global_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         t2_ij = t2[pi, pj] if pi <= pj else t2[pj, pi].T
         t2_pno_all[key] = S.T @ t2_ij @ S     # (n_pno, n_pno)
 
-    return e_total, t2_pno_all
+    return e_total, t2_pno_all, t1
 
 
 # ---------------------------------------------------------------------------
@@ -1004,7 +1004,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         e_ij = np.einsum('ab,ab->', K, Tt)
         e_total += e_ij if i == j else 2.0 * e_ij
 
-    return e_total, t2_pno_all
+    return e_total, t2_pno_all, t1_can
 
 
 # ---------------------------------------------------------------------------
@@ -1544,7 +1544,7 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
                  and vir_cas_idx is not None and mo_coeff_cas is not None
                  and len(vir_cas_idx) > 0)
     if has_tccsd:
-        e_tccsd, t2_pno_all = _run_global_lccsd(
+        e_tccsd, t2_pno_all, t1_can = _run_global_lccsd(
             mf, C_lmo, pno_spaces, strong_pairs,
             fock_ao, eps_lmo, s1e, conv_tol, max_cycle,
             t2_cas=t2_cas, occ_cas_idx=occ_cas_idx,
@@ -1552,18 +1552,12 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
     else:
         # No TCCSD: DLPNO-CCSD with per-pair PNO virtual spaces.
         # Converges to canonical CCSD when T_CutPNO→0.
-        e_tccsd, t2_pno_all = _run_dlpno_lccsd(
+        e_tccsd, t2_pno_all, t1_can = _run_dlpno_lccsd(
             mf, C_lmo, pno_spaces, strong_pairs,
             fock_ao, eps_lmo, s1e, conv_tol, max_cycle)
     print(f'  E_TCCSD = {e_tccsd:.15g}', flush=True)
 
-    # Return zero singles (t1-transformed Hamiltonian approach folds singles in)
-    nmo_full = mo_coeff_cas.shape[1]
-    nocc_full = np.count_nonzero(mf.mo_occ > 1e-10)
-    nvir_full = nmo_full - nocc_full
-    t1_singles = np.zeros((nocc_lmo, nvir_full))
-
-    return e_tccsd, t2_pno_all, t1_singles
+    return e_tccsd, t2_pno_all, t1_can
 
 
 def _solve_pair_ccsd(eris, fock, nocc, nvir,

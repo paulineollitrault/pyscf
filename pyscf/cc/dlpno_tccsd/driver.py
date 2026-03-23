@@ -135,7 +135,9 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
         import warnings
         warnings.warn(
             'mf does not have density fitting (with_df is None). '
-            'Exact 4-index integrals will be used — correct but slow for large systems.',
+            'Exact 4-index integrals will be used for LCCSD — correct but slow '
+            'for large systems. Note: the (T) correction requires density '
+            'fitting and will return 0.',
             UserWarning, stacklevel=2)
 
     mol = mf.mol
@@ -348,6 +350,7 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
         mf, C_lmo, pno_spaces,
         strong_pairs=strong_pairs,
         t2_pno_all=t2_pno_all,
+        t1_can=t1_singles,
         occ_cas_idx=occ_cas_idx,
         C_cas_vir=C_cas_vir,
         vir_cas_idx=vir_cas_idx,
