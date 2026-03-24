@@ -383,4 +383,5 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
         'C_lmo':        C_lmo,
         'pno_spaces':   pno_spaces,
         't2_pno_all':   t2_pno_all,
+        't1_singles':   t1_singles,
     }
