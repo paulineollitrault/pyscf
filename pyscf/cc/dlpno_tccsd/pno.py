@@ -78,6 +78,55 @@ def _build_ovL(with_df, C_occ, C_vir, max_memory=4000):
     return ovL
 
 
+def _build_ovL_batched(with_df, C_occ, C_vir_list, max_memory=4000):
+    """Build (occ,vir|L) for multiple virtual spaces in a single DF pass.
+
+    Instead of calling _build_ovL once per PNO space (each iterating over
+    all DF chunks), this function reads the DF file once and transforms
+    all virtual spaces in the inner loop.  The occ half-transform is
+    shared across all spaces, saving (n_spaces - 1) full DF reads.
+
+    Args:
+        with_df: PySCF DF object (mf.with_df).
+        C_occ (np.ndarray): (nao, nocc).
+        C_vir_list (list[np.ndarray]): List of (nao, nvir_k) arrays.
+        max_memory (int): Memory limit in MB (advisory).
+
+    Returns:
+        list[np.ndarray]: ovL_k of shape (nocc, nvir_k, naux) for each k.
+    """
+    from pyscf.lib import unpack_tril
+
+    nao, nocc = C_occ.shape
+    naux = with_df.get_naoaux()
+
+    # Pre-allocate outputs
+    results = []
+    for C_vir in C_vir_list:
+        nvir = C_vir.shape[1]
+        results.append(np.empty((nocc, nvir, naux)))
+
+    p1 = 0
+    for Lpq in with_df.loop():
+        nL = Lpq.shape[0]
+        p0 = p1
+        p1 = p0 + nL
+        # Half-transform to occ: L_occ[L,i,μ] = Σ_ν Lpq[L,μν] * C_occ[ν,i]
+        L_ao = unpack_tril(Lpq)              # (nL, nao, nao)
+        L_occ = np.tensordot(L_ao, C_occ, axes=([2], [0]))  # (nL, nao, nocc)
+        Lpq = L_ao = None  # free memory
+        # Complete transform for each virtual space
+        for idx, C_vir in enumerate(C_vir_list):
+            if C_vir.shape[1] == 0:
+                continue
+            # ovL_chunk[L,i,a] = Σ_μ L_occ[L,μ,i] * C_vir[μ,a]
+            ovL_chunk = np.tensordot(
+                L_occ, C_vir, axes=([1], [0]))  # (nL, nocc, nvir)
+            results[idx][:, :, p0:p1] = ovL_chunk.transpose(1, 2, 0)
+
+    return results
+
+
 def _pair_K_iajb(ovL_i, ovL_j):
     """Compute exchange integral K_iajb = (ia|jb) from DF 3-index tensors.
 
