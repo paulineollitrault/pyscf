@@ -262,8 +262,10 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             U_pno_kept = U_pno[:, keep]
             n_pno_kept = pno_occ[keep]
 
-            # Canonicalize PNOs w.r.t. Fock
-            F_pno_block = reduce(np.dot, (U_pno_kept.T, F_orth, U_pno_kept))
+            # Canonicalize PNOs w.r.t. Fock (in semicanonical basis)
+            # U_pno_kept lives in the semicanonical basis where F = diag(eps_sc)
+            F_sc_diag = np.diag(eps_sc)
+            F_pno_block = reduce(np.dot, (U_pno_kept.T, F_sc_diag, U_pno_kept))
             e_pno_sc, V_pno = np.linalg.eigh(F_pno_block)
             U_pno_kept = np.dot(U_pno_kept, V_pno)
 
