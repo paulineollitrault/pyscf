@@ -420,7 +420,7 @@ def _zero_cas_t2_amplitudes(t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir,
 def _process_one_triple(i, j, k,
                         pno_spaces, t2_for_T,
                         with_df, C_lmo, fock_ao, F_lmo, s1e,
-                        t1_can=None, C_vir_can=None):
+                        t1_pno=None):
     """Compute (T) energy contribution for one triple (i,j,k). Thread-safe.
 
     All inputs are read-only.  DF integral builds (C extensions) and all BLAS
@@ -484,15 +484,22 @@ def _process_one_triple(i, j, k,
     t2_lmo_block[1, 2] = t2_jk_sc;  t2_lmo_block[2, 1] = t2_jk_sc.T
     t2_sc_block = np.einsum('pm,qn,pqAB->mnAB', V_occ_sc, V_occ_sc, t2_lmo_block)
 
-    # Project T1 to semicanonical TNO basis for the V intermediate.
+    # Project local T1 to semicanonical TNO basis for the V intermediate.
     t1_sc = None
     fvo_sc = None
-    if t1_can is not None and C_vir_can is not None:
-        # t1_can: (nocc_lmo, nvir_can) in LMO × canonical virtual basis
-        # Project to TNO-sc: t1_tno_sc[r, c] = V_occ_sc.T @ t1_lmo_tno @ I
-        # where t1_lmo_tno = t1_can @ (C_vir_can.T @ S @ C_tno_sc)
-        U_vir = reduce(np.dot, (C_vir_can.T, s1e, C_tno_sc))  # (nvir_can, n_tno)
-        t1_lmo_tno = t1_can @ U_vir                            # (nocc_lmo, n_tno)
+    if t1_pno is not None:
+        # t1_pno[r]: (n_pno_rr,) in diagonal PNO basis of pair (r,r).
+        # Project each to TNO-sc: t1_lmo_tno[r, :] = U_rr.T @ t1_pno[r]
+        # where U_rr = C_pno_rr.T @ S @ C_tno_sc
+        nocc_lmo = C_lmo.shape[1]
+        t1_lmo_tno = np.zeros((nocc_lmo, n_tno))
+        for r in triple_lmo:
+            key_rr = (r, r)
+            if key_rr in pno_spaces and t1_pno.get(r) is not None:
+                C_pno_rr = pno_spaces[key_rr]['C_pno']
+                if C_pno_rr.shape[1] > 0 and t1_pno[r].size > 0:
+                    U_rr = reduce(np.dot, (C_pno_rr.T, s1e, C_tno_sc))
+                    t1_lmo_tno[r] = U_rr.T @ t1_pno[r]
         t1_triple = t1_lmo_tno[triple_lmo, :]                  # (3, n_tno)
         t1_sc = np.dot(V_occ_sc.T, t1_triple)                  # (3, n_tno)
 
@@ -509,7 +516,7 @@ def _process_one_triple(i, j, k,
 
 def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                     t2_pno_all, occ_cas_idx,
-                    t1_can=None,
+                    t1_pno=None,
                     C_cas_vir=None,
                     vir_cas_idx=None,
                     cas_proj_thresh=0.5,
@@ -533,8 +540,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
         strong_pairs (list): Strong pairs from pair classification.
         t2_pno_all (dict): Converged T2 amplitudes per pair from run_lccsd.
         occ_cas_idx (np.ndarray): CAS occupied indices.
-        t1_can (np.ndarray): (nocc_lmo, nvir_can) T1 in LMO × canonical
-            virtual basis.  If None, the V intermediate is omitted.
+        t1_pno (dict): i → (n_pno_ii,) local T1 amplitudes in diagonal PNO
+            basis (Jiang et al. JCP 2024).  If None, the V intermediate is omitted.
         C_cas_vir (np.ndarray): (nao, n_cas_vir) CAS virtual MO coefficients.
             Required for TCC; if None, T2 zeroing is skipped (warning issued).
         vir_cas_idx (array-like): CAS virtual indices (optional, for logging).
@@ -591,15 +598,11 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             for k in range(j + 1, nocc_lmo):
                 valid_triples.append((i, j, k))
 
-    # Canonical virtual MO coefficients for T1 projection to TNO basis
-    nocc_full = int(np.count_nonzero(mf.mo_occ > 1e-10))
-    C_vir_can = mf.mo_coeff[:, nocc_full:]
-
     triple_kwargs = dict(
         pno_spaces=pno_spaces, t2_for_T=t2_for_T,
         with_df=mf.with_df, C_lmo=C_lmo,
         fock_ao=fock_ao, F_lmo=F_lmo, s1e=s1e,
-        t1_can=t1_can, C_vir_can=C_vir_can,
+        t1_pno=t1_pno,
     )
 
     et_values = [_process_one_triple(i, j, k, **triple_kwargs)

@@ -327,7 +327,7 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
     # ------------------------------------------------------------------
     print('  Stage 5: DLPNO-TCCSD...', flush=True)
 
-    e_tccsd, t2_pno_all, t1_singles = run_lccsd(
+    e_tccsd, t2_pno_all, t1_pno = run_lccsd(
         mf, C_lmo, pno_spaces,
         strong_pairs=strong_pairs,
         cas_pairs=cas_pairs,
@@ -350,7 +350,7 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
         mf, C_lmo, pno_spaces,
         strong_pairs=strong_pairs,
         t2_pno_all=t2_pno_all,
-        t1_can=t1_singles,
+        t1_pno=t1_pno,
         occ_cas_idx=occ_cas_idx,
         C_cas_vir=C_cas_vir,
         vir_cas_idx=vir_cas_idx,
@@ -383,5 +383,5 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
         'C_lmo':        C_lmo,
         'pno_spaces':   pno_spaces,
         't2_pno_all':   t2_pno_all,
-        't1_singles':   t1_singles,
+        't1_pno':       t1_pno,
     }
