@@ -576,7 +576,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
         t2_for_T = _zero_cas_t2_amplitudes(
             t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir, s1e, cas_proj_thresh)
     else:
-        log.warn('TCC (T): C_cas_vir not provided — T2 amplitudes not zeroed!')
+        if C_cas_vir is None and len(occ_cas_set) > 0:
+            log.warn('TCC (T): C_cas_vir not provided — T2 amplitudes not zeroed!')
         t2_for_T = t2_pno_all
 
     # Fock diagonal in LMO basis for occupied orbital energies

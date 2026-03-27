@@ -59,7 +59,7 @@ from pyscf.cc.dlpno_tccsd.lccsd import run_lccsd
 from pyscf.cc.dlpno_tccsd.lccsd_t import run_lccsd_t_ext
 
 
-def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
+def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
                       frozen=0,
                       ncores=1,
                       lmo_method='pipek-mezey',
@@ -75,12 +75,16 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
                       ccsd_conv_tol=1e-7,
                       ccsd_max_cycle=50,
                       verbose=4):
-    """Run DMRG-DLPNO-TCCSD(T).
+    """Run DMRG-DLPNO-TCCSD(T), or plain DLPNO-CCSD(T) when ncas is None.
+
+    When ncas is None (or 0), the DMRG/CAS stages are skipped entirely and
+    the calculation reduces to a standard DLPNO-CCSD(T).
 
     The caller provides:
       - mf:      converged DF-RHF
-      - ncas:    number of active (CAS) orbitals
-      - nelec:   number of active electrons (int or (nalpha, nbeta))
+      - ncas:    number of active (CAS) orbitals, or None/0 for plain DLPNO-CCSD
+      - nelec:   number of active electrons (int or (nalpha, nbeta));
+                 ignored when ncas is None
       - mo_init: (nao, nmo) initial MO matrix with subspaces already in the
                  intended order: frozen-core | inactive-occ | active-occ |
                  active-vir | external-vir.  Typically the MP2 natural orbital
@@ -90,18 +94,20 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
     The driver then:
       1. Split-localises each orbital subspace independently (Pipek-Mezey by
          default) so that CAS and inactive occupied are separately localised.
-      2. Runs DMRG-CI in the localised active space to obtain tailoring
-         amplitudes.
+         For plain DLPNO-CCSD, all occupied orbitals are localised together.
+      2. Runs DMRG-CI in the localised active space → tailoring amplitudes.
+         (Skipped for plain DLPNO-CCSD.)
       3. Builds PAOs and PNOs in the same local basis.
       4. Classifies pairs (CAS / strong / weak / negligible).
-      5. Runs DLPNO-TCCSD tailored by DMRG.
+      5. Runs DLPNO-TCCSD (with DMRG tailoring) or DLPNO-CCSD.
       6. Adds the external (T) correction.
 
     Args:
         mf: Converged DF-RHF (scf.RHF(mol).density_fit()).
-        ncas (int): Number of CAS orbitals.
-        nelec (int or tuple): Active electrons.  If int, assumed closed-shell
-            (nelec//2, nelec//2).
+        ncas (int or None): Number of CAS orbitals.  None or 0 for plain
+            DLPNO-CCSD(T) without active space.
+        nelec (int, tuple, or None): Active electrons.  If int, assumed
+            closed-shell (nelec//2, nelec//2).  Ignored when ncas is None.
         mo_init (np.ndarray, optional): Initial MO coefficient matrix
             (nao, nmo) with subspaces arranged as described above.
         frozen (int or list): Frozen-core MOs excluded from correlation.
@@ -125,12 +131,19 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
     Returns:
         result (dict):
             'e_hf'        : HF total energy
-            'e_dmrg'      : DMRG-CI total energy (localised active space)
+            'e_dmrg'      : DMRG-CI total energy (None for plain DLPNO-CCSD)
             'e_lmp2_weak' : LMP2 correction from weak pairs
             'e_tccsd'     : DLPNO-TCCSD correlation energy (strong pairs)
             'e_t'         : External (T) correction
             'e_total'     : e_hf + e_tccsd + e_lmp2_weak + e_t
     """
+    # ------------------------------------------------------------------
+    # Determine whether this is a plain DLPNO-CCSD or TCCSD calculation
+    # ------------------------------------------------------------------
+    no_cas = (ncas is None or ncas == 0)
+    if no_cas:
+        ncas = 0
+
     if not hasattr(mf, 'with_df') or mf.with_df is None:
         import warnings
         warnings.warn(
@@ -145,6 +158,8 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
 
     nmo = mf.mo_coeff.shape[1]
     nocc = int(np.count_nonzero(mf.mo_occ > 1e-10))
+    method_label = 'DLPNO-CCSD(T)' if no_cas else 'DMRG-DLPNO-TCCSD(T)'
+    print(f'  {method_label}')
     print(f'  Basis: {mol.basis}  |  nMO: {nmo}  (occ: {nocc}  vir: {nmo - nocc})'
           f'  |  ncores: {ncores}')
 
@@ -154,7 +169,9 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
 
     # Normalise nelec to (nalpha, nbeta)
     mol_spin = mol.spin   # = 2*S; 0 for singlet, 2 for triplet, etc.
-    if isinstance(nelec, (int, np.integer)):
+    if no_cas:
+        nelec_cas = (0, 0)
+    elif isinstance(nelec, (int, np.integer)):
         n = int(nelec)
         if mol_spin > 0:
             nelec_cas = ((n + mol_spin) // 2, (n - mol_spin) // 2)
@@ -188,94 +205,125 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
     mf_init = _copy.copy(mf)
     mf_init.mo_coeff = mo_init
 
-    # For open-shell (ROHF), provide natural orbital occupations so that
-    # the active occupied subspace is split into doubly/singly occupied
-    # blocks before localization (Lang et al. JCTC 2020).
-    # In the MP2 NO ordering (descending NOON), the last mol_spin active
-    # occupied orbitals are the SOMOs (NOON ≈ 1.0).
-    occ_natural = None
-    if mol_spin > 0:
-        nocc_cas_a = nelec_cas[0]
-        n_docc = max(0, nocc_cas_a - mol_spin)
-        occ_natural = np.array([2.0] * n_docc + [1.0] * mol_spin)
+    if no_cas:
+        # Plain DLPNO-CCSD: localise all occupied orbitals together
+        from pyscf import lo
+        nocc_full = np.count_nonzero(mf.mo_occ > 1e-10)
+        C_occ = mo_init[:, n_frozen:nocc_full]
+        if C_occ.shape[1] > 1:
+            if lmo_method.lower() in ('pipek-mezey', 'pm'):
+                mlo = lo.PipekMezey(mol, C_occ)
+            elif lmo_method.lower() == 'boys':
+                mlo = lo.Boys(mol, C_occ)
+            else:
+                mlo = None
+            if mlo is not None:
+                mlo.verbose = 0
+                C_lmo = mlo.kernel()
+            else:
+                C_lmo = C_occ
+        else:
+            C_lmo = C_occ
+        mo_loc = mo_init.copy()
+        mo_loc[:, n_frozen:nocc_full] = C_lmo
+    else:
+        # TCCSD: split-localise each orbital subspace independently
+        # For open-shell (ROHF), provide natural orbital occupations so that
+        # the active occupied subspace is split into doubly/singly occupied
+        # blocks before localization (Lang et al. JCTC 2020).
+        occ_natural = None
+        if mol_spin > 0:
+            nocc_cas_a = nelec_cas[0]
+            n_docc = max(0, nocc_cas_a - mol_spin)
+            occ_natural = np.array([2.0] * n_docc + [1.0] * mol_spin)
 
-    mo_loc, C_lmo = split_localize_orbitals(
-        mf_init, ncas, nelec_cas,
-        method=lmo_method, frozen=n_frozen,
-        occ_natural=occ_natural)
+        mo_loc, C_lmo = split_localize_orbitals(
+            mf_init, ncas, nelec_cas,
+            method=lmo_method, frozen=n_frozen,
+            occ_natural=occ_natural)
 
     # ------------------------------------------------------------------
     # Stage 2: DMRG-CI in the localised active space (pyblock2)
     #          + exact CI→CC amplitude extraction from the MPS
+    #          (Skipped for plain DLPNO-CCSD)
     # ------------------------------------------------------------------
-    print(f'  Stage 2: DMRG-CI({ncas},{sum(nelec_cas)}) maxM={dmrg_maxM}...',
-          flush=True)
+    if no_cas:
+        print('  Stage 2: Skipped (no active space — plain DLPNO-CCSD)', flush=True)
+        t1_cas = None
+        t2_cas = None
+        occ_cas_idx = np.array([], dtype=int)
+        vir_cas_idx = np.array([], dtype=int)
+        mc = None
+        e_dmrg = None
+    else:
+        print(f'  Stage 2: DMRG-CI({ncas},{sum(nelec_cas)}) maxM={dmrg_maxM}...',
+              flush=True)
 
-    # Build a CASCI to get the effective h1e (with core contributions)
-    mc = mcscf.CASCI(mf, ncas, nelec_cas)
-    mc.mo_coeff = mo_loc
-    mc.frozen = n_frozen
-    mc.verbose = verbose
+        # Build a CASCI to get the effective h1e (with core contributions)
+        mc = mcscf.CASCI(mf, ncas, nelec_cas)
+        mc.mo_coeff = mo_loc
+        mc.frozen = n_frozen
+        mc.verbose = verbose
 
-    ncore = mc.ncore
-    nocc_cas = nelec_cas[0]
-    nvir_cas = ncas - nocc_cas
-    mo_cas = mo_loc[:, ncore:ncore + ncas]
-    h1e_cas, ecore = mc.h1e_for_cas()
+        ncore = mc.ncore
+        nocc_cas = nelec_cas[0]
+        nvir_cas = ncas - nocc_cas
+        mo_cas = mo_loc[:, ncore:ncore + ncas]
+        h1e_cas, ecore = mc.h1e_for_cas()
 
-    from pyscf import ao2mo as _ao2mo
-    h2e_cas = _ao2mo.kernel(mol, mo_cas, compact=False).reshape(
-        ncas, ncas, ncas, ncas)
+        from pyscf import ao2mo as _ao2mo
+        h2e_cas = _ao2mo.kernel(mol, mo_cas, compact=False).reshape(
+            ncas, ncas, ncas, ncas)
 
-    from pyblock2.driver.core import DMRGDriver, SymmetryTypes
-    import os as _os
-    _os.makedirs(dmrg_scratch, exist_ok=True)
+        from pyblock2.driver.core import DMRGDriver, SymmetryTypes
+        import os as _os
+        _os.makedirs(dmrg_scratch, exist_ok=True)
 
-    nalpha, nbeta = nelec_cas
-    n_elec = nalpha + nbeta
-    spin = nalpha - nbeta
+        nalpha, nbeta = nelec_cas
+        n_elec = nalpha + nbeta
+        spin = nalpha - nbeta
 
-    # Run DMRG-CI in SU2 mode (spin-adapted, more efficient)
-    su2_driver = DMRGDriver(scratch=dmrg_scratch, symm_type=SymmetryTypes.SU2,
-                            n_threads=ncores, stack_mem=int(100e9))
-    su2_driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin)
-    mpo = su2_driver.get_qc_mpo(h1e_cas, h2e_cas, ecore=ecore, iprint=0)
+        # Run DMRG-CI in SU2 mode (spin-adapted, more efficient)
+        su2_driver = DMRGDriver(scratch=dmrg_scratch, symm_type=SymmetryTypes.SU2,
+                                n_threads=ncores, stack_mem=int(100e9))
+        su2_driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin)
+        mpo = su2_driver.get_qc_mpo(h1e_cas, h2e_cas, ecore=ecore, iprint=0)
 
-    M1 = min(dmrg_maxM // 4, 100)
-    M2 = min(dmrg_maxM // 2, 250)
-    M3 = min(3 * dmrg_maxM // 4, 500)
-    ket_su2 = su2_driver.get_random_mps(tag="KET_SU2", bond_dim=M1, nroots=1)
-    e_dmrg = su2_driver.dmrg(
-        mpo, ket_su2,
-        bond_dims=[M1, M2, M3, dmrg_maxM, dmrg_maxM],
-        noises=[1e-4, 1e-4, 1e-5, 1e-5, 0],
-        thrds=[1e-5, 1e-5, 1e-6, 1e-7, dmrg_tol],
-        tol=1e-6, n_sweeps=30, twosite_to_onesite=18, iprint=1)
+        M1 = min(dmrg_maxM // 4, 100)
+        M2 = min(dmrg_maxM // 2, 250)
+        M3 = min(3 * dmrg_maxM // 4, 500)
+        ket_su2 = su2_driver.get_random_mps(tag="KET_SU2", bond_dim=M1, nroots=1)
+        e_dmrg = su2_driver.dmrg(
+            mpo, ket_su2,
+            bond_dims=[M1, M2, M3, dmrg_maxM, dmrg_maxM],
+            noises=[1e-4, 1e-4, 1e-5, 1e-5, 0],
+            thrds=[1e-5, 1e-5, 1e-6, 1e-7, dmrg_tol],
+            tol=1e-6, n_sweeps=30, twosite_to_onesite=18, iprint=1)
 
-    mc.e_tot = e_dmrg  # store for downstream use
-    print(f'  E(DMRG-CI) = {e_dmrg:.10f}')
+        mc.e_tot = e_dmrg  # store for downstream use
+        print(f'  E(DMRG-CI) = {e_dmrg:.10f}')
 
-    # Convert SU2 MPS → SZ MPS for determinant-based amplitude extraction
-    print('  Converting SU2 MPS to SZ for amplitude extraction...', flush=True)
-    ket_sz = su2_driver.mps_change_to_sz(ket_su2, tag="KET_SZ", sz=spin)
+        # Convert SU2 MPS → SZ MPS for determinant-based amplitude extraction
+        print('  Converting SU2 MPS to SZ for amplitude extraction...', flush=True)
+        ket_sz = su2_driver.mps_change_to_sz(ket_su2, tag="KET_SZ", sz=spin)
 
-    # Create SZ driver (same scratch dir) and load the converted MPS
-    sz_driver = DMRGDriver(scratch=dmrg_scratch, symm_type=SymmetryTypes.SZ,
-                           n_threads=ncores, stack_mem=int(100e9))
-    sz_driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin)
-    ket_sz_loaded = sz_driver.load_mps(tag="KET_SZ")
+        # Create SZ driver (same scratch dir) and load the converted MPS
+        sz_driver = DMRGDriver(scratch=dmrg_scratch, symm_type=SymmetryTypes.SZ,
+                               n_threads=ncores, stack_mem=int(100e9))
+        sz_driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin)
+        ket_sz_loaded = sz_driver.load_mps(tag="KET_SZ")
 
-    t1_cas, t2_cas = extract_amplitudes_from_mps(
-        sz_driver, ket_sz_loaded, ncas, nelec_cas, nocc_cas, nvir_cas, log)
+        t1_cas, t2_cas = extract_amplitudes_from_mps(
+            sz_driver, ket_sz_loaded, ncas, nelec_cas, nocc_cas, nvir_cas, log)
 
-    occ_cas_idx = np.arange(ncore, ncore + nocc_cas)
-    vir_cas_idx = np.arange(ncore + nocc_cas, ncore + ncas)
+        occ_cas_idx = np.arange(ncore, ncore + nocc_cas)
+        vir_cas_idx = np.arange(ncore + nocc_cas, ncore + ncas)
 
-    log.info('CAS amplitude norms: |t1|=%.4g  |t2|=%.4g',
-             np.linalg.norm(t1_cas), np.linalg.norm(t2_cas))
+        log.info('CAS amplitude norms: |t1|=%.4g  |t2|=%.4g',
+                 np.linalg.norm(t1_cas), np.linalg.norm(t2_cas))
 
-    # Convert occ_cas_idx from full-MO space to LMO-local space.
-    occ_cas_idx = occ_cas_idx - n_frozen
+        # Convert occ_cas_idx from full-MO space to LMO-local space.
+        occ_cas_idx = occ_cas_idx - n_frozen
 
     # ------------------------------------------------------------------
     # Stage 3: PAO + PNO construction
@@ -283,8 +331,9 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
     print('  Stage 3: PAO + PNO construction...', flush=True)
 
     s1e = mf.get_ovlp()
+    mf_or_mc = mf if no_cas else mc
     C_pao, pao_domains, S_pao, F_pao = make_paos(
-        mc, C_lmo, T_CutDO=T_CutDO, s1e=s1e)
+        mf_or_mc, C_lmo, T_CutDO=T_CutDO, s1e=s1e)
 
     nlmo = C_lmo.shape[1]
     domain_sizes = [len(pao_domains[i]) for i in range(nlmo)]
@@ -294,24 +343,29 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
     print('    ' + '  '.join(f'LMO{i}:{s}' for i, s in enumerate(domain_sizes)))
 
     # CAS virtual MO coefficients in AO basis (for extended PNO construction)
-    C_cas_vir = mo_loc[:, vir_cas_idx]  # vir_cas_idx is in full-MO space
-    nvir_cas = len(vir_cas_idx)
+    if no_cas:
+        C_cas_vir = None
+        nvir_cas_loc = 0
+    else:
+        C_cas_vir = mo_loc[:, vir_cas_idx]  # vir_cas_idx is in full-MO space
+        nvir_cas_loc = len(vir_cas_idx)
 
     pno_spaces, _, _, _ = make_pnos(
         mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         T_CutPNO=T_CutPNO, T_CutPairs=T_CutPairs,
         S_cut_domain=S_cut_domain,
         occ_cas_idx=occ_cas_idx, C_cas_vir=C_cas_vir,
-        nvir_cas=nvir_cas, s1e=s1e,
+        nvir_cas=nvir_cas_loc, s1e=s1e,
         verbose=verbose)
 
     # ------------------------------------------------------------------
     # Stage 4: Pair screening
     # ------------------------------------------------------------------
+    mo_coeff_ref = mo_loc if no_cas else mc.mo_coeff
     (cas_pairs, strong_pairs, weak_pairs, negligible_pairs,
      e_lmp2_weak, e_lmp2_strong) = classify_pairs(
         pno_spaces, occ_cas_idx, vir_cas_idx,
-        mc.mo_coeff, s1e,
+        mo_coeff_ref, s1e,
         T_CutPairs=T_CutPairs, T_CutPairs_MP2=T_CutPairs_MP2,
         verbose=verbose)
 
@@ -325,26 +379,28 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
     # ------------------------------------------------------------------
     # Stage 5: DLPNO-TCCSD
     # ------------------------------------------------------------------
-    print('  Stage 5: DLPNO-TCCSD...', flush=True)
+    stage5_label = 'DLPNO-CCSD' if no_cas else 'DLPNO-TCCSD'
+    print(f'  Stage 5: {stage5_label}...', flush=True)
 
+    mo_coeff_cas_arg = mo_loc if no_cas else mc.mo_coeff
     e_tccsd, t2_pno_all, t1_pno = run_lccsd(
         mf, C_lmo, pno_spaces,
         strong_pairs=strong_pairs,
         cas_pairs=cas_pairs,
         t1_cas=t1_cas, t2_cas=t2_cas,
         occ_cas_idx=occ_cas_idx, vir_cas_idx=vir_cas_idx,
-        mo_coeff_cas=mc.mo_coeff, s1e=s1e,
+        mo_coeff_cas=mo_coeff_cas_arg, s1e=s1e,
         conv_tol=ccsd_conv_tol, max_cycle=ccsd_max_cycle,
         ncores=ncores, C_pao=C_pao, verbose=verbose)
 
-    log.info('E(TCCSD) correlation = %.15g', e_tccsd)
+    log.info('E(%s) correlation = %.15g', stage5_label, e_tccsd)
 
     # ------------------------------------------------------------------
     # Stage 6: External (T) correction
     # ------------------------------------------------------------------
     print('  Stage 6: (T) correction...', flush=True)
 
-    C_cas_vir = mo_loc[:, vir_cas_idx]
+    C_cas_vir_t = None if no_cas else mo_loc[:, vir_cas_idx]
 
     e_t = run_lccsd_t_ext(
         mf, C_lmo, pno_spaces,
@@ -352,7 +408,7 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
         t2_pno_all=t2_pno_all,
         t1_pno=t1_pno,
         occ_cas_idx=occ_cas_idx,
-        C_cas_vir=C_cas_vir,
+        C_cas_vir=C_cas_vir_t,
         vir_cas_idx=vir_cas_idx,
         ncores=ncores, verbose=verbose)
 
@@ -365,7 +421,7 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
 
     return {
         'e_hf':         mf.e_tot,
-        'e_dmrg':       mc.e_tot,
+        'e_dmrg':       e_dmrg,
         'e_lmp2_weak':  e_lmp2_weak,
         'e_tccsd':      e_tccsd,
         'e_t':          e_t,
@@ -385,3 +441,19 @@ def run_dlpno_tccsd_t(mf, ncas, nelec, mo_init=None,
         't2_pno_all':   t2_pno_all,
         't1_pno':       t1_pno,
     }
+
+
+def run_dlpno_ccsd_t(mf, frozen=0, **kwargs):
+    """Convenience wrapper for plain DLPNO-CCSD(T) (no active space).
+
+    Equivalent to ``run_dlpno_tccsd_t(mf, ncas=None, frozen=frozen, **kwargs)``.
+
+    Args:
+        mf: Converged DF-RHF (scf.RHF(mol).density_fit()).
+        frozen (int or list): Frozen-core MOs excluded from correlation.
+        **kwargs: All other keyword arguments forwarded to run_dlpno_tccsd_t.
+
+    Returns:
+        result (dict): Same as run_dlpno_tccsd_t.
+    """
+    return run_dlpno_tccsd_t(mf, ncas=None, nelec=None, frozen=frozen, **kwargs)
