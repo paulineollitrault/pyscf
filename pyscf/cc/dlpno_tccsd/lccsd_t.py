@@ -92,11 +92,26 @@ def _triple_pno_union(pno_spaces, i, j, k, s1e, S_cut=1e-6):
     return C_tno, n_tno
 
 
-def _build_ovL_tno(with_df, C_lmo, C_tno, lmo_indices):
+def _preload_df_integrals(with_df):
+    """Preload all DF 3-index integrals into memory.
+
+    Returns Lpq_full as a contiguous (naux, nao_pair) array in packed
+    triangular format, ready for _ao2mo.nr_e2.  Reading the HDF5 file
+    once up-front makes all subsequent integral transforms thread-safe
+    and eliminates redundant I/O.
+    """
+    naux = with_df.get_naoaux()
+    chunks = []
+    for Lpq in with_df.loop():
+        chunks.append(Lpq.copy())
+    return np.vstack(chunks)   # (naux, nao_pair)
+
+
+def _build_ovL_tno(Lpq_full, C_lmo, C_tno, lmo_indices):
     """Build (LMO_i, TNO_a | L) 3-index DF tensor for selected LMOs.
 
     Args:
-        with_df: PySCF DF object.
+        Lpq_full (np.ndarray): (naux, nao_pair) preloaded DF integrals.
         C_lmo (np.ndarray): (nao, nocc_lmo) LMO coefficients.
         C_tno (np.ndarray): (nao, n_tno) TNO coefficients in AO basis.
         lmo_indices (list): LMO orbital indices to compute (e.g. [i, j, k]).
@@ -104,94 +119,65 @@ def _build_ovL_tno(with_df, C_lmo, C_tno, lmo_indices):
     Returns:
         ovL (np.ndarray): (len(lmo_indices), n_tno, naux)
     """
-    nao, nocc_lmo = C_lmo.shape
     n_tno = C_tno.shape[1]
-    naux = with_df.get_naoaux()
+    naux = Lpq_full.shape[0]
     n_sel = len(lmo_indices)
 
-    # Build C_occ for selected LMOs only
     C_occ_sel = C_lmo[:, lmo_indices]   # (nao, n_sel)
     nmo_sel = n_sel + n_tno
     mo = np.asarray(np.hstack((C_occ_sel, C_tno)), order='F')
     ijslice = (0, n_sel, n_sel, nmo_sel)
 
-    ovL = np.empty((n_sel, n_tno, naux))
-    buf = None
-    p1 = 0
-    for Lpq in with_df.loop():
-        nL = Lpq.shape[0]
-        p0 = p1
-        p1 = p0 + nL
-        buf = _ao2mo.nr_e2(Lpq, mo, ijslice, aosym='s2', out=buf)
-        ovL[:, :, p0:p1] = buf.reshape(nL, n_sel, n_tno).transpose(1, 2, 0)
-        Lpq = None
-
+    buf = _ao2mo.nr_e2(Lpq_full, mo, ijslice, aosym='s2')
+    ovL = buf.reshape(naux, n_sel, n_tno).transpose(1, 2, 0).copy()
     return ovL
 
 
-def _build_vvL_tno(with_df, C_tno):
+def _build_vvL_tno(Lpq_full, C_tno):
     """Build (TNO_a, TNO_b | L) 3-index DF tensor in TNO basis.
 
     Args:
-        with_df: PySCF DF object.
+        Lpq_full (np.ndarray): (naux, nao_pair) preloaded DF integrals.
         C_tno (np.ndarray): (nao, n_tno) TNO coefficients.
 
     Returns:
         vvL (np.ndarray): (n_tno, n_tno, naux)
     """
-    nao, n_tno = C_tno.shape
-    naux = with_df.get_naoaux()
+    n_tno = C_tno.shape[1]
+    naux = Lpq_full.shape[0]
 
     mo = np.asfortranarray(C_tno)
     ijslice = (0, n_tno, 0, n_tno)
 
-    vvL = np.empty((n_tno, n_tno, naux))
-    buf = None
-    p1 = 0
-    for Lpq in with_df.loop():
-        nL = Lpq.shape[0]
-        p0 = p1
-        p1 = p0 + nL
-        buf = _ao2mo.nr_e2(Lpq, mo, ijslice, aosym='s2', out=buf)
-        vvL[:, :, p0:p1] = buf.reshape(nL, n_tno, n_tno).transpose(1, 2, 0)
-        Lpq = None
-
+    buf = _ao2mo.nr_e2(Lpq_full, mo, ijslice, aosym='s2')
+    vvL = buf.reshape(naux, n_tno, n_tno).transpose(1, 2, 0).copy()
     return vvL
 
 
-def _build_ooL_triple(with_df, C_lmo, lmo_indices):
-    """Build (3, 3, naux) occ-occ DF integrals for 3 selected LMO indices.
+def _build_ooL_triple(Lpq_full, C_lmo, lmo_indices):
+    """Build (n_sel, n_sel, naux) occ-occ DF integrals for selected LMO indices.
 
     Args:
-        with_df: PySCF DF object.
+        Lpq_full (np.ndarray): (naux, nao_pair) preloaded DF integrals.
         C_lmo (np.ndarray): (nao, nocc_lmo) LMO coefficients.
-        lmo_indices (list): Three LMO orbital indices [i, j, k].
+        lmo_indices (list): LMO orbital indices [i, j, k] or [i, k].
 
     Returns:
-        ooL (np.ndarray): (3, 3, naux) occ-occ DF tensor in LMO basis.
+        ooL (np.ndarray): (n_sel, n_sel, naux) occ-occ DF tensor in LMO basis.
     """
     n_sel = len(lmo_indices)
-    naux = with_df.get_naoaux()
+    naux = Lpq_full.shape[0]
     C_occ_sel = C_lmo[:, lmo_indices]   # (nao, n_sel)
     mo = np.asfortranarray(C_occ_sel)
     ijslice = (0, n_sel, 0, n_sel)
 
-    ooL = np.empty((n_sel, n_sel, naux))
-    buf = None
-    p1 = 0
-    for Lpq in with_df.loop():
-        nL = Lpq.shape[0]
-        p0 = p1
-        p1 = p0 + nL
-        buf = _ao2mo.nr_e2(Lpq, mo, ijslice, aosym='s2', out=buf)
-        ooL[:, :, p0:p1] = buf.reshape(nL, n_sel, n_sel).transpose(1, 2, 0)
-        Lpq = None
-
+    buf = _ao2mo.nr_e2(Lpq_full, mo, ijslice, aosym='s2')
+    ooL = buf.reshape(naux, n_sel, n_sel).transpose(1, 2, 0).copy()
     return ooL
 
 
 def _w3_intermediate(t2_sc, ovL_sc, ooL_sc, vvL_sc, eps_occ, eps_vir,
-                     t1_sc=None, fvo_sc=None):
+                     t1_sc=None, fvo_sc=None, sum_all_occ=False):
     """Compute the (T) energy contribution for a single occupied triple (i,j,k).
 
     Follows the canonical formula from ccsd_t_slow.py:
@@ -245,10 +231,12 @@ def _w3_intermediate(t2_sc, ovL_sc, ooL_sc, vvL_sc, eps_occ, eps_vir,
     # ------------------------------------------------------------------
     # Stage 1: build the full W[a,b,c,p,q,r] tensor in one shot.
     # ------------------------------------------------------------------
-    # K[a,b,p,f] = sum_L ovL_sc[p,f,L]*vvL_sc[a,b,L] = (pf|ab)  — (n, n, 3, n)
-    K = np.einsum('pfL,abL->abpf', ovL_sc, vvL_sc)
-    # W_vvov[a,b,c,p,q,r] = sum_f K[a,b,p,f] * t2_sc[q,r,c,f]
-    W_all = np.einsum('abpf,qrcf->abcpqr', K, t2_sc)    # (n, n, n, 3, 3, 3)
+    # K[a,b,p,f] = sum_L ovL_sc[p,a,L]*vvL_sc[f,b,L] = (pa|fb)  — (n, n, 3, n)
+    # Canonical formula: w[i,j,k] = sum_f (ia|fb)*t2[k,j,c,f]
+    # so K uses the occ-vir integral (pa|fb), NOT (pf|ab).
+    K = np.einsum('paL,fbL->abpf', ovL_sc, vvL_sc)
+    # W_vvov[a,b,c,p,q,r] = sum_f K[a,b,p,f] * t2_sc[r,q,c,f]
+    W_all = np.einsum('abpf,rqcf->abcpqr', K, t2_sc)    # (n, n, n, 3, 3, 3)
     del K
 
     # A[p,a,q,m] = sum_L ovL_sc[p,a,L]*ooL_sc[q,m,L]  — (3, n, 3, 3)
@@ -266,8 +254,9 @@ def _w3_intermediate(t2_sc, ovL_sc, ooL_sc, vvL_sc, eps_occ, eps_vir,
     # ------------------------------------------------------------------
     has_v = (t1_sc is not None and fvo_sc is not None)
     if has_v:
-        # vvoo[a,b,p,q] = sum_L vvL_sc[a,b,L] * ooL_sc[p,q,L]
-        vvoo = np.einsum('abL,pqL->abpq', vvL_sc, ooL_sc)  # (n, n, 3, 3)
+        # vvoo[a,b,p,q] = (pa|qb) = sum_L ovL_sc[p,a,L] * ovL_sc[q,b,L]
+        # Canonical: eris_vvoo[a,b,i,j] = (ia|jb), NOT (ab|ij).
+        vvoo = np.einsum('paL,qbL->abpq', ovL_sc, ovL_sc)  # (n, n, 3, 3)
         # V_all[a,b,c,p,q,r] = vvoo[a,b,p,q] * t1_sc[r,c]
         #                    + t2_sc[p,q,a,b] * fvo_sc[c,r]
         V_all = np.einsum('abpq,rc->abcpqr', vvoo, t1_sc)
@@ -360,10 +349,17 @@ def _w3_intermediate(t2_sc, ovL_sc, ooL_sc, vvL_sc, eps_occ, eps_vir,
         + wbca*zcba.transpose(0,2,1,3) + wbac*zcba.transpose(0,2,3,1)
         + wacb*zcba.transpose(0,3,1,2) + wabc*zcba.transpose(0,3,2,1))
 
-    # Sum the 6 all-distinct occupied elements for each compact (a,b,c).
-    et = np.sum(contrib[:, 0, 1, 2] + contrib[:, 0, 2, 1]
-                + contrib[:, 1, 0, 2] + contrib[:, 1, 2, 0]
-                + contrib[:, 2, 0, 1] + contrib[:, 2, 1, 0])
+    # Sum occupied elements for each compact (a,b,c).
+    if sum_all_occ:
+        # Degenerate case (2 occ): sum ALL occupied elements.
+        # For a pair (i,k), the 2^3=8 entries contain {i,i,k} (3 entries),
+        # {i,k,k} (3 entries), and {i,i,i}/{k,k,k} (2 entries, zero after r3).
+        et = np.sum(contrib)
+    else:
+        # All-distinct case (3 occ): sum only the 6 all-distinct permutations.
+        et = np.sum(contrib[:, 0, 1, 2] + contrib[:, 0, 2, 1]
+                    + contrib[:, 1, 0, 2] + contrib[:, 1, 2, 0]
+                    + contrib[:, 2, 0, 1] + contrib[:, 2, 1, 0])
 
     # Factor 2 for closed-shell spin summation (matches canonical et *= 2)
     return float(et.real) * 2
@@ -419,12 +415,12 @@ def _zero_cas_t2_amplitudes(t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir,
 
 def _process_one_triple(i, j, k,
                         pno_spaces, t2_for_T,
-                        with_df, C_lmo, fock_ao, F_lmo, s1e,
+                        Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
                         t1_pno=None):
     """Compute (T) energy contribution for one triple (i,j,k). Thread-safe.
 
-    All inputs are read-only.  DF integral builds (C extensions) and all BLAS
-    calls release the GIL, so concurrent threads make real progress.
+    All inputs are read-only.  Lpq_full is the preloaded DF array (naux, nao_pair)
+    so no HDF5 reads happen here — fully thread-safe.
 
     Returns et_ijk (float), or 0.0 if the triple should be skipped.
     """
@@ -454,13 +450,13 @@ def _process_one_triple(i, j, k,
     t2_ik_sc = _map_t2(ik)
     t2_jk_sc = _map_t2(jk)
 
-    ovL_ijk    = _build_ovL_tno(with_df, C_lmo, C_tno_sc, [i, j, k])
-    vvL_sc     = _build_vvL_tno(with_df, C_tno_sc)
+    ovL_ijk    = _build_ovL_tno(Lpq_full, C_lmo, C_tno_sc, [i, j, k])
+    vvL_sc     = _build_vvL_tno(Lpq_full, C_tno_sc)
     triple_lmo = [i, j, k]
     F_occ_3x3  = F_lmo[np.ix_(triple_lmo, triple_lmo)]
     eps_occ_sc, V_occ_sc = np.linalg.eigh(F_occ_3x3)
     ovL_sc_occ = np.einsum('nm,naL->maL', V_occ_sc, ovL_ijk)
-    ooL_lmo    = _build_ooL_triple(with_df, C_lmo, triple_lmo)
+    ooL_lmo    = _build_ooL_triple(Lpq_full, C_lmo, triple_lmo)
     ooL_sc     = np.einsum('pm,qn,pqL->mnL', V_occ_sc, V_occ_sc, ooL_lmo)
 
     # Include diagonal pair amplitudes t2[i,i,a,b] — these are nonzero in
@@ -512,6 +508,123 @@ def _process_one_triple(i, j, k,
     return _w3_intermediate(t2_sc_block, ovL_sc_occ, ooL_sc, vvL_sc,
                             eps_occ_sc, eps_tno_sc,
                             t1_sc=t1_sc, fvo_sc=fvo_sc)
+
+
+def _process_degenerate_pair(i, k,
+                             pno_spaces, t2_for_T,
+                             Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
+                             t1_pno=None):
+    """Compute (T) energy from degenerate occupied triples {i,i,k} and {i,k,k}.
+
+    For a pair (i,k) with i<k, the 2^3=8 occupied combinations in the
+    2-LMO block cover: {i,i,k} (3 entries), {i,k,k} (3 entries), and
+    {i,i,i}/{k,k,k} (2 entries, zero after r3).
+
+    This captures all "two-equal" occupied contributions missing from the
+    all-distinct (i<j<k) loop.
+
+    Returns et (float), or 0.0 if the pair should be skipped.
+    """
+    ii = (i, i)
+    kk = (k, k)
+    ik = (min(i, k), max(i, k))
+
+    # Need diagonal pairs (i,i), (k,k) and off-diagonal (i,k)
+    if ik not in pno_spaces or ik not in t2_for_T:
+        return 0.0
+    # Diagonal pairs may not exist if they have no PNOs — treat as zero
+    has_ii = ii in pno_spaces and ii in t2_for_T
+    has_kk = kk in pno_spaces and kk in t2_for_T
+
+    # Build TNO space from available pair PNO spaces
+    cols = []
+    if has_ii:
+        C_ii = pno_spaces[ii]['C_pno']
+        if C_ii.shape[1] > 0:
+            cols.append(C_ii)
+    C_ik = pno_spaces[ik]['C_pno']
+    if C_ik.shape[1] > 0:
+        cols.append(C_ik)
+    if has_kk:
+        C_kk = pno_spaces[kk]['C_pno']
+        if C_kk.shape[1] > 0:
+            cols.append(C_kk)
+
+    if not cols:
+        return 0.0
+
+    C_pool = np.hstack(cols)
+    S_pool = reduce(np.dot, (C_pool.T, s1e, C_pool))
+    eigvals, eigvecs = np.linalg.eigh(S_pool)
+    keep = eigvals > 1e-6
+    n_tno = int(np.sum(keep))
+    if n_tno == 0:
+        return 0.0
+    X = eigvecs[:, keep] / np.sqrt(eigvals[keep])
+    C_tno = np.dot(C_pool, X)
+
+    # Semicanonicalize TNO
+    F_tno_full = reduce(np.dot, (C_tno.T, fock_ao, C_tno))
+    eps_tno_sc, V_sc = np.linalg.eigh(F_tno_full)
+    C_tno_sc = np.dot(C_tno, V_sc)
+
+    # Map T2 amplitudes to TNO-SC basis
+    def _map_t2(pk):
+        if pk not in pno_spaces or pk not in t2_for_T:
+            return np.zeros((n_tno, n_tno))
+        C_p = pno_spaces[pk]['C_pno']
+        if C_p.shape[1] == 0:
+            return np.zeros((n_tno, n_tno))
+        U = reduce(np.dot, (C_p.T, s1e, C_tno_sc))
+        return reduce(np.dot, (U.T, t2_for_T[pk], U))
+
+    # Build 2×2 occupied block (0→i, 1→k)
+    pair_lmo = [i, k]
+    t2_ii = _map_t2(ii)
+    t2_kk = _map_t2(kk)
+    t2_ik = _map_t2(ik)
+
+    t2_lmo_block = np.zeros((2, 2, n_tno, n_tno))
+    t2_lmo_block[0, 0] = t2_ii
+    t2_lmo_block[1, 1] = t2_kk
+    t2_lmo_block[0, 1] = t2_ik
+    t2_lmo_block[1, 0] = t2_ik.T
+
+    # Semicanonicalize occupied
+    F_occ_2x2 = F_lmo[np.ix_(pair_lmo, pair_lmo)]
+    eps_occ_sc, V_occ_sc = np.linalg.eigh(F_occ_2x2)
+    t2_sc_block = np.einsum('pm,qn,pqAB->mnAB', V_occ_sc, V_occ_sc, t2_lmo_block)
+
+    # Build integrals
+    ovL_pair = _build_ovL_tno(Lpq_full, C_lmo, C_tno_sc, pair_lmo)
+    ovL_sc_occ = np.einsum('nm,naL->maL', V_occ_sc, ovL_pair)
+    vvL_sc = _build_vvL_tno(Lpq_full, C_tno_sc)
+    ooL_lmo = _build_ooL_triple(Lpq_full, C_lmo, pair_lmo)
+    ooL_sc = np.einsum('pm,qn,pqL->mnL', V_occ_sc, V_occ_sc, ooL_lmo)
+
+    # Project T1 if available
+    t1_sc = None
+    fvo_sc = None
+    if t1_pno is not None:
+        nocc_lmo = C_lmo.shape[1]
+        t1_lmo_tno = np.zeros((nocc_lmo, n_tno))
+        for r in pair_lmo:
+            key_rr = (r, r)
+            if key_rr in pno_spaces and t1_pno.get(r) is not None:
+                C_pno_rr = pno_spaces[key_rr]['C_pno']
+                if C_pno_rr.shape[1] > 0 and t1_pno[r].size > 0:
+                    U_rr = reduce(np.dot, (C_pno_rr.T, s1e, C_tno_sc))
+                    t1_lmo_tno[r] = U_rr.T @ t1_pno[r]
+        t1_pair = t1_lmo_tno[pair_lmo, :]
+        t1_sc = np.dot(V_occ_sc.T, t1_pair)
+        C_lmo_pair = C_lmo[:, pair_lmo]
+        F_vo = reduce(np.dot, (C_tno_sc.T, fock_ao, C_lmo_pair))
+        fvo_sc = np.dot(F_vo, V_occ_sc)
+
+    return _w3_intermediate(t2_sc_block, ovL_sc_occ, ooL_sc, vvL_sc,
+                            eps_occ_sc, eps_tno_sc,
+                            t1_sc=t1_sc, fvo_sc=fvo_sc,
+                            sum_all_occ=True)
 
 
 def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
@@ -599,21 +712,64 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             for k in range(j + 1, nocc_lmo):
                 valid_triples.append((i, j, k))
 
+    # Preload all DF 3-index integrals into memory (single HDF5 read).
+    # This makes all subsequent nr_e2 calls thread-safe and eliminates
+    # redundant I/O (~252 DF reads → 1).
+    import time as _time
+    _t0 = _time.perf_counter()
+    Lpq_full = _preload_df_integrals(mf.with_df)
+    _dt_preload = _time.perf_counter() - _t0
+    log.info('(T) preloaded DF integrals: shape=%s, %.1f MB, %.2f s',
+             Lpq_full.shape,
+             Lpq_full.nbytes / 1e6,
+             _dt_preload)
+
     triple_kwargs = dict(
         pno_spaces=pno_spaces, t2_for_T=t2_for_T,
-        with_df=mf.with_df, C_lmo=C_lmo,
+        Lpq_full=Lpq_full, C_lmo=C_lmo,
         fock_ao=fock_ao, F_lmo=F_lmo, s1e=s1e,
         t1_pno=t1_pno,
     )
 
-    et_values = [_process_one_triple(i, j, k, **triple_kwargs)
-                 for i, j, k in valid_triples]
+    from concurrent.futures import ThreadPoolExecutor
+    _n_workers = max(1, min(ncores, len(valid_triples)))
 
-    e_t = sum(et_values)
+    def _do_triple(ijk):
+        return _process_one_triple(ijk[0], ijk[1], ijk[2], **triple_kwargs)
+
+    if _n_workers > 1:
+        with ThreadPoolExecutor(max_workers=_n_workers) as pool:
+            et_values = list(pool.map(_do_triple, valid_triples))
+    else:
+        et_values = [_do_triple(ijk) for ijk in valid_triples]
+
+    e_t_distinct = sum(et_values)
     n_triples = sum(1 for v in et_values if v != 0.0)
 
-    log.info('(T) correction: %d triples computed (%d total candidate triples)',
-             n_triples, len(valid_triples))
+    # Degenerate occupied triples: pairs (i,k) with i<k capture
+    # {i,i,k} and {i,k,k} contributions (60% of canonical (T)).
+    valid_pairs = [(i, k) for i in range(nocc_lmo)
+                           for k in range(i + 1, nocc_lmo)]
+
+    def _do_degen(ik):
+        return _process_degenerate_pair(ik[0], ik[1], **triple_kwargs)
+
+    if _n_workers > 1:
+        with ThreadPoolExecutor(max_workers=_n_workers) as pool:
+            et_degen_values = list(pool.map(_do_degen, valid_pairs))
+    else:
+        et_degen_values = [_do_degen(ik) for ik in valid_pairs]
+
+    e_t_degen = sum(et_degen_values)
+    n_degen = sum(1 for v in et_degen_values if v != 0.0)
+
+    e_t = e_t_distinct + e_t_degen
+
+    log.info('(T) correction: %d distinct triples, %d degenerate pairs '
+             '(%d + %d candidates)',
+             n_triples, n_degen, len(valid_triples), len(valid_pairs))
+    log.info('E(T) distinct = %.15g', e_t_distinct)
+    log.info('E(T) degenerate = %.15g', e_t_degen)
     log.info('E(T) external = %.15g', e_t)
 
     return e_t

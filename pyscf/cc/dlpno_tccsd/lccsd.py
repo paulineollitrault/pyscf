@@ -2126,7 +2126,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                      t2_cas=None, occ_cas_idx=None, vir_cas_idx=None,
                      mo_coeff_cas=None, diis_space=15,
                      damping=0.5, diis_start_cycle=6,
-                     C_pao=None, use_t1_transform=True):
+                     C_pao=None, use_t1_transform=True,
+                     ncores=1):
     """DLPNO-CCSD with pair-local residual and per-pair PNO virtual spaces.
 
     Each pair (i,j) updates ONLY its own T2_ij in its own PNO basis.
@@ -2393,56 +2394,46 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             if (key_ii, key_kk) not in S_pno_cache:
                 S_pno_cache[(key_ii, key_kk)] = C_pno_ii.T @ (s1e @ C_pno_kk)
 
-    # Pre-compute K_coul integrals: (jk|b_ij c_ik) [oovv-type]
-    # These cannot be factored from ovL_pno_cache, so we pre-compute them.
-    # K_coul_cache[(key_ij, key_pk, occ_bra1, occ_bra2)] = (n_pno_ij, n_pno_pk)
-    # For section 5 (ring/oovv): need (jk|b_ij c_ik) and (ik|a_ij c_jk)
-    K_coul_cache = {}
-    if with_df is not None:
-        for key_ij in keys_sorted:
-            i, j = key_ij
-            C_pno_ij = pno_spaces[key_ij]['C_pno']
-            n_ij = C_pno_ij.shape[1]
-            if n_ij == 0:
-                continue
-            for k in range(nocc):
-                # Pair (i,k) contributions to pair (i,j)
-                key_ik = (min(i, k), max(i, k))
-                if key_ik in pno_spaces:
-                    C_pno_ik = pno_spaces[key_ik]['C_pno']
-                    n_ik = C_pno_ik.shape[1]
-                    if n_ik > 0:
-                        cache_key = (key_ij, key_ik, j, k)
-                        if cache_key not in K_coul_cache:
-                            K_coul_cache[cache_key] = with_df.ao2mo(
-                                [C_lmo[:, [j]], C_lmo[:, [k]],
-                                 C_pno_ij, C_pno_ik],
-                                compact=False).reshape(1, 1, n_ij, n_ik)[0, 0]
-                # Pair (j,k) contributions to pair (i,j)
-                key_jk = (min(j, k), max(j, k))
-                if key_jk in pno_spaces:
-                    C_pno_jk = pno_spaces[key_jk]['C_pno']
-                    n_jk = C_pno_jk.shape[1]
-                    if n_jk > 0:
-                        cache_key = (key_ij, key_jk, i, k)
-                        if cache_key not in K_coul_cache:
-                            K_coul_cache[cache_key] = with_df.ao2mo(
-                                [C_lmo[:, [i]], C_lmo[:, [k]],
-                                 C_pno_ij, C_pno_jk],
-                                compact=False).reshape(1, 1, n_ij, n_jk)[0, 0]
-        _n_kcoul = len(K_coul_cache)
-        if _n_kcoul > 0:
-            _sample_kc = next(iter(K_coul_cache.values()))
-            _mem_kc = sum(v.nbytes for v in K_coul_cache.values()) / 1e6
-            print(f'  K_coul cache: {_n_kcoul} entries, '
-                  f'{_mem_kc:.0f} MB', flush=True)
-
     # Pre-compute occ-occ 3-index DF tensor ooL[i,j,Q] = (i_lmo j_lmo | Q)
     # for T1 integral dressing (Eq. 91-93 of Jiang et al.).
     ooL_3idx = None
     if with_df is not None:
         from pyscf.cc.dlpno_tccsd.pno import _build_ovL as _build_ovL_fn
         ooL_3idx = _build_ovL_fn(with_df, C_lmo, C_lmo)  # (nocc, nocc, naux)
+
+    # Pre-compute K_coul integrals: (jk|b_ij c_ik) [oovv-type]
+    # These cannot be factored from ovL_pno_cache, so we pre-compute them.
+    # K_coul_cache[(key_ij, key_pk, occ_bra1, occ_bra2)] = (n_pno_ij, n_pno_pk)
+    # For section 5 (ring/oovv): need (jk|b_ij c_ik) and (ik|a_ij c_jk)
+    K_coul_cache = {}
+    if with_df is not None:
+        # Collect all needed K_coul keys first
+        _kcoul_keys_set = set()
+        for key_ij in keys_sorted:
+            i, j = key_ij
+            n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
+            if n_ij == 0:
+                continue
+            for k in range(nocc):
+                key_ik = (min(i, k), max(i, k))
+                if key_ik in pno_spaces and pno_spaces[key_ik]['C_pno'].shape[1] > 0:
+                    _kcoul_keys_set.add((key_ij, key_ik, j, k))
+                key_jk = (min(j, k), max(j, k))
+                if key_jk in pno_spaces and pno_spaces[key_jk]['C_pno'].shape[1] > 0:
+                    _kcoul_keys_set.add((key_ij, key_jk, i, k))
+        _kcoul_keys_list = list(_kcoul_keys_set)
+
+        from pyscf.cc.dlpno_tccsd.pno import _build_kcoul_batched
+        K_coul_cache = _build_kcoul_batched(
+            with_df, C_lmo, pno_spaces, _kcoul_keys_list,
+            ooL_3idx=ooL_3idx)
+        del _kcoul_keys_set, _kcoul_keys_list
+
+        _n_kcoul = len(K_coul_cache)
+        if _n_kcoul > 0:
+            _mem_kc = sum(v.nbytes for v in K_coul_cache.values()) / 1e6
+            print(f'  K_coul cache: {_n_kcoul} entries, '
+                  f'{_mem_kc:.0f} MB', flush=True)
 
     # Build J_oo from ooL (avoids separate ao2mo call)
     if ooL_3idx is not None:
@@ -2499,7 +2490,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         this_max = max(max_cycle, 100) if boot_step == n_bootstrap - 1 else max(30, max_cycle // 2)
 
         e_prev = 0.0
+        import time as _time
         for cycle in range(this_max):
+            _t_cycle_start = _time.perf_counter()
             t2_new = {}
             t1_pno_old = {i: t1_pno[i].copy() for i in range(nocc)}
 
@@ -2514,6 +2507,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         C_lmo_t1[:, ii] += C_pno_ii @ t1_pno[ii]
 
                 # Rebuild ovL_pno_cache AND ooL in a single DF pass.
+                _t_ovl = _time.perf_counter()
                 from pyscf.cc.dlpno_tccsd.pno import _build_ovL_batched
                 _all_keys = list(keys_sorted)
                 for ii in range(nocc):
@@ -2533,20 +2527,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 ooL_flat = ooL_3idx.reshape(nocc * nocc, -1)
                 J_oo = (ooL_flat @ ooL_flat.T).reshape(nocc, nocc, nocc, nocc)
 
-                # Rebuild K_coul_cache with dressed C̃_lmo
-                for cache_key in list(K_coul_cache.keys()):
-                    key_ij, key_ik, m1, m2 = cache_key
-                    n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
-                    n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
-                    if n_ij == 0 or n_ik == 0:
-                        continue
-                    K_coul_cache[cache_key] = with_df.ao2mo(
-                        [C_lmo_t1[:, [m1]], C_lmo_t1[:, [m2]],
-                         pno_spaces[key_ij]['C_pno'],
-                         pno_spaces[key_ik]['C_pno']],
-                        compact=False).reshape(1, 1, n_ij, n_ik)[0, 0]
+                _t_ovl_done = _time.perf_counter()
+                # Rebuild K_coul_cache with dressed C̃_lmo (batched single DF pass)
+                _t_kcoul = _time.perf_counter()
+                from pyscf.cc.dlpno_tccsd.pno import _build_kcoul_batched
+                K_coul_cache = _build_kcoul_batched(
+                    with_df, C_lmo_t1, pno_spaces,
+                    list(K_coul_cache.keys()), ooL_3idx=ooL_3idx)
 
+                _t_kcoul_done = _time.perf_counter()
                 # Precompute T2-dressed foo
+                _t_foo = _time.perf_counter()
                 foo_dress = _compute_foo_dressed(
                     t2_pno_all, pno_spaces, nocc, with_df, C_lmo_t1, s1e,
                     ovL_pno_cache=ovL_pno_cache)
@@ -2554,24 +2545,26 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     t2_pno_all, pno_spaces, nocc, with_df, C_lmo, s1e,
                     ovL_pno_cache=ovL_pno_bare)
                 foo_total = foo_dress
+                _t_foo_done = _time.perf_counter()
             else:
                 # No T1 transform: use bare integrals, explicit T1 coupling
+                _t_ovl = _t_kcoul = _t_foo = _time.perf_counter()
                 foo_total = _compute_foo_dressed(
                     t2_pno_all, pno_spaces, nocc, with_df, C_lmo, s1e,
                     ovL_pno_cache=ovL_pno_cache)
                 foo_bare = foo_total
+                _t_ovl_done = _t_kcoul_done = _t_foo_done = _time.perf_counter()
 
-            for key in keys_sorted:
+            _t_pairs = _time.perf_counter()
+
+            def _update_pair(key):
+                """Compute T2 update for a single pair. Thread-safe (read-only
+                access to shared caches, writes only to returned arrays)."""
                 i, j = key
                 data = pno_spaces[key]
-                C_pno_ij = data['C_pno']
-                n_pno = C_pno_ij.shape[1]
-
+                n_pno = data['C_pno'].shape[1]
                 if n_pno == 0:
-                    t2_new[key] = np.zeros((0, 0))
-                    continue
-
-                # ---- Pair-local residual ----
+                    return key, np.zeros((0, 0))
                 R_ij = _compute_pair_residual_numerator(
                     i, j, t2_pno_all, pno_spaces, nocc,
                     C_pao, ovL_lmo_pao, F_lmo, s1e, with_df, C_lmo,
@@ -2588,8 +2581,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         - e_pno[:, None] - e_pno[None, :])
                 D_ij = np.where(np.abs(D_ij) > 1e-12, D_ij, 1e-12)
                 T2_ij_new = R_ij / D_ij
-
-                # ---- CAS freeze: restore scaled CAS block ----
                 if key in cas_blocks:
                     cb = cas_blocks[key]
                     cas_sl = cb[0]
@@ -2599,9 +2590,20 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                             t2c_mp2 + scale * (t2c_dmrg_ref - t2c_mp2))
                     else:
                         T2_ij_new[cas_sl, cas_sl] = cb[1]
+                return key, T2_ij_new
 
-                t2_new[key] = T2_ij_new
+            from concurrent.futures import ThreadPoolExecutor
+            _n_workers = max(1, min(ncores, len(keys_sorted)))
+            if _n_workers > 1:
+                with ThreadPoolExecutor(max_workers=_n_workers) as pool:
+                    for key, T2_ij_new in pool.map(_update_pair, keys_sorted):
+                        t2_new[key] = T2_ij_new
+            else:
+                for key in keys_sorted:
+                    _, T2_ij_new = _update_pair(key)
+                    t2_new[key] = T2_ij_new
 
+            _t_pairs_done = _time.perf_counter()
             # ---- Local T1 update ----
             if use_t1_transform and not getattr(
                     _run_dlpno_lccsd, '_dress_t1', False):
@@ -2734,8 +2736,16 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 e_cyc += e_p if pi == pj else 2.0 * e_p
             dE = abs(e_cyc - e_prev) if cycle > 0 else float('inf')
             e_prev = e_cyc
+            _t_cycle_end = _time.perf_counter()
+            _dt_ovl = _t_ovl_done - _t_ovl
+            _dt_kcoul = _t_kcoul_done - _t_kcoul
+            _dt_foo = _t_foo_done - _t_foo
+            _dt_pairs = _t_pairs_done - _t_pairs
+            _dt_total = _t_cycle_end - _t_cycle_start
             print(f'  Cycle {cycle + 1:3d}: dT = {dT:.3e}  E_corr = {e_cyc:.10f}'
-                  f'  dE = {dE:.2e}', flush=True)
+                  f'  dE = {dE:.2e}  [{_dt_total:.1f}s: ovL={_dt_ovl:.1f} '
+                  f'Kcoul={_dt_kcoul:.1f} foo={_dt_foo:.1f} '
+                  f'pairs={_dt_pairs:.1f}]', flush=True)
             if dT < this_tol:
                 print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (amplitude).',
                       flush=True)
@@ -3314,7 +3324,7 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
         fock_ao, eps_lmo, s1e, conv_tol, max_cycle,
         t2_cas=t2_cas, occ_cas_idx=occ_cas_idx,
         vir_cas_idx=vir_cas_idx, mo_coeff_cas=mo_coeff_cas,
-        C_pao=C_pao)
+        C_pao=C_pao, ncores=ncores)
     print(f'  E_TCCSD = {e_tccsd:.15g}', flush=True)
 
     return e_tccsd, t2_pno_all, t1_pno
