@@ -170,30 +170,39 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None):
     fock_ao = mf.get_fock()
     F_pao = reduce(np.dot, (C_pao.T, fock_ao, C_pao))
 
-    # LMO domain assignment
-    # For each LMO i, compute Mulliken-style weights |C_lmo[μ,i]|² * S[μ,μ]
-    # and normalize, then threshold at T_CutDO.
-    # This is the "simple" DOI criterion; more accurate versions integrate
-    # over a DFT grid (Pinski 2015 Eq. 4).
+    # LMO domain assignment (atom-based, following ORCA/MOLPRO convention)
+    # For each LMO i, compute the Mulliken-style differential overlap
+    # integral (DOI) per *atom* A: DOI(i,A) = sum_{μ∈A} |c_μi|² * s_μμ.
+    # If DOI(i,A) / sum_A DOI(i,A) > T_CutDO, ALL AOs on atom A are
+    # included in domain(i).  This is the standard Boughton-Pulay criterion.
+    #
+    # Build atom→AO mapping
+    ao_labels = mol.ao_labels(fmt=False)  # list of (atom_id, ...)
+    atom_ids = np.array([lbl[0] for lbl in ao_labels])
+    natom = mol.natm
+
     pao_domains = []
     for i in range(nocc_lmo):
         lmo_i = C_lmo[:, i]
-        # Mulliken populations: |c_μ|² * s_μμ (diagonal AO contribution)
-        pop_i = lmo_i ** 2 * np.diag(s1e)
-        total_pop = np.sum(pop_i)
+        # Per-AO Mulliken populations
+        pop_ao = lmo_i ** 2 * np.diag(s1e)
+        total_pop = np.sum(pop_ao)
         if total_pop < 1e-15:
-            # Degenerate LMO; give it all AOs
+            domain_i = np.arange(nao)
+        elif T_CutDO <= 0:
             domain_i = np.arange(nao)
         else:
-            frac_i = pop_i / total_pop
-            if T_CutDO <= 0:
-                domain_i = np.arange(nao)
-            else:
-                domain_i = np.where(frac_i > T_CutDO)[0]
+            # Aggregate populations per atom
+            pop_atom = np.zeros(natom)
+            for a in range(natom):
+                pop_atom[a] = np.sum(pop_ao[atom_ids == a])
+            frac_atom = pop_atom / total_pop
+            # Include all AOs on atoms exceeding the DOI threshold
+            atoms_in_domain = np.where(frac_atom > T_CutDO)[0]
+            domain_i = np.where(np.isin(atom_ids, atoms_in_domain))[0]
 
         if len(domain_i) == 0:
-            # Fallback: use all AOs with any population
-            domain_i = np.where(pop_i > 1e-12)[0]
+            domain_i = np.where(pop_ao > 1e-12)[0]
 
         pao_domains.append(domain_i)
 
