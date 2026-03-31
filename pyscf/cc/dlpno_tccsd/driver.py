@@ -47,6 +47,7 @@ References:
 """
 
 import copy as _copy
+import time as _time
 import numpy as np
 from pyscf import mcscf
 from pyscf.lib import logger
@@ -74,7 +75,8 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
                       cas_pno_proj_thresh=0.99,
                       ccsd_conv_tol=1e-7,
                       ccsd_max_cycle=50,
-                      verbose=4):
+                      verbose=4,
+                      _pool=None):
     """Run DMRG-DLPNO-TCCSD(T), or plain DLPNO-CCSD(T) when ncas is None.
 
     When ncas is None (or 0), the DMRG/CAS stages are skipped entirely and
@@ -163,9 +165,20 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     print(f'  Basis: {mol.basis}  |  nMO: {nmo}  (occ: {nocc}  vir: {nmo - nocc})'
           f'  |  ncores: {ncores}')
 
-    # Set PySCF/BLAS thread count for all subsequent numpy/scipy/BLAS calls
+    # Set BLAS threads once. Never toggle after this point.
     from pyscf import lib as _pyscf_lib
     _pyscf_lib.num_threads(ncores)
+
+    # Use caller-provided pool if available (avoids creating new thread
+    # IDs across molecules that exceed OpenBLAS MAX_THREADS), otherwise
+    # create one.
+    from concurrent.futures import ThreadPoolExecutor
+    _owns_pool = _pool is None
+    if _owns_pool:
+        _n_pool = max(1, ncores // 2)
+        _shared_pool = ThreadPoolExecutor(max_workers=_n_pool) if _n_pool > 1 else None
+    else:
+        _shared_pool = _pool
 
     # Normalise nelec to (nalpha, nbeta)
     mol_spin = mol.spin   # = 2*S; 0 for singlet, 2 for triplet, etc.
@@ -196,6 +209,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # Stage 1: Split-localise orbital subspaces
     # ------------------------------------------------------------------
     print('  Stage 1: Split-localising orbital subspaces...', flush=True)
+    _t_loc_start = _time.time()
 
     if mo_init is None:
         mo_init = mf.mo_coeff
@@ -241,6 +255,9 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
             mf_init, ncas, nelec_cas,
             method=lmo_method, frozen=n_frozen,
             occ_natural=occ_natural)
+
+    _t_loc = _time.time() - _t_loc_start
+    print(f'  Stage 1 wall time: {_t_loc:.2f} s', flush=True)
 
     # ------------------------------------------------------------------
     # Stage 2: DMRG-CI in the localised active space (pyblock2)
@@ -381,6 +398,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # ------------------------------------------------------------------
     stage5_label = 'DLPNO-CCSD' if no_cas else 'DLPNO-TCCSD'
     print(f'  Stage 5: {stage5_label}...', flush=True)
+    _t_ccsd_start = _time.time()
 
     mo_coeff_cas_arg = mo_loc if no_cas else mc.mo_coeff
     e_tccsd, t2_pno_all, t1_pno = run_lccsd(
@@ -391,14 +409,18 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         occ_cas_idx=occ_cas_idx, vir_cas_idx=vir_cas_idx,
         mo_coeff_cas=mo_coeff_cas_arg, s1e=s1e,
         conv_tol=ccsd_conv_tol, max_cycle=ccsd_max_cycle,
-        ncores=ncores, C_pao=C_pao, verbose=verbose)
+        ncores=ncores, C_pao=C_pao, verbose=verbose,
+        _pool=_shared_pool)
 
+    _t_ccsd = _time.time() - _t_ccsd_start
     log.info('E(%s) correlation = %.15g', stage5_label, e_tccsd)
+    print(f'  Stage 5 wall time: {_t_ccsd:.2f} s', flush=True)
 
     # ------------------------------------------------------------------
     # Stage 6: External (T) correction
     # ------------------------------------------------------------------
     print('  Stage 6: (T) correction...', flush=True)
+    _t_triples_start = _time.time()
 
     C_cas_vir_t = None if no_cas else mo_loc[:, vir_cas_idx]
 
@@ -410,14 +432,23 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         occ_cas_idx=occ_cas_idx,
         C_cas_vir=C_cas_vir_t,
         vir_cas_idx=vir_cas_idx,
-        ncores=ncores, verbose=verbose)
+        ncores=ncores, verbose=verbose,
+        _pool=_shared_pool)
 
+    _t_triples = _time.time() - _t_triples_start
+    if _owns_pool and _shared_pool is not None:
+        _shared_pool.shutdown(wait=True)
     log.info('E(T) external = %.15g', e_t)
+    print(f'  Stage 6 wall time: {_t_triples:.2f} s', flush=True)
 
     # ------------------------------------------------------------------
     # Total energy
     # ------------------------------------------------------------------
     e_total = mf.e_tot + e_tccsd + e_lmp2_weak + e_t
+
+    print(f'\n  Timings:  localization={_t_loc:.2f}s  '
+          f'CCSD={_t_ccsd:.2f}s  (T)={_t_triples:.2f}s  '
+          f'total={_t_loc + _t_ccsd + _t_triples:.2f}s', flush=True)
 
     return {
         'e_hf':         mf.e_tot,
@@ -426,6 +457,10 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         'e_tccsd':      e_tccsd,
         'e_t':          e_t,
         'e_total':      e_total,
+        # Timings (wall time in seconds)
+        't_localization': _t_loc,
+        't_ccsd':         _t_ccsd,
+        't_triples':      _t_triples,
         # Objects for analysis / diagnostics
         'mc':           mc,
         'mf':           mf,

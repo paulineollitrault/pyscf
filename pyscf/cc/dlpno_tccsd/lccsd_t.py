@@ -635,7 +635,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                     cas_proj_thresh=0.5,
                     T_CutTNO=1e-9,
                     ncores=1,
-                    verbose=None):
+                    verbose=None,
+                    _pool=None):
     """Compute the (T) energy correction for DLPNO-TCCSD(T).
 
     Loops over all distinct triples (i<j<k).  Per Lang et al. 2020
@@ -731,20 +732,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
         t1_pno=t1_pno,
     )
 
-    from concurrent.futures import ThreadPoolExecutor
-    _n_workers = max(1, min(ncores, len(valid_triples)))
-
     def _do_triple(ijk):
         return _process_one_triple(ijk[0], ijk[1], ijk[2], **triple_kwargs)
-
-    if _n_workers > 1:
-        with ThreadPoolExecutor(max_workers=_n_workers) as pool:
-            et_values = list(pool.map(_do_triple, valid_triples))
-    else:
-        et_values = [_do_triple(ijk) for ijk in valid_triples]
-
-    e_t_distinct = sum(et_values)
-    n_triples = sum(1 for v in et_values if v != 0.0)
 
     # Degenerate occupied triples: pairs (i,k) with i<k capture
     # {i,i,k} and {i,k,k} contributions (60% of canonical (T)).
@@ -754,11 +743,17 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     def _do_degen(ik):
         return _process_degenerate_pair(ik[0], ik[1], **triple_kwargs)
 
-    if _n_workers > 1:
-        with ThreadPoolExecutor(max_workers=_n_workers) as pool:
-            et_degen_values = list(pool.map(_do_degen, valid_pairs))
+    # Reuse the shared pool from the driver (same threads as LCCSD stage).
+    # Set BLAS to single-thread during pool phase, restore after.
+    if _pool is not None:
+        et_values = list(_pool.map(_do_triple, valid_triples))
+        et_degen_values = list(_pool.map(_do_degen, valid_pairs))
     else:
+        et_values = [_do_triple(ijk) for ijk in valid_triples]
         et_degen_values = [_do_degen(ik) for ik in valid_pairs]
+
+    e_t_distinct = sum(et_values)
+    n_triples = sum(1 for v in et_values if v != 0.0)
 
     e_t_degen = sum(et_degen_values)
     n_degen = sum(1 for v in et_degen_values if v != 0.0)

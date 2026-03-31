@@ -2127,7 +2127,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                      mo_coeff_cas=None, diis_space=15,
                      damping=0.5, diis_start_cycle=6,
                      C_pao=None, use_t1_transform=True,
-                     ncores=1):
+                     ncores=1, _pool=None):
     """DLPNO-CCSD with pair-local residual and per-pair PNO virtual spaces.
 
     Each pair (i,j) updates ONLY its own T2_ij in its own PNO basis.
@@ -2592,12 +2592,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         T2_ij_new[cas_sl, cas_sl] = cb[1]
                 return key, T2_ij_new
 
-            from concurrent.futures import ThreadPoolExecutor
-            _n_workers = max(1, min(ncores, len(keys_sorted)))
-            if _n_workers > 1:
-                with ThreadPoolExecutor(max_workers=_n_workers) as pool:
-                    for key, T2_ij_new in pool.map(_update_pair, keys_sorted):
-                        t2_new[key] = T2_ij_new
+            if _pool is not None:
+                for key, T2_ij_new in _pool.map(_update_pair, keys_sorted):
+                    t2_new[key] = T2_ij_new
             else:
                 for key in keys_sorted:
                     _, T2_ij_new = _update_pair(key)
@@ -3268,7 +3265,7 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
               mo_coeff_cas, s1e=None,
               conv_tol=1e-7, max_cycle=50, ncores=1,
               C_pao=None, max_outer_cycle=30, outer_conv_tol=1e-8,
-              verbose=None):
+              verbose=None, _pool=None):
     """Run pair-local CCSD over all strong pairs, injecting CAS amplitudes.
 
     For each strong pair (i,j):
@@ -3324,7 +3321,7 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
         fock_ao, eps_lmo, s1e, conv_tol, max_cycle,
         t2_cas=t2_cas, occ_cas_idx=occ_cas_idx,
         vir_cas_idx=vir_cas_idx, mo_coeff_cas=mo_coeff_cas,
-        C_pao=C_pao, ncores=ncores)
+        C_pao=C_pao, ncores=ncores, _pool=_pool)
     print(f'  E_TCCSD = {e_tccsd:.15g}', flush=True)
 
     return e_tccsd, t2_pno_all, t1_pno
