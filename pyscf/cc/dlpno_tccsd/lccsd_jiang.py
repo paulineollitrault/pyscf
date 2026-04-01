@@ -255,7 +255,7 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             # K_kl projected: S_kl_ki @ K_kl ... wait, need to check index mapping
 
             # Psi4: C_tilde_temp = t2_li @ S(li,kl) @ K_kl, then S(ki,li) @ ... @ S(kl,ki)
-            # Term 4 (T2 × K) is handled by section 5b, skip here
+            # Term 4 (T2 × K): skip when section 5b is active
             # C_temp = S_ki_li @ t2_li @ S_li_kl.T @ K_kl @ S_kl_ki.T
             # C_tilde_ki -= 0.5 * C_temp
             pass
@@ -435,8 +435,7 @@ def compute_pair_residual_jiang(
         fvv_t1_pair,
         ovL_pno_bare, S_pno_cache, K_coul_cache,
         ooL_bare, ooL_dressed,
-        ovL_pno_dressed=None,
-        C_tilde_cache=None):
+        ovL_pno_dressed=None):
     """Compute the DLPNO-CCSD T2 residual using Jiang et al. Eqs 75-81.
 
     Uses BARE integrals for all 2e integrals, with T1 effects entering
@@ -765,12 +764,20 @@ def compute_pair_residual_jiang(
         R_ij += t2_ij @ fvv_t2_dressed.T + fvv_t2_dressed @ t2_ij
 
     # ===================================================================
-    # C, D (Eqs 78-79): Ring with gamma/delta expansion
-    # Use BARE voov (K_dir) and BARE oovv (K_coul) integrals.
-    # Add gamma T1 corrections explicitly (Eq 83).
+    # Ring / voov / oovv (sections 5 of original code)
+    # K_dir uses dressed ovL (captures voov T1 dressing from MO rotation).
+    # K_coul uses oo-dressed cache + vv corrections (Eq 93-like dressing).
     # ===================================================================
-    _DEBUG_SKIP_RING = getattr(compute_pair_residual_jiang, '_skip_ring', False)
-    if with_df is not None and not _DEBUG_SKIP_RING:
+    if with_df is not None:
+        # Build T1_all projected to PNO_ij (reused for vv corrections)
+        _t1_all_ij = None
+        if (t1_pno is not None and S_pno_cache is not None
+                and ooL_dressed is not None and n_pno > 0):
+            _t1_all_ij = np.zeros((nocc_lmo, n_pno))
+            for kk in range(nocc_lmo):
+                _t1_all_ij[kk] = _project_t1_to_pair(
+                    t1_pno, kk, key, S_pno_cache, pno_spaces)
+
         for k in range(nocc_lmo):
             # --- Pair (i,k) contributions ---
             key_ik = (min(i, k), max(i, k))
@@ -782,71 +789,40 @@ def compute_pair_residual_jiang(
                     t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
                     S_ij_ik = _get_S(key_ik)
 
-                    # K_dir: use dressed ovL if available, else bare
-                    _DRESS_RING = getattr(compute_pair_residual_jiang, '_dress_ring', False)
-                    _ovL_src = ovL_pno_dressed if (_DRESS_RING and ovL_pno_dressed) else ovL_pno_bare
+                    # K_dir (voov): use dressed ovL — captures T1 via MO rotation
+                    _ovL_src = ovL_pno_dressed if ovL_pno_dressed else ovL_pno_bare
                     _ovL_j_ij = _ovL_src.get((key, j))
                     _ovL_k_ik = _ovL_src.get((key_ik, k))
                     K_dir = (_ovL_j_ij @ _ovL_k_ik.T
                              if _ovL_j_ij is not None and _ovL_k_ik is not None
                              else np.zeros((n_pno, n_ik)))
 
+                    # K_coul (oovv): from cache (oo-dressed if available)
                     _kc_key = (key, key_ik, j, k)
                     K_coul = (K_coul_cache.get(_kc_key)
                               if K_coul_cache else None)
                     if K_coul is None:
                         K_coul = np.zeros((n_pno, n_ik))
 
-                    # Delta T1 correction to K_coul (Eq 84 Terms 1-2)
-                    # oo dressing: use ooL_dressed for (jk) part
-                    # vv dressing: -Σ_m T1_m^b*(mc|Q)*ooL[j,k,Q] (first index)
-                    #              -Σ_m T1_m^c*(bm|Q)*ooL[j,k,Q] (second index)
-                    _DRESS_KCOUL = getattr(compute_pair_residual_jiang, '_dress_kcoul', False)
-                    if _DRESS_KCOUL and ooL_dressed is not None:
-                        # oo correction
-                        ooL_jk_bare = ooL_bare[j, k, :]
-                        ooL_jk_dressed = ooL_dressed[j, k, :]
-                        delta_oo_jk = ooL_jk_dressed - ooL_jk_bare  # (naux,)
-
-                        # Build T1_all for PNO_ij and PNO_ik
-                        if '_t1_all' not in dir() or _t1_all is None:
-                            _t1_all = np.zeros((nocc_lmo, n_pno))
-                            for kk_idx in range(nocc_lmo):
-                                _t1_all[kk_idx] = _project_t1_to_pair(
-                                    t1_pno, kk_idx, key, S_pno_cache, pno_spaces)
-                        _t1_all_ik = np.zeros((nocc_lmo, n_ik))
-                        for kk_idx in range(nocc_lmo):
-                            _t1_all_ik[kk_idx] = _project_t1_to_pair(
-                                t1_pno, kk_idx, key_ik, S_pno_cache, pno_spaces)
-
-                        # vv correction: use ooL_dressed for consistency with
-                        # oo-dressed K_coul (ensures cross term oo×vv is included)
+                    # vv correction to K_coul: Eq 93-like dressing of virtual indices
+                    # ΔK_coul_vv = -Σ_m T1_all_ij[m,b]*ovL_m_ik@ooL_d[j,k,:]
+                    #             -Σ_m T1_all_ik[m,c]*ovL_m_ij@ooL_d[j,k,:]
+                    if _t1_all_ij is not None and ooL_dressed is not None:
                         ooL_jk_d = ooL_dressed[j, k, :]
-                        # W[m, c_ik] = ovL_m_ik @ ooL_dressed[j,k,:]
-                        W_ik = np.zeros((nocc_lmo, n_ik))
+                        _t1_all_ik = np.zeros((nocc_lmo, n_ik))
                         for mm in range(nocc_lmo):
-                            ovL_m_ik = ovL_pno_bare.get((key_ik, mm))
-                            if ovL_m_ik is not None:
-                                W_ik[mm] = ovL_m_ik @ ooL_jk_d
-                        delta_vv1 = -_t1_all.T @ W_ik  # (n_pno, n_ik)
-
-                        # W2[m, b_ij] = ovL_m_ij @ ooL_dressed[j,k,:]
+                            _t1_all_ik[mm] = _project_t1_to_pair(
+                                t1_pno, mm, key_ik, S_pno_cache, pno_spaces)
+                        W_ik = np.zeros((nocc_lmo, n_ik))
                         W_ij = np.zeros((nocc_lmo, n_pno))
                         for mm in range(nocc_lmo):
+                            ovL_m_ik = ovL_pno_bare.get((key_ik, mm))
                             ovL_m_ij = ovL_pno_bare.get((key, mm))
+                            if ovL_m_ik is not None:
+                                W_ik[mm] = ovL_m_ik @ ooL_jk_d
                             if ovL_m_ij is not None:
                                 W_ij[mm] = ovL_m_ij @ ooL_jk_d
-                        delta_vv2 = -W_ij.T @ _t1_all_ik  # (n_pno, n_ik)
-
-                        # oo correction: ΔK = Σ_Q delta_oo[Q]*vvL_mixed[b,c,Q]
-                        # We can't compute vvL_mixed easily, but we can use:
-                        # K_coul_oo_dressed - K_coul_bare = ΔK_oo
-                        # which is: Σ_Q delta_oo[Q]*(b c|Q)
-                        # We approximate by computing K_coul from ooL_dressed:
-                        # K_coul_dressed_oo ≈ K_coul * (ooL_dressed[j,k]·ooL_bare[j,k])/(ooL_bare[j,k]·ooL_bare[j,k])
-                        # No — this is wrong. Use the dressed K_coul cache if available.
-                        # For now: use vv corrections only (oo handled separately)
-                        K_coul = K_coul + delta_vv1 + delta_vv2
+                        K_coul = K_coul - _t1_all_ij.T @ W_ik - W_ij.T @ _t1_all_ik
 
                     theta_ik = 2.0 * t2_ik - t2_ik.T
                     R_ij += S_ij_ik @ (theta_ik @ (K_dir.T - 0.5 * K_coul.T))
@@ -863,39 +839,38 @@ def compute_pair_residual_jiang(
                     t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
                     S_ij_jk = _get_S(key_jk)
 
-                    _ovL_src_j = ovL_pno_dressed if (_DRESS_RING and ovL_pno_dressed) else ovL_pno_bare
+                    # K_dir_j (voov): dressed ovL
+                    _ovL_src_j = ovL_pno_dressed if ovL_pno_dressed else ovL_pno_bare
                     _ovL_i_ij = _ovL_src_j.get((key, i))
                     _ovL_k_jk = _ovL_src_j.get((key_jk, k))
                     K_dir_j = (_ovL_i_ij @ _ovL_k_jk.T
                                if _ovL_i_ij is not None and _ovL_k_jk is not None
                                else np.zeros((n_pno, n_jk)))
 
+                    # K_coul_j (oovv): from cache (oo-dressed if available)
                     _kc_key_j = (key, key_jk, i, k)
                     K_coul_j = (K_coul_cache.get(_kc_key_j)
                                 if K_coul_cache else None)
                     if K_coul_j is None:
                         K_coul_j = np.zeros((n_pno, n_jk))
 
-                    # Delta T1 correction to K_coul_j (same structure as above)
-                    if _DRESS_KCOUL and ooL_dressed is not None:
+                    # vv correction to K_coul_j
+                    if _t1_all_ij is not None and ooL_dressed is not None:
                         ooL_ik_d = ooL_dressed[i, k, :]
                         _t1_all_jk = np.zeros((nocc_lmo, n_jk))
-                        for kk_idx in range(nocc_lmo):
-                            _t1_all_jk[kk_idx] = _project_t1_to_pair(
-                                t1_pno, kk_idx, key_jk, S_pno_cache, pno_spaces)
-                        W_jk_v = np.zeros((nocc_lmo, n_jk))
+                        for mm in range(nocc_lmo):
+                            _t1_all_jk[mm] = _project_t1_to_pair(
+                                t1_pno, mm, key_jk, S_pno_cache, pno_spaces)
+                        W_jk = np.zeros((nocc_lmo, n_jk))
+                        W_ij2 = np.zeros((nocc_lmo, n_pno))
                         for mm in range(nocc_lmo):
                             ovL_m_jk = ovL_pno_bare.get((key_jk, mm))
-                            if ovL_m_jk is not None:
-                                W_jk_v[mm] = ovL_m_jk @ ooL_ik_d
-                        delta_vv1_j = -_t1_all.T @ W_jk_v
-                        W_ij_v = np.zeros((nocc_lmo, n_pno))
-                        for mm in range(nocc_lmo):
                             ovL_m_ij = ovL_pno_bare.get((key, mm))
+                            if ovL_m_jk is not None:
+                                W_jk[mm] = ovL_m_jk @ ooL_ik_d
                             if ovL_m_ij is not None:
-                                W_ij_v[mm] = ovL_m_ij @ ooL_ik_d
-                        delta_vv2_j = -W_ij_v.T @ _t1_all_jk
-                        K_coul_j = K_coul_j + delta_vv1_j + delta_vv2_j
+                                W_ij2[mm] = ovL_m_ij @ ooL_ik_d
+                        K_coul_j = K_coul_j - _t1_all_ij.T @ W_jk - W_ij2.T @ _t1_all_jk
 
                     R_ij -= S_ij_jk @ (t2_jk.T @ K_coul_j.T)
                     theta_kj = 2.0 * t2_jk.T - t2_jk
@@ -903,52 +878,10 @@ def compute_pair_residual_jiang(
                     R_ij -= 0.5 * (K_coul_j @ t2_jk) @ S_ij_jk.T
 
     # ===================================================================
-    # C_tilde ring correction (Eq 78 Term 1: gamma × t2)
-    # C_ij[a,b] = -Σ_k (S(ij,ik) @ C_tilde(ki) @ S(ik,kj)) @ t2_kj.T @ S(kj,ij)
-    # Enters residual as P̂[0.5*C + C_ji]: R += 0.5*C + C.T
-    # ===================================================================
-    if C_tilde_cache is not None:
-        C_term = np.zeros((n_pno, n_pno))
-        for k in range(nocc_lmo):
-            key_ki = (min(k, i), max(k, i))
-            key_kj = (min(k, j), max(k, j))
-
-            # C_tilde now stores (k,i) ordered pairs
-            ct = C_tilde_cache.get((k, i))
-            if ct is None:
-                continue
-
-            if key_kj not in t2_pno_all or t2_pno_all[key_kj] is None:
-                continue
-            n_kj = pno_spaces[key_kj]['C_pno'].shape[1]
-            if n_kj == 0:
-                continue
-            t2_kj_raw = t2_pno_all[key_kj]
-            t2_kj = t2_kj_raw.T if k > j else t2_kj_raw
-
-            S_ij_ik = _get_S(key_ki)
-            S_ik_kj = S_pno_cache.get((key_ki, key_kj))
-            S_kj_ij = _get_S(key_kj)
-
-            if S_ij_ik is None or S_ik_kj is None or S_kj_ij is None:
-                continue
-
-            # gamma_total_proj = S(ij,ik) @ C_tilde(ki) @ S(ik,kj)
-            gamma_proj = S_ij_ik @ ct @ S_ik_kj  # (n_ij, n_kj)
-
-            # C_ij[a,b] -= gamma_proj[a,c] * t2_kj[b,c]...
-            # Actually: C_ij -= gamma_proj @ t2_kj.T @ S_kj_ij.T
-            C_term -= gamma_proj @ t2_kj.T @ S_kj_ij.T
-
-        # P̂ symmetrization: R += 0.5*C + C.T (from Eq 19)
-        R_ij += 0.5 * C_term + C_term.T
-
-    # ===================================================================
     # Section 5b: Quadratic T2 dressing of ring
     # (same as original code, using bare integrals)
     # ===================================================================
-    _DEBUG_SKIP_5B = getattr(compute_pair_residual_jiang, '_skip_5b', False)
-    if with_df is not None and foo_t2_dressed is not None and not _DEBUG_SKIP_5B:
+    if with_df is not None and foo_t2_dressed is not None:
         R_dress_ij = np.zeros((n_pno, n_pno))
         R_dress_ji = np.zeros((n_pno, n_pno))
         for k in range(nocc_lmo):

@@ -68,6 +68,8 @@ def compute_residual_v2(
     if ovL_i_d is not None and ovL_j_d is not None:
         R_sym += ovL_i_d @ ovL_j_d.T
 
+    if getattr(compute_residual_v2, '_debug', False):
+        with open('/tmp/v2_debug.txt', 'a') as _f: _f.write(f'v2({i},{j}): K done\n')
     # --- A (Eq 76): dressed ladder ---
     # B̃_{ab} = B_{ab} - Σ_k T1_all[k,a]*ovL_k[b,Q] (Eq 93)
     T1_all_ij = np.zeros((nocc, n_pno))
@@ -103,6 +105,8 @@ def compute_residual_v2(
             aux_off += nL
         R_sym += ladder
 
+    if getattr(compute_residual_v2, '_debug', False):
+        with open('/tmp/v2_debug.txt', 'a') as _f: _f.write(f'v2({i},{j}): A done\n')
     # --- B (Eq 77/82): Woooo with dressed β ---
     # β = B_tilde[k,l] (precomputed from ooL_dressed + tau×voov)
     for key_kl, t2_kl in t2_pno_all.items():
@@ -128,10 +132,18 @@ def compute_residual_v2(
         else:
             R_sym += beta_kl * tau_kl_proj
 
+    if getattr(compute_residual_v2, '_debug', False):
+        with open('/tmp/v2_debug.txt', 'a') as _f: _f.write(f'v2({i},{j}): B done\n')
     # --- E (Eq 80): t2 × F̃̃_{ab} ---
     # E_tilde = Fab_[ij] - Σ_kl S @ u_kl × K_kl @ S
     # Psi4: starts with Fab_[ij], subtracts u×K (bare K_iajb)
-    E_tilde = Fab.get(key, np.zeros((n_pno, n_pno))).copy()
+    # Fab includes diag(e_pno) per Eq 101. But our code puts e_pno in the
+    # denominator D, not the numerator. Subtract the diagonal to avoid
+    # double-counting. (Psi4 uses T -= R/D iterative update which handles
+    # this differently.)
+    Fab_ij = Fab.get(key, np.zeros((n_pno, n_pno))).copy()
+    e_pno = data['e_pno']
+    E_tilde = Fab_ij - np.diag(e_pno)  # remove diagonal (in denominator)
     for key_kl, t2_kl in t2_pno_all.items():
         if t2_kl is None or t2_kl.shape[0] == 0:
             continue
@@ -148,214 +160,164 @@ def compute_residual_v2(
             continue
         K_kl = ovL_k_kl @ ovL_l_kl.T  # bare K
 
-        S_kl_ij = _get_S(key_kl)
+        S_kl_ij = _get_S(key_kl)  # (n_ij, n_kl)
         E_temp = u_kl @ K_kl.T  # Tt × K (Psi4 line 2138)
-        E_tilde -= S_kl_ij.T @ E_temp @ S_kl_ij  # Psi4 line 2139 (note S transpose)
+        # Psi4: S_PNO(kl,ij).T @ E @ S_PNO(kl,ij) where S_PNO(kl,ij) = (n_kl, n_ij)
+        # Our _get_S returns (n_ij, n_kl), so S_PNO(kl,ij) = _get_S.T
+        E_tilde -= S_kl_ij @ E_temp @ S_kl_ij.T
 
     # Apply: R += t2 @ E_tilde.T + E_tilde @ t2 (Psi4 lines 2146-2147)
     R_sym += t2_ij @ E_tilde.T + E_tilde @ t2_ij
 
-    # === Non-symmetric buffer (C, D, G) ===
+    if getattr(compute_residual_v2, '_debug', False):
+        with open('/tmp/v2_debug.txt', 'a') as _f: _f.write(f'v2({i},{j}): E done\n')
+    # === Non-symmetric terms (C, D, G) ===
+    # Compute C_ij and C_ji in one pass, then form the full P̂ result.
+    # P̂(0.5*C + C_ji) = 0.5*(C_ij + C_ij.T) + (C_ji + C_ji.T) for i≠j
+    #                  = 1.5*(C + C.T) for i=j (since C_ji = C_ij)
     Rn_ij = np.zeros((n_pno, n_pno))
 
-    # --- C (Eq 78): ring with gamma ---
-    # C_ij = -Σ_k (J_bare(ik|ac_kj) + S@C_tilde(ki)@S) @ t2_kj.T @ S
+    # --- C (Eq 78) ---
     if C_tilde_cache is not None:
         C_ij = np.zeros((n_pno, n_pno))
+        C_ji = np.zeros((n_pno, n_pno))
         for k in range(nocc):
+            # --- C_ij: gamma(ki) × t2(kj) ---
             key_ik = (min(i, k), max(i, k))
-            key_ki_ordered = (k, i)  # ordered pair for C_tilde
             key_kj = (min(k, j), max(k, j))
+            if key_kj in t2_pno_all and t2_pno_all[key_kj] is not None:
+                t2_kj_raw = t2_pno_all[key_kj]
+                if t2_kj_raw.shape[0] > 0:
+                    t2_kj = t2_kj_raw.T if k > j else t2_kj_raw
+                    n_kj = t2_kj.shape[0]
+                    gamma_ij = np.zeros((n_pno, n_kj))
+                    # Bold: J(ik|a_ij c_kj)
+                    if J_ij_kj:
+                        J_b = J_ij_kj.get((key, k))
+                        if J_b is not None:
+                            gamma_ij += J_b
+                    # C_tilde(ki)
+                    ct = C_tilde_cache.get((k, i))
+                    if ct is not None:
+                        S_ij_ik = _get_S(key_ik)
+                        S_ik_kj = S_pno_cache.get((key_ik, key_kj))
+                        if S_ij_ik is not None and S_ik_kj is not None:
+                            gamma_ij += S_ij_ik @ ct @ S_ik_kj
+                    S_kj_ij = _get_S(key_kj)
+                    C_ij -= gamma_ij @ t2_kj.T @ S_kj_ij.T
 
-            if key_kj not in t2_pno_all or t2_pno_all[key_kj] is None:
-                continue
-            t2_kj_raw = t2_pno_all[key_kj]
-            if t2_kj_raw.shape[0] == 0:
-                continue
-            t2_kj = t2_kj_raw.T if k > j else t2_kj_raw
-            n_kj = t2_kj.shape[0]
+            # --- C_ji: gamma(kj) × t2(ki) ---
+            key_jk = (min(j, k), max(j, k))
+            key_ki = (min(k, i), max(k, i))
+            if key_ki in t2_pno_all and t2_pno_all[key_ki] is not None:
+                t2_ki_raw = t2_pno_all[key_ki]
+                if t2_ki_raw.shape[0] > 0:
+                    t2_ki = t2_ki_raw.T if k > i else t2_ki_raw
+                    n_ki = t2_ki.shape[0]
+                    gamma_ji = np.zeros((n_pno, n_ki))
+                    # Bold: J(jk|a_ij c_ki) = KC[(key_ij, key_ki, j, k)]
+                    if K_coul_cache:
+                        J_b_ji = K_coul_cache.get((key, key_ki, j, k))
+                        if J_b_ji is not None:
+                            gamma_ji += J_b_ji
+                    # C_tilde(kj)
+                    ct_j = C_tilde_cache.get((k, j))
+                    if ct_j is not None:
+                        S_ij_jk = _get_S(key_jk)
+                        S_jk_ki = S_pno_cache.get((key_jk, key_ki))
+                        if S_ij_jk is not None and S_jk_ki is not None:
+                            gamma_ji += S_ij_jk @ ct_j @ S_jk_ki
+                    S_ki_ij = _get_S(key_ki)
+                    C_ji -= gamma_ji @ t2_ki.T @ S_ki_ij.T
 
-            # gamma_total = J_bare(ik|a_ij c_kj) + S(ij,ik) @ C_tilde(ki) @ S(ik,kj)
-            gamma_total = np.zeros((n_pno, n_kj))
-
-            # Bold term: J_bare(ik|a_ij c_kj) — mixed domain integral
-            J_bare = J_ij_kj.get((key, k)) if J_ij_kj else None
-            if J_bare is not None:
-                gamma_total += J_bare
-
-            # C_tilde contribution
-            ct = C_tilde_cache.get(key_ki_ordered)
-            if ct is not None:
-                S_ij_ik = _get_S(key_ik)
-                S_ik_kj = S_pno_cache.get((key_ik, key_kj))
-                if S_ij_ik is not None and S_ik_kj is not None:
-                    gamma_total += S_ij_ik @ ct @ S_ik_kj
-
-            # C_ij -= gamma_total @ t2_kj.T @ S(kj,ij)
-            S_kj_ij = _get_S(key_kj)
-            C_ij -= gamma_total @ t2_kj.T @ S_kj_ij.T
-
-        # Psi4 lines 2167-2169: 0.5*C + C.T
-        Rn_ij += 0.5 * C_ij + C_ij.T
+        # P̂(0.5*C_ij + C_ji): apply as (0.5*C_ij + C_ji) + (0.5*C_ij + C_ji).T
+        C_phat = 0.5 * C_ij + C_ji
+        Rn_ij += C_phat + C_phat.T
 
     # --- D (Eq 79): antisymmetric ring with delta ---
+    # Compute D_ij and D_ji, then P̂(D) = D_ij + D_ji.T
     if D_tilde_cache is not None:
         D_ij = np.zeros((n_pno, n_pno))
+        D_ji = np.zeros((n_pno, n_pno))
         for k in range(nocc):
             key_ik = (min(i, k), max(i, k))
-            key_ik_ordered = (i, k)  # ordered for D_tilde
             key_jk = (min(j, k), max(j, k))
 
-            if key_jk not in t2_pno_all or t2_pno_all[key_jk] is None:
-                continue
-            t2_jk_raw = t2_pno_all[key_jk]
-            if t2_jk_raw.shape[0] == 0:
-                continue
-            t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
-            u_jk = 2.0 * t2_jk - t2_jk.T  # antisymmetrized
-            n_jk = t2_jk.shape[0]
+            # D_ij: delta(ik) × u(jk)
+            if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
+                t2_jk_raw = t2_pno_all[key_jk]
+                if t2_jk_raw.shape[0] > 0:
+                    t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
+                    u_jk = 2.0 * t2_jk - t2_jk.T
+                    S_ij_jk = _get_S(key_jk)
+                    S_jk_ik = S_pno_cache.get((key_jk, key_ik))
+                    if S_ij_jk is not None and S_jk_ik is not None:
+                        U_jk_proj = S_ij_jk @ u_jk @ S_jk_ik.T
+                        D_temp = np.zeros((n_pno, n_pno))
+                        dt = D_tilde_cache.get((i, k))
+                        if dt is not None:
+                            S_ij_ik = _get_S(key_ik)
+                            D_temp += S_ij_ik @ dt @ U_jk_proj.T
+                        # Bold: L = 2K-J with mixed domains
+                        K_b = K_ij_kj.get((key, k)) if K_ij_kj else None
+                        J_b = J_ij_kj.get((key, k)) if J_ij_kj else None
+                        if K_b is not None and J_b is not None:
+                            D_temp += (2.0*K_b - J_b) @ u_jk.T @ S_ij_jk.T
+                        D_ij += 0.5 * D_temp
 
-            # U_jk projected: S(ij,jk) @ u_jk @ S(jk,ik)
-            S_ij_jk = _get_S(key_jk)
-            S_jk_ik = S_pno_cache.get((key_jk, key_ik))
-            if S_ij_jk is None or S_jk_ik is None:
-                continue
-            U_jk_proj = S_ij_jk @ u_jk @ S_jk_ik.T  # (n_ij, n_ik)
+            # D_ji: delta(jk) × u(ik)
+            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
+                t2_ik_raw = t2_pno_all[key_ik]
+                if t2_ik_raw.shape[0] > 0:
+                    t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
+                    u_ik = 2.0 * t2_ik - t2_ik.T
+                    S_ij_ik2 = _get_S(key_ik)
+                    S_ik_jk = S_pno_cache.get((key_ik, key_jk))
+                    if S_ij_ik2 is not None and S_ik_jk is not None:
+                        U_ik_proj = S_ij_ik2 @ u_ik @ S_ik_jk.T
+                        D_temp_j = np.zeros((n_pno, n_pno))
+                        dt_j = D_tilde_cache.get((j, k))
+                        if dt_j is not None:
+                            S_ij_jk2 = _get_S(key_jk)
+                            D_temp_j += S_ij_jk2 @ dt_j @ U_ik_proj.T
+                        # Bold for D_ji: L(jk|a_ij c_ik)
+                        ovL_j_d = ovL_bare.get((key, j))
+                        ovL_k_ik_d = ovL_bare.get((key_ik, k))
+                        J_ji = K_coul_cache.get((key, key_ik, j, k)) if K_coul_cache else None
+                        if ovL_j_d is not None and ovL_k_ik_d is not None and J_ji is not None:
+                            K_ji = ovL_j_d @ ovL_k_ik_d.T
+                            D_temp_j += (2.0*K_ji - J_ji) @ u_ik.T @ S_ij_ik2.T
+                        D_ji += 0.5 * D_temp_j
 
-            D_temp = np.zeros((n_pno, n_pno))
-
-            # D_tilde contribution: S(ij,ik) @ D_tilde(ik) @ U_jk.T
-            dt = D_tilde_cache.get(key_ik_ordered)
-            if dt is not None:
-                S_ij_ik = _get_S(key_ik)
-                D_temp += S_ij_ik @ dt @ U_jk_proj.T
-
-            # Bold term: L(ik|a_ij c_jk) @ u_jk.T @ S(jk,ij)
-            # L = 2K - J: L_aikc = 2*(ia|kc) - (ik|ac)
-            K_bare = K_ij_kj.get((key, k)) if K_ij_kj else None
-            J_bare = J_ij_kj.get((key, k)) if J_ij_kj else None
-            if K_bare is not None and J_bare is not None:
-                L_bare = 2.0 * K_bare - J_bare
-                D_temp += L_bare @ u_jk.T @ S_ij_jk.T
-
-            D_temp *= 0.5
-            D_ij += D_temp
-
-        Rn_ij += D_ij
+        Rn_ij += D_ij + D_ji.T
 
     # --- G (Eq 81): Fock oo coupling ---
-    # G_ij = -Σ_k S @ t2_ik @ S × G_tilde(k,j)
+    # G_ij = -t_ik × G_tilde(k,j);  G_ji = -t_jk × G_tilde(k,i)
+    # P̂(G) = G_ij + G_ji.T
+    G_ij = np.zeros((n_pno, n_pno))
+    G_ji = np.zeros((n_pno, n_pno))
     for k in range(nocc):
         key_ik = (min(i, k), max(i, k))
-        if key_ik not in t2_pno_all or t2_pno_all[key_ik] is None:
-            continue
-        t2_ik_raw = t2_pno_all[key_ik]
-        if t2_ik_raw.shape[0] == 0:
-            continue
-        t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-        S_ij_ik = _get_S(key_ik)
-        T_ik_proj = S_ij_ik @ t2_ik @ S_ij_ik.T
-        Rn_ij -= T_ik_proj * G_tilde[k, j]
-
-    # === Final P̂ symmetrization ===
-    # Psi4 lines 2216-2217: R[ij] += Rn[ij] + Rn[ji].T
-    # For pair (i,j) with i≤j: Rn[ji] is Rn computed with (j,i) indices
-    # We compute Rn[ji] by calling with swapped i,j. But to avoid recursion,
-    # just compute Rn_ji inline by repeating C/D/G with i↔j.
-
-    # Actually, for diagonal pairs (i=j): Rn[ji] = Rn[ij] since i=j.
-    # For off-diagonal: Rn[ji].T involves C_ji, D_ji, G_ji with swapped indices.
-    # The Psi4 code computes Rn for ALL (ij) pairs, including ji.
-    # Our function is called once per (i,j) pair with i≤j, so we need to
-    # compute Rn_ji here.
-
-    Rn_ji = np.zeros((n_pno, n_pno))
-    if i != j:
-        # C term with i↔j: C_ji = -Σ_k gamma(kj) @ t2_ki.T @ S
-        if C_tilde_cache is not None:
-            C_ji = np.zeros((n_pno, n_pno))
-            for k in range(nocc):
-                key_jk = (min(j, k), max(j, k))
-                key_kj_ordered = (k, j)
-                key_ki = (min(k, i), max(k, i))
-
-                if key_ki not in t2_pno_all or t2_pno_all[key_ki] is None:
-                    continue
-                t2_ki_raw = t2_pno_all[key_ki]
-                if t2_ki_raw.shape[0] == 0:
-                    continue
-                t2_ki = t2_ki_raw.T if k > i else t2_ki_raw
-                n_ki = t2_ki.shape[0]
-
-                gamma_total_j = np.zeros((n_pno, n_ki))
-                J_bare_j = J_ij_kj.get((key, k)) if J_ij_kj else None
-                # For C_ji: need J(jk|a_ij c_ki) which is a different integral
-                # than J(ik|a_ij c_kj). In Psi4, J_ij_kj_[ji][k_ji] is different.
-                # We approximate by not using the bold term for Rn_ji.
-                # TODO: compute J_ji_ki properly
-                ct_j = C_tilde_cache.get(key_kj_ordered)
-                if ct_j is not None:
-                    S_ij_jk = _get_S(key_jk)
-                    S_jk_ki = S_pno_cache.get((key_jk, key_ki))
-                    if S_ij_jk is not None and S_jk_ki is not None:
-                        gamma_total_j += S_ij_jk @ ct_j @ S_jk_ki
-
-                S_ki_ij = _get_S(key_ki)
-                C_ji -= gamma_total_j @ t2_ki.T @ S_ki_ij.T
-
-            Rn_ji += 0.5 * C_ji + C_ji.T
-
-        # D term with i↔j
-        if D_tilde_cache is not None:
-            D_ji = np.zeros((n_pno, n_pno))
-            for k in range(nocc):
-                key_jk = (min(j, k), max(j, k))
-                key_jk_ordered = (j, k)
-                key_ik = (min(i, k), max(i, k))
-
-                if key_ik not in t2_pno_all or t2_pno_all[key_ik] is None:
-                    continue
-                t2_ik_raw = t2_pno_all[key_ik]
-                if t2_ik_raw.shape[0] == 0:
-                    continue
+        key_jk = (min(j, k), max(j, k))
+        if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
+            t2_ik_raw = t2_pno_all[key_ik]
+            if t2_ik_raw.shape[0] > 0:
                 t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-                u_ik = 2.0 * t2_ik - t2_ik.T
-                n_ik = t2_ik.shape[0]
-
                 S_ij_ik = _get_S(key_ik)
-                S_ik_jk = S_pno_cache.get((key_ik, key_jk))
-                if S_ij_ik is None or S_ik_jk is None:
-                    continue
-                U_ik_proj = S_ij_ik @ u_ik @ S_ik_jk.T
-
-                D_temp_j = np.zeros((n_pno, n_pno))
-                dt_j = D_tilde_cache.get(key_jk_ordered)
-                if dt_j is not None:
-                    S_ij_jk = _get_S(key_jk)
-                    D_temp_j += S_ij_jk @ dt_j @ U_ik_proj.T
-
-                K_bare_j = K_ij_kj.get((key, k)) if K_ij_kj else None
-                J_bare_j = J_ij_kj.get((key, k)) if J_ij_kj else None
-                # L for D_ji needs different integral ordering
-                # TODO: compute properly
-                D_temp_j *= 0.5
-                D_ji += D_temp_j
-            Rn_ji += D_ji
-
-        # G term with i↔j
-        for k in range(nocc):
-            key_jk = (min(j, k), max(j, k))
-            if key_jk not in t2_pno_all or t2_pno_all[key_jk] is None:
-                continue
+                G_ij -= (S_ij_ik @ t2_ik @ S_ij_ik.T) * G_tilde[k, j]
+        if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
             t2_jk_raw = t2_pno_all[key_jk]
-            if t2_jk_raw.shape[0] == 0:
-                continue
-            t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
-            S_ij_jk = _get_S(key_jk)
-            T_jk_proj = S_ij_jk @ t2_jk @ S_ij_jk.T
-            Rn_ji -= T_jk_proj * G_tilde[k, i]
+            if t2_jk_raw.shape[0] > 0:
+                t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
+                S_ij_jk = _get_S(key_jk)
+                G_ji -= (S_ij_jk @ t2_jk @ S_ij_jk.T) * G_tilde[k, i]
+    Rn_ij += G_ij + G_ji.T
 
-    # P̂: R_final = R_sym + Rn[ij] + Rn[ji].T
-    R_final = R_sym + Rn_ij + Rn_ji.T
+    # === R_final = R_sym + Rn (already fully P̂-symmetrized) ===
+    R_final = R_sym + Rn_ij
+
+    if getattr(compute_residual_v2, '_debug', False):
+        with open('/tmp/v2_debug.txt', 'a') as _f:
+            _f.write(f'v2({i},{j}): |R_sym|={np.linalg.norm(R_sym):.4e} |Rn_ij|={np.linalg.norm(Rn_ij):.4e} |R_final|={np.linalg.norm(R_final):.4e}\n')
 
     return R_final
