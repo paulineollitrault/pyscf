@@ -37,22 +37,24 @@ from pyscf.lib import logger
 from pyscf.ao2mo import _ao2mo
 
 
-def _triple_pno_union(pno_spaces, i, j, k, s1e, S_cut=1e-6):
-    """Compute the triple PNO space as the union of three pair PNO spaces.
+def _triple_pno_union(pno_spaces, i, j, k, s1e, t2_for_T=None,
+                      T_CutTNO=1e-9, S_cut=1e-6):
+    """Compute the TNO space from the averaged triplet density (Jiang 2024 eq.62).
 
-    The union is formed by pooling all columns from the three pair PNO matrices
-    and re-orthogonalising via canonical orthogonalisation in the S metric.
-    Near-linear dependencies (eigenvalue < S_cut) are removed.
-
-    This is the standard TNO construction used in LNO-CCSD(T) and DLPNO-(T):
-    the triple virtual space spans everything important for any of the three
-    pairs, so no contribution is lost.
+    1. Pool PNO columns from pairs ij, ik, jk.
+    2. Orthogonalize via canonical orthogonalization in S metric.
+    3. Project pair densities into this common space, average → D_ijk.
+    4. Diagonalize D_ijk, truncate at T_CutTNO → final TNO basis.
 
     Args:
         pno_spaces (dict): Output of pno.make_pnos.
         i, j, k (int): Triple LMO indices.
         s1e (np.ndarray): (nao, nao) AO overlap matrix S.
-        S_cut (float): Eigenvalue threshold for canonical orthogonalisation.
+        t2_for_T (dict, optional): T2 amplitudes in PNO basis for each pair.
+            If provided, pair densities are built from these (CCSD amplitudes).
+            Otherwise, initial PNO T2 from pno_spaces is used.
+        T_CutTNO (float): TNO occupation number truncation threshold.
+        S_cut (float): Eigenvalue threshold for canonical orthogonalization.
 
     Returns:
         C_tno (np.ndarray): (nao, n_tno) S-orthonormal TNO coefficients.
@@ -76,18 +78,61 @@ def _triple_pno_union(pno_spaces, i, j, k, s1e, S_cut=1e-6):
     cols = [c for c in (C_ij, C_ik, C_jk) if c.shape[1] > 0]
     C_pool = np.hstack(cols)   # (nao, n_ij + n_ik + n_jk)
 
-    # Canonical orthogonalisation in S metric: diagonalise S_pool, keep > S_cut
+    # Canonical orthogonalization in S metric: diagonalize S_pool, keep > S_cut
     S_pool = reduce(np.dot, (C_pool.T, s1e, C_pool))
     eigvals, eigvecs = np.linalg.eigh(S_pool)
     keep = eigvals > S_cut
-    n_tno = int(np.sum(keep))
+    n_union = int(np.sum(keep))
 
-    if n_tno == 0:
+    if n_union == 0:
         return np.zeros((s1e.shape[0], 0)), 0
 
-    # X[:,m] = eigvec[:,m] / sqrt(eigval[m])  →  C_pool @ X is S-orthonormal
     X = eigvecs[:, keep] / np.sqrt(eigvals[keep])
-    C_tno = np.dot(C_pool, X)   # (nao, n_tno), S-orthonormal
+    C_union = np.dot(C_pool, X)   # (nao, n_union), S-orthonormal
+
+    # If no T2 available or T_CutTNO <= 0, return the full union
+    if T_CutTNO <= 0:
+        return C_union, n_union
+
+    # Build averaged triplet density D_ijk = (D_ij + D_ik + D_jk) / 3
+    # Project each pair's T2 into the union basis, compute pair density
+    D_avg = np.zeros((n_union, n_union))
+    for pair_key, ii, jj in [(ij, i, j), (ik, i, k), (jk, j, k)]:
+        C_p = pno_spaces[pair_key]['C_pno']
+        if C_p.shape[1] == 0:
+            continue
+        # Projection matrix: PNO(pair) -> union TNO
+        U = reduce(np.dot, (C_p.T, s1e, C_union))   # (n_pno, n_union)
+        # Get T2 amplitudes
+        if t2_for_T is not None and pair_key in t2_for_T:
+            T2_p = t2_for_T[pair_key]
+        elif pno_spaces[pair_key].get('T2_pno') is not None:
+            T2_p = pno_spaces[pair_key]['T2_pno']
+        else:
+            continue
+        # Project T2 to union basis
+        T2_u = reduce(np.dot, (U.T, T2_p, U))   # (n_union, n_union)
+        Tt_u = 2.0 * T2_u - T2_u.T
+        # Pair density in union basis
+        D_p = np.dot(Tt_u, T2_u.T) + np.dot(T2_u, Tt_u.T)
+        if ii == jj:
+            D_p *= 0.5
+        D_avg += D_p
+
+    D_avg /= 3.0
+
+    # Diagonalize triplet density and truncate at T_CutTNO
+    tno_occ, tno_vecs = np.linalg.eigh(D_avg)
+    keep_tno = np.abs(tno_occ) > T_CutTNO
+    n_tno = int(np.sum(keep_tno))
+
+    if n_tno == 0:
+        # Keep at least the largest
+        n_tno = 1
+        keep_tno[np.argmax(np.abs(tno_occ))] = True
+
+    # Transform union → truncated TNO
+    C_tno = np.dot(C_union, tno_vecs[:, keep_tno])   # (nao, n_tno)
 
     return C_tno, n_tno
 
@@ -416,7 +461,7 @@ def _zero_cas_t2_amplitudes(t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir,
 def _process_one_triple(i, j, k,
                         pno_spaces, t2_for_T,
                         Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
-                        t1_pno=None):
+                        t1_pno=None, T_CutTNO=1e-9):
     """Compute (T) energy contribution for one triple (i,j,k). Thread-safe.
 
     All inputs are read-only.  Lpq_full is the preloaded DF array (naux, nao_pair)
@@ -433,7 +478,9 @@ def _process_one_triple(i, j, k,
     if (ij not in t2_for_T or ik not in t2_for_T or jk not in t2_for_T):
         return 0.0
 
-    C_tno, n_tno = _triple_pno_union(pno_spaces, i, j, k, s1e)
+    C_tno, n_tno = _triple_pno_union(pno_spaces, i, j, k, s1e,
+                                      t2_for_T=t2_for_T,
+                                      T_CutTNO=T_CutTNO)
     if n_tno == 0:
         return 0.0
 
@@ -513,7 +560,7 @@ def _process_one_triple(i, j, k,
 def _process_degenerate_pair(i, k,
                              pno_spaces, t2_for_T,
                              Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
-                             t1_pno=None):
+                             t1_pno=None, T_CutTNO=1e-9):
     """Compute (T) energy from degenerate occupied triples {i,i,k} and {i,k,k}.
 
     For a pair (i,k) with i<k, the 2^3=8 occupied combinations in the
@@ -538,17 +585,21 @@ def _process_degenerate_pair(i, k,
 
     # Build TNO space from available pair PNO spaces
     cols = []
+    pair_keys_available = []
     if has_ii:
         C_ii = pno_spaces[ii]['C_pno']
         if C_ii.shape[1] > 0:
             cols.append(C_ii)
+            pair_keys_available.append((ii, i, i))
     C_ik = pno_spaces[ik]['C_pno']
     if C_ik.shape[1] > 0:
         cols.append(C_ik)
+        pair_keys_available.append((ik, i, k))
     if has_kk:
         C_kk = pno_spaces[kk]['C_pno']
         if C_kk.shape[1] > 0:
             cols.append(C_kk)
+            pair_keys_available.append((kk, k, k))
 
     if not cols:
         return 0.0
@@ -556,12 +607,46 @@ def _process_degenerate_pair(i, k,
     C_pool = np.hstack(cols)
     S_pool = reduce(np.dot, (C_pool.T, s1e, C_pool))
     eigvals, eigvecs = np.linalg.eigh(S_pool)
-    keep = eigvals > 1e-6
-    n_tno = int(np.sum(keep))
-    if n_tno == 0:
+    S_cut = 1e-6
+    keep = eigvals > S_cut
+    n_union = int(np.sum(keep))
+    if n_union == 0:
         return 0.0
     X = eigvecs[:, keep] / np.sqrt(eigvals[keep])
-    C_tno = np.dot(C_pool, X)
+    C_union = np.dot(C_pool, X)
+
+    # Build averaged triplet density and truncate at T_CutTNO
+    if T_CutTNO > 0 and pair_keys_available:
+        D_avg = np.zeros((n_union, n_union))
+        n_pairs_used = 0
+        for pair_key, p, q in pair_keys_available:
+            C_p = pno_spaces[pair_key]['C_pno']
+            if C_p.shape[1] == 0:
+                continue
+            U = reduce(np.dot, (C_p.T, s1e, C_union))
+            T2_p = t2_for_T[pair_key]
+            T2_u = reduce(np.dot, (U.T, T2_p, U))
+            Tt_u = 2.0 * T2_u - T2_u.T
+            D_p = np.dot(Tt_u, T2_u.T) + np.dot(T2_u, Tt_u.T)
+            if p == q:
+                D_p *= 0.5
+            D_avg += D_p
+            n_pairs_used += 1
+        if n_pairs_used > 0:
+            D_avg /= max(n_pairs_used, 1)
+            tno_occ, tno_vecs = np.linalg.eigh(D_avg)
+            keep_tno = np.abs(tno_occ) > T_CutTNO
+            n_tno = int(np.sum(keep_tno))
+            if n_tno == 0:
+                n_tno = 1
+                keep_tno[np.argmax(np.abs(tno_occ))] = True
+            C_tno = np.dot(C_union, tno_vecs[:, keep_tno])
+        else:
+            C_tno = C_union
+            n_tno = n_union
+    else:
+        C_tno = C_union
+        n_tno = n_union
 
     # Semicanonicalize TNO
     F_tno_full = reduce(np.dot, (C_tno.T, fock_ao, C_tno))
@@ -730,6 +815,7 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
         Lpq_full=Lpq_full, C_lmo=C_lmo,
         fock_ao=fock_ao, F_lmo=F_lmo, s1e=s1e,
         t1_pno=t1_pno,
+        T_CutTNO=T_CutTNO,
     )
 
     def _do_triple(ijk):

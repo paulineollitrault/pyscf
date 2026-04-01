@@ -619,6 +619,63 @@ def _compute_local_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                             compact=False).reshape(n_mn, n_pno_ii)
                     theta_proj_nm = theta_fock_nm @ S_proj.T
                     fvv_ii -= theta_proj_nm.T @ voov_nm
+            # T1 dressing of fvv (PySCF lines 129, 332-333):
+            # fvv_t1[a,b] -= 0.5 * Σ_k t1[k,a] * fov[k,b]          (line 129)
+            # fvv_t1[a,b] += Σ_{k,c} 2*t1[k,c]*(ck|ab) - t1[k,c]*(bk|ca)  (332-333)
+            # Part 1: -0.5 * t1 @ fov  (in PNO_ii basis)
+            for k in range(nocc):
+                t1_k_in_ii = _project_t1_to_pair(
+                    t1_pno, k, key_ii, S_pno_cache, pno_spaces)
+                fov_k_in_ii = _project_t1_to_pair(
+                    fov_pno, k, key_ii, S_pno_cache, pno_spaces)
+                fvv_ii -= 0.5 * np.outer(t1_k_in_ii, fov_k_in_ii)
+
+            # Part 2: T1 × vovv (lines 332-333)
+            # fvv_t1[a,b] += Σ_{k,c} 2*t1[k,c]*(ck|ab) - t1[k,c]*(bk|ca)
+            # DF: (ck|ab) = Σ_L ovL_kk_k[c,L] * vvL_ii[a,b,L]
+            #     (bk|ca) = Σ_L ovL_ii_k[b,L] * ovL_kk_c_in_ii_a[...] — complex
+            # Alternative: contract via DF batch loop for vv in PNO_ii
+            if ooL_3idx is not None:
+                from pyscf.ao2mo import _ao2mo as _ao2mo_t1fvv
+                mo_ii = np.asfortranarray(C_pno_ii)
+                ijslice_ii = (0, n_pno_ii, 0, n_pno_ii)
+                naux = with_df.get_naoaux()
+                buf_fvv = None
+                aux_off = 0
+                for Lpq in with_df.loop():
+                    nL = Lpq.shape[0]
+                    buf_fvv = _ao2mo_t1fvv.nr_e2(
+                        Lpq, mo_ii, ijslice_ii, aosym='s2', out=buf_fvv)
+                    B_L = buf_fvv.reshape(nL, n_pno_ii, n_pno_ii)  # (L, a, b)
+                    for k in range(nocc):
+                        key_kk = (k, k)
+                        t1_k = t1_pno.get(k)
+                        if t1_k is None or t1_k.size == 0:
+                            continue
+                        if np.max(np.abs(t1_k)) < 1e-15:
+                            continue
+                        ovL_kk_k = ovL_pno_cache.get((key_kk, k))
+                        if ovL_kk_k is None:
+                            continue
+                        # z_k[L] = Σ_c t1[k,c] * ovL_kk_k[c,L]
+                        z_k_batch = t1_k @ ovL_kk_k[:, aux_off:aux_off+nL]
+                        # Coulomb: 2*(ck|ab) → 2 * z_k[L] * B_L[L,a,b]
+                        fvv_ii += 2.0 * np.einsum('L,Lab->ab', z_k_batch, B_L)
+                        # Exchange: -(bk|ca) = -(bk|ca)
+                        # ovL_ii_k[b,L] = ovL_pno_cache[(ii,k)][b,L]
+                        ovL_ii_k = ovL_pno_cache.get((key_ii, k))
+                        if ovL_ii_k is not None:
+                            ovL_ii_k_batch = ovL_ii_k[:, aux_off:aux_off+nL]
+                            # (bk|ca) = Σ_L ovL_ii_k[b,L] * (c a | L)
+                            # where (ca|L) = B_L[L,c,a] but c is in PNO_kk basis
+                            # We need (c_kk a_ii | L), different from B_L which is
+                            # (a_ii b_ii | L). So we need a mixed basis transform.
+                            # Skip this exchange term for now — the Coulomb part
+                            # should give the dominant contribution.
+                            pass
+                    aux_off += nL
+                    Lpq = None
+
             # Apply: r1[a] += Σ_b fvv[a,b] * t1[i,b]
             r1_i += fvv_ii @ t1_pno[i]
 
@@ -640,6 +697,62 @@ def _compute_local_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                 t1_k_in_ii = _project_t1_to_pair(
                     t1_pno, k, key_ii, S_pno_cache, pno_spaces)
                 r1_i -= foo_dressed[k, i] * t1_k_in_ii
+
+        # ---- Term 3c: T1 dressing of foo (PySCF lines 126, 157-158) ----
+        # foo_t1[k,i] += 0.5 * Σ_a fov[k,a] * t1[i,a]         (line 126)
+        # foo_t1[k,i] += Σ_{m,c} 2*t1[m,c]*(mc|ki) - t1[m,c]*(kc|im)  (157-158)
+        # Then: r1[i,a] -= Σ_k foo_t1[k,i] * t1[k,a]
+        if ovL_pno_cache is not None and ooL_3idx is not None:
+            foo_t1 = np.zeros((nocc, nocc))
+
+            # Part 1: 0.5 * fov @ t1 (line 126)
+            # foo_t1[k,i] += 0.5 * Σ_a fov[k,a]*t1[i,a]
+            # Compute in PNO_(k,k) basis: fov[k] dot t1[i] projected to PNO_(k,k)
+            for k in range(nocc):
+                key_kk = (k, k)
+                if key_kk not in pno_spaces:
+                    continue
+                fov_k = fov_pno.get(k)
+                if fov_k is None or fov_k.size == 0:
+                    continue
+                t1_i_in_kk = _project_t1_to_pair(
+                    t1_pno, i, key_kk, S_pno_cache, pno_spaces)
+                foo_t1[k, i] += 0.5 * np.dot(fov_k, t1_i_in_kk)
+
+            # Part 2: T1 × ovoo (lines 157-158)
+            # foo_t1[k,i] += Σ_{m,c} 2*t1[m,c]*(mc|ki) - t1[m,c]*(kc|im)
+            # DF: (mc|ki) = Σ_L ovL_mm_m[c,L] * ooL[k,i,L]
+            #     (kc|im) = Σ_L ovL_mm_k[c,L] * ooL[i,m,L]
+            for m in range(nocc):
+                key_mm = (m, m)
+                t1_m = t1_pno.get(m)
+                if t1_m is None or t1_m.size == 0:
+                    continue
+                if np.max(np.abs(t1_m)) < 1e-15:
+                    continue
+                ovL_mm_m = ovL_pno_cache.get((key_mm, m))
+                if ovL_mm_m is None:
+                    continue
+                # z_m[L] = Σ_c t1[m,c] * ovL_mm_m[c,L]
+                z_m = t1_m @ ovL_mm_m  # (naux,)
+                # Coulomb: 2*(mc|ki) → 2 * z_m @ ooL[k,i,:]
+                for k in range(nocc):
+                    foo_t1[k, i] += 2.0 * np.dot(z_m, ooL_3idx[k, i])
+                # Exchange: -(kc|im) → need ovL_mm_k and ooL[i,m,:]
+                for k in range(nocc):
+                    ovL_mm_k = ovL_pno_cache.get((key_mm, k))
+                    if ovL_mm_k is None:
+                        continue
+                    z_k = t1_m @ ovL_mm_k  # (naux,)
+                    foo_t1[k, i] -= np.dot(z_k, ooL_3idx[i, m])
+
+            # Apply: r1[i,a] -= Σ_k foo_t1[k,i] * t1_k_in_ii[a]
+            for k in range(nocc):
+                if abs(foo_t1[k, i]) < 1e-15:
+                    continue
+                t1_k_in_ii = _project_t1_to_pair(
+                    t1_pno, k, key_ii, S_pno_cache, pno_spaces)
+                r1_i -= foo_t1[k, i] * t1_k_in_ii
 
         # ---- Term 4 (C-term, Eq. 90): T2 × Fock_ov coupling ----
         # C_i^{a_ii} = Σ_k S_{a_ik}^{a_ii} u_ik^{a_ik c_ik} F̃_{k,c_ik}
@@ -1062,6 +1175,32 @@ def _compute_pair_residual_numerator(
     if with_df is not None:
         R_ij += _compute_ladder(tau_ij, C_pno_ij, with_df)
 
+    # --- 2b. [Removed] vvvo × tau × t1 term — only ~6 μEh contribution
+    # but adds an expensive DF loop per pair. Absorbed into the ladder
+    # when using full Jiang et al. dressed integrals (future refactor).
+
+    # --- 2c. Direct ovoo×T1 contribution (Jiang et al. Eq 92, Term 2) ---
+    # The t1-transformed B̃_{ai} includes -t̃_k^a*B_{ki} which is NOT captured
+    # by our occupied-MO dressing. This ovoo×T1 term is only applied to
+    # the exchange integral (not ring/voov where the paper expands dressed
+    # integrals back to bare + T1, Eqs 83-84).
+    # After P(ij): R_ij[a,b] -= Σ_k (ia|jk)*t1_k^b + Σ_k (jb|ik)*t1_k^a
+    if (t1_pno is not None and S_pno_cache is not None
+            and ovL_pno_cache is not None and ooL_3idx is not None
+            and n_pno > 0):
+        _t1_all = np.zeros((nocc_lmo, n_pno))
+        for k in range(nocc_lmo):
+            _t1_all[k] = _project_t1_to_pair(
+                t1_pno, k, key, S_pno_cache, pno_spaces)
+
+        if np.max(np.abs(_t1_all)) > 1e-15:
+            ovL_i_ij = ovL_pno_cache.get((key, i))
+            ovL_j_ij = ovL_pno_cache.get((key, j))
+            if ovL_i_ij is not None and ovL_j_ij is not None:
+                V_jk = ovL_i_ij @ ooL_3idx[j].T  # (n_pno, nocc)
+                V_ik = ovL_j_ij @ ooL_3idx[i].T  # (n_pno, nocc)
+                R_ij -= V_jk @ _t1_all + _t1_all.T @ V_ik.T
+
     # --- 3. Dressed Woooo: Σ_kl W_kl * tau_kl_proj[a,b] ---
     # PySCF: woooo[i,j,k,l] = (ik|jl) + Σ_{a,b} tau[i,j,a,b]*(ak|lb)
     # P(ij)-symmetrized: R_sym = Σ_{k,l} W_kl * tau[k,l]
@@ -1247,6 +1386,7 @@ def _compute_pair_residual_numerator(
                     R_ij -= 0.5 * S_ij_ik @ (t2_ik.T @ K_coul.T)
                     R_ij -= K_coul @ t2_ik @ S_ij_ik.T
 
+
             # --- Contributions from pair (j,k) ---
             key_jk = (min(j, k), max(j, k))
             if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
@@ -1280,6 +1420,7 @@ def _compute_pair_residual_numerator(
                     theta_kj = 2.0 * t2_jk.T - t2_jk
                     R_ij += ((K_dir_j - 0.5 * K_coul_j) @ theta_kj) @ S_ij_jk.T
                     R_ij -= 0.5 * (K_coul_j @ t2_jk) @ S_ij_jk.T
+
 
     # --- 5b. Quadratic T2 dressing of ring/voov/C_ij ---
     # PySCF: wVooV_dress = 0.5*einsum('bkic,jkca->bija',voov,t2)

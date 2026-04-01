@@ -255,11 +255,169 @@ def _pair_K_iajb(ovL_i, ovL_j):
 
 
 # ---------------------------------------------------------------------------
+# Iterative L-MP2 for PNO generation
+# ---------------------------------------------------------------------------
+
+def _iterative_lmp2(pair_data, F_lmo, s1e, nocc_lmo,
+                    max_iter=50, e_conv=1e-7, r_conv=5e-7,
+                    fock_cutoff=1e-5, log=None):
+    """Run iterative local MP2 with inter-pair occupied Fock coupling.
+
+    This matches ORCA's "full local MP2" used for PNO generation (Pass-2).
+    The inter-pair coupling via off-diagonal F_oo[i,k] produces ~2.4% larger
+    correlation energy than semicanonical MP2, yielding bigger pair densities
+    and more PNOs surviving the T_CutPNO threshold.
+
+    All amplitudes are stored and updated in each pair's SEMICANONICAL basis
+    where the virtual Fock matrix is diagonal.  This makes the Jacobi
+    preconditioner exact for the intra-pair part, ensuring stable convergence.
+    Inter-pair coupling is projected between different pairs' SC bases via
+    P_sc = U_sc_ij.T @ C_orth_ij.T @ S_ao @ C_orth_kj @ U_sc_kj.
+
+    Args:
+        pair_data (dict): key=(i,j), value=dict with:
+            'U_sc': (n_orth, n_orth) orth->SC transformation
+            'eps_sc': (n_orth,) SC orbital energies (eigenvalues of F_orth)
+            'K_sc': (n_orth, n_orth) exchange integrals in SC basis
+            'C_orth': (nao, n_orth) orthogonal PAO coefficients
+            'T2_orth': (n_orth, n_orth) SC-MP2 initial guess (in orth basis)
+        F_lmo (np.ndarray): (nocc, nocc) Fock matrix in LMO basis.
+        s1e (np.ndarray): (nao, nao) AO overlap matrix.
+        nocc_lmo (int): Number of occupied LMOs.
+        max_iter (int): Max L-MP2 iterations.
+        e_conv (float): Energy convergence tolerance.
+        r_conv (float): Residual convergence tolerance.
+        fock_cutoff (float): Skip F_oo[i,k] coupling if |F_oo[i,k]| < cutoff.
+        log: Logger object.
+
+    Returns:
+        t2 (dict): Converged T2 amplitudes in ORTH basis, key=(i,j).
+        e_lmp2 (float): Converged L-MP2 correlation energy.
+    """
+    keys = sorted(pair_data.keys())
+
+    # Initialize T2 in SC basis from the SC-MP2 solution
+    # T2_orth = U_sc @ T2_sc @ U_sc.T, so T2_sc = U_sc.T @ T2_orth @ U_sc
+    t2_sc = {}
+    for ij in keys:
+        U = pair_data[ij]['U_sc']
+        t2_sc[ij] = reduce(np.dot, (U.T, pair_data[ij]['T2_orth'], U))
+
+    # Precompute SC-basis projection matrices between coupled pair domains
+    # P_sc_{ij,kj} = U_sc_ij.T @ C_orth_ij.T @ S_ao @ C_orth_kj @ U_sc_kj
+    proj_sc_cache = {}
+    for ij in keys:
+        i, j = ij
+        C_ij = pair_data[ij]['C_orth']
+        U_ij = pair_data[ij]['U_sc']
+        SC_ij = U_ij.T @ C_ij.T @ s1e  # (n_sc_ij, nao)
+        for k in range(nocc_lmo):
+            if k != i and abs(F_lmo[i, k]) >= fock_cutoff:
+                kj = (min(k, j), max(k, j))
+                if kj in pair_data and (ij, kj) not in proj_sc_cache:
+                    C_kj = pair_data[kj]['C_orth']
+                    U_kj = pair_data[kj]['U_sc']
+                    proj_sc_cache[(ij, kj)] = SC_ij @ C_kj @ U_kj
+            if k != j and abs(F_lmo[k, j]) >= fock_cutoff:
+                ik = (min(i, k), max(i, k))
+                if ik in pair_data and (ij, ik) not in proj_sc_cache:
+                    C_ik = pair_data[ik]['C_orth']
+                    U_ik = pair_data[ik]['U_sc']
+                    proj_sc_cache[(ij, ik)] = SC_ij @ C_ik @ U_ik
+
+    # Precompute Jacobi preconditioner in SC basis:
+    # D_ij[a,b] = eps_sc_a + eps_sc_b - F_ii - F_jj  (exact diagonal)
+    D_all = {}
+    for ij in keys:
+        i, j = ij
+        eps = pair_data[ij]['eps_sc']
+        D = eps[:, None] + eps[None, :] - F_lmo[i, i] - F_lmo[j, j]
+        D_all[ij] = np.where(np.abs(D) > 1e-12, D, 1.0)
+
+    e_prev = 0.0
+    for iteration in range(max_iter):
+        e_lmp2 = 0.0
+        r_max = 0.0
+
+        for ij in keys:
+            i, j = ij
+            K_sc = pair_data[ij]['K_sc']
+            T2_ij = t2_sc[ij]
+
+            # Residual in SC basis (F_vv is diagonal = eps_sc):
+            # R = K_sc + D*T2 - coupling
+            # where D = eps_a + eps_b - eps_i - eps_j
+            R = K_sc + D_all[ij] * T2_ij
+
+            # Inter-pair coupling: -sum_k F_oo[i,k] * P @ T2_kj @ P.T
+            for k in range(nocc_lmo):
+                if k != i and abs(F_lmo[i, k]) >= fock_cutoff:
+                    kj = (min(k, j), max(k, j))
+                    if kj not in t2_sc:
+                        continue
+                    P = proj_sc_cache.get((ij, kj))
+                    if P is None:
+                        continue
+                    T2_kj = t2_sc[kj]
+                    if k > j:
+                        T2_kj_used = T2_kj.T
+                    else:
+                        T2_kj_used = T2_kj
+                    R -= F_lmo[i, k] * (P @ T2_kj_used @ P.T)
+
+            # Inter-pair coupling: -sum_k F_oo[k,j] * P @ T2_ik @ P.T
+            for k in range(nocc_lmo):
+                if k != j and abs(F_lmo[k, j]) >= fock_cutoff:
+                    ik = (min(i, k), max(i, k))
+                    if ik not in t2_sc:
+                        continue
+                    P = proj_sc_cache.get((ij, ik))
+                    if P is None:
+                        continue
+                    T2_ik = t2_sc[ik]
+                    if i > k:
+                        T2_ik_used = T2_ik.T
+                    else:
+                        T2_ik_used = T2_ik
+                    R -= F_lmo[k, j] * (P @ T2_ik_used @ P.T)
+
+            # Jacobi update: T2_new = T2 - R/D = -K/D + coupling/D
+            t2_sc[ij] = T2_ij - R / D_all[ij]
+
+            r_max = max(r_max, np.max(np.abs(R)))
+
+            # Pair energy
+            Tt = 2.0 * t2_sc[ij] - t2_sc[ij].T
+            e_ij = np.einsum('ab,ab->', K_sc, Tt)
+            e_lmp2 += e_ij * (1.0 if i == j else 2.0)
+
+        dE = abs(e_lmp2 - e_prev)
+        if log is not None and iteration % 2 == 0:
+            log.info('LMP2-Iter=%3d: E_LMP2=%.12f  dE=%.1e  Rmax=%.1e',
+                     iteration, e_lmp2, dE, r_max)
+        if dE < e_conv and r_max < r_conv:
+            if log is not None:
+                log.info('LMP2-Iter=%3d: E_LMP2=%.12f  dE=%.1e  Rmax=%.1e => CONVERGED',
+                         iteration, e_lmp2, dE, r_max)
+            break
+        e_prev = e_lmp2
+
+    # Transform converged T2 back to orthogonal basis for downstream use
+    t2_orth = {}
+    for ij in keys:
+        U = pair_data[ij]['U_sc']
+        t2_orth[ij] = reduce(np.dot, (U, t2_sc[ij], U.T))
+
+    return t2_orth, e_lmp2
+
+
+# ---------------------------------------------------------------------------
 # Main PNO construction
 # ---------------------------------------------------------------------------
 
 def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
               T_CutPNO=1e-7, T_CutPairs=1e-4, S_cut_domain=1e-6,
+              T_CutEnergy=1.0, T_CutTrace=1.0,
               occ_cas_idx=None, C_cas_vir=None, nvir_cas=0, s1e=None,
               verbose=None):
     """Construct PNO spaces for all LMO pairs and compute LMP2 energies.
@@ -271,7 +429,11 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
       4. Semicanonicalize: diagonalize F_vv → get diagonal orbital energies
       5. Compute semicanonical MP2 amplitudes T2 = -K / D
       6. Build pair density, diagonalize → PNOs (U_ij, n_ij)
-      7. Truncate at T_CutPNO, canonicalize PNOs w.r.t. Fock
+      7. Truncate PNOs using three criteria (Jiang et al. 2024):
+         a. Occupation: n_ij > T_CutPNO
+         b. Energy: cumulative pair energy / total > T_CutEnergy
+         c. Trace: cumulative occupation sum / total > T_CutTrace
+         A PNO is kept if ANY criterion requires it.
       8. Compute LMP2 energy for this pair
       9. Classify pair as strong / weak based on |e_ij| vs T_CutPairs
 
@@ -285,6 +447,10 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         T_CutPNO (float): PNO occupation truncation threshold.
         T_CutPairs (float): |e_ij| threshold: strong if > T_CutPairs, else weak.
         S_cut_domain (float): Eigenvalue cutoff for canonical orthogonalization.
+        T_CutEnergy (float): Energy criterion: keep PNOs until cumulative
+            pair energy ratio exceeds this (default 0.997, Jiang et al. 2024).
+        T_CutTrace (float): Trace criterion: keep PNOs until cumulative
+            occupation fraction exceeds this (default 0.999, Jiang et al. 2024).
         verbose: Verbosity.
 
     Returns:
@@ -341,6 +507,11 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
 
     occ_cas_set = set(occ_cas_idx.tolist()) if occ_cas_idx is not None else set()
 
+    # ===================================================================
+    # Phase 1: Build per-pair domain data and SC-MP2 initial guess
+    # ===================================================================
+    pair_domain_data = {}   # intermediate data for L-MP2 iteration
+
     for i in range(nocc_lmo):
         for j in range(i, nocc_lmo):
             # --- 1. Pair domain (union of LMO domains) ---
@@ -359,180 +530,221 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                 continue
 
             # --- 3. F_vv and K_iajb in orthogonal domain basis ---
-            # F in orthogonal domain: X_orth^T @ F_dom @ X_orth
-            F_dom = F_pao[np.ix_(domain_ij, domain_ij)]  # (n_dom, n_dom)
-            F_orth = reduce(np.dot, (X_orth_ij.T, F_dom, X_orth_ij))  # (n_orth, n_orth)
+            F_dom = F_pao[np.ix_(domain_ij, domain_ij)]
+            F_orth = reduce(np.dot, (X_orth_ij.T, F_dom, X_orth_ij))
 
-            # K_iajb in orthogonal domain
             if use_df:
-                # ovL[i, domain_ij, :] → transform to orthogonal basis
-                ovL_i_dom = ovL[i][domain_ij, :]   # (n_dom, naux)
-                ovL_j_dom = ovL[j][domain_ij, :]   # (n_dom, naux)
-                ovL_i_orth = np.dot(X_orth_ij.T, ovL_i_dom)   # (n_orth, naux)
-                ovL_j_orth = np.dot(X_orth_ij.T, ovL_j_dom)   # (n_orth, naux)
-                K_ij = _pair_K_iajb(ovL_i_orth, ovL_j_orth)   # (n_orth, n_orth)
+                ovL_i_dom = ovL[i][domain_ij, :]
+                ovL_j_dom = ovL[j][domain_ij, :]
+                ovL_i_orth = np.dot(X_orth_ij.T, ovL_i_dom)
+                ovL_j_orth = np.dot(X_orth_ij.T, ovL_j_dom)
+                K_ij = _pair_K_iajb(ovL_i_orth, ovL_j_orth)
             else:
-                # Exact 4-index: K_iajb_exact[i, :, j, :] → slice domain → transform
                 K_dom_ij = K_iajb_exact[i, :, j, :][np.ix_(domain_ij, domain_ij)]
-                K_ij = X_orth_ij.T @ K_dom_ij @ X_orth_ij    # (n_orth, n_orth)
+                K_ij = X_orth_ij.T @ K_dom_ij @ X_orth_ij
 
-            # --- 4. Semicanonicalize: diagonalize F_orth ---
-            # In semicanonical basis, F_vv is diagonal → denominators are exact
-            eps_sc, U_sc = np.linalg.eigh(F_orth)   # eigenvalues, (n_orth, n_orth)
+            # --- 4. Semicanonical MP2 initial guess ---
+            eps_sc, U_sc = np.linalg.eigh(F_orth)
+            K_sc = reduce(np.dot, (U_sc.T, K_ij, U_sc))
 
-            # K in semicanonical basis
-            K_sc = reduce(np.dot, (U_sc.T, K_ij, U_sc))    # (n_orth, n_orth)
+            D_ij_sc = (eps_i[i] + eps_i[j]
+                       - eps_sc[:, None] - eps_sc[None, :])
+            D_safe = np.where(np.abs(D_ij_sc) > 1e-12, D_ij_sc, 1.0)
+            T2_sc = K_sc / D_safe
+            T2_sc = np.where(np.abs(D_ij_sc) > 1e-12, T2_sc, 0.0)
 
-            # --- 5. Semicanonical MP2 amplitudes ---
-            # T2[a,b] = -K[a,b] / (eps_i + eps_j - eps_a - eps_b)
-            D_ij = (eps_i[i] + eps_i[j]
-                    - eps_sc[:, None] - eps_sc[None, :])   # (n_orth, n_orth)
-            # Avoid division by zero (should not occur in well-behaved systems)
-            D_safe = np.where(np.abs(D_ij) > 1e-12, D_ij, 1.0)
-            T2_sc = K_sc / D_safe   # (n_orth, n_orth)  T2 = K/D < 0 (D<0)
-            T2_sc = np.where(np.abs(D_ij) > 1e-12, T2_sc, 0.0)
+            # Transform SC-MP2 T2 back to orthogonal domain basis for L-MP2
+            T2_orth = reduce(np.dot, (U_sc, T2_sc, U_sc.T))
 
-            # --- 6. Pair density and PNO eigendecomposition ---
-            # Antisymmetrized amplitude: Tt = 2*T2 - T2.T
-            Tt_sc = 2.0 * T2_sc - T2_sc.T
-            # Pair density: D_ij = Tt @ T2.T + T2 @ Tt.T (symmetrized)
-            D_pair = np.dot(Tt_sc, T2_sc.T) + np.dot(T2_sc, Tt_sc.T)
-            if i == j:
-                D_pair *= 0.5
-
-            # Diagonalize: sort by abs value descending (most important first).
-            # For i==j the density is PSD; for i!=j it can have negative
-            # eigenvalues that still carry significant pair-correlation energy.
-            pno_occ, U_pno = np.linalg.eigh(D_pair)
-            order = np.argsort(np.abs(pno_occ))[::-1]
-            pno_occ = pno_occ[order]
-            U_pno = U_pno[:, order]
-
-            # --- 7. Build PNO basis ---
-            is_cas_pair = (i in occ_cas_set and j in occ_cas_set
-                           and C_cas_vir is not None and nvir_cas > 0)
-
-            nvir_cas_local = 0
-
-            # Standard PNO truncation (used for all pairs)
-            keep = np.abs(pno_occ) > T_CutPNO
-            n_pno = int(np.sum(keep))
-
-            if n_pno == 0:
-                n_pno = 1
-                keep[np.argmax(np.abs(pno_occ))] = True
-
-            U_pno_kept = U_pno[:, keep]
-            n_pno_kept = pno_occ[keep]
-
-            # Canonicalize PNOs w.r.t. Fock (in semicanonical basis)
-            # U_pno_kept lives in the semicanonical basis where F = diag(eps_sc)
-            F_sc_diag = np.diag(eps_sc)
-            F_pno_block = reduce(np.dot, (U_pno_kept.T, F_sc_diag, U_pno_kept))
-            e_pno_sc, V_pno = np.linalg.eigh(F_pno_block)
-            U_pno_kept = np.dot(U_pno_kept, V_pno)
-
-            if is_cas_pair:
-                # Lang et al. eq (10): S_ij = I_NCAS ⊕ d_ij
-                # The extended PNO space prepends the CAS MOs (identity block)
-                # to the *external* PNOs, which must be orthogonal to the CAS
-                # virtual block.  Without this orthogonalisation the CAS virtual
-                # MOs appear twice (once in columns 0:nvir_cas, once inside the
-                # span of the standard PNOs built from the full PAO domain),
-                # making C_pno_ij rank-deficient and the Jacobi iteration diverge.
-                nvir_cas_local = nvir_cas
-
-                # External PNOs in AO basis: standard PNO path
-                U_full_ext = np.dot(U_sc, U_pno_kept)
-                C_ext_pno = np.dot(C_orth_ij, U_full_ext)  # (nao, n_pno_kept)
-
-                # ---- Project CAS virtual directions out of external PNOs ----
-                if s1e is not None and C_ext_pno.shape[1] > 0:
-                    # Gram-Schmidt: remove <cas_vir | S | ext_pno> component
-                    overlap = C_cas_vir.T @ (s1e @ C_ext_pno)   # (nvir_cas, n_ext)
-                    C_ext_pno = C_ext_pno - C_cas_vir @ overlap
-                    # Drop columns with negligible norm (were fully in CAS vir space)
-                    col_norms = np.sqrt(np.maximum(
-                        np.einsum('ip,ip->p', C_ext_pno, s1e @ C_ext_pno), 0.0))
-                    C_ext_pno = C_ext_pno[:, col_norms > 1e-8]
-                    if C_ext_pno.shape[1] > 0:
-                        # Normalize then Löwdin-orthonormalize among themselves
-                        C_ext_pno /= col_norms[col_norms > 1e-8][None, :]
-                        S_ext = C_ext_pno.T @ (s1e @ C_ext_pno)
-                        sv, Vext = np.linalg.eigh(S_ext)
-                        C_ext_pno = (C_ext_pno @ Vext[:, sv > 1e-8]
-                                     / np.sqrt(sv[sv > 1e-8])[None, :])
-
-                # Extended PNO coefficients: [CAS_vir | ext_PNO]
-                C_pno_ij = np.hstack([C_cas_vir, C_ext_pno])
-
-                # Orbital energies: CAS from Fock, ext from Fock in projected basis
-                fock_ao_local = mf.get_fock() if not hasattr(mf, '_fock_cache') else mf._fock_cache
-                F_cas_vir = reduce(np.dot, (C_cas_vir.T, fock_ao_local, C_cas_vir))
-                e_cas_vir = np.diag(F_cas_vir).real
-                if C_ext_pno.shape[1] > 0:
-                    F_ext = C_ext_pno.T @ fock_ao_local @ C_ext_pno
-                    e_ext_sc, V_ext = np.linalg.eigh(F_ext)
-                    C_ext_pno = C_ext_pno @ V_ext          # re-canonicalise
-                    C_pno_ij = np.hstack([C_cas_vir, C_ext_pno])
-                else:
-                    e_ext_sc = np.array([])
-                e_pno_sc = np.concatenate([e_cas_vir, e_ext_sc])
-                n_pno_kept = np.ones(C_pno_ij.shape[1])
-
-                # No domain-based transformations for the CAS block —
-                # K and T2 will be recomputed from DF integrals in lccsd.py
-                # (the pair integral build uses C_pno_ij directly)
-                K_pno = None  # signal to recompute in LCCSD
-                T2_pno = None
-            else:
-                # Full transformation for non-CAS pairs
-                U_full = np.dot(U_sc, U_pno_kept)
-                C_pno_ij = np.dot(C_orth_ij, U_full)
-
-                # K and T2 in PNO basis
-                K_pno = reduce(np.dot, (U_pno_kept.T, K_sc, U_pno_kept))
-                T2_pno = reduce(np.dot, (U_pno_kept.T, T2_sc, U_pno_kept))
-
-            # --- 8. LMP2 pair energy ---
-            if K_pno is not None:
-                Tt_pno = 2.0 * T2_pno - T2_pno.T
-                e_ij = np.einsum('ab,ab->', K_pno, Tt_pno)
-            else:
-                # CAS pair: compute LMP2 energy from external PNOs only
-                # (the CAS block contribution will come from DMRG)
-                K_ext = reduce(np.dot, (U_pno_kept.T, K_sc, U_pno_kept))
-                T2_ext = reduce(np.dot, (U_pno_kept.T, T2_sc, U_pno_kept))
-                Tt_ext = 2.0 * T2_ext - T2_ext.T
-                e_ij = np.einsum('ab,ab->', K_ext, Tt_ext)
-
-            e_lmp2_total += e_ij * (1 if i == j else 2)
-
-            # --- 9. Classify pair ---
-            is_strong = abs(e_ij) > T_CutPairs
-
-            pno_spaces[(i, j)] = {
-                'C_pno': C_pno_ij,
-                'n_pno': n_pno_kept,
-                'e_pno': e_pno_sc,
-                'K_pno': K_pno,
-                'T2_pno': T2_pno,
-                'e_mp2': e_ij,
-                'domain_ij': domain_ij,
+            pair_domain_data[(i, j)] = {
+                'C_orth': C_orth_ij,
                 'X_orth': X_orth_ij,
-                'U_full': U_full if not is_cas_pair else None,
-                'domain_idx': domain_ij,
-                'is_cas_pair': is_cas_pair,
-                'nvir_cas_local': nvir_cas_local,
+                'F_orth': F_orth,
+                'K_orth': K_ij,
+                'T2_orth': T2_orth,
+                'U_sc': U_sc,
+                'eps_sc': eps_sc,
+                'K_sc': K_sc,
+                'domain_ij': domain_ij,
             }
 
-            if is_strong:
-                strong_pairs.append((i, j))
-                n_pairs_strong += 1
+    # ===================================================================
+    # Phase 2: Iterative L-MP2 with inter-pair Fock coupling
+    # ===================================================================
+    if s1e is None:
+        s1e = mf.get_ovlp()
+
+    t2_lmp2, e_lmp2_iter = _iterative_lmp2(
+        pair_domain_data, F_lmo, s1e, nocc_lmo, log=log)
+
+    log.info('L-MP2 correlation energy = %.15g', e_lmp2_iter)
+
+    # ===================================================================
+    # Phase 3: Build PNOs from converged L-MP2 amplitudes
+    # ===================================================================
+    for (i, j), pdata in pair_domain_data.items():
+        C_orth_ij = pdata['C_orth']
+        X_orth_ij = pdata['X_orth']
+        F_orth = pdata['F_orth']
+        K_ij = pdata['K_orth']
+        U_sc = pdata['U_sc']
+        eps_sc = pdata['eps_sc']
+        K_sc = pdata['K_sc']
+        domain_ij = pdata['domain_ij']
+
+        # Transform converged L-MP2 T2 to semicanonical basis
+        T2_orth_conv = t2_lmp2[(i, j)]
+        T2_sc = reduce(np.dot, (U_sc.T, T2_orth_conv, U_sc))
+
+        # L-MP2 pair energy (pre-truncation, for classification)
+        Tt_sc = 2.0 * T2_sc - T2_sc.T
+        e_ij = np.einsum('ab,ab->', K_sc, Tt_sc)
+
+        # --- 6. Pair density and PNO eigendecomposition ---
+        D_pair = np.dot(Tt_sc, T2_sc.T) + np.dot(T2_sc, Tt_sc.T)
+        if i == j:
+            D_pair *= 0.5
+
+        pno_occ, U_pno = np.linalg.eigh(D_pair)
+        order = np.argsort(np.abs(pno_occ))[::-1]
+        pno_occ = pno_occ[order]
+        U_pno = U_pno[:, order]
+
+        # --- 7. Build PNO basis ---
+        is_cas_pair = (i in occ_cas_set and j in occ_cas_set
+                       and C_cas_vir is not None and nvir_cas > 0)
+
+        nvir_cas_local = 0
+
+        # Diagonal pairs (i==j) use a tighter PNO cutoff for singles.
+        # ORCA TightPNO: TCutPNOSingles = 3e-9 (with TCutPNO = 1e-7).
+        T_CutPNO_ij = T_CutPNO * 3e-2 if i == j else T_CutPNO
+
+        # Three PNO significance criteria (Jiang et al. 2024, p.14):
+        # A PNO is kept if ANY criterion requires it.
+        # 1. Occupation criterion
+        keep_occ = np.abs(pno_occ) > T_CutPNO_ij
+
+        # 2. Energy criterion: include PNOs from largest to smallest occupation
+        #    until cumulative pair energy / total pair energy > T_CutEnergy.
+        n_sc = len(pno_occ)
+        keep_energy = np.zeros(n_sc, dtype=bool)
+        if T_CutEnergy < 1.0 and abs(e_ij) > 1e-15:
+            e_cum = 0.0
+            for p in range(n_sc):
+                # Pair energy from PNOs 0..p (in SC basis, projected through U_pno)
+                # Approximation: use diagonal MP2 energy per PNO
+                # E_p = K_sc_pno[p,p] * (2*T2_sc_pno[p,p] - T2_sc_pno[p,p]) / denominator
+                # More accurately: accumulate the MP2 pair energy in PNO basis
+                # by transforming K and T2 to PNO space up to index p.
+                # For efficiency, use the per-PNO contribution:
+                #   T2_pno[a,b] = U.T @ T2_sc @ U, K_pno[a,b] = U.T @ K_sc @ U
+                #   e_a = Σ_b K_pno[a,b] * (2*T2_pno[a,b] - T2_pno[b,a])
+                U_p = U_pno[:, :p+1]
+                K_p = reduce(np.dot, (U_p.T, K_sc, U_p))
+                T2_p = reduce(np.dot, (U_p.T, T2_sc, U_p))
+                Tt_p = 2.0 * T2_p - T2_p.T
+                e_cum = np.einsum('ab,ab->', K_p, Tt_p)
+                keep_energy[p] = True
+                if abs(e_cum / e_ij) >= T_CutEnergy:
+                    break
+
+        # 3. Trace criterion: include PNOs until cumulative occupation
+        #    fraction > T_CutTrace.
+        keep_trace = np.zeros(n_sc, dtype=bool)
+        total_trace = np.sum(np.abs(pno_occ))
+        if T_CutTrace < 1.0 and total_trace > 1e-15:
+            cum_trace = 0.0
+            for p in range(n_sc):
+                cum_trace += abs(pno_occ[p])
+                keep_trace[p] = True
+                if cum_trace / total_trace >= T_CutTrace:
+                    break
+
+        # Union of all three criteria
+        keep = keep_occ | keep_energy | keep_trace
+        n_pno = int(np.sum(keep))
+
+        if n_pno == 0:
+            n_pno = 1
+            keep[np.argmax(np.abs(pno_occ))] = True
+
+        U_pno_kept = U_pno[:, keep]
+        n_pno_kept = pno_occ[keep]
+
+        F_sc_diag = np.diag(eps_sc)
+        F_pno_block = reduce(np.dot, (U_pno_kept.T, F_sc_diag, U_pno_kept))
+        e_pno_sc, V_pno = np.linalg.eigh(F_pno_block)
+        U_pno_kept = np.dot(U_pno_kept, V_pno)
+
+        if is_cas_pair:
+            nvir_cas_local = nvir_cas
+            U_full_ext = np.dot(U_sc, U_pno_kept)
+            C_ext_pno = np.dot(C_orth_ij, U_full_ext)
+
+            if s1e is not None and C_ext_pno.shape[1] > 0:
+                overlap = C_cas_vir.T @ (s1e @ C_ext_pno)
+                C_ext_pno = C_ext_pno - C_cas_vir @ overlap
+                col_norms = np.sqrt(np.maximum(
+                    np.einsum('ip,ip->p', C_ext_pno, s1e @ C_ext_pno), 0.0))
+                C_ext_pno = C_ext_pno[:, col_norms > 1e-8]
+                if C_ext_pno.shape[1] > 0:
+                    C_ext_pno /= col_norms[col_norms > 1e-8][None, :]
+                    S_ext = C_ext_pno.T @ (s1e @ C_ext_pno)
+                    sv, Vext = np.linalg.eigh(S_ext)
+                    C_ext_pno = (C_ext_pno @ Vext[:, sv > 1e-8]
+                                 / np.sqrt(sv[sv > 1e-8])[None, :])
+
+            C_pno_ij = np.hstack([C_cas_vir, C_ext_pno])
+
+            fock_ao_local = mf.get_fock() if not hasattr(mf, '_fock_cache') else mf._fock_cache
+            F_cas_vir = reduce(np.dot, (C_cas_vir.T, fock_ao_local, C_cas_vir))
+            e_cas_vir = np.diag(F_cas_vir).real
+            if C_ext_pno.shape[1] > 0:
+                F_ext = C_ext_pno.T @ fock_ao_local @ C_ext_pno
+                e_ext_sc, V_ext = np.linalg.eigh(F_ext)
+                C_ext_pno = C_ext_pno @ V_ext
+                C_pno_ij = np.hstack([C_cas_vir, C_ext_pno])
             else:
-                if abs(e_ij) > 0.0:
-                    weak_pairs.append((i, j))
-                    n_pairs_weak += 1
+                e_ext_sc = np.array([])
+            e_pno_sc = np.concatenate([e_cas_vir, e_ext_sc])
+            n_pno_kept = np.ones(C_pno_ij.shape[1])
+
+            K_pno = None
+            T2_pno = None
+        else:
+            U_full = np.dot(U_sc, U_pno_kept)
+            C_pno_ij = np.dot(C_orth_ij, U_full)
+
+            K_pno = reduce(np.dot, (U_pno_kept.T, K_sc, U_pno_kept))
+            T2_pno = reduce(np.dot, (U_pno_kept.T, T2_sc, U_pno_kept))
+
+        e_lmp2_total += e_ij * (1 if i == j else 2)
+
+        is_strong = abs(e_ij) > T_CutPairs
+
+        pno_spaces[(i, j)] = {
+            'C_pno': C_pno_ij,
+            'n_pno': n_pno_kept,
+            'e_pno': e_pno_sc,
+            'K_pno': K_pno,
+            'T2_pno': T2_pno,
+            'e_mp2': e_ij,
+            'domain_ij': domain_ij,
+            'X_orth': X_orth_ij,
+            'U_full': U_full if not is_cas_pair else None,
+            'domain_idx': domain_ij,
+            'is_cas_pair': is_cas_pair,
+            'nvir_cas_local': nvir_cas_local,
+        }
+
+        if is_strong:
+            strong_pairs.append((i, j))
+            n_pairs_strong += 1
+        else:
+            if abs(e_ij) > 0.0:
+                weak_pairs.append((i, j))
+                n_pairs_weak += 1
 
     log.info('PNO construction complete: %d strong pairs, %d weak pairs',
              n_pairs_strong, n_pairs_weak)
