@@ -281,9 +281,7 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                 continue
             Lt1_ik = S_ik_lk @ Lt1  # (n_ik,)
             t1_l_ik = T1_all_ik[ll]
-            # Term 3 (T1² × L): small, skip for now
-            # D_tilde_ik -= np.outer(t1_l_ik, Lt1_ik)
-            pass
+            D_tilde_ik -= np.outer(t1_l_ik, Lt1_ik)
 
         # --- Term 4: +(1/2) Σ_l S@u_il@S @ L_kl @ S ---
         for ll in range(nocc):
@@ -306,19 +304,25 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             ovL_k_lk = ovL_bare.get((key_lk, k_idx))
             if ovL_l_lk is None or ovL_k_lk is None:
                 continue
-            K_lk = ovL_l_lk @ ovL_k_lk.T
-            L_kl = 2.0 * K_lk.T - K_lk  # L_{kl} = 2*K_{kl} - K_{kl}^swap
+            # Psi4: L[lk] = 2*K[lk] - K[lk].T where K[lk] = (la|kb)
+            K_lk = ovL_l_lk @ ovL_k_lk.T  # K[lk] = (la|kb)
+            L_lk = 2.0 * K_lk - K_lk.T    # L[lk] = 2*(la|kb) - (kb|la)
 
-            S_ik_il = S_pno_cache.get((key_ik, key_il))
-            S_il_lk = S_pno_cache.get((key_il, key_lk))
-            S_lk_ik = S_pno_cache.get((key_lk, key_ik))
+            def _get_S_or_I(ka, kb, n_a):
+                if ka == kb:
+                    return np.eye(n_a)
+                return S_pno_cache.get((ka, kb))
+
+            n_ik2 = pno_spaces[key_ik]['C_pno'].shape[1]
+            S_ik_il = _get_S_or_I(key_ik, key_il, n_ik2)
+            S_il_lk = _get_S_or_I(key_il, key_lk, n_il)
+            S_lk_ik = _get_S_or_I(key_lk, key_ik, n_lk)
             if S_ik_il is None or S_il_lk is None or S_lk_ik is None:
                 continue
 
-            # Term 4 (T2 × L): skip when section 5b is active
-            # D_temp = S_ik_il @ u_il @ S_il_lk.T @ L_kl @ S_lk_ik.T
-            # D_tilde_ik += 0.5 * D_temp
-            pass
+            # Psi4: S(ik,il) @ Tt[il] @ S(il,lk) @ L[lk] @ S(lk,ik)
+            D_temp = S_ik_il @ u_il @ S_il_lk @ L_lk @ S_lk_ik
+            D_tilde_ik += 0.5 * D_temp  # Term 4: Jiang Eq 84
 
         D_tilde_all[(i_idx, k_idx)] = D_tilde_ik
 

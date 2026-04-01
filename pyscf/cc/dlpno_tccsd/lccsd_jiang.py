@@ -244,21 +244,22 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                 continue
             K_kl = ovL_k_kl @ ovL_l_kl.T
 
-            S_ki_li = S_pno_cache.get((key_ki, key_li))
-            S_li_kl = S_pno_cache.get((key_li, key_kl))
-            S_kl_ki = S_pno_cache.get((key_kl, key_ki))
+            def _get_S_or_I(ka, kb, n_a):
+                if ka == kb:
+                    return np.eye(n_a)
+                S = S_pno_cache.get((ka, kb))
+                return S
+
+            n_ki2 = pno_spaces[key_ki]['C_pno'].shape[1]
+            S_ki_li = _get_S_or_I(key_ki, key_li, n_ki2)
+            S_li_kl = _get_S_or_I(key_li, key_kl, n_li)
+            S_kl_ki = _get_S_or_I(key_kl, key_ki, n_kl)
             if S_ki_li is None or S_li_kl is None or S_kl_ki is None:
                 continue
 
-            # t2_li projected: S_ki_li @ t2_li @ S_li_kl.T → (n_ki, n_kl)
-            t2_proj = S_ki_li @ t2_li @ S_li_kl.T
-            # K_kl projected: S_kl_ki @ K_kl ... wait, need to check index mapping
-
-            # Psi4: C_tilde_temp = t2_li @ S(li,kl) @ K_kl, then S(ki,li) @ ... @ S(kl,ki)
-            # Term 4 (T2 × K): skip when section 5b is active
-            # C_temp = S_ki_li @ t2_li @ S_li_kl.T @ K_kl @ S_kl_ki.T
-            # C_tilde_ki -= 0.5 * C_temp
-            pass
+            # Psi4: S(ki,li) @ T[li] @ S(li,kl) @ K[kl] @ S(kl,ki)
+            C_temp = S_ki_li @ t2_li @ S_li_kl @ K_kl @ S_kl_ki
+            C_tilde_ki -= 0.5 * C_temp  # Term 4: Jiang Eq 83
 
         C_tilde_all[(k, i)] = C_tilde_ki  # store with ORDERED (k,i) key
 

@@ -57,10 +57,21 @@ def compute_residual_v2(
                 return S
         return C_pno_ij.T @ (s1e @ pno_spaces[key_other]['C_pno'])
 
+    def _get_S2(key_a, key_b):
+        """Get S overlap between any two pair keys, with identity fallback."""
+        if key_a == key_b:
+            return np.eye(pno_spaces[key_a]['C_pno'].shape[1])
+        if S_pno_cache is not None:
+            S = S_pno_cache.get((key_a, key_b))
+            if S is not None:
+                return S
+        return pno_spaces[key_a]['C_pno'].T @ (s1e @ pno_spaces[key_b]['C_pno'])
+
     t2_ij = t2_pno_all[key]
 
     # === Symmetric buffer (K̃, A, B, E) ===
     R_sym = np.zeros((n_pno, n_pno))
+    _terms = {} if getattr(compute_residual_v2, '_save_terms', False) else None
 
     # --- K̃ (Eq 75): dressed exchange = i_Qa_t1 @ i_Qa_t1.T ---
     ovL_i_d = ovL_dressed.get((key, i))
@@ -68,8 +79,10 @@ def compute_residual_v2(
     if ovL_i_d is not None and ovL_j_d is not None:
         R_sym += ovL_i_d @ ovL_j_d.T
 
+    if _terms is not None: _terms['K'] = R_sym.copy()
     if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f: _f.write(f'v2({i},{j}): K done\n')
+        with open('/tmp/v2_debug.txt', 'a') as _f:
+            _f.write(f'v2({i},{j}): K R[1,1]={R_sym[1,1]:.10e}\n')
     # --- A (Eq 76): dressed ladder ---
     # B̃_{ab} = B_{ab} - Σ_k T1_all[k,a]*ovL_k[b,Q] (Eq 93)
     T1_all_ij = np.zeros((nocc, n_pno))
@@ -105,8 +118,10 @@ def compute_residual_v2(
             aux_off += nL
         R_sym += ladder
 
+    if _terms is not None: _terms['A'] = R_sym.copy() - _terms['K']
     if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f: _f.write(f'v2({i},{j}): A done\n')
+        with open('/tmp/v2_debug.txt', 'a') as _f:
+            _f.write(f'v2({i},{j}): A R[1,1]={R_sym[1,1]:.10e}\n')
     # --- B (Eq 77/82): Woooo with dressed β ---
     # β = B_tilde[k,l] (precomputed from ooL_dressed + tau×voov)
     for key_kl, t2_kl in t2_pno_all.items():
@@ -119,9 +134,7 @@ def compute_residual_v2(
             t1_l_kl = _project_t1_to_pair(t1_pno, l, key_kl, S_pno_cache, pno_spaces)
             tau_kl += np.outer(t1_k_kl, t1_l_kl)
 
-        S_proj = S_pno_cache.get((key, key_kl))
-        if S_proj is None:
-            continue
+        S_proj = _get_S(key_kl)
         tau_kl_proj = S_proj @ tau_kl @ S_proj.T
 
         # β = B_tilde[k,l] (from B_tilde matrix)
@@ -132,8 +145,10 @@ def compute_residual_v2(
         else:
             R_sym += beta_kl * tau_kl_proj
 
+    if _terms is not None: _terms['B'] = R_sym.copy() - _terms['K'] - _terms['A']
     if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f: _f.write(f'v2({i},{j}): B done\n')
+        with open('/tmp/v2_debug.txt', 'a') as _f:
+            _f.write(f'v2({i},{j}): B R[1,1]={R_sym[1,1]:.10e}\n')
     # --- E (Eq 80): t2 × F̃̃_{ab} ---
     # E_tilde = Fab_[ij] - Σ_kl S @ u_kl × K_kl @ S
     # Psi4: starts with Fab_[ij], subtracts u×K (bare K_iajb)
@@ -144,33 +159,33 @@ def compute_residual_v2(
     Fab_ij = Fab.get(key, np.zeros((n_pno, n_pno))).copy()
     e_pno = data['e_pno']
     E_tilde = Fab_ij - np.diag(e_pno)  # remove diagonal (in denominator)
+    # Psi4 E term: subtract u×K from E_tilde (Eq 85: F̃̃ = F̃ - u×K)
+    # This handles the fvv T2 dressing. C_tilde/D_tilde Term 4 handles
+    # a DIFFERENT T2 contribution (through the C/D ring terms).
     for key_kl, t2_kl in t2_pno_all.items():
         if t2_kl is None or t2_kl.shape[0] == 0:
             continue
         k, l = key_kl
-        n_kl = t2_kl.shape[0]
-        if n_kl == 0:
-            continue
-        # u = 2t2 - t2.T (antisymmetrized)
         u_kl = 2.0 * t2_kl - t2_kl.T
-        # K_kl = bare exchange (ka|lb) in PNO_kl
         ovL_k_kl = ovL_bare.get((key_kl, k))
         ovL_l_kl = ovL_bare.get((key_kl, l))
         if ovL_k_kl is None or ovL_l_kl is None:
             continue
-        K_kl = ovL_k_kl @ ovL_l_kl.T  # bare K
-
-        S_kl_ij = _get_S(key_kl)  # (n_ij, n_kl)
-        E_temp = u_kl @ K_kl.T  # Tt × K (Psi4 line 2138)
-        # Psi4: S_PNO(kl,ij).T @ E @ S_PNO(kl,ij) where S_PNO(kl,ij) = (n_kl, n_ij)
-        # Our _get_S returns (n_ij, n_kl), so S_PNO(kl,ij) = _get_S.T
-        E_tilde -= S_kl_ij @ E_temp @ S_kl_ij.T
+        K_kl = ovL_k_kl @ ovL_l_kl.T
+        S_kl_ij = _get_S(key_kl)
+        # (k,l) contribution
+        E_tilde -= S_kl_ij @ (u_kl @ K_kl.T) @ S_kl_ij.T
+        # (l,k) contribution for off-diagonal
+        if k != l:
+            E_tilde -= S_kl_ij @ ((2.0*t2_kl.T - t2_kl) @ K_kl) @ S_kl_ij.T
 
     # Apply: R += t2 @ E_tilde.T + E_tilde @ t2 (Psi4 lines 2146-2147)
     R_sym += t2_ij @ E_tilde.T + E_tilde @ t2_ij
 
+    if _terms is not None: _terms['E'] = R_sym.copy() - _terms['K'] - _terms['A'] - _terms['B']
     if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f: _f.write(f'v2({i},{j}): E done\n')
+        with open('/tmp/v2_debug.txt', 'a') as _f:
+            _f.write(f'v2({i},{j}): E R[1,1]={R_sym[1,1]:.10e} E_tilde[1,1]={E_tilde[1,1]:.10e}\n')
     # === Non-symmetric terms (C, D, G) ===
     # Compute C_ij and C_ji in one pass, then form the full P̂ result.
     # P̂(0.5*C + C_ji) = 0.5*(C_ij + C_ij.T) + (C_ji + C_ji.T) for i≠j
@@ -200,7 +215,7 @@ def compute_residual_v2(
                     ct = C_tilde_cache.get((k, i))
                     if ct is not None:
                         S_ij_ik = _get_S(key_ik)
-                        S_ik_kj = S_pno_cache.get((key_ik, key_kj))
+                        S_ik_kj = _get_S2(key_ik, key_kj)
                         if S_ij_ik is not None and S_ik_kj is not None:
                             gamma_ij += S_ij_ik @ ct @ S_ik_kj
                     S_kj_ij = _get_S(key_kj)
@@ -224,15 +239,16 @@ def compute_residual_v2(
                     ct_j = C_tilde_cache.get((k, j))
                     if ct_j is not None:
                         S_ij_jk = _get_S(key_jk)
-                        S_jk_ki = S_pno_cache.get((key_jk, key_ki))
+                        S_jk_ki = _get_S2(key_jk, key_ki)
                         if S_ij_jk is not None and S_jk_ki is not None:
                             gamma_ji += S_ij_jk @ ct_j @ S_jk_ki
                     S_ki_ij = _get_S(key_ki)
                     C_ji -= gamma_ji @ t2_ki.T @ S_ki_ij.T
 
-        # P̂(0.5*C_ij + C_ji): apply as (0.5*C_ij + C_ji) + (0.5*C_ij + C_ji).T
-        C_phat = 0.5 * C_ij + C_ji
-        Rn_ij += C_phat + C_phat.T
+        # P̂: Rn[ij] + Rn[ji].T where Rn[ij] = 0.5*C_ij + C_ij.T
+        Rn_C_ij = 0.5 * C_ij + C_ij.T
+        Rn_C_ji = 0.5 * C_ji + C_ji.T
+        Rn_ij += Rn_C_ij + Rn_C_ji.T
 
     # --- D (Eq 79): antisymmetric ring with delta ---
     # Compute D_ij and D_ji, then P̂(D) = D_ij + D_ji.T
@@ -250,7 +266,7 @@ def compute_residual_v2(
                     t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
                     u_jk = 2.0 * t2_jk - t2_jk.T
                     S_ij_jk = _get_S(key_jk)
-                    S_jk_ik = S_pno_cache.get((key_jk, key_ik))
+                    S_jk_ik = _get_S2(key_jk, key_ik)
                     if S_ij_jk is not None and S_jk_ik is not None:
                         U_jk_proj = S_ij_jk @ u_jk @ S_jk_ik.T
                         D_temp = np.zeros((n_pno, n_pno))
@@ -272,7 +288,7 @@ def compute_residual_v2(
                     t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
                     u_ik = 2.0 * t2_ik - t2_ik.T
                     S_ij_ik2 = _get_S(key_ik)
-                    S_ik_jk = S_pno_cache.get((key_ik, key_jk))
+                    S_ik_jk = _get_S2(key_ik, key_jk)
                     if S_ij_ik2 is not None and S_ik_jk is not None:
                         U_ik_proj = S_ij_ik2 @ u_ik @ S_ik_jk.T
                         D_temp_j = np.zeros((n_pno, n_pno))
@@ -313,8 +329,108 @@ def compute_residual_v2(
                 G_ji -= (S_ij_jk @ t2_jk @ S_ij_jk.T) * G_tilde[k, i]
     Rn_ij += G_ij + G_ji.T
 
+    if _terms is not None: _terms['CDG'] = Rn_ij.copy()
+    if getattr(compute_residual_v2, '_debug', False):
+        with open('/tmp/v2_debug.txt', 'a') as _f:
+            _f.write(f'v2({i},{j}): CDG Rn[1,1]={Rn_ij[1,1]:.10e} R_sym[1,1]={R_sym[1,1]:.10e}\n')
+
+    # === Section 5b: Quadratic T2 dressing of ring ===
+    # Same as original code, using bare voov integrals.
+    # This replaces C_tilde/D_tilde Term 4 which gives equivalent results
+    # only for single-pair systems.
+    _skip_5b = getattr(compute_residual_v2, '_skip_5b', False)
+    if with_df is not None and not _skip_5b:
+        R_dress_ij = np.zeros((n_pno, n_pno))
+        R_dress_ji = np.zeros((n_pno, n_pno))
+        for k in range(nocc):
+            key_ik = (min(i, k), max(i, k))
+            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
+                n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
+                if n_ik > 0:
+                    t2_ik_raw = t2_pno_all[key_ik]
+                    t2_ik_d = t2_ik_raw.T if i > k else t2_ik_raw
+                    theta_ik_d = 2.0 * t2_ik_d - t2_ik_d.T
+                    S_ij_ik_d = _get_S(key_ik)
+                    W_k = np.zeros((n_ik, n_pno))
+                    V_k = np.zeros((n_ik, n_pno))
+                    for l in range(nocc):
+                        key_jl = (min(j, l), max(j, l))
+                        if key_jl not in t2_pno_all or t2_pno_all[key_jl] is None:
+                            continue
+                        n_jl = pno_spaces[key_jl]['C_pno'].shape[1]
+                        if n_jl == 0:
+                            continue
+                        t2_jl_raw = t2_pno_all[key_jl]
+                        t2_jl = t2_jl_raw.T if j > l else t2_jl_raw
+                        S_ij_jl = _get_S(key_jl)
+                        _ovL_ik_l = ovL_bare.get((key_ik, l))
+                        _ovL_jl_k = ovL_bare.get((key_jl, k))
+                        if _ovL_ik_l is None or _ovL_jl_k is None:
+                            continue
+                        voov_lk = _ovL_ik_l @ _ovL_jl_k.T
+                        W_k += 0.5 * voov_lk @ t2_jl @ S_ij_jl.T
+                        _ovL_ik_k = ovL_bare.get((key_ik, k))
+                        _ovL_jl_l = ovL_bare.get((key_jl, l))
+                        if _ovL_ik_k is None or _ovL_jl_l is None:
+                            continue
+                        voov_kl = _ovL_ik_k @ _ovL_jl_l.T
+                        VOov_kl = voov_kl - 0.5 * voov_lk
+                        tau_ring_lj = 2.0 * t2_jl.T - t2_jl
+                        V_k += 0.5 * VOov_kl @ tau_ring_lj @ S_ij_jl.T
+                    R_dress_ij += S_ij_ik_d @ (theta_ik_d @ V_k)
+                    R_dress_ij += 0.5 * S_ij_ik_d @ (t2_ik_d.T @ W_k)
+                    R_dress_ji += S_ij_ik_d @ (t2_ik_d.T @ W_k)
+            # P(ij) partner (pair j,k)
+            key_jk = (min(j, k), max(j, k))
+            if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
+                n_jk = pno_spaces[key_jk]['C_pno'].shape[1]
+                if n_jk > 0:
+                    t2_jk_raw = t2_pno_all[key_jk]
+                    t2_jk_d = t2_jk_raw.T if j > k else t2_jk_raw
+                    theta_jk_d = 2.0 * t2_jk_d - t2_jk_d.T
+                    S_ij_jk_d = _get_S(key_jk)
+                    W_k_ji = np.zeros((n_jk, n_pno))
+                    V_k_ji = np.zeros((n_jk, n_pno))
+                    for l in range(nocc):
+                        key_il = (min(i, l), max(i, l))
+                        if key_il not in t2_pno_all or t2_pno_all[key_il] is None:
+                            continue
+                        n_il = pno_spaces[key_il]['C_pno'].shape[1]
+                        if n_il == 0:
+                            continue
+                        t2_il_raw = t2_pno_all[key_il]
+                        t2_il = t2_il_raw.T if i > l else t2_il_raw
+                        S_ij_il = _get_S(key_il)
+                        _ovL_jk_l = ovL_bare.get((key_jk, l))
+                        _ovL_il_k = ovL_bare.get((key_il, k))
+                        if _ovL_jk_l is None or _ovL_il_k is None:
+                            continue
+                        voov_lk_ji = _ovL_jk_l @ _ovL_il_k.T
+                        W_k_ji += 0.5 * voov_lk_ji @ t2_il @ S_ij_il.T
+                        _ovL_jk_k = ovL_bare.get((key_jk, k))
+                        _ovL_il_l = ovL_bare.get((key_il, l))
+                        if _ovL_jk_k is None or _ovL_il_l is None:
+                            continue
+                        voov_kl_ji = _ovL_jk_k @ _ovL_il_l.T
+                        VOov_kl_ji = voov_kl_ji - 0.5 * voov_lk_ji
+                        tau_ring_li = 2.0 * t2_il.T - t2_il
+                        V_k_ji += 0.5 * VOov_kl_ji @ tau_ring_li @ S_ij_il.T
+                    R_dress_ji += S_ij_jk_d @ (theta_jk_d @ V_k_ji)
+                    R_dress_ji += 0.5 * S_ij_jk_d @ (t2_jk_d.T @ W_k_ji)
+                    R_dress_ij += S_ij_jk_d @ (t2_jk_d.T @ W_k_ji)
+        R_sym += R_dress_ij + R_dress_ji.T
+
+    if getattr(compute_residual_v2, '_debug', False):
+        with open('/tmp/v2_debug.txt', 'a') as _f:
+            _f.write(f'v2({i},{j}): 5b R[1,1]={R_sym[1,1]:.10e}\n')
+
     # === R_final = R_sym + Rn (already fully P̂-symmetrized) ===
     R_final = R_sym + Rn_ij
+
+    # Debug: save partial sums if requested
+    if _terms is not None:
+        _terms['5b'] = R_sym - _terms['K'] - _terms['A'] - _terms['B'] - _terms['E']
+        compute_residual_v2._last_terms = _terms
 
     if getattr(compute_residual_v2, '_debug', False):
         with open('/tmp/v2_debug.txt', 'a') as _f:
