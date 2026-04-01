@@ -754,11 +754,13 @@ def _compute_local_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                     t1_pno, k, key_ii, S_pno_cache, pno_spaces)
                 r1_i -= foo_t1[k, i] * t1_k_in_ii
 
-        # ---- Term 4 (C-term, Eq. 90): T2 × Fock_ov coupling ----
-        # C_i^{a_ii} = Σ_k S_{a_ik}^{a_ii} u_ik^{a_ik c_ik} F̃_{k,c_ik}
-        # Simplified: C_i = Σ_k proj_to_ii( theta_ik @ fov_k_in_ik )
+        # ---- Term 4 (C-term, Eq. 90/DePrince Eq 22): T2 × Fock_ov coupling ----
+        # Psi4: C_i^a = Σ_k S(ii,ik) @ Tt[ik] @ Fkc[ki].T
+        # where Fkc[ki] = Σ_m S(ki,im) @ L[im] @ S(im,mm) @ T1_m
+        # Simplified: theta_ik @ fov_k + T1 correction through Fkc
         for k in range(nocc):
             key_ik = (min(i, k), max(i, k))
+            key_ki = (min(k, i), max(k, i))  # same as key_ik
             if key_ik not in t2_pno_all:
                 continue
             t2_ik_raw = t2_pno_all[key_ik]
@@ -767,13 +769,62 @@ def _compute_local_t1_residual(t1_pno, t2_pno_all, pno_spaces,
             # t2[i,k] from stored t2[min,max]
             t2_ik = t2_ik_raw if i <= k else t2_ik_raw.T
             theta_ik = 2.0 * t2_ik - t2_ik.T
+            n_ik = t2_ik.shape[0]
 
-            # fov[k] projected to PNO_{ik} basis
+            # fov[k] projected to PNO_{ik} basis (bare part)
             fov_k_in_ik = _project_t1_to_pair(
                 fov_pno, k, key_ik, S_pno_cache, pno_spaces)
 
-            # theta_ik @ fov_k gives result in PNO_{ik} basis
-            contrib_ik = theta_ik @ fov_k_in_ik  # (n_pno_ik,)
+            # Fkc T1 dressing: Σ_m S(ki,im) @ L[im] @ S(im,mm) @ T1_m
+            # For T_CutPNO=0: Fkc[c_ki] = Σ_m L_im[c,d] @ S(im,mm) @ T1_m[d]
+            # where L = 2K-K.T
+            fkc_dress = np.zeros(n_ik)
+            if ovL_pno_cache is not None:
+                for m in range(nocc):
+                    t1_m = t1_pno.get(m)
+                    if t1_m is None or t1_m.size == 0:
+                        continue
+                    if np.max(np.abs(t1_m)) < 1e-15:
+                        continue
+                    key_im = (min(i, m), max(i, m))
+                    key_mm = (m, m)
+                    if key_im not in pno_spaces or key_mm not in pno_spaces:
+                        continue
+                    n_im = pno_spaces[key_im]['C_pno'].shape[1]
+                    if n_im == 0:
+                        continue
+                    # L[im] = 2K[im] - K[im].T where K[im] = ovL_i @ ovL_m.T
+                    ovL_i_im = ovL_pno_cache.get((key_im, i))
+                    ovL_m_im = ovL_pno_cache.get((key_im, m))
+                    if ovL_i_im is None or ovL_m_im is None:
+                        continue
+                    K_im = ovL_i_im @ ovL_m_im.T
+                    L_im = 2.0 * K_im - K_im.T  # (n_im, n_im)
+
+                    # S(im, mm) @ T1_m: project T1_m to PNO_im
+                    S_im_mm = S_pno_cache.get((key_im, key_mm))
+                    if S_im_mm is None and key_im == key_mm:
+                        S_im_mm = np.eye(n_im)
+                    if S_im_mm is None:
+                        continue
+                    T1_m_in_im = S_im_mm @ t1_m  # (n_im,)
+
+                    # L_im @ T1_m_in_im: (n_im,)
+                    LT1 = L_im @ T1_m_in_im  # (n_im,)
+
+                    # Project from PNO_im to PNO_ki = PNO_ik
+                    S_ik_im = S_pno_cache.get((key_ik, key_im))
+                    if S_ik_im is None and key_ik == key_im:
+                        S_ik_im = np.eye(n_ik)
+                    if S_ik_im is None:
+                        continue
+                    fkc_dress += S_ik_im @ LT1
+
+            # Total Fkc = bare fov_k + T1 dressing
+            fkc_total = fov_k_in_ik + fkc_dress
+
+            # theta_ik @ fkc gives result in PNO_{ik} basis
+            contrib_ik = theta_ik @ fkc_total  # (n_pno_ik,)
 
             # Project result from PNO_{ik} to PNO_{ii}
             if key_ik == key_ii:

@@ -49,8 +49,8 @@ def build_dressed_ovL_cache(ovL_pno_bare, ooL_bare, t1_pno, pno_spaces,
 
     B̃_{mi}^Q = B_{mi}^Q + Σ_b B_{mb_ij}^Q · t̃_i^{b_ij} - Σ_k t̃_k^{a_ij} · B_{ki}^Q
 
-    This applies Eq 92 Terms 2-3 (linear in T1) to each ovL entry.
-    The cross term (Term 4, quadratic in T1) is omitted.
+    This applies Eq 92 Terms 2-4 (including quadratic T1) to each ovL entry.
+    Matches Psi4's i_Qa_t1_ construction (lines 1494-1507).
 
     Returns dict same format as ovL_pno_bare but with dressed values.
     """
@@ -83,7 +83,7 @@ def build_dressed_ovL_cache(ovL_pno_bare, ooL_bare, t1_pno, pno_spaces,
             t1_proj[m] = _project_t1_to_pair(
                 t1_pno, m, key, S_pno_cache, pno_spaces)
 
-        # Compute vvL × T1_m via DF loop for all m simultaneously
+        # Compute Term 3 (vvL × T1) via DF loop
         delta_vv = {m: np.zeros((n_pno, naux)) for m in range(nocc)}
         any_nonzero = any(np.max(np.abs(t1_proj[m])) > 1e-15 for m in range(nocc))
         if any_nonzero:
@@ -108,7 +108,8 @@ def build_dressed_ovL_cache(ovL_pno_bare, ooL_bare, t1_pno, pno_spaces,
                 continue
             # Term 2: -T1_all.T @ ooL_bare[:,m,:]
             delta_oo = -T1_all.T @ ooL_bare[:, m, :]  # (n_pno, naux)
-            # Full dressed = bare + delta_vv + delta_oo
+
+            # Full dressed = bare + delta_vv(Term 3) + delta_oo(Term 2)
             ovL_dressed[(key, m)] = ovL_bare_entry + delta_vv[m] + delta_oo
 
     return ovL_dressed
@@ -298,18 +299,9 @@ def _compute_foo_t1(t1_pno, fov_pno, pno_spaces, nocc,
     """
     foo_t1 = np.zeros((nocc, nocc))
 
-    # Eq 94 / line 126: F̃_{ij} += F_{ic}·t_j^c = 0.5·fov_i·t1_j
-    for ii in range(nocc):
-        key_ii = (ii, ii)
-        if key_ii not in pno_spaces:
-            continue
-        fov_ii = fov_pno.get(ii)
-        if fov_ii is None or fov_ii.size == 0:
-            continue
-        for jj in range(nocc):
-            t1_jj_in_ii = _project_t1_to_pair(
-                t1_pno, jj, key_ii, S_pno_cache, pno_spaces)
-            foo_t1[ii, jj] += 0.5 * np.dot(fov_ii, t1_jj_in_ii)
+    # NOTE: The 0.5*fov·t1 term (PySCF line 126) is NOT used here.
+    # In Jiang/Psi4, this contribution enters through Eq 94 (build_Fkj)
+    # via Fia_bar @ T1, which is handled separately.
 
     # Eq 98 / lines 157-158: F̄_{ij} += Σ_{k,c} [2(kc|ji) - (ic|jk)]·t1_k^c
     for kk in range(nocc):
@@ -350,13 +342,9 @@ def _compute_fvv_t1_pair(t1_pno, fov_pno, pno_spaces, nocc,
     C_pno_ij = pno_spaces[pair_key]['C_pno']
     fvv_t1 = np.zeros((n_pno, n_pno))
 
-    # Eq 97 / line 129: -0.5·t1_k^a·fov_k^b (projected to PNO_ij)
-    for kk in range(nocc):
-        t1_k_ij = _project_t1_to_pair(
-            t1_pno, kk, pair_key, S_pno_cache, pno_spaces)
-        fov_k_ij = _project_t1_to_pair(
-            fov_pno, kk, pair_key, S_pno_cache, pno_spaces)
-        fvv_t1 -= 0.5 * np.outer(t1_k_ij, fov_k_ij)
+    # NOTE: The -0.5*t1@fov term (PySCF line 129) is NOT used here.
+    # In Jiang/Psi4, this contribution enters through Eq 97 (build_Fab)
+    # via -T_n.T @ Fia_bar, which is handled separately.
 
     # Eq 98 / lines 332-333: Σ_{k,c} t1_k^c·[2(ck|ab) - (bk|ca)]
     # Coulomb: 2·Σ_k (Σ_c t1_k^c·ovL_k[c,Q])·vvL[a,b,Q]

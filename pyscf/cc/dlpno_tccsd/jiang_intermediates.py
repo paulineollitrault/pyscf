@@ -98,6 +98,60 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
     return G
 
 
+def _build_Fia_bar(t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pair_key):
+    """Build T1-dressed ov Fock Fia_bar for a specific pair.
+
+    Fia_bar[k, a] = Σ_Q [2*gamma_Q * ovL_k[a,Q] - (ovL_k @ T_n.T @ ovL_k)[k,a]]
+    where gamma_Q = Σ_{m,c} T1_all[m,c] * ovL_m[c,Q]
+
+    Returns (nocc, n_pno) matrix. Psi4 lines 1544-1571.
+    """
+    n_pno = pno_spaces[pair_key]['C_pno'].shape[1]
+    if n_pno == 0:
+        return np.zeros((nocc, 0))
+
+    # Build T1_all projected to this pair's PNO basis
+    T1_all = np.zeros((nocc, n_pno))
+    for m in range(nocc):
+        T1_all[m] = _project_t1_to_pair(
+            t1_pno, m, pair_key, S_pno_cache, pno_spaces)
+
+    # z_total[Q] = Σ_{m,c} T1_all[m,c] * ovL_m[c,Q]
+    naux = 0
+    for m in range(nocc):
+        entry = ovL_bare.get((pair_key, m))
+        if entry is not None:
+            naux = entry.shape[1]
+            break
+    if naux == 0:
+        return np.zeros((nocc, n_pno))
+
+    z_total = np.zeros(naux)
+    for m in range(nocc):
+        ovL_m = ovL_bare.get((pair_key, m))
+        if ovL_m is not None and np.max(np.abs(T1_all[m])) > 1e-15:
+            z_total += T1_all[m] @ ovL_m  # (naux,)
+
+    Fia_bar = np.zeros((nocc, n_pno))
+    for k in range(nocc):
+        ovL_k = ovL_bare.get((pair_key, k))
+        if ovL_k is None:
+            continue
+        # J: 2 * gamma * ovL_k
+        Fia_bar[k] += 2.0 * ovL_k @ z_total
+        # K: -Σ_n (ovL_n @ (T1_n @ ovL_k))[a]
+        for n in range(nocc):
+            if np.max(np.abs(T1_all[n])) < 1e-15:
+                continue
+            ovL_n = ovL_bare.get((pair_key, n))
+            if ovL_n is None:
+                continue
+            z_nk = T1_all[n] @ ovL_k  # (naux,)
+            Fia_bar[k] -= ovL_n @ z_nk  # (n_pno,)
+
+    return Fia_bar
+
+
 def build_Fkj(F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
               ovL_bare, ooL_bare, S_pno_cache, foo_t2):
     """Build F̃_{kj} = dressed Fock oo (Eqs 94, 98).
@@ -116,10 +170,24 @@ def build_Fkj(F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
 
     Fkj = F_lmo - np.diag(eps_lmo) + foo_t2 + foo_t1
 
-    # Eq 94 additional: F̃_{kj} += F̄_{kc}·t_j^c
-    # This is 0.5*fov@t1 (line 265 analog) — already included in foo_t1
-    # via the line 126 contribution. But Eq 94 adds Fia_bar × t1 which
-    # is a higher-order term. Skip for now (T1² effect).
+    # Eq 94: F̃_{kj} += Σ_a F̄_{ka}(jj) · t̃_j^a
+    # F̄_{ka} = fov_bare + [2J-K]·T1 (Fia_bar)
+    # Psi4 line 1618-1622: Fkj(i,j) += Fia_bar[jj](i,:) · T1_j
+    for j_idx in range(nocc):
+        key_jj = (j_idx, j_idx)
+        if key_jj not in pno_spaces or t1_pno[j_idx].size == 0:
+            continue
+        t1_j = t1_pno[j_idx]
+
+        # Build full Fia_bar for diagonal pair (j,j)
+        Fia_bar_jj = _build_Fia_bar(
+            t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, key_jj)
+
+        # Add bare fov contribution (not in Fia_bar which starts from zero)
+        for i_idx in range(nocc):
+            fov_i_jj = _project_t1_to_pair(
+                fov_pno, i_idx, key_jj, S_pno_cache, pno_spaces)
+            Fkj[i_idx, j_idx] += np.dot(fov_i_jj + Fia_bar_jj[i_idx], t1_j)
 
     return Fkj, foo_t1
 
@@ -150,9 +218,22 @@ def build_Fab(t1_pno, fov_pno, pno_spaces, nocc,
         ovL_bare, S_pno_cache, with_df, pair_key)
     Fab += fvv_t1
 
-    # Eq 97: F̃_{ab} = F̄_{ab} - Σ_k t̃_k^a·F̄_{kb}
-    # F̄_{kb} is the ov Fock (Eq 99), which depends on T1.
-    # This is a T1² correction — skip for now.
+    # Eq 97: F̃_{ab} = F̄_{ab} - Σ_k t̃_k^a · F̄_{kb}
+    # Psi4 line 1640: Fab -= T_n_ij.T @ Fia_bar
+    # F̄_{kb} = fov_bare + [2J-K]·T1 (full Fia_bar)
+    Fia_bar_ij = _build_Fia_bar(
+        t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pair_key)
+    T1_all = np.zeros((nocc, n_pno))
+    for kk in range(nocc):
+        T1_all[kk] = _project_t1_to_pair(
+            t1_pno, kk, pair_key, S_pno_cache, pno_spaces)
+    # fov_bare for all occ in this pair's PNO domain
+    fov_all = np.zeros((nocc, n_pno))
+    for kk in range(nocc):
+        fov_all[kk] = _project_t1_to_pair(
+            fov_pno, kk, pair_key, S_pno_cache, pno_spaces)
+    # Fab -= T1_all.T @ (fov_all + Fia_bar)
+    Fab -= T1_all.T @ (fov_all + Fia_bar_ij)
 
     return Fab
 
