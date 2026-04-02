@@ -2319,6 +2319,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                      mo_coeff_cas=None, diis_space=15,
                      damping=0.5, diis_start_cycle=6,
                      C_pao=None, use_t1_transform=True,
+                     use_jiang=False,
                      ncores=1, _pool=None):
     """DLPNO-CCSD with pair-local residual and per-pair PNO virtual spaces.
 
@@ -2351,6 +2352,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     mol = mf.mol
     with_df = getattr(mf, 'with_df', None)
     nocc = C_lmo.shape[1]
+
+    # Jiang uses bare integrals with explicit T1 dressing
+    if use_jiang:
+        use_t1_transform = False
 
     # ------------------------------------------------------------------
     # Pre-compute quantities needed by the pair-local residual
@@ -2747,6 +2752,68 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 foo_bare = foo_total
                 _t_ovl_done = _t_kcoul_done = _t_foo_done = _time.perf_counter()
 
+            # ---- Jiang intermediates (precomputed once per iteration) ----
+            _jiang_cache = None
+            if use_jiang:
+                from pyscf.cc.dlpno_tccsd.lccsd_jiang import (
+                    compute_C_tilde, _build_ooL_dressed,
+                    build_dressed_ovL_cache)
+                from pyscf.cc.dlpno_tccsd.jiang_intermediates import (
+                    build_D_tilde, build_Fkj, build_G_tilde,
+                    build_mixed_domain_integrals)
+
+                _t_jiang = _time.perf_counter()
+
+                # T1-dressed ooL/ovL (Eqs 91-92)
+                _jiang_ooL_d = _build_ooL_dressed(
+                    ooL_3idx, ovL_pno_cache, t1_pno, pno_spaces, nocc)
+                _all_keys_j = list(keys_sorted)
+                for ii in range(nocc):
+                    kii = (ii, ii)
+                    if kii not in _all_keys_j and kii in pno_spaces:
+                        _all_keys_j.append(kii)
+                _jiang_ovL_d = build_dressed_ovL_cache(
+                    ovL_pno_cache, ooL_3idx, t1_pno, pno_spaces,
+                    S_pno_cache, nocc, with_df, _all_keys_j)
+
+                # C_tilde / D_tilde (Eqs 83-84, including Term 4)
+                _jiang_C = compute_C_tilde(
+                    t1_pno, t2_pno_all, pno_spaces, nocc,
+                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df)
+                _jiang_D = build_D_tilde(
+                    t1_pno, t2_pno_all, pno_spaces, nocc,
+                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df)
+
+                # Fkj / G_tilde (Eqs 94, 86)
+                _jiang_Fkj, _jiang_foo_t1 = build_Fkj(
+                    F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
+                    ovL_pno_cache, ooL_3idx, S_pno_cache, foo_total)
+                _jiang_G = build_G_tilde(
+                    t2_pno_all, t1_pno, pno_spaces, nocc,
+                    ovL_pno_cache, ooL_3idx, S_pno_cache,
+                    _jiang_Fkj, _jiang_foo_t1)
+
+                # Mixed-domain integrals for C/D bold terms
+                _jiang_K_mixed = build_mixed_domain_integrals(
+                    t2_pno_all, pno_spaces, nocc,
+                    ovL_pno_cache, ooL_3idx, S_pno_cache)
+
+                # Dressed J_oo for B_tilde
+                _ooLf = _jiang_ooL_d.reshape(nocc * nocc, -1)
+                _jiang_J_oo_d = (_ooLf @ _ooLf.T).reshape(
+                    nocc, nocc, nocc, nocc)
+
+                _t_jiang_done = _time.perf_counter()
+
+                _jiang_cache = {
+                    'C_tilde': _jiang_C, 'D_tilde': _jiang_D,
+                    'G_tilde': _jiang_G,
+                    'ovL_dressed': _jiang_ovL_d,
+                    'ooL_dressed': _jiang_ooL_d,
+                    'J_oo_d': _jiang_J_oo_d,
+                    'K_mixed': _jiang_K_mixed,
+                }
+
             _t_pairs = _time.perf_counter()
 
             def _update_pair(key):
@@ -2757,17 +2824,73 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 n_pno = data['C_pno'].shape[1]
                 if n_pno == 0:
                     return key, np.zeros((0, 0))
-                R_ij = _compute_pair_residual_numerator(
-                    i, j, t2_pno_all, pno_spaces, nocc,
-                    C_pao, ovL_lmo_pao, F_lmo, s1e, with_df, C_lmo,
-                    J_oo, K_pno_cache, eps_lmo,
-                    t1_pno=t1_pno, fov_pno=fov_pno,
-                    foo_dressed=foo_total,
-                    ovL_pno_cache=ovL_pno_cache,
-                    S_pno_cache=S_pno_cache,
-                    K_coul_cache=K_coul_cache,
-                    ooL_3idx=ooL_3idx,
-                    skip_t1_integral_dressing=use_t1_transform)
+
+                if use_jiang and _jiang_cache is not None:
+                    from pyscf.cc.dlpno_tccsd.lccsd_jiang_v2 import (
+                        compute_residual_v2)
+                    from pyscf.cc.dlpno_tccsd.jiang_intermediates import (
+                        build_Fab)
+                    jc = _jiang_cache
+
+                    # Per-pair: Fab (requires DF loop)
+                    Fab_ij = build_Fab(
+                        t1_pno, fov_pno, pno_spaces, nocc,
+                        ovL_pno_cache, S_pno_cache, with_df, key)
+
+                    # Per-pair: B_tilde (J_oo_dressed + tau × voov)
+                    t1_i = _project_t1_to_pair(
+                        t1_pno, i, key, S_pno_cache, pno_spaces)
+                    t1_j = _project_t1_to_pair(
+                        t1_pno, j, key, S_pno_cache, pno_spaces)
+                    tau = t2_pno_all[key] + np.outer(t1_i, t1_j)
+                    B_tilde_oo = np.zeros((nocc, nocc))
+                    for k in range(nocc):
+                        for l in range(nocc):
+                            B_tilde_oo[k, l] = jc['J_oo_d'][k, i, l, j]
+                            _ok = ovL_pno_cache.get((key, k))
+                            _ol = ovL_pno_cache.get((key, l))
+                            if _ok is not None and _ol is not None:
+                                B_tilde_oo[k, l] += np.einsum(
+                                    'ab,ab->', tau, _ok @ _ol.T)
+
+                    # Per-pair: J_ij_kj from K_coul_cache
+                    J_pair = {}
+                    for k in range(nocc):
+                        kj = (min(k, j), max(k, j))
+                        kc = (key, kj, i, k)
+                        if K_coul_cache and kc in K_coul_cache:
+                            J_pair[(key, k)] = K_coul_cache[kc]
+
+                    R_ij = compute_residual_v2(
+                        i, j, t2_pno_all, pno_spaces, nocc,
+                        F_lmo, s1e, with_df, eps_lmo,
+                        ovL_bare=ovL_pno_cache,
+                        ooL_bare=ooL_3idx,
+                        S_pno_cache=S_pno_cache,
+                        K_coul_cache=K_coul_cache,
+                        K_pno_bare=K_pno_cache,
+                        ovL_dressed=jc['ovL_dressed'],
+                        ooL_dressed=jc['ooL_dressed'],
+                        B_tilde=B_tilde_oo,
+                        Fab={key: Fab_ij},
+                        G_tilde=jc['G_tilde'],
+                        C_tilde_cache=jc['C_tilde'],
+                        D_tilde_cache=jc['D_tilde'],
+                        J_ij_kj=J_pair,
+                        K_ij_kj=jc['K_mixed'],
+                        t1_pno=t1_pno)
+                else:
+                    R_ij = _compute_pair_residual_numerator(
+                        i, j, t2_pno_all, pno_spaces, nocc,
+                        C_pao, ovL_lmo_pao, F_lmo, s1e, with_df, C_lmo,
+                        J_oo, K_pno_cache, eps_lmo,
+                        t1_pno=t1_pno, fov_pno=fov_pno,
+                        foo_dressed=foo_total,
+                        ovL_pno_cache=ovL_pno_cache,
+                        S_pno_cache=S_pno_cache,
+                        K_coul_cache=K_coul_cache,
+                        ooL_3idx=ooL_3idx,
+                        skip_t1_integral_dressing=use_t1_transform)
                 e_pno = data['e_pno']
                 D_ij = (eps_lmo[i] + eps_lmo[j]
                         - e_pno[:, None] - e_pno[None, :])
@@ -3457,7 +3580,7 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
               mo_coeff_cas, s1e=None,
               conv_tol=1e-7, max_cycle=50, ncores=1,
               C_pao=None, max_outer_cycle=30, outer_conv_tol=1e-8,
-              verbose=None, _pool=None):
+              verbose=None, use_jiang=False, _pool=None):
     """Run pair-local CCSD over all strong pairs, injecting CAS amplitudes.
 
     For each strong pair (i,j):
@@ -3513,7 +3636,8 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
         fock_ao, eps_lmo, s1e, conv_tol, max_cycle,
         t2_cas=t2_cas, occ_cas_idx=occ_cas_idx,
         vir_cas_idx=vir_cas_idx, mo_coeff_cas=mo_coeff_cas,
-        C_pao=C_pao, ncores=ncores, _pool=_pool)
+        C_pao=C_pao, use_jiang=use_jiang,
+        ncores=ncores, _pool=_pool)
     print(f'  E_TCCSD = {e_tccsd:.15g}', flush=True)
 
     return e_tccsd, t2_pno_all, t1_pno

@@ -71,7 +71,6 @@ def compute_residual_v2(
 
     # === Symmetric buffer (K̃, A, B, E) ===
     R_sym = np.zeros((n_pno, n_pno))
-    _terms = {} if getattr(compute_residual_v2, '_save_terms', False) else None
 
     # --- K̃ (Eq 75): dressed exchange = i_Qa_t1 @ i_Qa_t1.T ---
     ovL_i_d = ovL_dressed.get((key, i))
@@ -79,10 +78,6 @@ def compute_residual_v2(
     if ovL_i_d is not None and ovL_j_d is not None:
         R_sym += ovL_i_d @ ovL_j_d.T
 
-    if _terms is not None: _terms['K'] = R_sym.copy()
-    if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f:
-            _f.write(f'v2({i},{j}): K R[1,1]={R_sym[1,1]:.10e}\n')
     # --- A (Eq 76): dressed ladder ---
     # B̃_{ab} = B_{ab} - Σ_k T1_all[k,a]*ovL_k[b,Q] (Eq 93)
     T1_all_ij = np.zeros((nocc, n_pno))
@@ -118,10 +113,6 @@ def compute_residual_v2(
             aux_off += nL
         R_sym += ladder
 
-    if _terms is not None: _terms['A'] = R_sym.copy() - _terms['K']
-    if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f:
-            _f.write(f'v2({i},{j}): A R[1,1]={R_sym[1,1]:.10e}\n')
     # --- B (Eq 77/82): Woooo with dressed β ---
     # β = B_tilde[k,l] (precomputed from ooL_dressed + tau×voov)
     for key_kl, t2_kl in t2_pno_all.items():
@@ -145,10 +136,6 @@ def compute_residual_v2(
         else:
             R_sym += beta_kl * tau_kl_proj
 
-    if _terms is not None: _terms['B'] = R_sym.copy() - _terms['K'] - _terms['A']
-    if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f:
-            _f.write(f'v2({i},{j}): B R[1,1]={R_sym[1,1]:.10e}\n')
     # --- E (Eq 80): t2 × F̃̃_{ab} ---
     # E_tilde = Fab_[ij] - Σ_kl S @ u_kl × K_kl @ S
     # Psi4: starts with Fab_[ij], subtracts u×K (bare K_iajb)
@@ -182,10 +169,6 @@ def compute_residual_v2(
     # Apply: R += t2 @ E_tilde.T + E_tilde @ t2 (Psi4 lines 2146-2147)
     R_sym += t2_ij @ E_tilde.T + E_tilde @ t2_ij
 
-    if _terms is not None: _terms['E'] = R_sym.copy() - _terms['K'] - _terms['A'] - _terms['B']
-    if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f:
-            _f.write(f'v2({i},{j}): E R[1,1]={R_sym[1,1]:.10e} E_tilde[1,1]={E_tilde[1,1]:.10e}\n')
     # === Non-symmetric terms (C, D, G) ===
     # Compute C_ij and C_ji in one pass, then form the full P̂ result.
     # P̂(0.5*C + C_ji) = 0.5*(C_ij + C_ij.T) + (C_ji + C_ji.T) for i≠j
@@ -329,17 +312,11 @@ def compute_residual_v2(
                 G_ji -= (S_ij_jk @ t2_jk @ S_ij_jk.T) * G_tilde[k, i]
     Rn_ij += G_ij + G_ji.T
 
-    if _terms is not None: _terms['CDG'] = Rn_ij.copy()
-    if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f:
-            _f.write(f'v2({i},{j}): CDG Rn[1,1]={Rn_ij[1,1]:.10e} R_sym[1,1]={R_sym[1,1]:.10e}\n')
-
     # === Section 5b: Quadratic T2 dressing of ring ===
-    # Same as original code, using bare voov integrals.
-    # This replaces C_tilde/D_tilde Term 4 which gives equivalent results
-    # only for single-pair systems.
-    _skip_5b = getattr(compute_residual_v2, '_skip_5b', False)
-    if with_df is not None and not _skip_5b:
+    # NOT used when C_tilde/D_tilde include Term 4 (Jiang's formulation).
+    # Kept for reference / ORCA-compatible mode.
+    _use_5b = getattr(compute_residual_v2, '_use_5b', False)
+    if with_df is not None and _use_5b:
         R_dress_ij = np.zeros((n_pno, n_pno))
         R_dress_ji = np.zeros((n_pno, n_pno))
         for k in range(nocc):
@@ -420,20 +397,5 @@ def compute_residual_v2(
                     R_dress_ij += S_ij_jk_d @ (t2_jk_d.T @ W_k_ji)
         R_sym += R_dress_ij + R_dress_ji.T
 
-    if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f:
-            _f.write(f'v2({i},{j}): 5b R[1,1]={R_sym[1,1]:.10e}\n')
-
     # === R_final = R_sym + Rn (already fully P̂-symmetrized) ===
-    R_final = R_sym + Rn_ij
-
-    # Debug: save partial sums if requested
-    if _terms is not None:
-        _terms['5b'] = R_sym - _terms['K'] - _terms['A'] - _terms['B'] - _terms['E']
-        compute_residual_v2._last_terms = _terms
-
-    if getattr(compute_residual_v2, '_debug', False):
-        with open('/tmp/v2_debug.txt', 'a') as _f:
-            _f.write(f'v2({i},{j}): |R_sym|={np.linalg.norm(R_sym):.4e} |Rn_ij|={np.linalg.norm(Rn_ij):.4e} |R_final|={np.linalg.norm(R_final):.4e}\n')
-
-    return R_final
+    return R_sym + Rn_ij

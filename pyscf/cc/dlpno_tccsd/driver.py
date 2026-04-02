@@ -77,6 +77,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
                       cas_pno_proj_thresh=0.99,
                       ccsd_conv_tol=1e-7,
                       ccsd_max_cycle=50,
+                      use_jiang=False,
                       verbose=4,
                       _pool=None):
     """Run DMRG-DLPNO-TCCSD(T), or plain DLPNO-CCSD(T) when ncas is None.
@@ -413,7 +414,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         mo_coeff_cas=mo_coeff_cas_arg, s1e=s1e,
         conv_tol=ccsd_conv_tol, max_cycle=ccsd_max_cycle,
         ncores=ncores, C_pao=C_pao, verbose=verbose,
-        _pool=_shared_pool)
+        use_jiang=use_jiang, _pool=_shared_pool)
 
     _t_ccsd = _time.time() - _t_ccsd_start
     log.info('E(%s) correlation = %.15g', stage5_label, e_tccsd)

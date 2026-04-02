@@ -49,8 +49,8 @@ def build_dressed_ovL_cache(ovL_pno_bare, ooL_bare, t1_pno, pno_spaces,
 
     B̃_{mi}^Q = B_{mi}^Q + Σ_b B_{mb_ij}^Q · t̃_i^{b_ij} - Σ_k t̃_k^{a_ij} · B_{ki}^Q
 
-    This applies Eq 92 Terms 2-4 (including quadratic T1) to each ovL entry.
-    Matches Psi4's i_Qa_t1_ construction (lines 1494-1507).
+    Applies Eq 92 Terms 2-3 (linear in T1) to each ovL entry.
+    Matches Psi4's i_Qa_t1_ construction (lines 1494-1495).
 
     Returns dict same format as ovL_pno_bare but with dressed values.
     """
@@ -289,12 +289,11 @@ def _build_psi_ao(t1_pno, pno_spaces, C_lmo, nocc):
 
 def _compute_foo_t1(t1_pno, fov_pno, pno_spaces, nocc,
                     ovL_pno_bare, ooL_bare, S_pno_cache):
-    """T1-dressed occupied Fock correction (Eqs 94, 98: lines 126, 157-158).
+    """T1-dressed occupied Fock correction (Eq 98).
 
-    F̃_{ij} = F_{ij} + F_{ic}·t_j^c  [Eq 94]
-    where F_{ij} includes the T1 correction from Eq 98:
-      F̄_{ij} = F_{ij} + [2J-K]_{kc}^{ij} · t̃_k^c  [line 157-158 analog]
+    F̄_{ij} = F_{ij} + [2J-K]_{kc}^{ij} · t̃_k^c  [Eq 98, PySCF lines 157-158]
 
+    The Eq 94 part (F̄_{kc}·t_j^c) is handled in build_Fkj via Fia_bar.
     Returns (nocc, nocc) T1 correction to add to bare foo.
     """
     foo_t1 = np.zeros((nocc, nocc))
@@ -332,8 +331,10 @@ def _compute_foo_t1(t1_pno, fov_pno, pno_spaces, nocc,
 
 def _compute_fvv_t1_pair(t1_pno, fov_pno, pno_spaces, nocc,
                          ovL_pno_bare, S_pno_cache, with_df, pair_key):
-    """T1-dressed virtual Fock for pair ij (Eqs 97, 98: lines 129, 332-333).
+    """T1-dressed virtual Fock F̄_{ab} for pair ij (Eq 101, PySCF lines 332-333).
 
+    Computes [2(ab|kc)-(ac|kb)]·t̃_k^c part of the dressed Fock.
+    The Eq 97 part (-Σ_k t̃_k^a·F̄_{kb}) is handled in build_Fab via Fia_bar.
     Returns (n_pno, n_pno) T1 correction to fvv in PNO_ij basis.
     """
     n_pno = pno_spaces[pair_key]['C_pno'].shape[1]
