@@ -37,6 +37,7 @@ def compute_residual_v2(
         J_ij_kj,        # dict: (ij, k) -> (n_ij, n_kj) bare Coulomb (ik|a_ij c_kj)
         K_ij_kj,        # dict: (ij, k) -> (n_ij, n_kj) bare exchange (ia_ij|kc_kj)
         t1_pno=None,
+        ladder_precomputed=None,
 ):
     """Compute T2 residual following Psi4 ccsd.cc lines 2052-2221 exactly.
 
@@ -90,8 +91,10 @@ def compute_residual_v2(
     t1_j_pno = T1_all_ij[j] if t1_pno else np.zeros(n_pno)
     tau_ij = t2_ij + np.outer(t1_i_pno, t1_j_pno)
 
-    if with_df is not None:
-        # Precompute correction tensor for B̃_{ab}
+    if ladder_precomputed is not None and key in ladder_precomputed:
+        R_sym += ladder_precomputed[key]
+    elif with_df is not None:
+        # Fallback: compute ladder inline (per-pair DF loop)
         naux = ooL_bare.shape[2]
         ovL_stacked = np.stack(
             [ovL_bare[(key, k)] for k in range(nocc)])  # (nocc, n_pno, naux)
@@ -251,7 +254,7 @@ def compute_residual_v2(
                     S_ij_jk = _get_S(key_jk)
                     S_jk_ik = _get_S2(key_jk, key_ik)
                     if S_ij_jk is not None and S_jk_ik is not None:
-                        U_jk_proj = S_ij_jk @ u_jk @ S_jk_ik.T
+                        U_jk_proj = S_ij_jk @ u_jk @ S_jk_ik
                         D_temp = np.zeros((n_pno, n_pno))
                         dt = D_tilde_cache.get((i, k))
                         if dt is not None:
@@ -273,7 +276,7 @@ def compute_residual_v2(
                     S_ij_ik2 = _get_S(key_ik)
                     S_ik_jk = _get_S2(key_ik, key_jk)
                     if S_ij_ik2 is not None and S_ik_jk is not None:
-                        U_ik_proj = S_ij_ik2 @ u_ik @ S_ik_jk.T
+                        U_ik_proj = S_ij_ik2 @ u_ik @ S_ik_jk
                         D_temp_j = np.zeros((n_pno, n_pno))
                         dt_j = D_tilde_cache.get((j, k))
                         if dt_j is not None:

@@ -25,16 +25,17 @@ Dependencies:
     mpi4py           (optional, for MPI parallelism over fragments)
 """
 
-from pyscf.cc.dlpno_tccsd.driver import run_dlpno_tccsd_t, run_dlpno_ccsd_t
+from pyscf.cc.dlpno_tccsd.driver import run_dlpno_tccsd_t, run_dlpno_ccsd_t, count_frozen_core
 from pyscf.cc.dlpno_tccsd.dmrg_interface import run_dmrg_casscf, get_cas_amplitudes
 from pyscf.cc.dlpno_tccsd.local_orbs import make_lmos, make_paos
 from pyscf.cc.dlpno_tccsd.pno import make_pnos, classify_cas_pairs
 from pyscf.cc.dlpno_tccsd.lccsd import run_lccsd
-from pyscf.cc.dlpno_tccsd.lccsd_t import run_lccsd_t_ext
+from pyscf.cc.dlpno_tccsd.lccsd_t import run_lccsd_t_ext, run_lccsd_t1_iterations
 
 __all__ = [
     'run_dlpno_tccsd_t',
     'run_dlpno_ccsd_t',
+    'count_frozen_core',
     'run_dmrg_casscf',
     'get_cas_amplitudes',
     'make_lmos',
@@ -43,4 +44,5 @@ __all__ = [
     'classify_cas_pairs',
     'run_lccsd',
     'run_lccsd_t_ext',
+    'run_lccsd_t1_iterations',
 ]

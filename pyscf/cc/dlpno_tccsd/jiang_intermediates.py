@@ -238,11 +238,57 @@ def build_Fab(t1_pno, fov_pno, pno_spaces, nocc,
     return Fab
 
 
+def build_Fab_all(t1_pno, fov_pno, pno_spaces, nocc,
+                  ovL_bare, S_pno_cache, with_df, pair_keys,
+                  _fvv_t1_precomputed=None):
+    """Precompute Fab for ALL pairs in a single DF pass.
+
+    Replaces per-pair build_Fab() calls, avoiding redundant DF reads and
+    the thread-safety issue with with_df.loop().
+
+    Returns dict: pair_key -> (n_pno, n_pno) Fab matrix.
+    """
+    if _fvv_t1_precomputed is not None:
+        fvv_t1_all = _fvv_t1_precomputed
+    else:
+        from pyscf.cc.dlpno_tccsd.lccsd_jiang import compute_fvv_t1_all_pairs
+        fvv_t1_all = compute_fvv_t1_all_pairs(
+            t1_pno, fov_pno, pno_spaces, nocc,
+            ovL_bare, S_pno_cache, with_df, pair_keys)
+
+    # Complete Fab for each pair (Eq 97: Fab -= T1.T @ (fov + Fia_bar))
+    Fab_all = {}
+    for pk in pair_keys:
+        n_pno = pno_spaces[pk]['C_pno'].shape[1]
+        if n_pno == 0:
+            Fab_all[pk] = np.zeros((0, 0))
+            continue
+
+        e_pno = pno_spaces[pk]['e_pno']
+        Fab = np.diag(e_pno) + fvv_t1_all[pk]
+
+        # Eq 97: F̃_{ab} = F̄_{ab} - Σ_k t̃_k^a · F̄_{kb}
+        Fia_bar_ij = _build_Fia_bar(
+            t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pk)
+        T1_all = _build_T1_all(t1_pno, pk, nocc, S_pno_cache, pno_spaces)
+        fov_all = np.zeros((nocc, n_pno))
+        for kk in range(nocc):
+            fov_all[kk] = _project_t1_to_pair(
+                fov_pno, kk, pk, S_pno_cache, pno_spaces)
+        Fab -= T1_all.T @ (fov_all + Fia_bar_ij)
+
+        Fab_all[pk] = Fab
+
+    return Fab_all
+
+
 def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
-                  ovL_bare, ooL_bare, S_pno_cache, with_df):
+                  ovL_bare, ooL_bare, S_pno_cache, with_df,
+                  _term2_precomputed=None):
     """Build D_tilde (delta, Eq 84) for all ordered (i,k) pairs.
 
     delta_{ik}^{ac} = Terms 1-4 of Eq 84, using M/L integrals.
+    Term 2 uses a batched single DF pass over all (i,k) pairs.
 
     Following Psi4 ccsd.cc compute_D_tilde() lines 1753-1818.
     """
@@ -257,6 +303,46 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
         all_pairs.add((a, b))
         all_pairs.add((b, a))
 
+    # Term 2 can be precomputed via unified DF pass
+    if _term2_precomputed is None:
+        # Batched Term 2 via single DF pass (fallback)
+        term2_data = {}
+        for i_idx, k_idx in all_pairs:
+            key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
+            n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
+            if n_ik == 0:
+                continue
+            t1_i_ik = _project_t1_to_pair(
+                t1_pno, i_idx, key_ik, S_pno_cache, pno_spaces)
+            if np.max(np.abs(t1_i_ik)) < 1e-15:
+                continue
+            ovL_k_ik = ovL_bare.get((key_ik, k_idx))
+            if ovL_k_ik is None:
+                continue
+            term2_data[(i_idx, k_idx)] = {
+                'key_ik': key_ik, 'n_ik': n_ik,
+                'C_pno': np.asfortranarray(pno_spaces[key_ik]['C_pno']),
+                't1_i': t1_i_ik, 'ovL_k': ovL_k_ik,
+                'result': np.zeros((n_ik, n_ik)),
+            }
+        if term2_data:
+            aux_off = 0
+            for Lpq in with_df.loop():
+                nL = Lpq.shape[0]
+                for (i_idx, k_idx), td in term2_data.items():
+                    n_ik = td['n_ik']
+                    buf = _ao2mo.nr_e2(Lpq, td['C_pno'],
+                                       (0, n_ik, 0, n_ik), aosym='s2')
+                    B_L = buf.reshape(nL, n_ik, n_ik)
+                    ovL_k_batch = td['ovL_k'][:, aux_off:aux_off+nL]
+                    z_c = np.einsum('b,Lbc->Lc', td['t1_i'], B_L)
+                    y = td['t1_i'] @ ovL_k_batch
+                    td['result'] += 2.0 * ovL_k_batch @ z_c
+                    td['result'] -= np.einsum('L,Lac->ac', y, B_L)
+                aux_off += nL
+            _term2_precomputed = {ik: td['result'] for ik, td in term2_data.items()}
+
+    # --- Build D_tilde for each (i,k) pair ---
     for i_idx, k_idx in all_pairs:
         key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
         n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
@@ -275,45 +361,9 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             T1_all_ik[mm] = _project_t1_to_pair(
                 t1_pno, mm, key_ik, S_pno_cache, pno_spaces)
 
-        # --- Term 2: +t̃_i^b · M_{kb}^{ac} ---
-        # M = 2K - J. In PNO_ik: M_{kb}^{ac} = 2*(ka|bc) - (kb|ac)
-        # This needs (ka|bc) = vovv integral → DF loop
-        # Psi4 uses K_tilde_chem_[ki] = ovL_k @ vvL.T for the K part
-        # and reshapes for contraction with T1_i.
-        # For now: compute via DF loop
-        if np.max(np.abs(t1_i_ik)) > 1e-15:
-            C_pno_ik = pno_spaces[key_ik]['C_pno']
-            ovL_k_ik = ovL_bare.get((key_ik, k_idx))
-            if ovL_k_ik is not None:
-                mo_vv = np.asfortranarray(C_pno_ik)
-                ijslice = (0, n_ik, 0, n_ik)
-                buf = None
-                # Term 2: +Σ_b T1_i[b] * M_{kb}^{ac}
-                # M_{kb}^{ac} = 2*(ka|bc) - (kb|ac)
-                # (ka|bc) = ovL_k[a,L]*B_L[L,b,c]
-                # (kb|ac) = ovL_k[b,L]*B_L[L,a,c]
-                D_tilde_ik_term2 = np.zeros((n_ik, n_ik))
-                aux_off = 0
-                for Lpq in with_df.loop():
-                    nL = Lpq.shape[0]
-                    buf = _ao2mo.nr_e2(Lpq, mo_vv, ijslice, aosym='s2', out=buf)
-                    B_L = buf.reshape(nL, n_ik, n_ik)
-                    ovL_k_batch = ovL_k_ik[:, aux_off:aux_off+nL]
-                    # (ka|bc): ovL_k[a,L]*B_L[L,b,c]
-                    # Need: Σ_b T1_i[b] * M_{kb}^{ac}
-                    # M_{kb}^{ac} = 2*(ka|bc) - (kb|ac)
-                    # = 2*ovL_k[a,L]*B_L[L,b,c] - ovL_k[b,L]*B_L[L,a,c]
-                    # Σ_b T1[b] * M[b,a,c]:
-                    # = 2*Σ_b T1[b]*ovL_k[a,L]*B_L[L,b,c] - Σ_b T1[b]*ovL_k[b,L]*B_L[L,a,c]
-                    # = 2*ovL_k[a,L]*Σ_b T1[b]*B_L[L,b,c] - (T1@ovL_k_batch)[L]*B_L[L,a,c]
-                    z_c = np.einsum('b,Lbc->Lc', t1_i_ik, B_L)  # (nL, n_ik)
-                    y = t1_i_ik @ ovL_k_batch  # (nL,)
-                    # Term: 2*ovL_k[a,L]*z_c[L,c]
-                    D_tilde_ik_term2 += 2.0 * ovL_k_batch @ z_c
-                    # Term: -y[L]*B_L[L,a,c]
-                    D_tilde_ik_term2 -= np.einsum('L,Lac->ac', y, B_L)
-                    aux_off += nL
-                D_tilde_ik += D_tilde_ik_term2  # Add Term 2 contribution
+        # Term 2: from precomputed or batched computation
+        if _term2_precomputed and (i_idx, k_idx) in _term2_precomputed:
+            D_tilde_ik += _term2_precomputed[(i_idx, k_idx)]
 
         # --- Term 1: -Σ_l T1_all[l,a] · M_{ik}^{lc} ---
         # M_{ik}^{lc} = 2*(il|kc) - (ik|lc)

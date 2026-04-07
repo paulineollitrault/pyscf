@@ -222,192 +222,105 @@ def _build_ooL_triple(Lpq_full, C_lmo, lmo_indices):
 
 
 def _w3_intermediate(t2_sc, ovL_sc, ooL_sc, vvL_sc, eps_occ, eps_vir,
-                     t1_sc=None, fvo_sc=None, sum_all_occ=False):
-    """Compute the (T) energy contribution for a single occupied triple (i,j,k).
+                     t1_sc=None, fvo_sc=None, sum_all_occ=False,
+                     occ_indices=None,
+                     ooL_sc_full=None, t2_sc_full=None):
+    """Compute (T) energy for one triple i<=j<=k using Eq 53 (Jiang 2024).
 
-    Follows the canonical formula from ccsd_t_slow.py:
-        z = r3(w + 0.5*v) / D
-        E = sum w * z  (over 36 terms)
+    Uses the base W (single occupied assignment, no P_L permutation) with the
+    Eq 53 closed-shell antisymmetrizer acting on virtual indices. The factor 6
+    (= 2 spin × 3 closed-shell) converts from the spin-orbital formula.
 
-    where W is the connected part (T2 × integrals) and V is the disconnected
-    part (T1 × vvoo integrals + T2 × Fock off-diagonal).
+    The vooo (A*t2) term sums over ALL occupied LMOs when ooL_sc_full and
+    t2_sc_full are provided, matching Psi4's triplet-domain approach.
 
-    Two-stage approach for maximum speed:
-
-    1. Precompute W_all[a,b,c,p,q,r] for ALL virtual (a,b,c) at once using two
-       vectorised numpy contractions:
-
-           K[a,b,p,f]        = sum_L ovL_sc[p,f,L] * vvL_sc[a,b,L]
-           A[p,a,q,m]        = sum_L ovL_sc[p,a,L] * ooL_sc[q,m,L]
-           W_vvov[a,b,c,p,q,r] = sum_f K[a,b,p,f] * t2_sc[q,r,c,f]
-           W_vooo[a,b,c,p,q,r] = sum_m A[p,a,q,m] * t2_sc[m,r,b,c]
-           W_all = W_vvov - W_vooo
-
-       Memory: (n,n,n,3,3,3) × 8 bytes — e.g. 31 MB for n=53.
-
-    2. Loop over compact (a>=b>=c) virtual triples, but each build_w(x,y,z) is
-       now just a free slice of the precomputed W_all — no arithmetic inside
-       the loop at all.  The 26K × 6 r3 calls operate on 3×3×3 arrays (trivial)
-       and accumulate the 36-term energy formula.
-
-    The formula and sign convention match ccsd_t_slow.py exactly; r3 acts on
-    the occupied (p,q,r) axes.  The compact loop with degeneracy factors is
-    the standard way to handle the sum over distinct virtual triples.
-
-    This is correct for non-antisymmetric T2 (pair CCSD T2 has exchange
-    symmetry only, not full antisymmetry) because the energy formula uses
-    the same compact-loop structure as the original, just with precomputed W.
+    The occupied degeneracy factor 1/(1+δ_ij+δ_jk+δ_ik+2δ_ijδ_jkδ_ik)
+    is applied when occ_indices=(i,j,k) is given.
 
     Args:
-        t2_sc (np.ndarray): (3, 3, n_tno, n_tno) T2[p,q,a,b] in SC occ × SC vir.
-        ovL_sc (np.ndarray): (3, n_tno, naux) SC-occ × TNO DF integrals.
-        ooL_sc (np.ndarray): (3, 3, naux) SC-occ × SC-occ DF integrals.
-        vvL_sc (np.ndarray): (n_tno, n_tno, naux) TNO × TNO DF integrals.
-        eps_occ (np.ndarray): (3,) SC occupied orbital energies.
-        eps_vir (np.ndarray): (n_tno,) SC virtual orbital energies.
+        t2_sc: (nocc_t, nocc_t, n, n) T2 in SC occ × SC vir.
+        ovL_sc: (nocc_t, n, naux) SC-occ × TNO DF integrals.
+        ooL_sc: (nocc_t, nocc_t, naux) or larger for full-occ A*t2.
+        vvL_sc: (n, n, naux) TNO × TNO DF integrals.
+        eps_occ: SC occupied orbital energies.
+        eps_vir: (n,) SC virtual orbital energies.
+        occ_indices: (i, j, k) global occupied indices for degeneracy factor.
+        ooL_sc_full: (nocc_t, nocc_all, naux) for full-occ vooo term.
+        t2_sc_full: (nocc_all, nocc_t, n, n) for full-occ vooo term.
 
     Returns:
-        et_ijk (float): (T) energy contribution from this triple (× spin factor 2).
+        et_ijk (float): (T) energy contribution including spin factor.
     """
     n = len(eps_vir)
     if n == 0:
         return 0.0
 
-    # ------------------------------------------------------------------
-    # Stage 1: build the full W[a,b,c,p,q,r] tensor in one shot.
-    # ------------------------------------------------------------------
-    # K[a,b,p,f] = sum_L ovL_sc[p,a,L]*vvL_sc[f,b,L] = (pa|fb)  — (n, n, 3, n)
-    # Canonical formula: w[i,j,k] = sum_f (ia|fb)*t2[k,j,c,f]
-    # so K uses the occ-vir integral (pa|fb), NOT (pf|ab).
-    K = np.einsum('paL,fbL->abpf', ovL_sc, vvL_sc)
-    # W_vvov[a,b,c,p,q,r] = sum_f K[a,b,p,f] * t2_sc[r,q,c,f]
-    W_all = np.einsum('abpf,rqcf->abcpqr', K, t2_sc)    # (n, n, n, 3, 3, 3)
-    del K
+    nocc_triple = ovL_sc.shape[0]
+    naux = ovL_sc.shape[2]
 
-    # A[p,a,q,m] = sum_L ovL_sc[p,a,L]*ooL_sc[q,m,L]  — (3, n, 3, 3)
-    A = np.einsum('paL,qmL->paqm', ovL_sc, ooL_sc)
-    # W_vooo[a,b,c,p,q,r] = sum_m A[p,a,q,m] * t2_sc[m,r,b,c]  (subtract in-place)
-    W_all -= np.einsum('paqm,mrbc->abcpqr', A, t2_sc)
+    # --- Denominator ---
+    D_vir = eps_vir[:, None, None] + eps_vir[None, :, None] + eps_vir[None, None, :]
+    D_occ = eps_occ[0] + eps_occ[1] + eps_occ[2]
+    D = D_vir - D_occ  # eps_abc - eps_ijk (positive for occupied < virtual)
 
-    # Make contiguous so slices W_all[a,b,c] are fast.
-    W_all = np.ascontiguousarray(W_all)
-
-    # ------------------------------------------------------------------
-    # Build V_all (disconnected part): T1 × vvoo integrals + T2 × Fock
-    # From ccsd_t_slow.py:
-    #   v[a,b,c; i,j,k] = vvoo[a,b,i,j] * t1[k,c] + t2[i,j,a,b] * fvo[c,k]
-    # ------------------------------------------------------------------
-    has_v = (t1_sc is not None and fvo_sc is not None)
-    if has_v:
-        # vvoo[a,b,p,q] = (pa|qb) = sum_L ovL_sc[p,a,L] * ovL_sc[q,b,L]
-        # Canonical: eris_vvoo[a,b,i,j] = (ia|jb), NOT (ab|ij).
-        vvoo = np.einsum('paL,qbL->abpq', ovL_sc, ovL_sc)  # (n, n, 3, 3)
-        # V_all[a,b,c,p,q,r] = vvoo[a,b,p,q] * t1_sc[r,c]
-        #                    + t2_sc[p,q,a,b] * fvo_sc[c,r]
-        V_all = np.einsum('abpq,rc->abcpqr', vvoo, t1_sc)
-        V_all += np.einsum('pqab,cr->abcpqr', t2_sc, fvo_sc)
-        V_all = np.ascontiguousarray(V_all)
-        del vvoo
-
-    # ------------------------------------------------------------------
-    # Stage 2: fully vectorised compact (a>=b>=c) energy accumulation.
-    # ------------------------------------------------------------------
-    # Build compact index arrays once (no Python loop at all).
-    a_arr = np.empty(n*(n+1)*(n+2)//6, dtype=np.int32)
-    b_arr = np.empty_like(a_arr)
-    c_arr = np.empty_like(a_arr)
-    idx = 0
-    for a in range(n):
-        for b in range(a + 1):
-            for c in range(b + 1):
-                a_arr[idx] = a; b_arr[idx] = b; c_arr[idx] = c
-                idx += 1
-    # n_compact = C(n+2,3)
-
-    # Batch-extract W for all 6 virtual permutations at once (fancy indexing).
-    # Shape: (n_compact, 3, 3, 3)
-    wabc = W_all[a_arr, b_arr, c_arr];  wacb = W_all[a_arr, c_arr, b_arr]
-    wbac = W_all[b_arr, a_arr, c_arr];  wbca = W_all[b_arr, c_arr, a_arr]
-    wcab = W_all[c_arr, a_arr, b_arr];  wcba = W_all[c_arr, b_arr, a_arr]
-    del W_all  # free memory
-
-    # Batch-extract V (disconnected part) if available.
-    if has_v:
-        vabc = V_all[a_arr, b_arr, c_arr];  vacb = V_all[a_arr, c_arr, b_arr]
-        vbac = V_all[b_arr, a_arr, c_arr];  vbca = V_all[b_arr, c_arr, a_arr]
-        vcab = V_all[c_arr, a_arr, b_arr];  vcba = V_all[c_arr, b_arr, a_arr]
-        del V_all
-
-    # r3 antisymmetriser acting on axes 1,2,3 (occupied p,q,r) — batched.
-    def r3b(W):   # W: (N, 3, 3, 3)
-        return (4*W
-                + W.transpose(0, 2, 3, 1) + W.transpose(0, 3, 1, 2)
-                - 2*W.transpose(0, 1, 3, 2) - 2*W.transpose(0, 2, 1, 3)
-                - 2*W.transpose(0, 3, 2, 1))
-
-    # Denominator: D_occ[p,q,r] - eps_vir[a] - eps_vir[b] - eps_vir[c]
-    D_occ = (eps_occ[:, None, None]
-             + eps_occ[None, :, None]
-             + eps_occ[None, None, :])   # (3,3,3)
-    D_abc = eps_vir[a_arr] + eps_vir[b_arr] + eps_vir[c_arr]         # (n_compact,)
-    D_batch = D_occ[None, :, :, :] - D_abc[:, None, None, None]      # (n_compact,3,3,3)
-
-    # Degeneracy factors (matches ccsd_t_slow.py compact loop).
-    all_same = (a_arr == c_arr)                           # a==b==c
-    ab_bc    = ((a_arr == b_arr) | (b_arr == c_arr)) & ~all_same
-    D_batch[all_same] *= 6
-    D_batch[ab_bc]    *= 2
-    D_safe = np.where(np.abs(D_batch) > 1e-12, D_batch, 1e-12)
-
-    # z = r3(w + 0.5*v) / D for all 6 permutations at once.
-    if has_v:
-        zabc = r3b(wabc + 0.5*vabc) / D_safe
-        zacb = r3b(wacb + 0.5*vacb) / D_safe
-        zbac = r3b(wbac + 0.5*vbac) / D_safe
-        zbca = r3b(wbca + 0.5*vbca) / D_safe
-        zcab = r3b(wcab + 0.5*vcab) / D_safe
-        zcba = r3b(wcba + 0.5*vcba) / D_safe
+    # --- Occupied degeneracy factor ---
+    if occ_indices is not None:
+        i, j, k = occ_indices
+        dij = int(i == j); djk = int(j == k); dik = int(i == k)
+        occ_denom = 1 + dij + djk + dik + 2 * dij * djk * dik
     else:
-        zabc = r3b(wabc) / D_safe;  zacb = r3b(wacb) / D_safe
-        zbac = r3b(wbac) / D_safe;  zbca = r3b(wbca) / D_safe
-        zcab = r3b(wcab) / D_safe;  zcba = r3b(wcba) / D_safe
+        occ_denom = 1
 
-    # 36-term energy accumulation (all n_compact triples at once).
-    # Transpositions act on axes 1,2,3 (p,q,r); axis 0 is batch.
-    contrib = (
-        wabc*zabc         + wacb*zabc.transpose(0,1,3,2)
-        + wbac*zabc.transpose(0,2,1,3) + wbca*zabc.transpose(0,2,3,1)
-        + wcab*zabc.transpose(0,3,1,2) + wcba*zabc.transpose(0,3,2,1)
-        + wacb*zacb       + wabc*zacb.transpose(0,1,3,2)
-        + wcab*zacb.transpose(0,2,1,3) + wcba*zacb.transpose(0,2,3,1)
-        + wbac*zacb.transpose(0,3,1,2) + wbca*zacb.transpose(0,3,2,1)
-        + wbac*zbac       + wbca*zbac.transpose(0,1,3,2)
-        + wabc*zbac.transpose(0,2,1,3) + wacb*zbac.transpose(0,2,3,1)
-        + wcba*zbac.transpose(0,3,1,2) + wcab*zbac.transpose(0,3,2,1)
-        + wbca*zbca       + wbac*zbca.transpose(0,1,3,2)
-        + wcba*zbca.transpose(0,2,1,3) + wcab*zbca.transpose(0,2,3,1)
-        + wabc*zbca.transpose(0,3,1,2) + wacb*zbca.transpose(0,3,2,1)
-        + wcab*zcab       + wcba*zcab.transpose(0,1,3,2)
-        + wacb*zcab.transpose(0,2,1,3) + wabc*zcab.transpose(0,2,3,1)
-        + wbca*zcab.transpose(0,3,1,2) + wbac*zcab.transpose(0,3,2,1)
-        + wcba*zcba       + wcab*zcba.transpose(0,1,3,2)
-        + wbca*zcba.transpose(0,2,1,3) + wbac*zcba.transpose(0,2,3,1)
-        + wacb*zcba.transpose(0,3,1,2) + wabc*zcba.transpose(0,3,2,1))
+    # --- Build P_L-assembled W (Jiang Eq 47+49) ---
+    # P_L simultaneously permutes occupied (i,j,k) and virtual (a,b,c).
+    # For each S_3 permutation σ: W[a,b,c] += base(σ(i),σ(j),σ(k))[σ(a),σ(b),σ(c)]
+    # The transpose maps base[x,y,z] → W[a,b,c] by inverting the virtual permutation.
+    trans = [lambda x: x,                     # (i,j,k) → identity
+             lambda x: x.transpose(0,2,1),    # (i,k,j) → (a,c,b)
+             lambda x: x.transpose(1,0,2),    # (j,i,k) → (b,a,c)
+             lambda x: x.transpose(2,0,1),    # (j,k,i) → (b,c,a)
+             lambda x: x.transpose(1,2,0),    # (k,i,j) → (c,a,b)
+             lambda x: x.transpose(2,1,0)]    # (k,j,i) → (c,b,a)
 
-    # Sum occupied elements for each compact (a,b,c).
-    if sum_all_occ:
-        # Degenerate case (2 occ): sum ALL occupied elements.
-        # For a pair (i,k), the 2^3=8 entries contain {i,i,k} (3 entries),
-        # {i,k,k} (3 entries), and {i,i,i}/{k,k,k} (2 entries, zero after r3).
-        et = np.sum(contrib)
-    else:
-        # All-distinct case (3 occ): sum only the 6 all-distinct permutations.
-        et = np.sum(contrib[:, 0, 1, 2] + contrib[:, 0, 2, 1]
-                    + contrib[:, 1, 0, 2] + contrib[:, 1, 2, 0]
-                    + contrib[:, 2, 0, 1] + contrib[:, 2, 1, 0])
+    W = np.zeros((n, n, n))
+    for pidx in range(6):
+        p_map = [(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0)][pidx]
+        ip, iq, ir = p_map
 
-    # Factor 2 for closed-shell spin summation (matches canonical et *= 2)
-    return float(et.real) * 2
+        K_ab = np.einsum('aL,fbL->abf', ovL_sc[ip], vvL_sc)
+        base = np.einsum('abf,cf->abc', K_ab, t2_sc[ir, iq])
+
+        if ooL_sc_full is not None and t2_sc_full is not None:
+            A_al = np.einsum('aL,mL->am', ovL_sc[ip], ooL_sc_full[iq])
+            base -= np.einsum('am,mbc->abc', A_al, t2_sc_full[:, ir])
+        else:
+            A_al = np.einsum('aL,mL->am', ovL_sc[ip], ooL_sc[iq])
+            base -= np.einsum('am,mbc->abc', A_al, t2_sc[:, ir])
+
+        W += trans[pidx](base)
+
+    # --- T = -W/D ---
+    T = -W / D
+
+    # --- V = W + T1 disconnected (Psi4 lines 930-962) ---
+    V = W.copy()
+    if t1_sc is not None and fvo_sc is not None:
+        K_jk = np.einsum('bL,cL->bc', ovL_sc[1], ovL_sc[2])
+        K_ik = np.einsum('aL,cL->ac', ovL_sc[0], ovL_sc[2])
+        K_ij = np.einsum('aL,bL->ab', ovL_sc[0], ovL_sc[1])
+        V += (np.einsum('a,bc->abc', t1_sc[0], K_jk)
+              + np.einsum('b,ac->abc', t1_sc[1], K_ik)
+              + np.einsum('c,ab->abc', t1_sc[2], K_ij))
+
+    # --- Energy: Eq 53 antisymmetrizer on virtual indices ---
+    et = (8 * np.sum(V * T)
+          - 4 * np.sum(V.transpose(2, 1, 0) * T)
+          - 4 * np.sum(V.transpose(0, 2, 1) * T)
+          - 4 * np.sum(V.transpose(1, 0, 2) * T)
+          + 2 * np.sum(V.transpose(1, 2, 0) * T)
+          + 2 * np.sum(V.transpose(2, 0, 1) * T))
+
+    return float(et / occ_denom)
 
 
 def _zero_cas_t2_amplitudes(t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir,
@@ -500,61 +413,65 @@ def _process_one_triple(i, j, k,
     ovL_ijk    = _build_ovL_tno(Lpq_full, C_lmo, C_tno_sc, [i, j, k])
     vvL_sc     = _build_vvL_tno(Lpq_full, C_tno_sc)
     triple_lmo = [i, j, k]
-    F_occ_3x3  = F_lmo[np.ix_(triple_lmo, triple_lmo)]
-    eps_occ_sc, V_occ_sc = np.linalg.eigh(F_occ_3x3)
-    ovL_sc_occ = np.einsum('nm,naL->maL', V_occ_sc, ovL_ijk)
-    ooL_lmo    = _build_ooL_triple(Lpq_full, C_lmo, triple_lmo)
-    ooL_sc     = np.einsum('pm,qn,pqL->mnL', V_occ_sc, V_occ_sc, ooL_lmo)
+    nocc_lmo = C_lmo.shape[1]
 
-    # Include diagonal pair amplitudes t2[i,i,a,b] — these are nonzero in
-    # spatial-orbital CCSD and contribute to the (T) correction.
-    def _map_t2_diag(idx):
-        pair_key = (idx, idx)
-        if pair_key not in pno_spaces or pair_key not in t2_for_T:
+    # No occupied semicanonalization — use diagonal LMO Fock for the denominator.
+    # This matches Psi4's (T0) implementation.  The off-diagonal occupied Fock
+    # elements are neglected in (T0); the (T1) iterative approach corrects for
+    # them via inter-triple coupling.
+    eps_occ = np.array([F_lmo[ii, ii] for ii in triple_lmo])
+
+    # Full-occ ooL for the vooo (A*t2) term
+    ooL_lmo_full = _build_ooL_triple(Lpq_full, C_lmo, list(range(nocc_lmo)))
+
+    # T2 for all occupied paired with triple LMOs: t2_mr[l, r_local] = t2[l, triple[r]]
+    def _proj_t2(p, q):
+        pk = (min(p, q), max(p, q))
+        if pk not in t2_for_T or pk not in pno_spaces:
             return np.zeros((n_tno, n_tno))
-        C_p = pno_spaces[pair_key]['C_pno']
+        C_p = pno_spaces[pk]['C_pno']
         if C_p.shape[1] == 0:
             return np.zeros((n_tno, n_tno))
         U = reduce(np.dot, (C_p.T, s1e, C_tno_sc))
-        return reduce(np.dot, (U.T, t2_for_T[pair_key], U))
+        t2_proj = reduce(np.dot, (U.T, t2_for_T[pk], U))
+        if p > q:
+            t2_proj = t2_proj.T
+        return t2_proj
 
-    t2_lmo_block = np.zeros((3, 3, n_tno, n_tno))
-    t2_lmo_block[0, 0] = _map_t2_diag(i)
-    t2_lmo_block[1, 1] = _map_t2_diag(j)
-    t2_lmo_block[2, 2] = _map_t2_diag(k)
-    t2_lmo_block[0, 1] = t2_ij_sc;  t2_lmo_block[1, 0] = t2_ij_sc.T
-    t2_lmo_block[0, 2] = t2_ik_sc;  t2_lmo_block[2, 0] = t2_ik_sc.T
-    t2_lmo_block[1, 2] = t2_jk_sc;  t2_lmo_block[2, 1] = t2_jk_sc.T
-    t2_sc_block = np.einsum('pm,qn,pqAB->mnAB', V_occ_sc, V_occ_sc, t2_lmo_block)
+    t2_mr = np.zeros((nocc_lmo, 3, n_tno, n_tno))
+    for r_local, r_global in enumerate(triple_lmo):
+        for m in range(nocc_lmo):
+            t2_mr[m, r_local] = _proj_t2(m, r_global)
 
-    # Project local T1 to semicanonical TNO basis for the V intermediate.
-    t1_sc = None
-    fvo_sc = None
+    # T2 block for the 3 triple LMOs (used by _w3_intermediate)
+    t2_block = np.zeros((3, 3, n_tno, n_tno))
+    for p in range(3):
+        for q in range(3):
+            t2_block[p, q] = t2_mr[triple_lmo[p], q]
+
+    # Project local T1 to TNO basis for the V intermediate.
+    t1_lmo = None
+    fvo = None
     if t1_pno is not None:
-        # t1_pno[r]: (n_pno_rr,) in diagonal PNO basis of pair (r,r).
-        # Project each to TNO-sc: t1_lmo_tno[r, :] = U_rr.T @ t1_pno[r]
-        # where U_rr = C_pno_rr.T @ S @ C_tno_sc
-        nocc_lmo = C_lmo.shape[1]
-        t1_lmo_tno = np.zeros((nocc_lmo, n_tno))
-        for r in triple_lmo:
-            key_rr = (r, r)
-            if key_rr in pno_spaces and t1_pno.get(r) is not None:
+        t1_lmo_tno = np.zeros((3, n_tno))
+        for idx_local, r_global in enumerate(triple_lmo):
+            key_rr = (r_global, r_global)
+            if key_rr in pno_spaces and t1_pno.get(r_global) is not None:
                 C_pno_rr = pno_spaces[key_rr]['C_pno']
-                if C_pno_rr.shape[1] > 0 and t1_pno[r].size > 0:
+                if C_pno_rr.shape[1] > 0 and t1_pno[r_global].size > 0:
                     U_rr = reduce(np.dot, (C_pno_rr.T, s1e, C_tno_sc))
-                    t1_lmo_tno[r] = U_rr.T @ t1_pno[r]
-        t1_triple = t1_lmo_tno[triple_lmo, :]                  # (3, n_tno)
-        t1_sc = np.dot(V_occ_sc.T, t1_triple)                  # (3, n_tno)
+                    t1_lmo_tno[idx_local] = U_rr.T @ t1_pno[r_global]
+        t1_lmo = t1_lmo_tno
 
-        # Fock virtual-occupied block in semicanonical basis:
-        # fvo_sc[c, r] = C_tno_sc.T @ fock_ao @ C_lmo_triple @ V_occ_sc
-        C_lmo_triple = C_lmo[:, triple_lmo]                     # (nao, 3)
-        F_vo = reduce(np.dot, (C_tno_sc.T, fock_ao, C_lmo_triple))  # (n_tno, 3)
-        fvo_sc = np.dot(F_vo, V_occ_sc)                         # (n_tno, 3)
+        C_lmo_triple = C_lmo[:, triple_lmo]
+        fvo = reduce(np.dot, (C_tno_sc.T, fock_ao, C_lmo_triple))
 
-    return _w3_intermediate(t2_sc_block, ovL_sc_occ, ooL_sc, vvL_sc,
-                            eps_occ_sc, eps_tno_sc,
-                            t1_sc=t1_sc, fvo_sc=fvo_sc)
+    return _w3_intermediate(t2_block, ovL_ijk, None, vvL_sc,
+                            eps_occ, eps_tno_sc,
+                            t1_sc=t1_lmo, fvo_sc=fvo,
+                            occ_indices=(i, j, k),
+                            ooL_sc_full=ooL_lmo_full[triple_lmo],
+                            t2_sc_full=t2_mr)
 
 
 def _process_degenerate_pair(i, k,
@@ -562,6 +479,24 @@ def _process_degenerate_pair(i, k,
                              Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
                              t1_pno=None, T_CutTNO=1e-9):
     """Compute (T) energy from degenerate occupied triples {i,i,k} and {i,k,k}.
+
+    With the Eq 53 formula, _process_one_triple handles degenerate triples
+    correctly via the occ_indices degeneracy factor. We just call it for both
+    (i,i,k) and (i,k,k).
+    """
+    kwargs = dict(pno_spaces=pno_spaces, t2_for_T=t2_for_T,
+                  Lpq_full=Lpq_full, C_lmo=C_lmo, fock_ao=fock_ao,
+                  F_lmo=F_lmo, s1e=s1e, t1_pno=t1_pno, T_CutTNO=T_CutTNO)
+    et_iik = _process_one_triple(i, i, k, **kwargs)
+    et_ikk = _process_one_triple(i, k, k, **kwargs)
+    return et_iik + et_ikk
+
+
+def _process_degenerate_pair_old(i, k,
+                             pno_spaces, t2_for_T,
+                             Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
+                             t1_pno=None, T_CutTNO=1e-9):
+    """OLD: Compute (T) energy from degenerate occupied triples {i,i,k} and {i,k,k}.
 
     For a pair (i,k) with i<k, the 2^3=8 occupied combinations in the
     2-LMO block cover: {i,i,k} (3 entries), {i,k,k} (3 entries), and
@@ -853,4 +788,480 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     log.info('E(T) degenerate = %.15g', e_t_degen)
     log.info('E(T) external = %.15g', e_t)
 
+    return e_t
+
+
+# =============================================================================
+# (T1) Iterative Triples — Jiang JCP 2024 / Psi4 lccsd_t_iterations
+# =============================================================================
+
+def _build_triple_W_V_T0(i, j, k, pno_spaces, t2_for_T,
+                          Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
+                          ooL_full, t1_pno=None, T_CutTNO=1e-9):
+    """Compute W, V, T0 and TNO data for one triple.
+
+    No occupied semicanonalization — uses diagonal LMO Fock for the denominator.
+    The virtual space is semicanonalized (Fock-diagonal TNOs).
+
+    Args:
+        ooL_full: (nocc, nocc, naux) prebuilt ooL for all occupied pairs.
+
+    Returns:
+        dict with W, V, T, C_tno_sc, eps_tno, n_tno, or None if skipped.
+    """
+    ij = (min(i, j), max(i, j))
+    ik = (min(i, k), max(i, k))
+    jk = (min(j, k), max(j, k))
+
+    if (ij not in pno_spaces or ik not in pno_spaces or jk not in pno_spaces):
+        return None
+    if (ij not in t2_for_T or ik not in t2_for_T or jk not in t2_for_T):
+        return None
+
+    C_tno, n_tno = _triple_pno_union(pno_spaces, i, j, k, s1e,
+                                      t2_for_T=t2_for_T, T_CutTNO=T_CutTNO)
+    if n_tno == 0:
+        return None
+
+    n = n_tno
+    triple_lmo = [i, j, k]
+    nocc = C_lmo.shape[1]
+
+    # Virtual semicanonalization only
+    F_tno_full = reduce(np.dot, (C_tno.T, fock_ao, C_tno))
+    eps_tno, V_sc = np.linalg.eigh(F_tno_full)
+    C_tno_sc = np.dot(C_tno, V_sc)
+
+    # DF integrals in LMO-occ × SC-vir basis
+    ovL = _build_ovL_tno(Lpq_full, C_lmo, C_tno_sc, triple_lmo)  # (3, n, naux)
+    vvL = _build_vvL_tno(Lpq_full, C_tno_sc)  # (n, n, naux)
+
+    # T2 for all occ paired with triple LMOs: t2_mr[l, r_local] = t2[l, triple[r]]
+    def _proj_t2(p, q):
+        pk = (min(p, q), max(p, q))
+        if pk not in t2_for_T or pk not in pno_spaces:
+            return np.zeros((n, n))
+        C_p = pno_spaces[pk]['C_pno']
+        if C_p.shape[1] == 0:
+            return np.zeros((n, n))
+        U = reduce(np.dot, (C_p.T, s1e, C_tno_sc))
+        t2_proj = reduce(np.dot, (U.T, t2_for_T[pk], U))
+        if p > q:
+            t2_proj = t2_proj.T
+        return t2_proj
+
+    t2_mr = np.zeros((nocc, 3, n, n))
+    for r_local, r_global in enumerate(triple_lmo):
+        for m in range(nocc):
+            t2_mr[m, r_local] = _proj_t2(m, r_global)
+
+    # P_L-assembled W (corrected virtual transposes)
+    perms = [(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0)]
+    trans_axes = [(0,1,2),(0,2,1),(1,0,2),(2,0,1),(1,2,0),(2,1,0)]
+
+    W = np.zeros((n, n, n))
+    for pidx, (ip, iq, ir) in enumerate(perms):
+        # vvov: sum_f (ip_a|b f) * t2[r,q,c,f]
+        K_abf = np.einsum('aL,fbL->abf', ovL[ip], vvL)
+        t2_rq = t2_mr[triple_lmo[ir], iq]  # t2[triple[ir], triple[iq]]
+        base = np.einsum('abf,cf->abc', K_abf, t2_rq)
+
+        # vooo: -sum_l (ip_a | iq_l) * t2[l, ir, b, c]  (Eq47 factorization)
+        A_al = np.einsum('aL,lL->al', ovL[ip], ooL_full[triple_lmo[iq]])
+        base -= np.einsum('al,lbc->abc', A_al, t2_mr[:, ir])
+
+        W += base.transpose(trans_axes[pidx])
+
+    # Denominator: diagonal LMO Fock (no occupied SC)
+    eps_occ = np.array([F_lmo[ii, ii] for ii in triple_lmo])
+    D_occ = eps_occ[0] + eps_occ[1] + eps_occ[2]
+    D = eps_tno[:, None, None] + eps_tno[None, :, None] + eps_tno[None, None, :] - D_occ
+
+    T = -W / D
+
+    # V = W + T1 disconnected
+    V = W.copy()
+    if t1_pno is not None:
+        t1_tno = np.zeros((3, n))
+        for idx_local, r_global in enumerate(triple_lmo):
+            key_rr = (r_global, r_global)
+            if key_rr in pno_spaces and t1_pno.get(r_global) is not None:
+                C_pno_rr = pno_spaces[key_rr]['C_pno']
+                if C_pno_rr.shape[1] > 0 and t1_pno[r_global].size > 0:
+                    U_rr = reduce(np.dot, (C_pno_rr.T, s1e, C_tno_sc))
+                    t1_tno[idx_local] = U_rr.T @ t1_pno[r_global]
+        K_jk = np.einsum('bL,cL->bc', ovL[1], ovL[2])
+        K_ik = np.einsum('aL,cL->ac', ovL[0], ovL[2])
+        K_ij = np.einsum('aL,bL->ab', ovL[0], ovL[1])
+        V += (np.einsum('a,bc->abc', t1_tno[0], K_jk)
+              + np.einsum('b,ac->abc', t1_tno[1], K_ik)
+              + np.einsum('c,ab->abc', t1_tno[2], K_ij))
+
+    return {
+        'W': W, 'V': V, 'T': T,
+        'C_tno_sc': C_tno_sc,
+        'eps_tno': eps_tno,
+        'D': D,
+        'n_tno': n_tno,
+        'i': i, 'j': j, 'k': k,
+    }
+
+
+def _triples_permuter(X, i_perm, j_perm, k_perm):
+    """Permute virtual indices of X[a,b,c] based on occupied ordering.
+
+    X is stored with canonical ordering (i<=j<=k). Given a target occupied
+    ordering (i_perm, j_perm, k_perm), return X with virtual indices permuted
+    to match. Follows Psi4's triples_permuter() logic.
+
+    The mapping: determine which S_3 element maps the canonical ordering
+    to the target ordering, then apply the same permutation to (a,b,c).
+    """
+    # Determine permutation index from the sorted ordering
+    if i_perm <= j_perm and j_perm <= k_perm:
+        return X                                        # identity
+    elif i_perm <= k_perm and k_perm <= j_perm:
+        return X.transpose(0, 2, 1)                     # swap b↔c
+    elif j_perm <= i_perm and i_perm <= k_perm:
+        return X.transpose(1, 0, 2)                     # swap a↔b
+    elif j_perm <= k_perm and k_perm <= i_perm:
+        # cycle: (j,k,i) stored as (i',j',k') where i'<=j'<=k'
+        # perm_idx 3 → (b,c,a) in Psi4
+        return X.transpose(2, 0, 1)                     # a→c, b→a, c→b
+    elif k_perm <= i_perm and i_perm <= j_perm:
+        # cycle: (k,i,j) stored as (i',j',k') where i'<=j'<=k'
+        # perm_idx 4 → (c,a,b) in Psi4
+        return X.transpose(1, 2, 0)                     # a→b, b→c, c→a
+    else:
+        return X.transpose(2, 1, 0)                     # swap a↔c
+
+
+def _project_t3(T_src, S):
+    """Project T3 amplitudes from source TNO basis to target TNO basis.
+
+    Implements: T_tgt[a,b,c] = sum_{a',b',c'} S[a,a'] S[b,b'] S[c,c'] T_src[a',b',c']
+    Uses BLAS matmul for efficiency (3 dgemm calls).
+
+    Args:
+        T_src: (n_src, n_src, n_src) T3 in source TNO basis.
+        S: (n_tgt, n_src) overlap matrix between target and source TNOs.
+
+    Returns:
+        T_tgt: (n_tgt, n_tgt, n_tgt) T3 in target TNO basis.
+    """
+    n_tgt, n_src = S.shape
+    # Contract first index (a'): result[i, b', c'] = sum_a' S[i,a'] T[a',b',c']
+    tmp = np.dot(S, T_src.reshape(n_src, n_src * n_src))   # (n_tgt, n_src^2)
+    tmp = tmp.reshape(n_tgt, n_src, n_src)                  # (i, b', c')
+    # Contract second index (b'): put b' as column for matmul
+    tmp = tmp.transpose(0, 2, 1).reshape(n_tgt * n_src, n_src)  # (i*n_src+c', b')
+    tmp = np.dot(tmp, S.T)                                  # (i*n_src+c', j)
+    # Contract third index (c'): put c' as column for matmul
+    tmp = tmp.reshape(n_tgt, n_src, n_tgt).transpose(0, 2, 1)  # (i, j, c')
+    return np.dot(tmp.reshape(n_tgt * n_tgt, n_src), S.T).reshape(n_tgt, n_tgt, n_tgt)
+
+
+def _compute_t1_energy(triple_data_list, triple_idx_map, F_lmo, nocc):
+    """Compute (T) energy from stored V and T using Eq53 antisymmetrizer.
+
+    For each triple, applies: e_ijk = prefactor * (8V·T - 4V(cba)·T - ...)
+
+    Args:
+        triple_data_list: list of dicts from _build_triple_W_V_T0 (or None).
+        triple_idx_map: dict (i,j,k) → index into triple_data_list.
+        F_lmo: (nocc, nocc) LMO Fock matrix.
+        nocc: number of occupied.
+
+    Returns:
+        e_t (float), e_ijk_list (list of per-triple energies).
+    """
+    e_ijk_list = [0.0] * len(triple_data_list)
+
+    for idx, td in enumerate(triple_data_list):
+        if td is None:
+            continue
+        i, j, k = td['i'], td['j'], td['k']
+        V = td['V']
+        T = td['T']
+
+        # Degeneracy factor
+        dij = int(i == j); djk = int(j == k); dik = int(i == k)
+        occ_denom = 1 + dij + djk + dik + 2 * dij * djk * dik
+
+        # Eq53 antisymmetrizer: 8V·T - 4V(kji)·T - 4V(ikj)·T - 4V(jik)·T
+        #                        + 2V(jki)·T + 2V(kij)·T
+        et = (8.0 * np.sum(V * T)
+              - 4.0 * np.sum(V.transpose(2, 1, 0) * T)    # V(k,j,i)
+              - 4.0 * np.sum(V.transpose(0, 2, 1) * T)    # V(i,k,j)
+              - 4.0 * np.sum(V.transpose(1, 0, 2) * T)    # V(j,i,k)
+              + 2.0 * np.sum(V.transpose(1, 2, 0) * T)    # V(j,k,i) → transpose(2,0,1) for (b,c,a)
+              + 2.0 * np.sum(V.transpose(2, 0, 1) * T))   # V(k,i,j) → transpose(1,2,0) for (c,a,b)
+
+        # Wait: the antisymmetrizer permutes V's virtual indices based on
+        # occupied permutation. For V stored as V[a,b,c] (a↔i,b↔j,c↔k),
+        # permute(V, k,j,i) means virtual perm matching (k,j,i):
+        #   perm_idx=5 → (c,b,a) → V.transpose(2,1,0) ✓
+        # permute(V, i,k,j) → perm_idx=1 → (a,c,b) → V.transpose(0,2,1) ✓
+        # permute(V, j,i,k) → perm_idx=2 → (b,a,c) → V.transpose(1,0,2) ✓
+        # permute(V, j,k,i) → perm_idx=3 → (b,c,a) → V.transpose(2,0,1) ✓
+        # permute(V, k,i,j) → perm_idx=4 → (c,a,b) → V.transpose(1,2,0) ✓
+
+        e_ijk_list[idx] = float(et / occ_denom)
+
+    return sum(e_ijk_list), e_ijk_list
+
+
+def run_lccsd_t1_iterations(mf, C_lmo, pno_spaces, strong_pairs,
+                             t2_pno_all, occ_cas_idx,
+                             t1_pno=None,
+                             C_cas_vir=None,
+                             T_CutTNO=1e-9,
+                             ncores=1,
+                             verbose=None,
+                             _pool=None,
+                             max_iter=50,
+                             e_conv=1e-8,
+                             r_conv=1e-6,
+                             F_CUT_T=1e-5,
+                             T_CUT_ITER=0.0):
+    """Compute (T1) iterative triples correction (Jiang JCP 2024).
+
+    Improves upon the (T0) semicanonical approximation by iteratively
+    solving for T3 amplitudes including off-diagonal occupied Fock coupling
+    between neighboring triples.
+
+    The algorithm (following Psi4's lccsd_t_iterations):
+    1. Compute W, V for all triples; initialize T = -W/D (T0).
+    2. Iterate:
+       R = W + T*D - sum_l F_lmo[l,k] * S_overlap * T3_neighbor
+       T -= R/D
+    3. Compute energy from converged V and T.
+
+    Args:
+        Same as run_lccsd_t_ext, plus:
+        max_iter (int): Maximum number of iterations (default 50).
+        e_conv (float): Energy convergence threshold (default 1e-8).
+        r_conv (float): Residual convergence threshold (default 1e-6).
+        F_CUT_T (float): Off-diagonal Fock cutoff for coupling (default 1e-5).
+        T_CUT_ITER (float): Skip triples whose energy changed less than
+            this fraction (default 0.0 = no skipping).
+
+    Returns:
+        e_t (float): Converged (T1) energy correction.
+    """
+    import time as _time
+    log = logger.new_logger(mf, verbose)
+
+    if not hasattr(mf, 'with_df') or mf.with_df is None:
+        import warnings
+        warnings.warn('mf.with_df is None — (T) correction requires DF.', UserWarning)
+        return 0.0
+
+    occ_cas_set = set(occ_cas_idx.tolist()) if occ_cas_idx is not None else set()
+    nocc = C_lmo.shape[1]
+    s1e = mf.get_ovlp()
+    fock_ao = mf.get_fock()
+    F_lmo = reduce(np.dot, (C_lmo.T, fock_ao, C_lmo))
+
+    # Zero CAS T2 amplitudes
+    if C_cas_vir is not None and C_cas_vir.shape[1] > 0:
+        t2_for_T = _zero_cas_t2_amplitudes(
+            t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir, s1e)
+    else:
+        t2_for_T = t2_pno_all
+
+    # Preload DF integrals
+    _t0 = _time.perf_counter()
+    Lpq_full = _preload_df_integrals(mf.with_df)
+    log.info('(T1) preloaded DF integrals: %.1f MB, %.2f s',
+             Lpq_full.nbytes / 1e6, _time.perf_counter() - _t0)
+
+    # Build full ooL (nocc, nocc, naux) once for all triples
+    _t0 = _time.perf_counter()
+    ooL_full = _build_ooL_triple(Lpq_full, C_lmo, list(range(nocc)))
+    log.info('(T1) built ooL_full: shape=%s, %.2f s',
+             ooL_full.shape, _time.perf_counter() - _t0)
+
+    # =========================================================================
+    # Phase 1: Enumerate triples (i<=j<=k) and compute W, V, T0
+    # =========================================================================
+    all_triples = []
+    for i in range(nocc):
+        for j in range(i, nocc):
+            for k in range(j, nocc):
+                all_triples.append((i, j, k))
+
+    triple_idx_map = {ijk: idx for idx, ijk in enumerate(all_triples)}
+    n_triples = len(all_triples)
+
+    _t0 = _time.perf_counter()
+    triple_data = [None] * n_triples
+
+    common_kwargs = dict(
+        pno_spaces=pno_spaces, t2_for_T=t2_for_T,
+        Lpq_full=Lpq_full, C_lmo=C_lmo, fock_ao=fock_ao,
+        F_lmo=F_lmo, s1e=s1e, ooL_full=ooL_full,
+        t1_pno=t1_pno, T_CutTNO=T_CutTNO,
+    )
+
+    def _build_one(ijk):
+        return _build_triple_W_V_T0(ijk[0], ijk[1], ijk[2], **common_kwargs)
+
+    if _pool is not None:
+        results = list(_pool.map(_build_one, all_triples))
+    else:
+        results = [_build_one(ijk) for ijk in all_triples]
+
+    for idx, td in enumerate(results):
+        triple_data[idx] = td
+
+    n_active = sum(1 for td in triple_data if td is not None)
+    _dt = _time.perf_counter() - _t0
+    log.info('(T1) Phase 1: %d/%d active triples, %.2f s', n_active, n_triples, _dt)
+
+    if n_active == 0:
+        log.info('(T1) No active triples — returning 0.')
+        return 0.0
+
+    # Compute initial T0 energy
+    e_t0, e_ijk_list = _compute_t1_energy(triple_data, triple_idx_map, F_lmo, nocc)
+    log.info('(T1) E(T0) = %.12f', e_t0)
+
+    # =========================================================================
+    # Phase 2: Build coupling structure and TNO overlap matrices
+    # =========================================================================
+    # For each active triple (i,j,k), find neighbors (i,j,l), (i,l,k), (l,j,k)
+    # with F_lmo[l, replaced_idx] >= F_CUT_T.
+    # Pre-compute TNO→TNO overlap S and cache.
+
+    _t0 = _time.perf_counter()
+    # Cache: coupling_info[idx] = list of (neighbor_idx, F_coupling, S_overlap, perm_occ)
+    coupling_info = [[] for _ in range(n_triples)]
+
+    for idx, td in enumerate(triple_data):
+        if td is None:
+            continue
+        i, j, k = td['i'], td['j'], td['k']
+        n_tgt = td['n_tno']
+        C_tgt = td['C_tno_sc']  # (nao, n_tgt)
+
+        for l in range(nocc):
+            # Channel 1: (i,j,l) replaces k, coupling F_lmo[l,k]
+            if l != k and abs(F_lmo[l, k]) >= F_CUT_T:
+                # Canonical ordering of (i,j,l)
+                sorted_ijl = tuple(sorted([i, j, l]))
+                if sorted_ijl in triple_idx_map:
+                    nbr_idx = triple_idx_map[sorted_ijl]
+                    nbr_td = triple_data[nbr_idx]
+                    if nbr_td is not None:
+                        # TNO overlap: S(n_tgt, n_src)
+                        S_ov = reduce(np.dot, (C_tgt.T, s1e, nbr_td['C_tno_sc']))
+                        coupling_info[idx].append((
+                            nbr_idx, -F_lmo[l, k], S_ov,
+                            (i, j, l)  # target occ ordering for permuter
+                        ))
+
+            # Channel 2: (i,l,k) replaces j, coupling F_lmo[l,j]
+            if l != j and abs(F_lmo[l, j]) >= F_CUT_T:
+                sorted_ilk = tuple(sorted([i, l, k]))
+                if sorted_ilk in triple_idx_map:
+                    nbr_idx = triple_idx_map[sorted_ilk]
+                    nbr_td = triple_data[nbr_idx]
+                    if nbr_td is not None:
+                        S_ov = reduce(np.dot, (C_tgt.T, s1e, nbr_td['C_tno_sc']))
+                        coupling_info[idx].append((
+                            nbr_idx, -F_lmo[l, j], S_ov,
+                            (i, l, k)
+                        ))
+
+            # Channel 3: (l,j,k) replaces i, coupling F_lmo[l,i]
+            if l != i and abs(F_lmo[l, i]) >= F_CUT_T:
+                sorted_ljk = tuple(sorted([l, j, k]))
+                if sorted_ljk in triple_idx_map:
+                    nbr_idx = triple_idx_map[sorted_ljk]
+                    nbr_td = triple_data[nbr_idx]
+                    if nbr_td is not None:
+                        S_ov = reduce(np.dot, (C_tgt.T, s1e, nbr_td['C_tno_sc']))
+                        coupling_info[idx].append((
+                            nbr_idx, -F_lmo[l, i], S_ov,
+                            (l, j, k)
+                        ))
+
+    n_couplings = sum(len(ci) for ci in coupling_info)
+    _dt = _time.perf_counter() - _t0
+    log.info('(T1) Phase 2: %d coupling terms, %.2f s', n_couplings, _dt)
+
+    # =========================================================================
+    # Phase 3: Jacobi iterations
+    # =========================================================================
+    log.info('')
+    log.info('  ==> Local CCSD(T1) Iterations <==')
+    log.info('')
+    log.info('  E_CONVERGENCE = %.2e', e_conv)
+    log.info('  R_CONVERGENCE = %.2e', r_conv)
+    log.info('  F_CUT_T       = %.2e', F_CUT_T)
+    log.info('')
+    log.info('  %5s %18s %12s %12s %8s',
+             'Iter', 'Corr. Energy', 'Delta E', 'Max R', 'Time')
+
+    e_prev = e_t0
+    e_ijk_old = list(e_ijk_list)
+
+    for iteration in range(1, max_iter + 1):
+        _t_iter = _time.perf_counter()
+        r_max_list = [0.0] * n_triples
+
+        # Snapshot current T for Jacobi semantics (read from old, write to new)
+        T_snapshot = [td['T'].copy() if td is not None else None
+                      for td in triple_data]
+
+        for idx, td in enumerate(triple_data):
+            if td is None:
+                continue
+
+            if T_CUT_ITER > 0 and abs(e_ijk_list[idx] - e_ijk_old[idx]) < abs(e_ijk_old[idx] * T_CUT_ITER):
+                continue
+
+            W = td['W']
+            T_old = T_snapshot[idx]
+            D = td['D']
+
+            R = W + T_old * D
+
+            for nbr_idx, f_coupling, S_ov, perm_occ in coupling_info[idx]:
+                T_nbr = T_snapshot[nbr_idx]
+                if T_nbr is None:
+                    continue
+                T_perm = _triples_permuter(T_nbr, *perm_occ)
+                T_proj = _project_t3(T_perm, S_ov)
+                R += f_coupling * T_proj
+
+            td['T'] = T_old - R / D
+            r_max_list[idx] = float(np.sqrt(np.mean(R**2)))
+
+        # Compute energy
+        e_ijk_old = list(e_ijk_list)
+        e_curr, e_ijk_list = _compute_t1_energy(triple_data, triple_idx_map, F_lmo, nocc)
+
+        r_max = max(r_max_list)
+        delta_e = e_curr - e_prev
+        _dt_iter = _time.perf_counter() - _t_iter
+
+        log.info('  %5d %18.12f %12.3e %12.3e %8.1f',
+                 iteration, e_curr, delta_e, r_max, _dt_iter)
+
+        e_converged = abs(delta_e) < e_conv
+        r_converged = abs(r_max) < r_conv
+
+        if e_converged and r_converged:
+            log.info('')
+            log.info('  (T1) converged in %d iterations.', iteration)
+            break
+
+        e_prev = e_curr
+    else:
+        log.warn('  (T1) NOT converged after %d iterations!', max_iter)
+
+    e_t = e_curr
+    log.info('E(T1) = %.15g', e_t)
     return e_t

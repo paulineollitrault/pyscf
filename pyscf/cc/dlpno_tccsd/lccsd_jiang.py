@@ -116,7 +116,8 @@ def build_dressed_ovL_cache(ovL_pno_bare, ooL_bare, t1_pno, pno_spaces,
 
 
 def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
-                    ovL_pno_bare, ooL_bare, S_pno_cache, with_df):
+                    ovL_pno_bare, ooL_bare, S_pno_cache, with_df,
+                    _term2_precomputed=None):
     """Compute C_tilde (gamma intermediate, Eq 83) for all pairs.
 
     C_tilde[ki][a_ki, c_ki] = gamma_{ki}^{ac} =
@@ -139,6 +140,41 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
         all_pairs.add((k, i))
         all_pairs.add((i, k))
 
+    # Term 2 can be precomputed via unified DF pass
+    if _term2_precomputed is None:
+        # Batched Term 2 via single DF pass (fallback)
+        term2_data = {}
+        for k, i in all_pairs:
+            key_ki = (min(k, i), max(k, i))
+            n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+            if n_ki == 0:
+                continue
+            t1_i_ki = _project_t1_to_pair(t1_pno, i, key_ki, S_pno_cache, pno_spaces)
+            if np.max(np.abs(t1_i_ki)) < 1e-15:
+                continue
+            ovL_i_ki = ovL_pno_bare.get((key_ki, i))
+            if ovL_i_ki is None:
+                continue
+            term2_data[(k, i)] = {
+                'key_ki': key_ki, 'n_ki': n_ki,
+                'C_pno': np.asfortranarray(pno_spaces[key_ki]['C_pno']),
+                't1_i': t1_i_ki, 'ovL_i': ovL_i_ki,
+                'result': np.zeros((n_ki, n_ki)),
+            }
+        if term2_data:
+            aux_off = 0
+            for Lpq in with_df.loop():
+                nL = Lpq.shape[0]
+                for (k, i), td in term2_data.items():
+                    n_ki = td['n_ki']
+                    buf = _ao2mo.nr_e2(Lpq, td['C_pno'],
+                                       (0, n_ki, 0, n_ki), aosym='s2')
+                    B_L = buf.reshape(nL, n_ki, n_ki)
+                    z_i = td['t1_i'] @ td['ovL_i'][:, aux_off:aux_off+nL]
+                    td['result'] += np.einsum('L,Lac->ac', z_i, B_L)
+                aux_off += nL
+        _term2_precomputed = {ki: td['result'] for ki, td in term2_data.items()}
+
     for k, i in all_pairs:
         key_ki = (min(k, i), max(k, i))  # storage key
         n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
@@ -147,31 +183,9 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
 
         C_tilde_ki = np.zeros((n_ki, n_ki))
 
-        # --- Term 2: +T1_i^b · (kb|ac) in PNO_ki ---
-        # K_tilde_chem[ki] = ovL_i_ki @ vvL_ki.T → need DF loop for vvL
-        # (kb|ac) = Σ_Q ovL_i_ki[b,Q]*vvL_ki[a,c,Q]
-        # T1_i projected to PNO_ki:
-        key_ii = (i, i)
-        t1_i_ki = _project_t1_to_pair(t1_pno, i, key_ki, S_pno_cache, pno_spaces)
-
-        if np.max(np.abs(t1_i_ki)) > 1e-15:
-            ovL_i_ki = ovL_pno_bare.get((key_ki, i))
-            if ovL_i_ki is not None:
-                C_pno_ki = pno_spaces[key_ki]['C_pno']
-                mo_vv = np.asfortranarray(C_pno_ki)
-                ijslice = (0, n_ki, 0, n_ki)
-                buf = None
-                aux_off = 0
-                for Lpq in with_df.loop():
-                    nL = Lpq.shape[0]
-                    buf = _ao2mo.nr_e2(Lpq, mo_vv, ijslice, aosym='s2', out=buf)
-                    B_L = buf.reshape(nL, n_ki, n_ki)  # (L, a, c)
-                    ovL_i_batch = ovL_i_ki[:, aux_off:aux_off+nL]
-                    # Σ_b T1_i[b] * ovL_i[b,L] = z_i[L]
-                    z_i = t1_i_ki @ ovL_i_batch  # (nL,)
-                    # Term 2: C_tilde[a,c] += Σ_L z_i[L]*B_L[L,a,c]
-                    C_tilde_ki += np.einsum('L,Lac->ac', z_i, B_L)
-                    aux_off += nL
+        # Term 2 from precomputed or batched computation
+        if (k, i) in _term2_precomputed:
+            C_tilde_ki += _term2_precomputed[(k, i)]
 
         # --- Term 1: -Σ_l T1_all[l,a] · (ki|lc) ---
         # K_bar_chem[ki][l,c] = Σ_Q ooL[k,i,Q]*ovL_l_ki[c,Q] = (ki|lc)
@@ -410,6 +424,102 @@ def _compute_fvv_t1_pair(t1_pno, fov_pno, pno_spaces, nocc,
             aux_off += nL
 
     return fvv_t1
+
+
+def compute_fvv_t1_all_pairs(t1_pno, fov_pno, pno_spaces, nocc,
+                              ovL_pno_bare, S_pno_cache, with_df,
+                              pair_keys):
+    """Batched fvv_t1 for ALL pairs in a single DF pass.
+
+    Same result as calling _compute_fvv_t1_pair per pair, but reads the
+    DF integrals only once instead of N_pairs times.
+
+    Returns dict: pair_key -> (n_pno, n_pno) fvv_t1 matrix.
+    """
+    # Precompute per-pair data: z_total, t1_projections, ovL, C_pno
+    pair_data = {}
+    for pk in pair_keys:
+        n_pno = pno_spaces[pk]['C_pno'].shape[1]
+        if n_pno == 0:
+            continue
+        C_pno_ij = pno_spaces[pk]['C_pno']
+
+        # Get naux
+        naux = 0
+        for m in range(nocc):
+            entry = ovL_pno_bare.get((pk, m))
+            if entry is not None:
+                naux = entry.shape[1]
+                break
+        if naux == 0:
+            continue
+
+        # z_total[Q] = Σ_k Σ_c t1_k^c · ovL_k[c,Q]
+        z_total = np.zeros(naux)
+        t1_proj_all = {}
+        ovL_k_all = {}
+        for kk in range(nocc):
+            t1_k_ij = _project_t1_to_pair(
+                t1_pno, kk, pk, S_pno_cache, pno_spaces)
+            if np.max(np.abs(t1_k_ij)) < 1e-15:
+                continue
+            ovL_k_ij = ovL_pno_bare.get((pk, kk))
+            if ovL_k_ij is not None:
+                z_total += t1_k_ij @ ovL_k_ij
+                t1_proj_all[kk] = t1_k_ij
+                ovL_k_all[kk] = ovL_k_ij
+
+        if len(t1_proj_all) == 0:
+            continue
+
+        pair_data[pk] = {
+            'n_pno': n_pno,
+            'C_pno': np.asfortranarray(C_pno_ij),
+            'z_total': z_total,
+            't1_proj': t1_proj_all,
+            'ovL_k': ovL_k_all,
+            'fvv_t1': np.zeros((n_pno, n_pno)),
+        }
+
+    if not pair_data:
+        return {pk: np.zeros((pno_spaces[pk]['C_pno'].shape[1],) * 2)
+                for pk in pair_keys}
+
+    # Single DF pass: loop over batches, process all pairs per batch
+    aux_off = 0
+    for Lpq in with_df.loop():
+        nL = Lpq.shape[0]
+
+        for pk, pd in pair_data.items():
+            n_pno = pd['n_pno']
+            ijslice = (0, n_pno, 0, n_pno)
+            buf = _ao2mo.nr_e2(Lpq, pd['C_pno'], ijslice, aosym='s2')
+            B_L = buf.reshape(nL, n_pno, n_pno)
+
+            # Coulomb
+            z_batch = pd['z_total'][aux_off:aux_off + nL]
+            pd['fvv_t1'] += 2.0 * np.einsum('L,Lab->ab', z_batch, B_L)
+
+            # Exchange
+            for kk, t1_k in pd['t1_proj'].items():
+                ovL_k = pd['ovL_k'].get(kk)
+                if ovL_k is None:
+                    continue
+                Y_k = np.einsum('c,Lca->aL', t1_k, B_L)
+                ovL_k_batch = ovL_k[:, aux_off:aux_off + nL]
+                pd['fvv_t1'] -= Y_k @ ovL_k_batch.T
+
+        aux_off += nL
+
+    # Build result dict
+    result = {}
+    for pk in pair_keys:
+        n_pno = pno_spaces[pk]['C_pno'].shape[1]
+        if pk in pair_data:
+            result[pk] = pair_data[pk]['fvv_t1']
+        else:
+            result[pk] = np.zeros((n_pno, n_pno))
+    return result
 
 
 # ---------------------------------------------------------------------------

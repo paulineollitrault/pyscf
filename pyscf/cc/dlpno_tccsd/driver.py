@@ -57,7 +57,7 @@ from pyscf.cc.dlpno_tccsd.local_orbs import split_localize_orbitals, make_paos
 from pyscf.cc.dlpno_tccsd.pno import make_pnos
 from pyscf.cc.dlpno_tccsd.screening import classify_pairs
 from pyscf.cc.dlpno_tccsd.lccsd import run_lccsd
-from pyscf.cc.dlpno_tccsd.lccsd_t import run_lccsd_t_ext
+from pyscf.cc.dlpno_tccsd.lccsd_t import run_lccsd_t_ext, run_lccsd_t1_iterations
 
 
 def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
@@ -72,12 +72,13 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
                       T_CutPairs_MP2=1e-6,
                       T_CutDO=0.02,
                       S_cut_domain=1e-6,
-                      T_CutEnergy=1.0,
+                      T_CutEnergy=0.97,
                       T_CutTrace=1.0,
                       cas_pno_proj_thresh=0.99,
                       ccsd_conv_tol=1e-7,
                       ccsd_max_cycle=50,
                       use_jiang=False,
+                      use_t1_iterations=False,
                       verbose=4,
                       _pool=None):
     """Run DMRG-DLPNO-TCCSD(T), or plain DLPNO-CCSD(T) when ncas is None.
@@ -352,8 +353,10 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
 
     s1e = mf.get_ovlp()
     mf_or_mc = mf if no_cas else mc
+    # Use per-PAO DOI (Jiang Eq 58) when DF is available
+    _with_df = getattr(mf, 'with_df', None)
     C_pao, pao_domains, S_pao, F_pao = make_paos(
-        mf_or_mc, C_lmo, T_CutDO=T_CutDO, s1e=s1e)
+        mf_or_mc, C_lmo, T_CutDO=T_CutDO, s1e=s1e, with_df=_with_df)
 
     nlmo = C_lmo.shape[1]
     domain_sizes = [len(pao_domains[i]) for i in range(nlmo)]
@@ -428,16 +431,28 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
 
     C_cas_vir_t = None if no_cas else mo_loc[:, vir_cas_idx]
 
-    e_t = run_lccsd_t_ext(
-        mf, C_lmo, pno_spaces,
-        strong_pairs=strong_pairs,
-        t2_pno_all=t2_pno_all,
-        t1_pno=t1_pno,
-        occ_cas_idx=occ_cas_idx,
-        C_cas_vir=C_cas_vir_t,
-        vir_cas_idx=vir_cas_idx,
-        ncores=ncores, verbose=verbose,
-        _pool=_shared_pool)
+    if use_t1_iterations:
+        e_t = run_lccsd_t1_iterations(
+            mf, C_lmo, pno_spaces,
+            strong_pairs=strong_pairs,
+            t2_pno_all=t2_pno_all,
+            t1_pno=t1_pno,
+            occ_cas_idx=occ_cas_idx,
+            C_cas_vir=C_cas_vir_t,
+            T_CutTNO=1e-9,
+            ncores=ncores, verbose=verbose,
+            _pool=_shared_pool)
+    else:
+        e_t = run_lccsd_t_ext(
+            mf, C_lmo, pno_spaces,
+            strong_pairs=strong_pairs,
+            t2_pno_all=t2_pno_all,
+            t1_pno=t1_pno,
+            occ_cas_idx=occ_cas_idx,
+            C_cas_vir=C_cas_vir_t,
+            vir_cas_idx=vir_cas_idx,
+            ncores=ncores, verbose=verbose,
+            _pool=_shared_pool)
 
     _t_triples = _time.time() - _t_triples_start
     if _owns_pool and _shared_pool is not None:
@@ -496,3 +511,36 @@ def run_dlpno_ccsd_t(mf, frozen=0, **kwargs):
         result (dict): Same as run_dlpno_tccsd_t.
     """
     return run_dlpno_tccsd_t(mf, ncas=None, nelec=None, frozen=frozen, **kwargs)
+
+
+def count_frozen_core(mol):
+    """Count frozen-core orbitals using ORCA's default frozen-core convention.
+
+    ORCA does NOT freeze 1s for Li and Be — their 1s electrons are valence.
+    For Na/Mg, only 1s is frozen (2s2p are valence).
+
+    Args:
+        mol: PySCF Mole object.
+
+    Returns:
+        int: Number of frozen-core orbitals.
+    """
+    # Number of frozen core orbitals per element (by atomic number)
+    # Z=1-2: 0, Z=3-4: 0 (Li/Be 1s is valence),
+    # Z=5-10: 1 (freeze 1s), Z=11-12: 1 (Na/Mg: freeze 1s only),
+    # Z=13-18: 5 (Al-Ar: freeze 1s2s2p), Z=19-36: 9, etc.
+    frozen_per_z = {
+        1: 0, 2: 0,                                       # H, He
+        3: 0, 4: 0,                                        # Li, Be
+        5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 1,              # B-Ne
+        11: 1, 12: 1,                                       # Na, Mg
+        13: 5, 14: 5, 15: 5, 16: 5, 17: 5, 18: 5,         # Al-Ar
+        19: 9, 20: 9,                                       # K, Ca
+        21: 9, 22: 9, 23: 9, 24: 9, 25: 9, 26: 9, 27: 9,  # Sc-Co
+        28: 9, 29: 9, 30: 9,                                # Ni, Cu, Zn
+        31: 14, 32: 14, 33: 14, 34: 14, 35: 14, 36: 14,   # Ga-Kr
+    }
+    nfrozen = 0
+    for z in mol.atom_charges():
+        nfrozen += frozen_per_z.get(int(z), 0)
+    return nfrozen

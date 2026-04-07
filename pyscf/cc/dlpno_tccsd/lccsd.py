@@ -2503,35 +2503,67 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
 
     # ------------------------------------------------------------------
     # Pre-compute ovL_pno cache: 3-index DF tensors in PNO basis.
-    # ovL_pno_cache[(pair_key, lmo_idx)] = (n_pno, naux) tensor.
-    # Built via _build_ovL(with_df, C_lmo, C_pno_ij) which gives the
-    # exact DF factorization: (a_P k|l b_Q) =
-    #   ovL_pno_cache[(P,k)] @ ovL_pno_cache[(Q,l)].T
+    # With local DF fitting (Jiang Eq 63-64): each pair only uses aux
+    # functions on atoms with significant Mulliken population (T_CutMKN).
+    # ovL_pno_cache[(pair_key, lmo_idx)] = (n_pno, naux_local) tensor.
+    # pair_aux_idx[pair_key] = integer array of global aux indices in domain.
     # ------------------------------------------------------------------
     from pyscf.cc.dlpno_tccsd.pno import _build_ovL, _build_ovL_batched
+    T_CutMKN = 1e-3  # ORCA TightPNO default
     ovL_pno_cache = {}
+    pair_aux_idx = {}  # pair_key -> np.array of aux indices in local domain
     if with_df is not None:
-        # Collect all PNO virtual spaces (including diagonal pairs for T1)
+        # --- Compute per-LMO local auxiliary domains (Eq 63-64) ---
+        _ao_labels = mf.mol.ao_labels(fmt=False)
+        _atom_ids = np.array([lbl[0] for lbl in _ao_labels])
+        _natm = mf.mol.natm
+        _auxmol = with_df.auxmol
+        _aux_atom_ids = np.array([lbl[0] for lbl in _auxmol.ao_labels(fmt=False)])
+        _naux_full = with_df.get_naoaux()
+
+        _lmo_aux_mask = []  # per-LMO boolean mask over aux functions
+        for i in range(nocc):
+            c_i = C_lmo[:, i]
+            Sc = s1e @ c_i
+            pop = c_i * Sc  # Mulliken population per AO
+            pop_atom = np.array([np.sum(pop[_atom_ids == a]) for a in range(_natm)])
+            total = np.sum(pop_atom)
+            q_iA = pop_atom / total if abs(total) > 1e-15 else np.zeros(_natm)
+            atoms_in = np.where(np.abs(q_iA) > T_CutMKN)[0]
+            _lmo_aux_mask.append(np.isin(_aux_atom_ids, atoms_in))
+
+        # Pair aux domain = union of LMO i and LMO j aux domains
         _all_keys_init = list(keys_sorted)
         for i in range(nocc):
             key_ii = (i, i)
             if key_ii not in _all_keys_init and key_ii in pno_spaces:
                 _all_keys_init.append(key_ii)
+
+        for key in _all_keys_init:
+            i, j = key
+            _pmask = _lmo_aux_mask[i] | _lmo_aux_mask[j]
+            pair_aux_idx[key] = np.where(_pmask)[0]
+
+        # Build ovL (full aux) — local DF truncation is applied at contraction
+        # time via pair_aux_idx, not at storage time, because ooL_3idx uses
+        # the full aux basis and many contraction sites mix pair contexts.
         _vir_list_init = [pno_spaces[k]['C_pno'] for k in _all_keys_init]
-        # Single DF pass for all PNO spaces
         _ovL_all_init = _build_ovL_batched(with_df, C_lmo, _vir_list_init)
         for idx, key in enumerate(_all_keys_init):
-            ovL_ij = _ovL_all_init[idx]
+            ovL_ij = _ovL_all_init[idx]  # (nocc, n_pno, naux_full)
             for k in range(nocc):
                 ovL_pno_cache[(key, k)] = ovL_ij[k]
-        del _ovL_all_init, _vir_list_init, _all_keys_init
+        del _ovL_all_init, _vir_list_init
 
         _n_entries = len(ovL_pno_cache)
         if _n_entries > 0:
             _sample = next(iter(ovL_pno_cache.values()))
             _mem_mb = _n_entries * _sample.nbytes / 1e6
+            _avg_local = np.mean([len(v) for v in pair_aux_idx.values()])
             print(f'  ovL_pno cache: {_n_entries} entries, '
-                  f'{_mem_mb:.0f} MB', flush=True)
+                  f'{_mem_mb:.0f} MB (local DF: avg {_avg_local:.0f}/'
+                  f'{_naux_full} aux)', flush=True)
+        del _lmo_aux_mask, _ao_labels, _atom_ids, _aux_atom_ids
 
     # Pre-compute PNO overlap matrices S_pno_cache[(key_ij, key_kl)]
     # for all pair combinations that share an occupied index (connected pairs).
@@ -2593,10 +2625,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
 
     # Pre-compute occ-occ 3-index DF tensor ooL[i,j,Q] = (i_lmo j_lmo | Q)
     # for T1 integral dressing (Eq. 91-93 of Jiang et al.).
+    # With local DF, ooL_3idx stays full (nocc, nocc, naux_full) since it's
+    # used across many pair contexts. Individual contractions slice to
+    # the pair's local aux domain via pair_aux_idx.
     ooL_3idx = None
     if with_df is not None:
         from pyscf.cc.dlpno_tccsd.pno import _build_ovL as _build_ovL_fn
-        ooL_3idx = _build_ovL_fn(with_df, C_lmo, C_lmo)  # (nocc, nocc, naux)
+        ooL_3idx = _build_ovL_fn(with_df, C_lmo, C_lmo)  # (nocc, nocc, naux_full)
 
     # Pre-compute K_coul integrals: (jk|b_ij c_ik) [oovv-type]
     # These cannot be factored from ovL_pno_cache, so we pre-compute them.
@@ -2760,11 +2795,14 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     build_dressed_ovL_cache)
                 from pyscf.cc.dlpno_tccsd.jiang_intermediates import (
                     build_D_tilde, build_Fkj, build_G_tilde,
-                    build_mixed_domain_integrals)
+                    build_mixed_domain_integrals, build_Fab_all)
+                from pyscf.cc.dlpno_tccsd.jiang_df_unified import (
+                    compute_all_df_terms)
 
                 _t_jiang = _time.perf_counter()
 
                 # T1-dressed ooL/ovL (Eqs 91-92)
+                _tj0 = _time.perf_counter()
                 _jiang_ooL_d = _build_ooL_dressed(
                     ooL_3idx, ovL_pno_cache, t1_pno, pno_spaces, nocc)
                 _all_keys_j = list(keys_sorted)
@@ -2775,16 +2813,32 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _jiang_ovL_d = build_dressed_ovL_cache(
                     ovL_pno_cache, ooL_3idx, t1_pno, pno_spaces,
                     S_pno_cache, nocc, with_df, _all_keys_j)
+                _tj_ovl = _time.perf_counter() - _tj0
 
-                # C_tilde / D_tilde (Eqs 83-84, including Term 4)
+                # Unified single DF pass: fvv_t1, C/D Term 2, ladder
+                _tj0 = _time.perf_counter()
+                _fvv_t1_pre, _c_t2_pre, _d_t2_pre, _jiang_ladder_all = \
+                    compute_all_df_terms(
+                        t1_pno, fov_pno, t2_pno_all, pno_spaces, nocc,
+                        ovL_pno_cache, S_pno_cache, with_df, keys_sorted)
+                _tj_df = _time.perf_counter() - _tj0
+
+                # C_tilde / D_tilde (Eqs 83-84, with precomputed Term 2)
+                _tj0 = _time.perf_counter()
                 _jiang_C = compute_C_tilde(
                     t1_pno, t2_pno_all, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df)
+                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+                    _term2_precomputed=_c_t2_pre)
+                _tj_C = _time.perf_counter() - _tj0
+                _tj0 = _time.perf_counter()
                 _jiang_D = build_D_tilde(
                     t1_pno, t2_pno_all, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df)
+                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+                    _term2_precomputed=_d_t2_pre)
+                _tj_D = _time.perf_counter() - _tj0
 
                 # Fkj / G_tilde (Eqs 94, 86)
+                _tj0 = _time.perf_counter()
                 _jiang_Fkj, _jiang_foo_t1 = build_Fkj(
                     F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
                     ovL_pno_cache, ooL_3idx, S_pno_cache, foo_total)
@@ -2792,18 +2846,34 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     t2_pno_all, t1_pno, pno_spaces, nocc,
                     ovL_pno_cache, ooL_3idx, S_pno_cache,
                     _jiang_Fkj, _jiang_foo_t1)
+                _tj_FG = _time.perf_counter() - _tj0
 
                 # Mixed-domain integrals for C/D bold terms
+                _tj0 = _time.perf_counter()
                 _jiang_K_mixed = build_mixed_domain_integrals(
                     t2_pno_all, pno_spaces, nocc,
                     ovL_pno_cache, ooL_3idx, S_pno_cache)
+                _tj_Km = _time.perf_counter() - _tj0
 
                 # Dressed J_oo for B_tilde
                 _ooLf = _jiang_ooL_d.reshape(nocc * nocc, -1)
                 _jiang_J_oo_d = (_ooLf @ _ooLf.T).reshape(
                     nocc, nocc, nocc, nocc)
 
+                # Precompute Fab for ALL pairs (with precomputed fvv_t1)
+                _tj0 = _time.perf_counter()
+                _jiang_Fab_all = build_Fab_all(
+                    t1_pno, fov_pno, pno_spaces, nocc,
+                    ovL_pno_cache, S_pno_cache, with_df, keys_sorted,
+                    _fvv_t1_precomputed=_fvv_t1_pre)
+                _tj_Fab = _time.perf_counter() - _tj0
+
                 _t_jiang_done = _time.perf_counter()
+                if False:  # Set to True for detailed jiang timing
+                    print(f'    [jiang] ovL_d={_tj_ovl:.3f} df={_tj_df:.3f} '
+                          f'C={_tj_C:.3f} D={_tj_D:.3f} FG={_tj_FG:.3f} '
+                          f'Km={_tj_Km:.3f} Fab={_tj_Fab:.3f} '
+                          f'total={_t_jiang_done-_t_jiang:.3f}s', flush=True)
 
                 _jiang_cache = {
                     'C_tilde': _jiang_C, 'D_tilde': _jiang_D,
@@ -2812,9 +2882,14 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     'ooL_dressed': _jiang_ooL_d,
                     'J_oo_d': _jiang_J_oo_d,
                     'K_mixed': _jiang_K_mixed,
+                    'Fab_all': _jiang_Fab_all,
+                    'ladder_all': _jiang_ladder_all,
                 }
 
             _t_pairs = _time.perf_counter()
+
+            # Accumulator for per-pair timing (thread-safe via list append)
+            _pair_timings = {'fab': [], 'resid': [], 'btilde': []}
 
             def _update_pair(key):
                 """Compute T2 update for a single pair. Thread-safe (read-only
@@ -2828,30 +2903,40 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 if use_jiang and _jiang_cache is not None:
                     from pyscf.cc.dlpno_tccsd.lccsd_jiang_v2 import (
                         compute_residual_v2)
-                    from pyscf.cc.dlpno_tccsd.jiang_intermediates import (
-                        build_Fab)
                     jc = _jiang_cache
 
-                    # Per-pair: Fab (requires DF loop)
-                    Fab_ij = build_Fab(
-                        t1_pno, fov_pno, pno_spaces, nocc,
-                        ovL_pno_cache, S_pno_cache, with_df, key)
+                    # Per-pair: Fab (precomputed in jiang block)
+                    _tf0 = _time.perf_counter()
+                    Fab_ij = jc['Fab_all'][key]
+                    _pair_timings['fab'].append(_time.perf_counter() - _tf0)
 
                     # Per-pair: B_tilde (J_oo_dressed + tau × voov)
+                    # Vectorized: B[k,l] = J_oo_d[k,i,l,j] + tr(tau @ ovL_k @ ovL_l.T)
+                    # = J_oo_d[k,i,l,j] + z_k · z_l  where z_k = (tau @ ovL_k).ravel()
+                    _tb0 = _time.perf_counter()
                     t1_i = _project_t1_to_pair(
                         t1_pno, i, key, S_pno_cache, pno_spaces)
                     t1_j = _project_t1_to_pair(
                         t1_pno, j, key, S_pno_cache, pno_spaces)
                     tau = t2_pno_all[key] + np.outer(t1_i, t1_j)
-                    B_tilde_oo = np.zeros((nocc, nocc))
-                    for k in range(nocc):
-                        for l in range(nocc):
-                            B_tilde_oo[k, l] = jc['J_oo_d'][k, i, l, j]
+                    B_tilde_oo = jc['J_oo_d'][:, i, :, j].copy()
+                    # Vectorized voov contribution to B_tilde:
+                    # B[k,l] += tr(tau.T @ ovL_k @ ovL_l.T)
+                    # = sum_{b,Q} P_k[b,Q] * ovL_l[b,Q]
+                    # where P_k = tau.T @ ovL_k
+                    _naux_ij = ovL_pno_cache.get((key, 0))
+                    if _naux_ij is not None:
+                        _na = _naux_ij.shape[1]
+                        ovL_stack = np.zeros((nocc, n_pno, _na))
+                        for k in range(nocc):
                             _ok = ovL_pno_cache.get((key, k))
-                            _ol = ovL_pno_cache.get((key, l))
-                            if _ok is not None and _ol is not None:
-                                B_tilde_oo[k, l] += np.einsum(
-                                    'ab,ab->', tau, _ok @ _ol.T)
+                            if _ok is not None:
+                                ovL_stack[k] = _ok
+                        # P[k,b,Q] = sum_a tau.T[b,a] * ovL[k,a,Q]
+                        P_stack = np.einsum('ba,kaQ->kbQ', tau.T, ovL_stack)
+                        P_flat = P_stack.reshape(nocc, -1)
+                        ovL_flat = ovL_stack.reshape(nocc, -1)
+                        B_tilde_oo += P_flat @ ovL_flat.T
 
                     # Per-pair: J_ij_kj from K_coul_cache
                     J_pair = {}
@@ -2860,7 +2945,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         kc = (key, kj, i, k)
                         if K_coul_cache and kc in K_coul_cache:
                             J_pair[(key, k)] = K_coul_cache[kc]
+                    _pair_timings['btilde'].append(
+                        _time.perf_counter() - _tb0)
 
+                    _tr0 = _time.perf_counter()
                     R_ij = compute_residual_v2(
                         i, j, t2_pno_all, pno_spaces, nocc,
                         F_lmo, s1e, with_df, eps_lmo,
@@ -2878,7 +2966,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         D_tilde_cache=jc['D_tilde'],
                         J_ij_kj=J_pair,
                         K_ij_kj=jc['K_mixed'],
-                        t1_pno=t1_pno)
+                        t1_pno=t1_pno,
+                        ladder_precomputed=jc.get('ladder_all'))
+                    _pair_timings['resid'].append(
+                        _time.perf_counter() - _tr0)
                 else:
                     R_ij = _compute_pair_residual_numerator(
                         i, j, t2_pno_all, pno_spaces, nocc,
@@ -2916,6 +3007,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     t2_new[key] = T2_ij_new
 
             _t_pairs_done = _time.perf_counter()
+            if False:  # Set to True for detailed pair timing
+                _sf = sum(_pair_timings['fab'])
+                _sb = sum(_pair_timings['btilde'])
+                _sr = sum(_pair_timings['resid'])
+                print(f'    [pairs] fab={_sf:.3f}s btilde={_sb:.3f}s '
+                      f'resid={_sr:.3f}s ({len(_pair_timings["fab"])} pairs)',
+                      flush=True)
+            if use_jiang:
+                _pair_timings['fab'].clear()
+                _pair_timings['btilde'].clear()
+                _pair_timings['resid'].clear()
             # ---- Local T1 update ----
             if use_t1_transform and not getattr(
                     _run_dlpno_lccsd, '_dress_t1', False):
@@ -3053,11 +3155,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _dt_kcoul = _t_kcoul_done - _t_kcoul
             _dt_foo = _t_foo_done - _t_foo
             _dt_pairs = _t_pairs_done - _t_pairs
+            _dt_jiang = (_t_jiang_done - _t_jiang) if use_jiang else 0.0
             _dt_total = _t_cycle_end - _t_cycle_start
+            _jiang_str = f' jiang={_dt_jiang:.1f}' if use_jiang else ''
             print(f'  Cycle {cycle + 1:3d}: dT = {dT:.3e}  E_corr = {e_cyc:.10f}'
                   f'  dE = {dE:.2e}  [{_dt_total:.1f}s: ovL={_dt_ovl:.1f} '
-                  f'Kcoul={_dt_kcoul:.1f} foo={_dt_foo:.1f} '
-                  f'pairs={_dt_pairs:.1f}]', flush=True)
+                  f'Kcoul={_dt_kcoul:.1f} foo={_dt_foo:.1f}'
+                  f'{_jiang_str} pairs={_dt_pairs:.1f}]', flush=True)
             if dT < this_tol:
                 print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (amplitude).',
                       flush=True)

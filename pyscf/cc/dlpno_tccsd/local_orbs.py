@@ -63,25 +63,33 @@ def make_lmos(mf_or_mc, method='pipek-mezey', frozen=0):
         log.warn('No active occupied orbitals to localize.')
         return orbocc_active, mo_coeff[:, :nocc]
 
-    if method.lower() in ('pipek-mezey', 'pm'):
-        mlo = lo.PipekMezey(mol, orbocc_active)
-        mlo.verbose = mol.verbose - 1
-        C_lmo = mlo.kernel()
-        # Stability: always do Jacobi sweep to escape local minima / saddle pts
-        for _ in range(3):
-            C_lmo1 = mlo.stability_jacobi()[1]
-            if C_lmo1 is C_lmo:
-                break
-            mlo = lo.PipekMezey(mol, C_lmo1)
+    # PySCF's localization routines suffer severe thread contention with
+    # many BLAS threads (e.g. 0.6s → 6s going from 1 → 64 threads).
+    # Temporarily reduce to 1 thread for this small, serial step.
+    _saved_threads = lib.num_threads()
+    lib.num_threads(1)
+    try:
+        if method.lower() in ('pipek-mezey', 'pm'):
+            mlo = lo.PipekMezey(mol, orbocc_active)
             mlo.verbose = mol.verbose - 1
-            mlo.init_guess = None
             C_lmo = mlo.kernel()
-    elif method.lower() == 'boys':
-        mlo = lo.Boys(mol, orbocc_active)
-        mlo.verbose = mol.verbose - 1
-        C_lmo = mlo.kernel()
-    else:
-        raise ValueError(f'Unknown localization method: {method}')
+            # Stability: always do Jacobi sweep to escape local minima
+            for _ in range(3):
+                C_lmo1 = mlo.stability_jacobi()[1]
+                if C_lmo1 is C_lmo:
+                    break
+                mlo = lo.PipekMezey(mol, C_lmo1)
+                mlo.verbose = mol.verbose - 1
+                mlo.init_guess = None
+                C_lmo = mlo.kernel()
+        elif method.lower() == 'boys':
+            mlo = lo.Boys(mol, orbocc_active)
+            mlo.verbose = mol.verbose - 1
+            C_lmo = mlo.kernel()
+        else:
+            raise ValueError(f'Unknown localization method: {method}')
+    finally:
+        lib.num_threads(_saved_threads)
 
     # Assemble full occupied block (frozen canonical + localized active)
     if frozen > 0:
@@ -93,7 +101,7 @@ def make_lmos(mf_or_mc, method='pipek-mezey', frozen=0):
     return C_lmo, C_lmo_full
 
 
-def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None):
+def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None):
     """Construct Projected Atomic Orbitals (PAOs) and per-LMO domains.
 
     PAOs are constructed by projecting the occupied MO space out of the AO
@@ -170,41 +178,62 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None):
     fock_ao = mf.get_fock()
     F_pao = reduce(np.dot, (C_pao.T, fock_ao, C_pao))
 
-    # LMO domain assignment (atom-based, following ORCA/MOLPRO convention)
-    # For each LMO i, compute the Mulliken-style differential overlap
-    # integral (DOI) per *atom* A: DOI(i,A) = sum_{μ∈A} |c_μi|² * s_μμ.
-    # If DOI(i,A) / sum_A DOI(i,A) > T_CutDO, ALL AOs on atom A are
-    # included in domain(i).  This is the standard Boughton-Pulay criterion.
-    #
-    # Build atom→AO mapping
-    ao_labels = mol.ao_labels(fmt=False)  # list of (atom_id, ...)
-    atom_ids = np.array([lbl[0] for lbl in ao_labels])
-    natom = mol.natm
+    # LMO domain assignment using per-PAO differential overlap integrals
+    # (Jiang et al. 2024, Eq 58):
+    #   DOI_{i,μ̃} = (iμ̃|iμ̃)^{1/2} = ||B^Q_{iμ̃}||₂
+    # PAO μ̃ is included in domain(i) if DOI > T_CutDO.
+    # When DF is available, this is computed exactly via 3-index integrals.
+    # Fallback: Löwdin population-based assignment.
 
     pao_domains = []
-    for i in range(nocc_lmo):
-        lmo_i = C_lmo[:, i]
-        # Per-AO Mulliken populations
-        pop_ao = lmo_i ** 2 * np.diag(s1e)
-        total_pop = np.sum(pop_ao)
-        if total_pop < 1e-15:
-            domain_i = np.arange(nao)
-        elif T_CutDO <= 0:
-            domain_i = np.arange(nao)
-        else:
-            # Aggregate populations per atom
-            pop_atom = np.zeros(natom)
-            for a in range(natom):
-                pop_atom[a] = np.sum(pop_ao[atom_ids == a])
-            frac_atom = pop_atom / total_pop
-            # Include all AOs on atoms exceeding the DOI threshold
-            atoms_in_domain = np.where(frac_atom > T_CutDO)[0]
-            domain_i = np.where(np.isin(atom_ids, atoms_in_domain))[0]
 
-        if len(domain_i) == 0:
-            domain_i = np.where(pop_ao > 1e-12)[0]
+    if with_df is not None and T_CutDO > 0:
+        # Per-PAO DOI via DF: compute ovL[i, μ̃, Q] between LMOs and PAOs
+        from pyscf.cc.dlpno_tccsd.pno import _build_ovL
+        ovL_lmo_pao = _build_ovL(with_df, C_lmo, C_pao)  # (nocc, nao, naux)
 
-        pao_domains.append(domain_i)
+        for i in range(nocc_lmo):
+            # DOI[μ̃] = sqrt(sum_Q ovL[i, μ̃, Q]²) = ||ovL[i,μ̃,:]||₂
+            doi = np.sqrt(np.sum(ovL_lmo_pao[i] ** 2, axis=1))  # (nao,)
+            domain_i = np.where(doi > T_CutDO)[0]
+            if len(domain_i) == 0:
+                domain_i = np.array([np.argmax(doi)])
+            pao_domains.append(domain_i)
+        del ovL_lmo_pao
+    else:
+        # Fallback: Löwdin population-based (for when DF is not available)
+        ao_labels = mol.ao_labels(fmt=False)
+        atom_ids = np.array([lbl[0] for lbl in ao_labels])
+        natom = mol.natm
+        from scipy.linalg import sqrtm
+        S_half = np.real(sqrtm(s1e))
+
+        for i in range(nocc_lmo):
+            lmo_i = C_lmo[:, i]
+            pop_ao = (S_half @ lmo_i) ** 2
+            total_pop = np.sum(pop_ao)
+            if total_pop < 1e-15 or T_CutDO <= 0:
+                domain_i = np.arange(nao)
+            else:
+                pop_atom = np.zeros(natom)
+                for a in range(natom):
+                    pop_atom[a] = np.sum(pop_ao[atom_ids == a])
+                frac_atom = pop_atom / total_pop
+                atoms_in_domain = list(np.where(frac_atom > T_CutDO)[0])
+                completeness = sum(frac_atom[a] for a in atoms_in_domain)
+                completeness_target = 1.0 - 2.0 * T_CutDO
+                if completeness < completeness_target:
+                    remaining = [a for a in np.argsort(frac_atom)[::-1]
+                                 if a not in set(atoms_in_domain)]
+                    for a in remaining:
+                        atoms_in_domain.append(a)
+                        completeness += frac_atom[a]
+                        if completeness >= completeness_target:
+                            break
+                domain_i = np.where(np.isin(atom_ids, atoms_in_domain))[0]
+            if len(domain_i) == 0:
+                domain_i = np.where(pop_ao > 1e-12)[0]
+            pao_domains.append(domain_i)
 
     log.info('PAO construction: nao=%d  avg domain size=%.1f',
              nao, np.mean([len(d) for d in pao_domains]))
