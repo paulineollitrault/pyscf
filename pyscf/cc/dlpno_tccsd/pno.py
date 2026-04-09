@@ -254,6 +254,67 @@ def _pair_K_iajb(ovL_i, ovL_j):
     return np.dot(ovL_i, ovL_j.T)   # (nvir_i, nvir_j)
 
 
+def _build_raw_ovL_batched(mol, auxmol, C_occ, C_vir_list):
+    """Build raw (unfitted) 3-index integrals for multiple virtual spaces.
+
+    Like _build_ovL_batched but computes RAW integrals (no J^{-1/2} fitting).
+    Reads raw (mn|Q) from AO integral engine per aux shell.
+
+    Args:
+        mol: PySCF Mole object (orbital basis).
+        auxmol: PySCF Mole object (auxiliary basis).
+        C_occ: (nao, nocc) occupied MO coefficients.
+        C_vir_list: list of (nao, nvir_k) virtual orbital coefficient arrays.
+
+    Returns:
+        list of (nocc, nvir_k, naux) raw 3-index integral arrays.
+    """
+    nao = mol.nao_nr()
+    nocc = C_occ.shape[1]
+    naux = auxmol.nao_nr()
+
+    slices = []
+    col = 0
+    c_parts = []
+    for C_vir in C_vir_list:
+        nvir = C_vir.shape[1]
+        slices.append(slice(col, col + nvir))
+        if nvir > 0:
+            c_parts.append(C_vir)
+        col += nvir
+    C_all = np.hstack(c_parts) if c_parts else np.empty((nao, 0))
+
+    results = [np.empty((nocc, C_vir.shape[1], naux)) for C_vir in C_vir_list]
+
+    pmol = mol + auxmol
+    mol_nbas = mol.nbas
+
+    q_offset = 0
+    for q_sh in range(auxmol.nbas):
+        q_start = auxmol.ao_loc_nr()[q_sh]
+        q_end = auxmol.ao_loc_nr()[q_sh + 1]
+        nq = q_end - q_start
+
+        shls_slice = (0, mol_nbas, 0, mol_nbas,
+                      mol_nbas + q_sh, mol_nbas + q_sh + 1)
+        raw_3c = pmol.intor('int3c2e', shls_slice=shls_slice)  # (nao, nao, nq)
+
+        L_occ = np.tensordot(C_occ, raw_3c, axes=([0], [0]))  # (nocc, nao, nq)
+        raw_3c = None
+        ovL_all = np.tensordot(C_all, L_occ, axes=([0], [1]))  # (n_total, nocc, nq)
+        L_occ = None
+        ovL_all = ovL_all.transpose(1, 0, 2)  # (nocc, n_total, nq)
+
+        for idx, sl in enumerate(slices):
+            if sl.start == sl.stop:
+                continue
+            results[idx][:, :, q_offset:q_offset + nq] = ovL_all[:, sl, :]
+
+        q_offset += nq
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Iterative L-MP2 for PNO generation
 # ---------------------------------------------------------------------------
@@ -416,8 +477,9 @@ def _iterative_lmp2(pair_data, F_lmo, s1e, nocc_lmo,
 # ---------------------------------------------------------------------------
 
 def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
-              T_CutPNO=1e-7, T_CutPairs=1e-4, S_cut_domain=1e-6,
+              T_CutPNO=1e-7, T_CutPairs=1e-4, S_cut_domain=1e-8,
               T_CutEnergy=1.0, T_CutTrace=1.0,
+              T_CutPNO_MP2=None, T_CutTrace_MP2=0.9999, T_CutEnergy_MP2=0.999,
               occ_cas_idx=None, C_cas_vir=None, nvir_cas=0, s1e=None,
               verbose=None):
     """Construct PNO spaces for all LMO pairs and compute LMP2 energies.
@@ -480,6 +542,17 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         ovL = _build_ovL(mf.with_df, C_lmo, C_pao, max_memory=mf.max_memory)
         # ovL[i, a, L]: i = LMO index, a = PAO index (global), L = aux index
         use_df = True
+        # Also build raw 3-center integrals for local DF K (matching Psi4)
+        _auxmol = mf.with_df.auxmol
+        _naux = _auxmol.nao_nr()
+        _pmol = mf.mol + _auxmol
+        _shls = (0, mf.mol.nbas, 0, mf.mol.nbas,
+                 mf.mol.nbas, mf.mol.nbas + _auxmol.nbas)
+        _raw_3c = _pmol.intor('int3c2e', shls_slice=_shls)  # (nao, nao, naux)
+        _j2c = _auxmol.intor('int2c2e')  # (naux, naux) Coulomb metric
+        # Precompute raw_3c @ C_pao for half-transform
+        _raw_half_pao = np.tensordot(_raw_3c, C_pao, axes=([1], [0]))  # (nao, naux, npao)
+        del _raw_3c
     else:
         log.info('Building LMO/PAO exact 4-index integrals (no density fitting)...')
         from pyscf import ao2mo as _ao2mo_mod
@@ -496,6 +569,37 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     fock_ao = mf.get_fock()
     F_lmo = reduce(np.dot, (C_lmo.T, fock_ao, C_lmo))
     eps_i = F_lmo.diagonal().real   # (nocc_lmo,)
+
+    # Per-LMO local aux domains (for local DF K in PNO construction).
+    # Mulliken formula matching Psi4 dlpnobase.cc:667-704 exactly:
+    # P_i[u,v] = C[u,i] * S[u,v] * C[v,i]
+    # mkn_pop[atom_u] += p_uv * p_uu / (p_uu + p_vv)
+    # mkn_pop[atom_v] += p_uv * p_vv / (p_uu + p_vv)
+    # (asymmetric split based on diagonal weights, NOT a row sum)
+    _lmo_aux_mask = None
+    if use_df and s1e is not None:
+        _ao_labels = mf.mol.ao_labels(fmt=False)
+        _atom_ids = np.array([lbl[0] for lbl in _ao_labels])
+        _aux_atom_ids = np.array([lbl[0] for lbl in _auxmol.ao_labels(fmt=False)])
+        _T_CutMKN = 1e-3
+        _natm = mf.mol.natm
+        _lmo_aux_mask = []
+        for ii in range(nocc_lmo):
+            c_i = C_lmo[:, ii]
+            P_i = s1e * c_i[:, None] * c_i[None, :]
+            p_diag = np.diag(P_i)
+            sum_diag = p_diag[:, None] + p_diag[None, :]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                w_u = np.where(sum_diag > 1e-15, p_diag[:, None] / sum_diag, 0.0)
+                w_v = np.where(sum_diag > 1e-15, p_diag[None, :] / sum_diag, 0.0)
+            contrib_u = P_i * w_u   # contribution to atom of row index u
+            contrib_v = P_i * w_v   # contribution to atom of col index v
+            mkn_pop = np.zeros(_natm)
+            for a in range(_natm):
+                mask_a = (_atom_ids == a)
+                mkn_pop[a] = np.sum(contrib_u[mask_a, :]) + np.sum(contrib_v[:, mask_a])
+            _lmo_aux_mask.append(
+                np.isin(_aux_atom_ids, np.where(np.abs(mkn_pop) > _T_CutMKN)[0]))
 
     pno_spaces = {}
     strong_pairs = []
@@ -522,8 +626,12 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                 continue
 
             # --- 2. Canonical orthogonalization of PAOs in pair domain ---
+            # Use Psi4's exact PartialCholesky algorithm so the canonical
+            # PAO basis matches Psi4 — eliminates the e_pno drift that
+            # propagated through CCSD iterations.
             C_orth_ij, X_orth_ij = orthogonalize_pao_domain(
-                C_pao, S_pao, domain_ij, S_cut=S_cut_domain)
+                C_pao, S_pao, domain_ij, S_cut=S_cut_domain,
+                method='psi4')
             n_orth = C_orth_ij.shape[1]
 
             if n_orth == 0:
@@ -534,11 +642,32 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             F_orth = reduce(np.dot, (X_orth_ij.T, F_dom, X_orth_ij))
 
             if use_df:
-                ovL_i_dom = ovL[i][domain_ij, :]
-                ovL_j_dom = ovL[j][domain_ij, :]
-                ovL_i_orth = np.dot(X_orth_ij.T, ovL_i_dom)
-                ovL_j_orth = np.dot(X_orth_ij.T, ovL_j_dom)
-                K_ij = _pair_K_iajb(ovL_i_orth, ovL_j_orth)
+                if _lmo_aux_mask is not None:
+                    # Local DF K matching Psi4 pno_transform():
+                    # K = raw_i_orth^T @ J_local^{-1} @ raw_j_orth
+                    _pair_aux = np.where(_lmo_aux_mask[i] | _lmo_aux_mask[j])[0]
+                    # raw_i[a_dom, Q] = C_lmo[:,i]^T @ raw_half_pao[:, Q, a_dom]
+                    _raw_i_dom = np.tensordot(C_lmo[:, i], _raw_half_pao[:, :, domain_ij],
+                                              axes=([0], [0]))  # (naux, n_dom)
+                    _raw_j_dom = np.tensordot(C_lmo[:, j], _raw_half_pao[:, :, domain_ij],
+                                              axes=([0], [0]))
+                    # Transform to orth basis
+                    _raw_i_orth = _raw_i_dom @ X_orth_ij  # (naux, n_orth)
+                    _raw_j_orth = _raw_j_dom @ X_orth_ij
+                    # Extract local aux and apply J^{-1}
+                    _raw_i_local = _raw_i_orth[_pair_aux, :]  # (n_local, n_orth)
+                    _raw_j_local = _raw_j_orth[_pair_aux, :]
+                    _j2c_local = _j2c[np.ix_(_pair_aux, _pair_aux)]
+                    # K = raw_i^T @ J^{-1} @ raw_j
+                    _fitted_j = np.linalg.solve(_j2c_local, _raw_j_local)
+                    K_ij = _raw_i_local.T @ _fitted_j  # (n_orth, n_orth)
+                else:
+                    # Fallback: global DF
+                    ovL_i_dom = ovL[i][domain_ij, :]
+                    ovL_j_dom = ovL[j][domain_ij, :]
+                    ovL_i_orth = np.dot(X_orth_ij.T, ovL_i_dom)
+                    ovL_j_orth = np.dot(X_orth_ij.T, ovL_j_dom)
+                    K_ij = _pair_K_iajb(ovL_i_orth, ovL_j_orth)
             else:
                 K_dom_ij = K_iajb_exact[i, :, j, :][np.ix_(domain_ij, domain_ij)]
                 K_ij = X_orth_ij.T @ K_dom_ij @ X_orth_ij
@@ -569,118 +698,341 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             }
 
     # ===================================================================
-    # Phase 2: Iterative L-MP2 with inter-pair Fock coupling
+    # Phase 2a: Build INITIAL PNOs from direct SC-MP2 T2
+    # (matching Psi4 compute_pair_energies<false>() lines 489-609)
     # ===================================================================
     if s1e is None:
         s1e = mf.get_ovlp()
 
-    t2_lmp2, e_lmp2_iter = _iterative_lmp2(
-        pair_domain_data, F_lmo, s1e, nocc_lmo, log=log)
-
-    log.info('L-MP2 correlation energy = %.15g', e_lmp2_iter)
-
-    # ===================================================================
-    # Phase 3: Build PNOs from converged L-MP2 amplitudes
-    # ===================================================================
+    # Build initial PNOs from direct SC-MP2 T2 for each pair
+    initial_pno_data = {}
     for (i, j), pdata in pair_domain_data.items():
-        C_orth_ij = pdata['C_orth']
-        X_orth_ij = pdata['X_orth']
-        F_orth = pdata['F_orth']
-        K_ij = pdata['K_orth']
         U_sc = pdata['U_sc']
         eps_sc = pdata['eps_sc']
         K_sc = pdata['K_sc']
+        K_ij = pdata['K_orth']
         domain_ij = pdata['domain_ij']
+        C_orth_ij = pdata['C_orth']
+        X_orth_ij = pdata['X_orth']
 
-        # Transform converged L-MP2 T2 to semicanonical basis
-        T2_orth_conv = t2_lmp2[(i, j)]
-        T2_sc = reduce(np.dot, (U_sc.T, T2_orth_conv, U_sc))
+        # Direct SC-MP2 T2
+        D_sc_ij = (eps_i[i] + eps_i[j] - eps_sc[:, None] - eps_sc[None, :])
+        D_safe = np.where(np.abs(D_sc_ij) > 1e-12, D_sc_ij, 1.0)
+        T2_sc_init = K_sc / D_safe
+        T2_sc_init = np.where(np.abs(D_sc_ij) > 1e-12, T2_sc_init, 0.0)
 
-        # L-MP2 pair energy (pre-truncation, for classification)
-        Tt_sc = 2.0 * T2_sc - T2_sc.T
-        e_ij = np.einsum('ab,ab->', K_sc, Tt_sc)
+        Tt_sc_init = 2.0 * T2_sc_init - T2_sc_init.T
+        e_ij_init = np.einsum('ab,ab->', K_sc, Tt_sc_init)
 
-        # --- 6. Pair density and PNO eigendecomposition ---
-        D_pair = np.dot(Tt_sc, T2_sc.T) + np.dot(T2_sc, Tt_sc.T)
+        # Pair density from direct SC-MP2
+        D_pair = np.dot(Tt_sc_init, T2_sc_init.T) + np.dot(Tt_sc_init.T, T2_sc_init)
         if i == j:
             D_pair *= 0.5
 
+        pno_occ_init, U_pno_init = np.linalg.eigh(D_pair)
+        # Sort by VALUE descending (matching Psi4's descending diagonalize)
+        order = np.argsort(pno_occ_init)[::-1]
+        pno_occ_init = pno_occ_init[order]
+        U_pno_init = U_pno_init[:, order]
+
+        # Initial PNO selection: Psi4 uses three OR'd criteria (Psi4 ccsd.cc
+        # lines 516-523): keep PNO if eigenvalue >= cutoff OR cumulative trace
+        # < target OR cumulative energy < target. Eigenvalue-only is too
+        # aggressive for off-diagonal pairs with flat eigenvalue spectra.
+        _t_cut_mp2 = T_CutPNO_MP2 if T_CutPNO_MP2 is not None else T_CutPNO * 0.01
+        _t_cut_mp2_ij = _t_cut_mp2 * 1e-3 if i == j else _t_cut_mp2
+        n_sc = len(pno_occ_init)
+        # Cumulative trace and energy criteria
+        occ_total_init = np.sum(pno_occ_init)
+        # K and Tt in pno basis (for energy cumulation)
+        K_pno_init_full = U_pno_init.T @ K_sc @ U_pno_init
+        Tt_pno_init_full = U_pno_init.T @ Tt_sc_init @ U_pno_init
+        keep = np.zeros(n_sc, dtype=bool)
+        e_pno_cum = 0.0
+        occ_pno_cum = 0.0
+        for a in range(n_sc):
+            cond_occ = abs(pno_occ_init[a]) >= _t_cut_mp2_ij
+            cond_trace = (occ_pno_cum / occ_total_init < T_CutTrace_MP2
+                          if abs(occ_total_init) > 1e-15 and T_CutTrace_MP2 < 1.0
+                          else False)
+            cond_energy = (abs(e_pno_cum) < T_CutEnergy_MP2 * abs(e_ij_init)
+                           if abs(e_ij_init) > 1e-15 and T_CutEnergy_MP2 < 1.0
+                           else False)
+            if cond_occ or cond_trace or cond_energy:
+                keep[a] = True
+                # Update cumulative quantities using submatrix [0..a]
+                e_pno_cum = np.einsum(
+                    'ab,ab->',
+                    K_pno_init_full[:a+1, :a+1],
+                    Tt_pno_init_full[:a+1, :a+1])
+                occ_pno_cum += pno_occ_init[a]
+        if not np.any(keep):
+            keep[np.argmax(np.abs(pno_occ_init))] = True
+        n_pno_init = int(np.sum(keep))
+        if getattr(make_pnos, '_debug_npno_init', False):
+            print(f'NPNO_INIT pair({i},{j}): n_sc={n_sc} n_pno_init={n_pno_init}', flush=True)
+
+        U_pno_kept = U_pno_init[:, keep]
+        # X_pno in SC basis: columns of U_pno that are kept
+        # Transform to orthogonal PAO basis: X_orth @ U_sc @ U_pno_kept
+        X_pno_sc = U_sc @ U_pno_kept  # SC → PNO transform
+
+        # K and T2 in initial PNO basis
+        K_pno = U_pno_kept.T @ K_sc @ U_pno_kept
+        T2_pno = U_pno_kept.T @ T2_sc_init @ U_pno_kept
+        # PNO orbital energies (diagonal of F_pno)
+        F_sc = np.diag(eps_sc)
+        F_pno = U_pno_kept.T @ F_sc @ U_pno_kept
+        e_pno = np.diag(F_pno)
+        # Semicanonicalize PNOs (Psi4 convention: descending eigenvalues)
+        e_pno_sc, V_pno = np.linalg.eigh(F_pno)
+        e_pno_sc = e_pno_sc[::-1]
+        V_pno = V_pno[:, ::-1]
+        # Apply semicanonicalization
+        X_pno_final = X_pno_sc @ V_pno
+        K_pno = V_pno.T @ K_pno @ V_pno
+        T2_pno = V_pno.T @ T2_pno @ V_pno
+
+        # C_pno in AO basis
+        C_pno = C_orth_ij @ X_pno_final
+
+        initial_pno_data[(i, j)] = {
+            'C_pno': C_pno, 'e_pno': e_pno_sc, 'K_pno': K_pno,
+            'T2_pno': T2_pno, 'n_pno': n_pno_init,
+            'e_ij': e_ij_init, 'domain_ij': domain_ij,
+            'X_pno_final': X_pno_final,
+            'C_orth': C_orth_ij, 'X_orth': X_orth_ij,
+            'F_orth': pdata['F_orth'],
+            'U_sc': pdata['U_sc'], 'eps_sc': pdata['eps_sc'],
+        }
+
+    # ===================================================================
+    # Phase 2b: Iterative LMP2 in PNO space
+    # (matching Psi4 pno_lmp2_iterations() lines 690-802)
+    # ===================================================================
+    log.info('Running iterative LMP2 in PNO space...')
+
+    # Build PNO overlap matrices for inter-pair coupling
+    pno_S_cache = {}
+    F_CUT = 1e-5  # Fock coupling threshold
+    for key_ij in initial_pno_data:
+        i, j = key_ij
+        for k in range(nocc_lmo):
+            key_kj = (min(k, j), max(k, j))
+            key_ik = (min(i, k), max(i, k))
+            if key_kj in initial_pno_data and i != k and abs(F_lmo[i, k]) > F_CUT:
+                C_pno_ij = initial_pno_data[key_ij]['C_pno']
+                C_pno_kj = initial_pno_data[key_kj]['C_pno']
+                pno_S_cache[(key_ij, key_kj)] = C_pno_ij.T @ s1e @ C_pno_kj
+            if key_ik in initial_pno_data and j != k and abs(F_lmo[k, j]) > F_CUT:
+                C_pno_ij = initial_pno_data[key_ij]['C_pno']
+                C_pno_ik = initial_pno_data[key_ik]['C_pno']
+                pno_S_cache[(key_ij, key_ik)] = C_pno_ij.T @ s1e @ C_pno_ik
+
+    # Iterative LMP2 in PNO space with DIIS (matching Psi4 lines 690-802)
+    T2_pno_all = {k: d['T2_pno'].copy() for k, d in initial_pno_data.items()}
+    max_lmp2_iter = 50
+    e_conv_lmp2 = 1e-9
+    r_conv_lmp2 = 5e-9
+    e_prev_lmp2 = 0.0
+
+    # Ordered pair keys for consistent flattening
+    _lmp2_keys = [k for k in initial_pno_data if initial_pno_data[k]['n_pno'] > 0]
+    _lmp2_sizes = {k: initial_pno_data[k]['n_pno'] ** 2 for k in _lmp2_keys}
+
+    # DIIS setup (matching Psi4 line 700)
+    from pyscf.lib.diis import DIIS
+    lmp2_diis = DIIS()
+    lmp2_diis.space = 8
+
+    for lmp2_iter in range(max_lmp2_iter):
+        # Step 1: Compute residuals for ALL pairs
+        R_all = {}
+        r_max = 0.0
+        for key_ij, pdata in initial_pno_data.items():
+            i, j = key_ij
+            n = pdata['n_pno']
+            if n == 0:
+                continue
+            K_pno = pdata['K_pno']
+            e_pno = pdata['e_pno']
+            T2 = T2_pno_all[key_ij]
+
+            D = e_pno[:, None] + e_pno[None, :] - F_lmo[i, i] - F_lmo[j, j]
+            R = K_pno + D * T2
+
+            # Inter-pair Fock coupling (matching Psi4 lines 717-733)
+            for k in range(nocc_lmo):
+                key_kj = (min(k, j), max(k, j))
+                if key_kj in initial_pno_data and i != k and abs(F_lmo[i, k]) > F_CUT:
+                    S = pno_S_cache.get((key_ij, key_kj))
+                    if S is not None and initial_pno_data[key_kj]['n_pno'] > 0:
+                        T2_kj = T2_pno_all.get(key_kj)
+                        if T2_kj is not None:
+                            if k > j:
+                                T2_kj = T2_kj.T
+                            R -= F_lmo[i, k] * S @ T2_kj @ S.T
+                key_ik = (min(i, k), max(i, k))
+                if key_ik in initial_pno_data and j != k and abs(F_lmo[k, j]) > F_CUT:
+                    S = pno_S_cache.get((key_ij, key_ik))
+                    if S is not None and initial_pno_data[key_ik]['n_pno'] > 0:
+                        T2_ik = T2_pno_all.get(key_ik)
+                        if T2_ik is not None:
+                            if i > k:
+                                T2_ik = T2_ik.T
+                            R -= F_lmo[k, j] * S @ T2_ik @ S.T
+
+            R_all[key_ij] = R
+            r_max = max(r_max, np.max(np.abs(R)))
+
+        # Step 2: Jacobi update (matching Psi4 lines 757-767)
+        for key_ij, pdata in initial_pno_data.items():
+            n = pdata['n_pno']
+            if n == 0:
+                continue
+            i, j = key_ij
+            e_pno = pdata['e_pno']
+            D = e_pno[:, None] + e_pno[None, :] - F_lmo[i, i] - F_lmo[j, j]
+            D_safe = np.where(np.abs(D) > 1e-12, D, 1.0)
+            T2_pno_all[key_ij] -= R_all[key_ij] / D_safe
+
+        # Step 3: DIIS extrapolation (matching Psi4 lines 769-781)
+        t2_flat = np.concatenate([T2_pno_all[k].ravel() for k in _lmp2_keys])
+        r_flat = np.concatenate([R_all[k].ravel() for k in _lmp2_keys])
+        t2_flat = lmp2_diis.update(t2_flat, r_flat)
+        # Unflatten
+        offset = 0
+        for k in _lmp2_keys:
+            sz = _lmp2_sizes[k]
+            n = initial_pno_data[k]['n_pno']
+            T2_pno_all[k] = t2_flat[offset:offset + sz].reshape(n, n)
+            offset += sz
+
+        # Step 4: Build Tt and energy (matching Psi4 lines 783-799)
+        e_curr_lmp2 = 0.0
+        for key_ij, pdata in initial_pno_data.items():
+            i, j = key_ij
+            T2 = T2_pno_all[key_ij]
+            K_pno = pdata['K_pno']
+            Tt = 2.0 * T2 - T2.T
+            e_pair = np.einsum('ab,ab->', K_pno, Tt)
+            e_curr_lmp2 += e_pair if i == j else 2.0 * e_pair
+
+        dE = abs(e_curr_lmp2 - e_prev_lmp2)
+        if lmp2_iter > 0:
+            log.info('LMP2-Iter=%3d: E_LMP2=%.12f  dE=%.1e  Rmax=%.1e',
+                     lmp2_iter, e_curr_lmp2, dE, r_max)
+        if lmp2_iter > 0 and dE < e_conv_lmp2 and r_max < r_conv_lmp2:
+            log.info('LMP2-Iter=%3d: E_LMP2=%.12f  dE=%.1e  Rmax=%.1e => CONVERGED',
+                     lmp2_iter, e_curr_lmp2, dE, r_max)
+            break
+        e_prev_lmp2 = e_curr_lmp2
+
+    log.info('L-MP2 correlation energy = %.15g', e_curr_lmp2)
+
+    # ===================================================================
+    # Phase 3: Recompute PNOs from converged PNO-LMP2 amplitudes
+    # (matching Psi4 pno_lmp2_iterations lines 816-900)
+    # ===================================================================
+    for (i, j), pdata in initial_pno_data.items():
+        n = pdata['n_pno']
+        if n == 0:
+            continue
+        K_pno = pdata['K_pno']
+        T2 = T2_pno_all[(i, j)]
+        Tt = 2.0 * T2 - T2.T
+
+        # Pair density from converged PNO-LMP2 T2 (in PNO space, matching Psi4 line 831)
+        D_pair = np.dot(Tt, T2.T) + np.dot(Tt.T, T2)
+        if i == j:
+            D_pair *= 0.5
+
+        # Eigendecomposition in PNO space (matching Psi4 line 840)
+        # Sort by VALUE descending (matching Psi4's 'descending' diagonalize)
         pno_occ, U_pno = np.linalg.eigh(D_pair)
-        order = np.argsort(np.abs(pno_occ))[::-1]
+        order = np.argsort(pno_occ)[::-1]  # value descending
         pno_occ = pno_occ[order]
         U_pno = U_pno[:, order]
 
-        # --- 7. Build PNO basis ---
+        # Total pair energy (matching Psi4 line 848)
+        e_ij = np.einsum('ab,ab->', K_pno, Tt)
+
+        domain_ij = pdata['domain_ij']
+        C_orth_ij = pdata['C_orth']
+        X_pno_old = pdata['X_pno_final']  # orth → old PNO
+
+        # Transform K, Tt to new PNO basis for energy criterion (Psi4 lines 851-852)
+        K_pno_new = reduce(np.dot, (U_pno.T, K_pno, U_pno))
+        Tt_pno_new = reduce(np.dot, (U_pno.T, Tt, U_pno))
+
+        # --- PNO selection (matching Psi4 lines 856-873) ---
         is_cas_pair = (i in occ_cas_set and j in occ_cas_set
                        and C_cas_vir is not None and nvir_cas > 0)
 
         nvir_cas_local = 0
 
-        # Diagonal pairs (i==j) use a tighter PNO cutoff for singles.
-        # ORCA TightPNO: TCutPNOSingles = 3e-9 (with TCutPNO = 1e-7).
-        T_CutPNO_ij = T_CutPNO * 3e-2 if i == j else T_CutPNO
+        T_CutPNO_ij = T_CutPNO * 1e-3 if i == j else T_CutPNO
 
-        # Three PNO significance criteria (Jiang et al. 2024, p.14):
-        # A PNO is kept if ANY criterion requires it.
-        # 1. Occupation criterion
-        keep_occ = np.abs(pno_occ) > T_CutPNO_ij
+        # Combined loop matching Psi4 exactly (lines 856-873):
+        # Keep PNO if ANY of: occ >= threshold, trace < target, energy < target
+        occ_total = np.sum(pno_occ)  # signed sum (Psi4 line 846)
+        n_pno_total = len(pno_occ)
+        e_pno_cum = 0.0
+        occ_pno_cum = 0.0
+        n_pno = 0
+        _trace_dbg = (getattr(make_pnos, '_disable_debug', False)
+                      and i == 0 and j == 1)
+        for p in range(n_pno_total):
+            cond_occ = abs(pno_occ[p]) >= T_CutPNO_ij
+            cond_trace = (occ_pno_cum / occ_total < T_CutTrace
+                          if abs(occ_total) > 1e-15 and T_CutTrace < 1.0
+                          else False)
+            cond_energy = (abs(e_pno_cum) < T_CutEnergy * abs(e_ij)
+                           if abs(e_ij) > 1e-15 and T_CutEnergy < 1.0
+                           else False)
+            if _trace_dbg:
+                print(f'  p={p} occ={pno_occ[p]:+.4e} '
+                      f'occ_cum={occ_pno_cum:+.4e}/{occ_total:+.4e}={occ_pno_cum/max(abs(occ_total),1e-15):+.4f} '
+                      f'e_cum={e_pno_cum:+.4e}/{e_ij:+.4e}={e_pno_cum/max(abs(e_ij),1e-15):+.4f} '
+                      f'cond_o={cond_occ} cond_t={cond_trace} cond_e={cond_energy}',
+                      flush=True)
+            if cond_occ or cond_trace or cond_energy:
+                # Update cumulative energy using submatrix [0..p] (Psi4 line 869)
+                K_sub = K_pno_new[:p+1, :p+1]
+                Tt_sub = Tt_pno_new[:p+1, :p+1]
+                e_pno_cum = np.einsum('ab,ab->', K_sub, Tt_sub)
+                occ_pno_cum += pno_occ[p]
+                n_pno += 1
+            # Once all three conditions fail, no more PNOs can be kept
+            # (eigenvalues decrease, cumulative values only grow)
 
-        # 2. Energy criterion: include PNOs from largest to smallest occupation
-        #    until cumulative pair energy / total pair energy > T_CutEnergy.
-        n_sc = len(pno_occ)
-        keep_energy = np.zeros(n_sc, dtype=bool)
-        if T_CutEnergy < 1.0 and abs(e_ij) > 1e-15:
-            e_cum = 0.0
-            for p in range(n_sc):
-                # Pair energy from PNOs 0..p (in SC basis, projected through U_pno)
-                # Approximation: use diagonal MP2 energy per PNO
-                # E_p = K_sc_pno[p,p] * (2*T2_sc_pno[p,p] - T2_sc_pno[p,p]) / denominator
-                # More accurately: accumulate the MP2 pair energy in PNO basis
-                # by transforming K and T2 to PNO space up to index p.
-                # For efficiency, use the per-PNO contribution:
-                #   T2_pno[a,b] = U.T @ T2_sc @ U, K_pno[a,b] = U.T @ K_sc @ U
-                #   e_a = Σ_b K_pno[a,b] * (2*T2_pno[a,b] - T2_pno[b,a])
-                U_p = U_pno[:, :p+1]
-                K_p = reduce(np.dot, (U_p.T, K_sc, U_p))
-                T2_p = reduce(np.dot, (U_p.T, T2_sc, U_p))
-                Tt_p = 2.0 * T2_p - T2_p.T
-                e_cum = np.einsum('ab,ab->', K_p, Tt_p)
-                keep_energy[p] = True
-                if abs(e_cum / e_ij) >= T_CutEnergy:
-                    break
+        n_pno = max(n_pno, 1)
+        if getattr(make_pnos, '_debug_phase3', False):
+            print(f'PHASE3 pair({i},{j}): n_total={n_pno_total} n_kept={n_pno} '
+                  f'top5_occ={pno_occ[:5].tolist()} '
+                  f'occ_total={occ_total:.4e} e_ij={e_ij:.4e}', flush=True)
 
-        # 3. Trace criterion: include PNOs until cumulative occupation
-        #    fraction > T_CutTrace.
-        keep_trace = np.zeros(n_sc, dtype=bool)
-        total_trace = np.sum(np.abs(pno_occ))
-        if T_CutTrace < 1.0 and total_trace > 1e-15:
-            cum_trace = 0.0
-            for p in range(n_sc):
-                cum_trace += abs(pno_occ[p])
-                keep_trace[p] = True
-                if cum_trace / total_trace >= T_CutTrace:
-                    break
+        U_pno_kept = U_pno[:, :n_pno]
+        n_pno_kept = pno_occ[:n_pno]
 
-        # Union of all three criteria
-        keep = keep_occ | keep_energy | keep_trace
-        n_pno = int(np.sum(keep))
-
-        if n_pno == 0:
-            n_pno = 1
-            keep[np.argmax(np.abs(pno_occ))] = True
-
-        U_pno_kept = U_pno[:, keep]
-        n_pno_kept = pno_occ[keep]
-
-        F_sc_diag = np.diag(eps_sc)
-        F_pno_block = reduce(np.dot, (U_pno_kept.T, F_sc_diag, U_pno_kept))
-        e_pno_sc, V_pno = np.linalg.eigh(F_pno_block)
+        # Semicanonicalize: F in PNO space (Psi4 line 828/886)
+        # Psi4 sorts eigenvalues DESCENDING (canonicalizer uses descending)
+        F_pno_old = reduce(np.dot, (X_pno_old.T, pdata['F_orth'], X_pno_old))
+        F_pno_new = reduce(np.dot, (U_pno_kept.T, F_pno_old, U_pno_kept))
+        e_pno_sc, V_pno = np.linalg.eigh(F_pno_new)
+        # Reverse to match Psi4's descending order
+        e_pno_sc = e_pno_sc[::-1]
+        V_pno = V_pno[:, ::-1]
         U_pno_kept = np.dot(U_pno_kept, V_pno)
+
+        # Get SC-space quantities for CAS pair handling
+        U_sc = pdata.get('U_sc', np.eye(X_pno_old.shape[0]))
+        eps_sc = pdata.get('eps_sc', np.zeros(X_pno_old.shape[0]))
 
         if is_cas_pair:
             nvir_cas_local = nvir_cas
-            U_full_ext = np.dot(U_sc, U_pno_kept)
-            C_ext_pno = np.dot(C_orth_ij, U_full_ext)
+            X_new_cas = np.dot(X_pno_old, U_pno_kept)
+            C_ext_pno = np.dot(C_orth_ij, X_new_cas)
 
             if s1e is not None and C_ext_pno.shape[1] > 0:
                 overlap = C_cas_vir.T @ (s1e @ C_ext_pno)
@@ -713,11 +1065,13 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             K_pno = None
             T2_pno = None
         else:
-            U_full = np.dot(U_sc, U_pno_kept)
-            C_pno_ij = np.dot(C_orth_ij, U_full)
+            # New PNO in AO basis: C_orth @ X_pno_old @ U_pno_kept
+            X_new = np.dot(X_pno_old, U_pno_kept)  # orth → new PNO
+            C_pno_ij = np.dot(C_orth_ij, X_new)
+            U_full = X_new  # for backward compat
 
-            K_pno = reduce(np.dot, (U_pno_kept.T, K_sc, U_pno_kept))
-            T2_pno = reduce(np.dot, (U_pno_kept.T, T2_sc, U_pno_kept))
+            K_pno = reduce(np.dot, (U_pno_kept.T, pdata['K_pno'], U_pno_kept))
+            T2_pno = reduce(np.dot, (U_pno_kept.T, T2, U_pno_kept))
 
         e_lmp2_total += e_ij * (1 if i == j else 2)
 
@@ -731,7 +1085,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             'T2_pno': T2_pno,
             'e_mp2': e_ij,
             'domain_ij': domain_ij,
-            'X_orth': X_orth_ij,
+            'X_orth': pdata['X_orth'],
             'U_full': U_full if not is_cas_pair else None,
             'domain_idx': domain_ij,
             'is_cas_pair': is_cas_pair,

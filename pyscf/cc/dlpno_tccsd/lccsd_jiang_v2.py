@@ -38,6 +38,8 @@ def compute_residual_v2(
         K_ij_kj,        # dict: (ij, k) -> (n_ij, n_kj) bare exchange (ia_ij|kc_kj)
         t1_pno=None,
         ladder_precomputed=None,
+        K_dressed_override=None,
+        cc_ints=None,
 ):
     """Compute T2 residual following Psi4 ccsd.cc lines 2052-2221 exactly.
 
@@ -72,12 +74,23 @@ def compute_residual_v2(
 
     # === Symmetric buffer (K̃, A, B, E) ===
     R_sym = np.zeros((n_pno, n_pno))
+    _DEBUG_PTERM = getattr(compute_residual_v2, '_debug_pterm', False)
 
-    # --- K̃ (Eq 75): dressed exchange = i_Qa_t1 @ i_Qa_t1.T ---
-    ovL_i_d = ovL_dressed.get((key, i))
-    ovL_j_d = ovL_dressed.get((key, j))
-    if ovL_i_d is not None and ovL_j_d is not None:
-        R_sym += ovL_i_d @ ovL_j_d.T
+    def _rms(M):
+        return float(np.sqrt(np.mean(M*M)))
+
+    # --- K̃ (Eq 75): dressed exchange ---
+    K_term = np.zeros((n_pno, n_pno))
+    if K_dressed_override is not None:
+        K_term += K_dressed_override
+    else:
+        ovL_i_d = ovL_dressed.get((key, i))
+        ovL_j_d = ovL_dressed.get((key, j))
+        if ovL_i_d is not None and ovL_j_d is not None:
+            K_term += ovL_i_d @ ovL_j_d.T
+    R_sym += K_term
+    if _DEBUG_PTERM:
+        print(f"  PTERM pair({i},{j}): K_rms={_rms(K_term):.12f} R_K={_rms(R_sym):.12f}")
 
     # --- A (Eq 76): dressed ladder ---
     # B̃_{ab} = B_{ab} - Σ_k T1_all[k,a]*ovL_k[b,Q] (Eq 93)
@@ -91,8 +104,10 @@ def compute_residual_v2(
     t1_j_pno = T1_all_ij[j] if t1_pno else np.zeros(n_pno)
     tau_ij = t2_ij + np.outer(t1_i_pno, t1_j_pno)
 
+    A_term = np.zeros((n_pno, n_pno))
     if ladder_precomputed is not None and key in ladder_precomputed:
-        R_sym += ladder_precomputed[key]
+        A_term = ladder_precomputed[key]
+        R_sym += A_term
     elif with_df is not None:
         # Fallback: compute ladder inline (per-pair DF loop)
         naux = ooL_bare.shape[2]
@@ -115,9 +130,12 @@ def compute_residual_v2(
             ladder += np.einsum('Lad,Lbd->ab', X_L, B_tilde_L)
             aux_off += nL
         R_sym += ladder
+        A_term = ladder
+    if _DEBUG_PTERM:
+        print(f"  PTERM pair({i},{j}): A_rms={_rms(A_term):.12f} R_KA={_rms(R_sym):.12f}")
 
     # --- B (Eq 77/82): Woooo with dressed β ---
-    # β = B_tilde[k,l] (precomputed from ooL_dressed + tau×voov)
+    B_term = np.zeros((n_pno, n_pno))
     for key_kl, t2_kl in t2_pno_all.items():
         if t2_kl is None or t2_kl.shape[0] == 0:
             continue
@@ -131,13 +149,15 @@ def compute_residual_v2(
         S_proj = _get_S(key_kl)
         tau_kl_proj = S_proj @ tau_kl @ S_proj.T
 
-        # β = B_tilde[k,l] (from B_tilde matrix)
         beta_kl = B_tilde[k, l]
         if k != l:
             beta_lk = B_tilde[l, k]
-            R_sym += beta_kl * tau_kl_proj + beta_lk * tau_kl_proj.T
+            B_term += beta_kl * tau_kl_proj + beta_lk * tau_kl_proj.T
         else:
-            R_sym += beta_kl * tau_kl_proj
+            B_term += beta_kl * tau_kl_proj
+    R_sym += B_term
+    if _DEBUG_PTERM:
+        print(f"  PTERM pair({i},{j}): B_rms={_rms(B_term):.12f} R_KAB={_rms(R_sym):.12f}")
 
     # --- E (Eq 80): t2 × F̃̃_{ab} ---
     # E_tilde = Fab_[ij] - Σ_kl S @ u_kl × K_kl @ S
@@ -148,7 +168,10 @@ def compute_residual_v2(
     # this differently.)
     Fab_ij = Fab.get(key, np.zeros((n_pno, n_pno))).copy()
     e_pno = data['e_pno']
-    E_tilde = Fab_ij - np.diag(e_pno)  # remove diagonal (in denominator)
+    # Match Psi4 exactly: keep full Fab including diag(e_pno).
+    # The (e_a+e_b)*T term enters R; balanced by -(F_ii+F_jj)*T from G.
+    # Update is T -= R/D_psi4, so R = 0 at convergence (full Psi4 residual).
+    E_tilde = Fab_ij.copy()
     # Psi4 E term: subtract u×K from E_tilde (Eq 85: F̃̃ = F̃ - u×K)
     # This handles the fvv T2 dressing. C_tilde/D_tilde Term 4 handles
     # a DIFFERENT T2 contribution (through the C/D ring terms).
@@ -157,11 +180,23 @@ def compute_residual_v2(
             continue
         k, l = key_kl
         u_kl = 2.0 * t2_kl - t2_kl.T
-        ovL_k_kl = ovL_bare.get((key_kl, k))
-        ovL_l_kl = ovL_bare.get((key_kl, l))
-        if ovL_k_kl is None or ovL_l_kl is None:
-            continue
-        K_kl = ovL_k_kl @ ovL_l_kl.T
+        if cc_ints is not None:
+            from pyscf.cc.dlpno_tccsd.local_df import get_local_K
+            _K = get_local_K(cc_ints, key_kl, k, l)
+            if _K is not None:
+                K_kl = _K
+            else:
+                ovL_k_kl = ovL_bare.get((key_kl, k))
+                ovL_l_kl = ovL_bare.get((key_kl, l))
+                if ovL_k_kl is None or ovL_l_kl is None:
+                    continue
+                K_kl = ovL_k_kl @ ovL_l_kl.T
+        else:
+            ovL_k_kl = ovL_bare.get((key_kl, k))
+            ovL_l_kl = ovL_bare.get((key_kl, l))
+            if ovL_k_kl is None or ovL_l_kl is None:
+                continue
+            K_kl = ovL_k_kl @ ovL_l_kl.T
         S_kl_ij = _get_S(key_kl)
         # (k,l) contribution
         E_tilde -= S_kl_ij @ (u_kl @ K_kl.T) @ S_kl_ij.T
@@ -169,8 +204,19 @@ def compute_residual_v2(
         if k != l:
             E_tilde -= S_kl_ij @ ((2.0*t2_kl.T - t2_kl) @ K_kl) @ S_kl_ij.T
 
+    if _DEBUG_PTERM:
+        print(f"  PTERM pair({i},{j}): Etilde_rms={_rms(E_tilde):.12f}")
+        # Decompose: Fab and the subtraction
+        E_tilde_diag = np.diag(E_tilde)
+        Fab_diag = np.diag(Fab_ij)
+        sub = Fab_ij - E_tilde
+        print(f"  PTERM_DECOMP pair({i},{j}): Fab_rms={_rms(Fab_ij):.12f} "
+              f"Fab_diag_first={Fab_diag[0]:.10f} sub_rms={_rms(sub):.12f}")
     # Apply: R += t2 @ E_tilde.T + E_tilde @ t2 (Psi4 lines 2146-2147)
-    R_sym += t2_ij @ E_tilde.T + E_tilde @ t2_ij
+    E_term = t2_ij @ E_tilde.T + E_tilde @ t2_ij
+    R_sym += E_term
+    if _DEBUG_PTERM:
+        print(f"  PTERM pair({i},{j}): E_rms={_rms(E_term):.12f} R_KABE={_rms(R_sym):.12f}")
 
     # === Non-symmetric terms (C, D, G) ===
     # Compute C_ij and C_ji in one pass, then form the full P̂ result.
@@ -179,7 +225,8 @@ def compute_residual_v2(
     Rn_ij = np.zeros((n_pno, n_pno))
 
     # --- C (Eq 78) ---
-    if C_tilde_cache is not None:
+    _SKIP_C = getattr(compute_residual_v2, '_skip_C', False)
+    if C_tilde_cache is not None and not _SKIP_C:
         C_ij = np.zeros((n_pno, n_pno))
         C_ji = np.zeros((n_pno, n_pno))
         for k in range(nocc):
@@ -234,11 +281,18 @@ def compute_residual_v2(
         # P̂: Rn[ij] + Rn[ji].T where Rn[ij] = 0.5*C_ij + C_ij.T
         Rn_C_ij = 0.5 * C_ij + C_ij.T
         Rn_C_ji = 0.5 * C_ji + C_ji.T
-        Rn_ij += Rn_C_ij + Rn_C_ji.T
+        C_term = Rn_C_ij + Rn_C_ji.T
+        Rn_ij += C_term
+        if _DEBUG_PTERM:
+            # Print C_ij and C_ji separately to compare with Psi4 (which prints
+            # the unsymmetrized C_ij per ordered pair).
+            print(f"  PTERM pair({i},{j}): C_ij_unsym_rms={_rms(C_ij):.12f} C_ji_unsym_rms={_rms(C_ji):.12f}")
+    else:
+        C_term = np.zeros((n_pno, n_pno))
 
     # --- D (Eq 79): antisymmetric ring with delta ---
-    # Compute D_ij and D_ji, then P̂(D) = D_ij + D_ji.T
-    if D_tilde_cache is not None:
+    _SKIP_D = getattr(compute_residual_v2, '_skip_D', False)
+    if D_tilde_cache is not None and not _SKIP_D:
         D_ij = np.zeros((n_pno, n_pno))
         D_ji = np.zeros((n_pno, n_pno))
         for k in range(nocc):
@@ -291,14 +345,18 @@ def compute_residual_v2(
                             D_temp_j += (2.0*K_ji - J_ji) @ u_ik.T @ S_ij_ik2.T
                         D_ji += 0.5 * D_temp_j
 
-        Rn_ij += D_ij + D_ji.T
+        D_term = D_ij + D_ji.T
+        Rn_ij += D_term
+        if _DEBUG_PTERM:
+            print(f"  PTERM pair({i},{j}): D_ij_unsym_rms={_rms(D_ij):.12f} D_ji_unsym_rms={_rms(D_ji):.12f}")
+    else:
+        D_term = np.zeros((n_pno, n_pno))
 
     # --- G (Eq 81): Fock oo coupling ---
-    # G_ij = -t_ik × G_tilde(k,j);  G_ji = -t_jk × G_tilde(k,i)
-    # P̂(G) = G_ij + G_ji.T
+    _SKIP_G = getattr(compute_residual_v2, '_skip_G', False)
     G_ij = np.zeros((n_pno, n_pno))
     G_ji = np.zeros((n_pno, n_pno))
-    for k in range(nocc):
+    for k in (range(nocc) if not _SKIP_G else []):
         key_ik = (min(i, k), max(i, k))
         key_jk = (min(j, k), max(j, k))
         if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
@@ -313,7 +371,32 @@ def compute_residual_v2(
                 t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
                 S_ij_jk = _get_S(key_jk)
                 G_ji -= (S_ij_jk @ t2_jk @ S_ij_jk.T) * G_tilde[k, i]
-    Rn_ij += G_ij + G_ji.T
+    G_term = G_ij + G_ji.T
+    Rn_ij += G_term
+
+    if _DEBUG_PTERM:
+        print(f"  PTERM pair({i},{j}): G_ij_unsym_rms={_rms(G_ij):.12f} G_ji_unsym_rms={_rms(G_ji):.12f}")
+        R_total = R_sym + Rn_ij
+        print(f"  PTERM pair({i},{j}): Rn={_rms(Rn_ij):.12f} R_total={_rms(R_total):.12f}")
+    if _DEBUG_PTERM and not getattr(compute_residual_v2, '_dump_done', False):
+        if i == 0 and j == 0:
+            print(f"  DUMP_R2 pair(0,0) npno={n_pno}")
+            for a in range(min(n_pno, 5)):
+                for b in range(min(n_pno, 5)):
+                    print(f"  DUMP_R2[{a},{b}]={R_total[a,b]:.15e}")
+            print(f"  DUMP_T2 pair(0,0)")
+            for a in range(min(n_pno, 5)):
+                for b in range(min(n_pno, 5)):
+                    print(f"  DUMP_T2[{a},{b}]={t2_ij[a,b]:.15e}")
+            print(f"  DUMP_K pair(0,0)")
+            K_dump = K_dressed_override if K_dressed_override is not None else K_term
+            for a in range(min(n_pno, 5)):
+                for b in range(min(n_pno, 5)):
+                    print(f"  DUMP_K[{a},{b}]={K_dump[a,b]:.15e}")
+            print(f"  DUMP_EPNO pair(0,0)")
+            for a in range(min(n_pno, 10)):
+                print(f"  DUMP_EPNO[{a}]={e_pno[a]:.15e}")
+            compute_residual_v2._dump_done = True
 
     # === Section 5b: Quadratic T2 dressing of ring ===
     # NOT used when C_tilde/D_tilde include Term 4 (Jiang's formulation).

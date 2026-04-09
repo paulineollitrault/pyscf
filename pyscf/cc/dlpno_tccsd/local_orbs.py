@@ -101,38 +101,48 @@ def make_lmos(mf_or_mc, method='pipek-mezey', frozen=0):
     return C_lmo, C_lmo_full
 
 
-def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None):
+def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
+              T_CutMKN=0.0, doi_method='pao'):
     """Construct Projected Atomic Orbitals (PAOs) and per-LMO domains.
 
     PAOs are constructed by projecting the occupied MO space out of the AO
     basis, then normalized. This follows Eq. (1-5) of Riplinger & Neese 2013
     and Algorithm 1 of Jiang JCP 2024.
 
-    The domain of LMO i is determined by the Differential Overlap Integral
-    (DOI) threshold T_CutDO: AO μ belongs to domain(i) if
-        |C_lmo[μ,i]|² / sum_μ |C_lmo[μ,i]|² > T_CutDO
-    (simplified criterion based on LMO Mulliken populations).
+    Three domain assignment methods are available:
 
-    Note: The full Psi4 DLPNO code uses a numerical integration grid for DOI
-    integrals (Eq. 4 of Pinski 2015).  Here we use the simpler AO-coefficient
-    criterion which is equivalent up to the normalization of the AO basis and
-    is standard in ORCA/MOLPRO implementations.
+    doi_method='pao' (default, Jiang 2024):
+        Per-PAO differential overlap integral DOI_{i,mu} = (i mu|i mu)^{1/2}.
+        Computed via DF: DOI = ||B^Q_{iu}||_2. This is a Coulomb-weighted
+        integral and tends to give larger domains than grid-based DOI.
+
+    doi_method='grid' (Psi4-compatible):
+        Grid-based differential overlap integral:
+        DOI_{i,u} = sqrt( integral w(r) |phi_i(r)|^2 |phi_u(r)|^2 dr )
+        Computed on a DFT-style numerical grid. This matches Psi4's DOI
+        and gives physically compact domains. Atom completion is applied.
+
+    doi_method='mulliken' (ORCA-compatible):
+        Atom-based Mulliken population. Atom A is included in domain(i)
+        if sum_{mu in A} (C_lmo * S)_{mu,i}^2 > T_CutMKN.
+        All PAOs on included atoms enter the domain. This matches ORCA's
+        domain construction with TCutMKN.
 
     Args:
         mf_or_mc: RHF or CASSCF object (for mol and mo_coeff).
         C_lmo (np.ndarray): Shape (nao, nocc_active). LMO coefficients.
-        T_CutDO (float): Differential overlap threshold for PAO domain selection.
+        T_CutDO (float): Per-PAO DOI threshold (used when doi_method='pao').
         s1e (np.ndarray, optional): AO overlap matrix. Computed if not provided.
+        with_df: DF object for integral-based DOI (used when doi_method='pao').
+        T_CutMKN (float): Atom Mulliken population threshold (doi_method='mulliken').
+            ORCA TightPNO default: 1e-3.
+        doi_method (str): 'pao' for per-PAO DOI, 'mulliken' for atom-based Mulliken.
 
     Returns:
         C_pao (np.ndarray): Shape (nao, nao). PAO coefficients (all PAOs).
-            The PAOs are normalized but not orthogonalized globally; they form
-            a redundant, non-orthogonal basis.
         pao_domains (list of np.ndarray): pao_domains[i] is an integer array
             of the AO indices belonging to the domain of LMO i.
-        S_pao (np.ndarray): Shape (nao, nao). PAO overlap matrix S_pao[μν] =
-            <μ̃|ν̃> where μ̃ is the projected PAO. Needed for domain
-            orthogonalization in pno.py.
+        S_pao (np.ndarray): Shape (nao, nao). PAO overlap matrix.
         F_pao (np.ndarray): Shape (nao, nao). Fock matrix in PAO basis.
     """
     if hasattr(mf_or_mc, 'nelecas'):
@@ -178,28 +188,108 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None):
     fock_ao = mf.get_fock()
     F_pao = reduce(np.dot, (C_pao.T, fock_ao, C_pao))
 
-    # LMO domain assignment using per-PAO differential overlap integrals
-    # (Jiang et al. 2024, Eq 58):
-    #   DOI_{i,μ̃} = (iμ̃|iμ̃)^{1/2} = ||B^Q_{iμ̃}||₂
-    # PAO μ̃ is included in domain(i) if DOI > T_CutDO.
-    # When DF is available, this is computed exactly via 3-index integrals.
-    # Fallback: Löwdin population-based assignment.
+    # LMO domain assignment: select PAOs for each LMO's local virtual space.
 
     pao_domains = []
+    ao_labels = mol.ao_labels(fmt=False)
+    atom_ids = np.array([lbl[0] for lbl in ao_labels])
 
-    if with_df is not None and T_CutDO > 0:
-        # Per-PAO DOI via DF: compute ovL[i, μ̃, Q] between LMOs and PAOs
+    if doi_method == 'mulliken' and T_CutMKN > 0:
+        # ORCA-compatible atom-based Mulliken domain assignment.
+        # Atom A is in domain(i) if Mulliken_pop(A, LMO_i) > T_CutMKN.
+        # All PAOs centered on included atoms are added to the domain.
+        natom = mol.natm
+        # Mulliken population matrix: P_{mu,i} = C_lmo[mu,i] * (S @ C_lmo)[mu,i]
+        SC = np.dot(s1e, C_lmo)  # (nao, nocc)
+        for i in range(nocc_lmo):
+            pop_ao = C_lmo[:, i] * SC[:, i]   # (nao,) Mulliken AO populations
+            pop_atom = np.zeros(natom)
+            for a in range(natom):
+                pop_atom[a] = np.sum(pop_ao[atom_ids == a])
+            atoms_in = np.where(np.abs(pop_atom) > T_CutMKN)[0]
+            if len(atoms_in) == 0:
+                atoms_in = np.array([np.argmax(np.abs(pop_atom))])
+            domain_i = np.where(np.isin(atom_ids, atoms_in))[0]
+            pao_domains.append(domain_i)
+        log.info('Domain method: Mulliken atom (T_CutMKN=%.1e), '
+                 'avg atoms/LMO=%.1f, avg PAOs/LMO=%.1f',
+                 T_CutMKN,
+                 np.mean([len(np.unique(atom_ids[d])) for d in pao_domains]),
+                 np.mean([len(d) for d in pao_domains]))
+
+    elif T_CutDO > 0 and doi_method == 'grid':
+        # Grid-based DOI matching Psi4 (dlpnobase.cc compute_overlap_ints):
+        #   DOI_{i,u} = sqrt( integral w(r) |phi_i(r)|^2 |phi_u(r)|^2 dr )
+        # Uses a DFT-style numerical grid. Atom completion is applied after
+        # thresholding (if any PAO on an atom passes, all PAOs on that atom
+        # are included).
+        from pyscf.dft import gen_grid, numint
+        grids = gen_grid.Grids(mol)
+        grids.level = 1  # moderate grid, similar to Psi4 defaults
+        grids.build()
+
+        ao_labels = mol.ao_labels(fmt=False)
+        atom_ids_local = np.array([lbl[0] for lbl in ao_labels])
+
+        ni = numint.NumInt()
+        doi_iu = np.zeros((nocc_lmo, nao))
+
+        # Evaluate AO values on grid in blocks
+        for ao_val, mask, weight, coords in ni.block_loop(mol, grids, nao):
+            # ao_val: (npts, nao) AO values at grid points
+            # weight: (npts,) quadrature weights
+            npts = ao_val.shape[0]
+
+            # LMO values at grid points: phi_i(r) = sum_mu C_lmo[mu,i] * chi_mu(r)
+            lmo_vals = ao_val @ C_lmo  # (npts, nocc)
+            # PAO values at grid points: phi_u(r) = sum_mu C_pao[mu,u] * chi_mu(r)
+            pao_vals = ao_val @ C_pao  # (npts, nao)
+
+            # Square and weight: w(r) * |phi_i(r)|^2 and |phi_u(r)|^2
+            lmo_sq_w = lmo_vals ** 2 * weight[:, None]  # (npts, nocc)
+            pao_sq = pao_vals ** 2  # (npts, nao)
+
+            # Accumulate DOI^2 = sum_r w(r) |phi_i(r)|^2 |phi_u(r)|^2
+            doi_iu += lmo_sq_w.T @ pao_sq  # (nocc, nao)
+
+        doi_iu = np.sqrt(doi_iu)
+
+        for i in range(nocc_lmo):
+            doi = doi_iu[i]
+            pao_inds = np.where(doi > T_CutDO)[0]
+            if len(pao_inds) == 0:
+                pao_inds = np.array([np.argmax(doi)])
+            # Atom completion: if any PAO on atom passes, include all PAOs on that atom
+            atoms_in = np.unique(atom_ids_local[pao_inds])
+            domain_i = np.where(np.isin(atom_ids_local, atoms_in))[0]
+            pao_domains.append(domain_i)
+        log.info('Domain method: grid DOI (T_CutDO=%.1e), '
+                 'avg atoms/LMO=%.1f, avg PAOs/LMO=%.1f',
+                 T_CutDO,
+                 np.mean([len(np.unique(atom_ids_local[d])) for d in pao_domains]),
+                 np.mean([len(d) for d in pao_domains]))
+
+    elif with_df is not None and T_CutDO > 0 and doi_method == 'pao':
+        # Per-PAO DOI via DF (Jiang et al. 2024, Eq 58):
+        #   DOI_{i,μ̃} = (iμ̃|iμ̃)^{1/2} = ||B^Q_{iμ̃}||₂
+        # With atom completion: if ANY PAO on atom A passes the threshold,
+        # ALL PAOs on atom A are included (matches Jiang/Psi4 contract_lists).
         from pyscf.cc.dlpno_tccsd.pno import _build_ovL
         ovL_lmo_pao = _build_ovL(with_df, C_lmo, C_pao)  # (nocc, nao, naux)
 
+        ao_labels_df = mol.ao_labels(fmt=False)
+        atom_ids_df = np.array([lbl[0] for lbl in ao_labels_df])
         for i in range(nocc_lmo):
-            # DOI[μ̃] = sqrt(sum_Q ovL[i, μ̃, Q]²) = ||ovL[i,μ̃,:]||₂
             doi = np.sqrt(np.sum(ovL_lmo_pao[i] ** 2, axis=1))  # (nao,)
-            domain_i = np.where(doi > T_CutDO)[0]
-            if len(domain_i) == 0:
-                domain_i = np.array([np.argmax(doi)])
+            pao_inds = np.where(doi > T_CutDO)[0]
+            if len(pao_inds) == 0:
+                pao_inds = np.array([np.argmax(doi)])
+            # Atom completion: if any PAO on atom passes, include all on that atom
+            atoms_in = np.unique(atom_ids_df[pao_inds])
+            domain_i = np.where(np.isin(atom_ids_df, atoms_in))[0]
             pao_domains.append(domain_i)
         del ovL_lmo_pao
+
     else:
         # Fallback: Löwdin population-based (for when DF is not available)
         ao_labels = mol.ao_labels(fmt=False)
@@ -459,36 +549,139 @@ def pao_domain_union(pao_domains_i, pao_domains_j):
     return np.union1d(pao_domains_i, pao_domains_j)
 
 
-def orthogonalize_pao_domain(C_pao, S_pao, domain_idx, S_cut=1e-6):
-    """Orthogonalize PAOs within a given domain using canonical orthogonalization.
+def _pivoted_cholesky(S, tol=1e-8):
+    """Pivoted Cholesky decomposition to select important basis functions.
 
-    Removes near-linear dependencies (eigenvalues of S < S_cut).
+    Iteratively selects pivot indices (basis functions with largest residual
+    diagonal) until the residual falls below tol. Matches Psi4's
+    Matrix::pivoted_cholesky() used in PartialCholesky orthogonalization.
 
     Args:
-        C_pao (np.ndarray): Full PAO coefficient matrix (nao, nao).
-        S_pao (np.ndarray): Full PAO overlap matrix (nao, nao).
-        domain_idx (np.ndarray): Integer indices of PAOs in this domain.
-        S_cut (float): Threshold for removing near-linear dependencies.
+        S: (n, n) symmetric positive semi-definite overlap matrix.
+        tol: threshold for residual diagonal.
 
     Returns:
-        C_orth (np.ndarray): Shape (nao, n_orth). Orthogonal PAOs in AO basis.
-        X_orth (np.ndarray): Shape (n_domain, n_orth). Transformation from
-            domain PAOs to orthogonal basis.
+        pivots: sorted list of selected pivot indices.
     """
-    # Sub-block of PAO overlap within domain
+    n = S.shape[0]
+    d = np.diag(S).copy()
+    pivots = []
+    L = np.zeros((n, n))
+
+    for k in range(n):
+        idx = np.argmax(d)
+        if d[idx] < tol:
+            break
+        pivots.append(idx)
+        L[idx, k] = np.sqrt(d[idx])
+        for i in range(n):
+            if i == idx:
+                continue
+            L[i, k] = (S[i, idx] - np.dot(L[i, :k], L[idx, :k])) / L[idx, k]
+        d -= L[:, k] ** 2
+        d = np.maximum(d, 0.0)
+
+    return sorted(pivots)
+
+
+def orthogonalize_pao_domain(C_pao, S_pao, domain_idx, S_cut=1e-6,
+                             method='cholesky'):
+    """Orthogonalize PAOs within a domain.
+
+    Three methods available:
+    - 'canonical': standard eigenvalue-based orthogonalization (PySCF default)
+    - 'cholesky': pivoted Cholesky-based selection followed by canonical orth
+    - 'psi4': Exact Psi4 PartialCholesky algorithm. Matches
+      `BasisSetOrthogonalization::compute_partial_cholesky_orthog` in
+      `libmints/orthog.cc`. Steps:
+        1. Normalize the overlap matrix (S → S / sqrt(diag) outer-product)
+        2. Sort columns by INCREASING off-diagonal sum (low-overlap first)
+        3. LAPACK pivoted Cholesky (DPSTRF) with cutoff `S_cut`
+        4. Canonical orthogonalization on the reduced sub-matrix with
+           lindep_tol = 0 (Psi4 line 234: lindep_tolerance is 0.0)
+        5. Pad back to original ordering
+      This gives the EXACT same canonical PAO basis dimension as Psi4.
+
+    Args:
+        C_pao: (nao, npao) PAO coefficients.
+        S_pao: (npao, npao) PAO overlap matrix.
+        domain_idx: integer array of PAO indices in domain.
+        S_cut: threshold for removing linear dependencies.
+        method: 'canonical', 'cholesky', or 'psi4'.
+
+    Returns:
+        C_orth: (nao, n_orth) orthogonal PAOs in AO basis.
+        X_orth: (n_domain, n_orth) domain PAO → orth transformation.
+    """
     S_dom = S_pao[np.ix_(domain_idx, domain_idx)]
+    n_dom = len(domain_idx)
 
-    # Canonical orthogonalization: diagonalize S, keep eigenvectors > S_cut
-    eigvals, eigvecs = np.linalg.eigh(S_dom)
-    keep = eigvals > S_cut
-    if not np.any(keep):
-        # Degenerate domain — return empty
-        return np.zeros((C_pao.shape[0], 0)), np.zeros((len(domain_idx), 0))
+    if method == 'psi4':
+        # === Psi4 PartialCholesky exactly ===
+        from scipy.linalg.lapack import dpstrf
+        # 1. Normalize: S_norm[i,j] = S[i,j] / sqrt(S[i,i]*S[j,j])
+        diag = np.diag(S_dom).copy()
+        diag = np.where(diag > 0, diag, 1.0)
+        norm = 1.0 / np.sqrt(diag)
+        S_norm = S_dom * norm[:, None] * norm[None, :]
+        # 2. Sort columns by increasing off-diagonal sum
+        od = np.sum(np.abs(S_norm), axis=1) - np.abs(np.diag(S_norm))
+        order = np.argsort(od, kind='stable')
+        S_reord = S_norm[np.ix_(order, order)]
+        # 3. LAPACK pivoted Cholesky (DPSTRF) with tol = S_cut
+        c, piv, rank_c, info = dpstrf(S_reord.copy(), tol=S_cut, lower=1)
+        if rank_c == 0:
+            return np.zeros((C_pao.shape[0], 0)), np.zeros((n_dom, 0))
+        # piv is 1-indexed Fortran; convert to 0-indexed
+        cholesky_pivots_in_reord = (piv[:rank_c] - 1).tolist()
+        # Translate from reordered indices back to original domain indices
+        pivots = sorted(order[i] for i in cholesky_pivots_in_reord)
+        # 4. Build sub-overlap matrix on selected pivots
+        S_sub = S_norm[np.ix_(pivots, pivots)]
+        # Canonical orthogonalization with lindep_tol = 0 (keep all > 0)
+        eigvals, eigvecs = np.linalg.eigh(S_sub)
+        keep = eigvals > 0.0
+        if not np.any(keep):
+            return np.zeros((C_pao.shape[0], 0)), np.zeros((n_dom, 0))
+        X_sub = eigvecs[:, keep] / np.sqrt(eigvals[keep])
+        # 5. Pad back to full domain (in normalized basis)
+        X_orth = np.zeros((n_dom, X_sub.shape[1]))
+        for m in range(X_sub.shape[1]):
+            for k_idx, p in enumerate(pivots):
+                X_orth[p, m] = X_sub[k_idx, m]
+        # Unroll normalization: scale rows by 1/sqrt(diag) (Psi4 line 87-88)
+        X_orth = X_orth * norm[:, None]
 
-    X_orth = eigvecs[:, keep] / np.sqrt(eigvals[keep])[None, :]   # (n_dom, n_orth)
+    elif method == 'cholesky':
+        # Step 1: Pivoted Cholesky to select important PAOs
+        pivots = _pivoted_cholesky(S_dom, tol=S_cut)
+        n_chol = len(pivots)
+        if n_chol == 0:
+            return np.zeros((C_pao.shape[0], 0)), np.zeros((n_dom, 0))
 
-    # Orthogonal PAOs in AO basis: pick domain columns of C_pao, apply X_orth
-    C_dom = C_pao[:, domain_idx]   # (nao, n_domain)
-    C_orth = np.dot(C_dom, X_orth)  # (nao, n_orth)
+        # Step 2: Canonical orthogonalization of Cholesky subset
+        S_sub = S_dom[np.ix_(pivots, pivots)]
+        eigvals, eigvecs = np.linalg.eigh(S_sub)
+        keep = eigvals > S_cut
+        if not np.any(keep):
+            return np.zeros((C_pao.shape[0], 0)), np.zeros((n_dom, 0))
+        X_sub = eigvecs[:, keep] / np.sqrt(eigvals[keep])
+
+        # Step 3: Pad back to full domain
+        X_orth = np.zeros((n_dom, X_sub.shape[1]))
+        for m in range(X_sub.shape[1]):
+            for k_idx, p in enumerate(pivots):
+                X_orth[p, m] = X_sub[k_idx, m]
+
+    else:
+        # Standard canonical orthogonalization
+        eigvals, eigvecs = np.linalg.eigh(S_dom)
+        keep = eigvals > S_cut
+        if not np.any(keep):
+            return np.zeros((C_pao.shape[0], 0)), np.zeros((n_dom, 0))
+        X_orth = eigvecs[:, keep] / np.sqrt(eigvals[keep])
+
+    C_dom = C_pao[:, domain_idx]
+    C_orth = np.dot(C_dom, X_orth)
 
     return C_orth, X_orth

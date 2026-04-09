@@ -80,6 +80,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
                       use_jiang=False,
                       use_t1_iterations=False,
                       verbose=4,
+                      _C_lmo_override=None,
                       _pool=None):
     """Run DMRG-DLPNO-TCCSD(T), or plain DLPNO-CCSD(T) when ncas is None.
 
@@ -228,7 +229,10 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         from pyscf import lo
         nocc_full = np.count_nonzero(mf.mo_occ > 1e-10)
         C_occ = mo_init[:, n_frozen:nocc_full]
-        if C_occ.shape[1] > 1:
+        if _C_lmo_override is not None:
+            C_lmo = _C_lmo_override
+            log.info('Using externally provided LMOs (override)')
+        elif C_occ.shape[1] > 1:
             if lmo_method.lower() in ('pipek-mezey', 'pm'):
                 mlo = lo.PipekMezey(mol, C_occ)
             elif lmo_method.lower() == 'boys':
@@ -353,10 +357,12 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
 
     s1e = mf.get_ovlp()
     mf_or_mc = mf if no_cas else mc
-    # Use per-PAO DOI (Jiang Eq 58) when DF is available
+    # Use grid-based DOI to match Psi4 (Jiang Eq 58 PAO-based DOI gives
+    # much larger domains and is not compatible with Psi4's truncation).
     _with_df = getattr(mf, 'with_df', None)
     C_pao, pao_domains, S_pao, F_pao = make_paos(
-        mf_or_mc, C_lmo, T_CutDO=T_CutDO, s1e=s1e, with_df=_with_df)
+        mf_or_mc, C_lmo, T_CutDO=T_CutDO, s1e=s1e, with_df=_with_df,
+        doi_method='grid')
 
     nlmo = C_lmo.shape[1]
     domain_sizes = [len(pao_domains[i]) for i in range(nlmo)]

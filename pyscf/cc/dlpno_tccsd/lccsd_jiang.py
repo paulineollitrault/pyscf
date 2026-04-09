@@ -117,7 +117,7 @@ def build_dressed_ovL_cache(ovL_pno_bare, ooL_bare, t1_pno, pno_spaces,
 
 def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                     ovL_pno_bare, ooL_bare, S_pno_cache, with_df,
-                    _term2_precomputed=None):
+                    _term2_precomputed=None, cc_ints=None):
     """Compute C_tilde (gamma intermediate, Eq 83) for all pairs.
 
     C_tilde[ki][a_ki, c_ki] = gamma_{ki}^{ac} =
@@ -189,17 +189,31 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
 
         # --- Term 1: -Σ_l T1_all[l,a] · (ki|lc) ---
         # K_bar_chem[ki][l,c] = Σ_Q ooL[k,i,Q]*ovL_l_ki[c,Q] = (ki|lc)
-        ooL_ki = ooL_bare[k, i, :]  # (naux,)
         T1_all_ki = np.zeros((nocc, n_ki))
         for ll in range(nocc):
             T1_all_ki[ll] = _project_t1_to_pair(
                 t1_pno, ll, key_ki, S_pno_cache, pno_spaces)
-        # K_bar_chem[l, c] = ovL_l_ki @ ooL_ki
         K_bar_chem = np.zeros((nocc, n_ki))
-        for ll in range(nocc):
-            ovL_l_ki = ovL_pno_bare.get((key_ki, ll))
-            if ovL_l_ki is not None:
-                K_bar_chem[ll] = ovL_l_ki @ ooL_ki
+        if cc_ints is not None and key_ki in cc_ints and cc_ints[key_ki] is not None:
+            from pyscf.cc.dlpno_tccsd.local_df import get_local_ovL, get_local_ooL_vec
+            _ooL_ki = get_local_ooL_vec(cc_ints, k, i, key_ki)
+            if _ooL_ki is not None:
+                for ll in range(nocc):
+                    _ovL_l = get_local_ovL(cc_ints, key_ki, ll)
+                    if _ovL_l is not None:
+                        K_bar_chem[ll] = _ovL_l @ _ooL_ki
+            else:
+                ooL_ki = ooL_bare[k, i, :]
+                for ll in range(nocc):
+                    ovL_l_ki = ovL_pno_bare.get((key_ki, ll))
+                    if ovL_l_ki is not None:
+                        K_bar_chem[ll] = ovL_l_ki @ ooL_ki
+        else:
+            ooL_ki = ooL_bare[k, i, :]
+            for ll in range(nocc):
+                ovL_l_ki = ovL_pno_bare.get((key_ki, ll))
+                if ovL_l_ki is not None:
+                    K_bar_chem[ll] = ovL_l_ki @ ooL_ki
         C_tilde_ki -= T1_all_ki.T @ K_bar_chem  # (n_ki, n_ki)
 
         # --- Term 3: -Σ_l T1_l^a · (S @ K_kl @ T1_i_kl) ---
@@ -211,11 +225,23 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             if n_kl == 0:
                 continue
             # K_kl[a_kl, b_kl] = (ka|lb) = exchange in PNO_kl
-            ovL_k_kl = ovL_pno_bare.get((key_kl, k))
-            ovL_l_kl = ovL_pno_bare.get((key_kl, ll))
-            if ovL_k_kl is None or ovL_l_kl is None:
-                continue
-            K_kl = ovL_k_kl @ ovL_l_kl.T  # (n_kl, n_kl)
+            if cc_ints is not None:
+                from pyscf.cc.dlpno_tccsd.local_df import get_local_K
+                _K = get_local_K(cc_ints, key_kl, k, ll)
+                if _K is not None:
+                    K_kl = _K
+                else:
+                    ovL_k_kl = ovL_pno_bare.get((key_kl, k))
+                    ovL_l_kl = ovL_pno_bare.get((key_kl, ll))
+                    if ovL_k_kl is None or ovL_l_kl is None:
+                        continue
+                    K_kl = ovL_k_kl @ ovL_l_kl.T
+            else:
+                ovL_k_kl = ovL_pno_bare.get((key_kl, k))
+                ovL_l_kl = ovL_pno_bare.get((key_kl, ll))
+                if ovL_k_kl is None or ovL_l_kl is None:
+                    continue
+                K_kl = ovL_k_kl @ ovL_l_kl.T
 
             # T1_i projected to PNO_kl
             t1_i_kl = _project_t1_to_pair(t1_pno, i, key_kl, S_pno_cache, pno_spaces)
@@ -253,11 +279,23 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
 
             t2_li = t2_li_raw.T if ll > i else t2_li_raw
 
-            ovL_k_kl = ovL_pno_bare.get((key_kl, k))
-            ovL_l_kl = ovL_pno_bare.get((key_kl, ll))
-            if ovL_k_kl is None or ovL_l_kl is None:
-                continue
-            K_kl = ovL_k_kl @ ovL_l_kl.T
+            if cc_ints is not None:
+                from pyscf.cc.dlpno_tccsd.local_df import get_local_K
+                _K = get_local_K(cc_ints, key_kl, k, ll)
+                if _K is not None:
+                    K_kl = _K
+                else:
+                    ovL_k_kl = ovL_pno_bare.get((key_kl, k))
+                    ovL_l_kl = ovL_pno_bare.get((key_kl, ll))
+                    if ovL_k_kl is None or ovL_l_kl is None:
+                        continue
+                    K_kl = ovL_k_kl @ ovL_l_kl.T
+            else:
+                ovL_k_kl = ovL_pno_bare.get((key_kl, k))
+                ovL_l_kl = ovL_pno_bare.get((key_kl, ll))
+                if ovL_k_kl is None or ovL_l_kl is None:
+                    continue
+                K_kl = ovL_k_kl @ ovL_l_kl.T
 
             def _get_S_or_I(ka, kb, n_a):
                 if ka == kb:
