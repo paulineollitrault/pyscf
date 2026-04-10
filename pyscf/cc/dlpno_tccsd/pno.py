@@ -633,6 +633,9 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                 C_pao, S_pao, domain_ij, S_cut=S_cut_domain,
                 method='psi4')
             n_orth = C_orth_ij.shape[1]
+            if getattr(make_pnos, '_dump_n_orth', False):
+                print(f'NORTH pair({i},{j}): npao_raw={len(domain_ij)} '
+                      f'npao_ortho={n_orth}', flush=True)
 
             if n_orth == 0:
                 continue
@@ -645,7 +648,10 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                 if _lmo_aux_mask is not None:
                     # Local DF K matching Psi4 pno_transform():
                     # K = raw_i_orth^T @ J_local^{-1} @ raw_j_orth
-                    _pair_aux = np.where(_lmo_aux_mask[i] | _lmo_aux_mask[j])[0]
+                    if getattr(make_pnos, '_force_full_aux', False):
+                        _pair_aux = np.arange(_j2c.shape[0])
+                    else:
+                        _pair_aux = np.where(_lmo_aux_mask[i] | _lmo_aux_mask[j])[0]
                     # raw_i[a_dom, Q] = C_lmo[:,i]^T @ raw_half_pao[:, Q, a_dom]
                     _raw_i_dom = np.tensordot(C_lmo[:, i], _raw_half_pao[:, :, domain_ij],
                                               axes=([0], [0]))  # (naux, n_dom)
@@ -723,6 +729,9 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
 
         Tt_sc_init = 2.0 * T2_sc_init - T2_sc_init.T
         e_ij_init = np.einsum('ab,ab->', K_sc, Tt_sc_init)
+        if getattr(make_pnos, '_dump_e_ij_init', False):
+            print(f'EIJ_INIT pair({i},{j}): e_ij={e_ij_init:.10e} '
+                  f'norm_K={np.linalg.norm(K_sc):.4e}', flush=True)
 
         # Pair density from direct SC-MP2
         D_pair = np.dot(Tt_sc_init, T2_sc_init.T) + np.dot(Tt_sc_init.T, T2_sc_init)
@@ -953,6 +962,9 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         order = np.argsort(pno_occ)[::-1]  # value descending
         pno_occ = pno_occ[order]
         U_pno = U_pno[:, order]
+        if getattr(make_pnos, '_debug_pno_occ', False):
+            print(f'PNOOCC pair({i},{j}): n={len(pno_occ)} top: '
+                  f'{pno_occ[:5].tolist()}', flush=True)
 
         # Total pair energy (matching Psi4 line 848)
         e_ij = np.einsum('ab,ab->', K_pno, Tt)

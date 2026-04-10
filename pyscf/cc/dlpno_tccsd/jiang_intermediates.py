@@ -380,8 +380,29 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             T1_all_ik[mm] = _project_t1_to_pair(
                 t1_pno, mm, key_ik, S_pno_cache, pno_spaces)
 
-        # Term 2: from precomputed or batched computation
-        if _term2_precomputed and (i_idx, k_idx) in _term2_precomputed:
+        # Term 2: Psi4 lines 1791-1801 use K_tilde_chem[ki] × t1_i.
+        # K_tc[b, a*n+c] = Σ_Q k_Qa[Q,b] * Qab[Q,a,c]
+        # Part A: D[a,b] += 2 * Σ_{Q,c} k_Qa[Q,b] * Qab[Q,a,c] * t1_i[c]
+        # Part B: D[r,s] -= Σ_{Q,b} t1_i[b] * k_Qa[Q,b] * Qab[Q,s,r]
+        key_ki = (min(k_idx, i_idx), max(k_idx, i_idx))
+        if cc_ints is not None and key_ki in cc_ints and cc_ints[key_ki] is not None:
+            ci_ki = cc_ints[key_ki]
+            if key_ki[0] == k_idx:
+                k_Qa = ci_ki['i_Qa']
+            else:
+                k_Qa = ci_ki['j_Qa']
+            Qab_ki = ci_ki['Qab']
+            # Part A: D[a,b] += 2 * Σ_{Q,c} k_Qa[Q,b]*Qab[Q,a,c]*t1_i[c]
+            # z[Q,a] = Σ_c Qab[Q,a,c]*t1_i[c]
+            z_Qa = np.einsum('Qac,c->Qa', Qab_ki, t1_i_ik)
+            # D[a,b] += 2 * Σ_Q z_Qa[Q,a] * k_Qa[Q,b] = 2 * z_Qa.T @ k_Qa
+            D_tilde_ik += 2.0 * z_Qa.T @ k_Qa
+            # Part B: D[r,s] -= Σ_{Q,b} t1_i[b]*k_Qa[Q,b]*Qab[Q,s,r]
+            # w[Q] = Σ_b t1_i[b]*k_Qa[Q,b]
+            w = k_Qa @ t1_i_ik  # (n_local,)
+            # D[r,s] -= Σ_Q w[Q]*Qab[Q,s,r]
+            D_tilde_ik -= np.einsum('Q,Qsr->rs', w, Qab_ki)
+        elif _term2_precomputed and (i_idx, k_idx) in _term2_precomputed:
             D_tilde_ik += _term2_precomputed[(i_idx, k_idx)]
 
         # --- Term 1: -Σ_l T1_all[l,a] · M_{ik}^{lc} ---

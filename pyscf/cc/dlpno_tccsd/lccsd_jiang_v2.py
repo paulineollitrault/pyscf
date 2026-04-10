@@ -74,7 +74,8 @@ def compute_residual_v2(
 
     # === Symmetric buffer (K̃, A, B, E) ===
     R_sym = np.zeros((n_pno, n_pno))
-    _DEBUG_PTERM = getattr(compute_residual_v2, '_debug_pterm', False)
+    _DEBUG_PTERM = getattr(compute_residual_v2, '_debug_pterm', False) or \
+                   getattr(compute_residual_v2, '_debug_pterm_all', False)
 
     def _rms(M):
         return float(np.sqrt(np.mean(M*M)))
@@ -135,26 +136,22 @@ def compute_residual_v2(
         print(f"  PTERM pair({i},{j}): A_rms={_rms(A_term):.12f} R_KA={_rms(R_sym):.12f}")
 
     # --- B (Eq 77/82): Woooo with dressed β ---
+    # Psi4 uses BARE T2 (T_iajb_), NOT tau. See ccsd.cc line 2137.
     B_term = np.zeros((n_pno, n_pno))
     for key_kl, t2_kl in t2_pno_all.items():
         if t2_kl is None or t2_kl.shape[0] == 0:
             continue
         k, l = key_kl
-        tau_kl = t2_kl.copy()
-        if t1_pno is not None:
-            t1_k_kl = _project_t1_to_pair(t1_pno, k, key_kl, S_pno_cache, pno_spaces)
-            t1_l_kl = _project_t1_to_pair(t1_pno, l, key_kl, S_pno_cache, pno_spaces)
-            tau_kl += np.outer(t1_k_kl, t1_l_kl)
 
         S_proj = _get_S(key_kl)
-        tau_kl_proj = S_proj @ tau_kl @ S_proj.T
+        t2_kl_proj = S_proj @ t2_kl @ S_proj.T
 
         beta_kl = B_tilde[k, l]
         if k != l:
             beta_lk = B_tilde[l, k]
-            B_term += beta_kl * tau_kl_proj + beta_lk * tau_kl_proj.T
+            B_term += beta_kl * t2_kl_proj + beta_lk * t2_kl_proj.T
         else:
-            B_term += beta_kl * tau_kl_proj
+            B_term += beta_kl * t2_kl_proj
     R_sym += B_term
     if _DEBUG_PTERM:
         print(f"  PTERM pair({i},{j}): B_rms={_rms(B_term):.12f} R_KAB={_rms(R_sym):.12f}")
@@ -336,13 +333,21 @@ def compute_residual_v2(
                         if dt_j is not None:
                             S_ij_jk2 = _get_S(key_jk)
                             D_temp_j += S_ij_jk2 @ dt_j @ U_ik_proj.T
-                        # Bold for D_ji: L(jk|a_ij c_ik)
-                        ovL_j_d = ovL_bare.get((key, j))
-                        ovL_k_ik_d = ovL_bare.get((key_ik, k))
-                        J_ji = K_coul_cache.get((key, key_ik, j, k)) if K_coul_cache else None
-                        if ovL_j_d is not None and ovL_k_ik_d is not None and J_ji is not None:
-                            K_ji = ovL_j_d @ ovL_k_ik_d.T
-                            D_temp_j += (2.0*K_ji - J_ji) @ u_ik.T @ S_ij_ik2.T
+                        # Bold for D_ji: L(jk|a_ij c_ik) = 2K-J cross-domain
+                        # Use local DF cross-integrals (J_ji_ki, K_ji_ki) when available
+                        _ci_ij = cc_ints.get(key) if cc_ints is not None else None
+                        K_ji_local = _ci_ij.get('K_ji_ki', {}).get((key, k)) if _ci_ij else None
+                        J_ji_local = _ci_ij.get('J_ji_ki', {}).get((key, k)) if _ci_ij else None
+                        if K_ji_local is not None and J_ji_local is not None:
+                            D_temp_j += (2.0*K_ji_local - J_ji_local) @ u_ik.T @ S_ij_ik2.T
+                        else:
+                            # Fallback to global DF
+                            ovL_j_d = ovL_bare.get((key, j))
+                            ovL_k_ik_d = ovL_bare.get((key_ik, k))
+                            J_ji = K_coul_cache.get((key, key_ik, j, k)) if K_coul_cache else None
+                            if ovL_j_d is not None and ovL_k_ik_d is not None and J_ji is not None:
+                                K_ji = ovL_j_d @ ovL_k_ik_d.T
+                                D_temp_j += (2.0*K_ji - J_ji) @ u_ik.T @ S_ij_ik2.T
                         D_ji += 0.5 * D_temp_j
 
         D_term = D_ij + D_ji.T
@@ -378,7 +383,8 @@ def compute_residual_v2(
         print(f"  PTERM pair({i},{j}): G_ij_unsym_rms={_rms(G_ij):.12f} G_ji_unsym_rms={_rms(G_ji):.12f}")
         R_total = R_sym + Rn_ij
         print(f"  PTERM pair({i},{j}): Rn={_rms(Rn_ij):.12f} R_total={_rms(R_total):.12f}")
-    if _DEBUG_PTERM and not getattr(compute_residual_v2, '_dump_done', False):
+    if _DEBUG_PTERM and not getattr(compute_residual_v2, '_dump_done', False) and \
+       not getattr(compute_residual_v2, '_debug_pterm_all', False):
         if i == 0 and j == 0:
             print(f"  DUMP_R2 pair(0,0) npno={n_pno}")
             for a in range(min(n_pno, 5)):

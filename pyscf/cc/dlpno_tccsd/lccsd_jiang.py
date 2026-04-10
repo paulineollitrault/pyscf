@@ -183,8 +183,19 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
 
         C_tilde_ki = np.zeros((n_ki, n_ki))
 
-        # Term 2 from precomputed or batched computation
-        if (k, i) in _term2_precomputed:
+        # Term 2: Σ_b t1_i^b · (kb|ac) = Σ_{Q,b} t1_i[b]*k_Qa[Q,b]*Qab[Q,a,c]
+        # Use local DF when cc_ints available, otherwise precomputed (global DF)
+        if cc_ints is not None and key_ki in cc_ints and cc_ints[key_ki] is not None:
+            ci_ki = cc_ints[key_ki]
+            if key_ki[0] == k:
+                k_Qa = ci_ki['i_Qa']
+            else:
+                k_Qa = ci_ki['j_Qa']
+            Qab_ki = ci_ki['Qab']
+            t1_i_ki = _project_t1_to_pair(t1_pno, i, key_ki, S_pno_cache, pno_spaces)
+            z = k_Qa @ t1_i_ki
+            C_tilde_ki += np.einsum('Q,Qac->ac', z, Qab_ki)
+        elif (k, i) in _term2_precomputed:
             C_tilde_ki += _term2_precomputed[(k, i)]
 
         # --- Term 1: -Σ_l T1_all[l,a] · (ki|lc) ---

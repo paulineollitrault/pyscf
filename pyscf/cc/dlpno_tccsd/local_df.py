@@ -201,6 +201,31 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
             K_ij_kj_dict[(key, k)] = q_iv.T @ q_kv_kj  # (npno, n_kj)
             del tmp_kj, raw_cross
 
+        # Also build cross-pair integrals from j-side: (j*a_ij | k*c_ki)
+        # Needed for D_ji bold term, matching Psi4's K_ij_kj_[ji][k].
+        # These use pair (i,j)'s local fitting (same J^{-1/2}).
+        J_ji_ki = {}
+        K_ji_ki_dict = {}
+        for k in range(nocc):
+            key_ki = (min(k, i), max(k, i))
+            if key_ki not in key_set or key_ki not in pno_spaces:
+                continue
+            C_pno_ki = pno_spaces[key_ki]['C_pno']
+            n_ki = C_pno_ki.shape[1]
+            if n_ki == 0:
+                continue
+            tmp_ki = np.tensordot(raw_3c, C_pno_ki, axes=([1], [0]))
+            raw_cross_ji = np.tensordot(C_pno, tmp_ki, axes=([0], [0]))
+            cross_local_ji = jhi @ raw_cross_ji[:, aux_idx, :].transpose(1, 0, 2).reshape(
+                len(aux_idx), npno * n_ki)
+            cross_fitted_ji = cross_local_ji.reshape(n_local, npno, n_ki)
+            q_jk = jhi @ raw_oo[j, k, aux_idx]
+            J_ji_ki[(key, k)] = np.einsum('Q,Qac->ac', q_jk, cross_fitted_ji)
+            raw_kv_ki = np.tensordot(C_lmo[:, k], tmp_ki, axes=([0], [0]))
+            q_kv_ki = jhi @ raw_kv_ki[aux_idx]
+            K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki  # (npno, n_ki)
+            del tmp_ki, raw_cross_ji
+
         cc_ints[key] = {
             'K_iajb': K_iajb,
             'K_mnij': K_mnij,
@@ -210,6 +235,8 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
             'J_ijab': J_ijab,
             'J_ij_kj': J_ij_kj,
             'K_ij_kj': K_ij_kj_dict,
+            'J_ji_ki': J_ji_ki,       # j-side cross-pair: (j*a_ij | k*c_ki)
+            'K_ji_ki': K_ji_ki_dict,
             # 3-index (stored for T1 dressing and Term A)
             'i_Qa': q_iv.copy(),     # (n_local, npno) — Psi4 convention
             'j_Qa': q_jv.copy(),     # (n_local, npno)
@@ -351,21 +378,14 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
         Y = np.einsum('Qab,nb->Qan', Qab, T1_all)  # (n_local, npno, nocc)
         Fab -= np.einsum('Qan,Qnc->ac', Y, Qma)
 
-        # Eq 97: Fab -= T1_all^T @ (fov + Fia_bar)
-        # Vectorized Fia_bar:
-        # Fia_bar[k,a] = 2*(Qma[:,k,:].T @ gamma) - Σ_n Qma[:,n,:].T @ (T1[n] @ Qma[:,k,:].T)
-        # J part: 2 * einsum('Qka,Q->ka', Qma, gamma)
-        # K part: -einsum('Qna,nb,Qkb->ka', Qma, T1_all, Qma)
+        # Psi4 ccsd.cc line 1639-1640:
+        #   Fab_[ij] = Fab_bar[ij] - T_n.T @ Fia_bar[ij]
+        # Fia_bar[k,a] = 2*gamma*Qma[k,a] - Qma@T_n.T@Qma  (lines 1602-1628)
         Fia_bar = 2.0 * np.einsum('Qka,Q->ka', Qma, gamma)
-        # Z[Q,n,k] = Σ_b T1[n,b]*Qma[Q,k,b] = einsum('nb,Qkb->Qnk', T1, Qma)
         Z = np.einsum('nb,Qkb->Qnk', T1_all, Qma)
         Fia_bar -= np.einsum('Qna,Qnk->ka', Qma, Z)
 
-        fov_all = np.zeros((nocc, npno))
-        for k in range(nocc):
-            fov_all[k] = _project_t1_to_pair(
-                fov_pno, k, key, S_pno_cache, pno_spaces)
-        Fab -= T1_all.T @ (fov_all + Fia_bar)
+        Fab -= T1_all.T @ Fia_bar
 
         Fab_all[key] = Fab
 
@@ -388,12 +408,35 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
         Fia_bar_jj = 2.0 * np.einsum('Qka,Q->ka', Qma_jj, gamma)
         Z_jj = np.einsum('nb,Qkb->Qnk', T1_all, Qma_jj)
         Fia_bar_jj -= np.einsum('Qna,Qnk->ka', Qma_jj, Z_jj)
-        fov_all = np.zeros((nocc, npno))
-        for k in range(nocc):
-            fov_all[k] = _project_t1_to_pair(
-                fov_pno, k, key_jj, S_pno_cache, pno_spaces)
+        # Psi4 ccsd.cc line 1621: Fkj_(i,j) += Fia_bar[jj](i,:) . T_ia[j]
         for i_idx in range(nocc):
-            Fkj[i_idx, j_idx] += np.dot(fov_all[i_idx] + Fia_bar_jj[i_idx], t1_j)
+            Fkj[i_idx, j_idx] += np.dot(Fia_bar_jj[i_idx], t1_j)
+
+    if getattr(t1_fock, '_dump_fkj', False):
+        Fkj_step1 = Fkj - F_lmo  # Step 1 only (before Step 2 was added above)
+        # Wait - Step 2 already added. Need to separate.
+        # Recompute Step 2 contribution
+        Fkj_step2 = np.zeros_like(Fkj)
+        for j_idx2 in range(nocc):
+            key_jj2 = (j_idx2, j_idx2)
+            ci2 = cc_ints.get(key_jj2)
+            if ci2 is None: continue
+            t1_j2 = t1_pno.get(j_idx2)
+            if t1_j2 is None or t1_j2.size == 0: continue
+            npno2 = pno_spaces[key_jj2]['C_pno'].shape[1]
+            T1_all2 = np.zeros((nocc, npno2))
+            for k2 in range(nocc):
+                T1_all2[k2] = _project_t1_to_pair(t1_pno, k2, key_jj2, S_pno_cache, pno_spaces)
+            gamma2 = np.einsum('ma,Qma->Q', T1_all2, ci2['Qma'])
+            Fia_bar2 = 2.0 * np.einsum('Qka,Q->ka', ci2['Qma'], gamma2)
+            Z2 = np.einsum('nb,Qkb->Qnk', T1_all2, ci2['Qma'])
+            Fia_bar2 -= np.einsum('Qna,Qnk->ka', ci2['Qma'], Z2)
+            for i_idx2 in range(nocc):
+                Fkj_step2[i_idx2, j_idx2] = np.dot(Fia_bar2[i_idx2], t1_j2)
+        step1_only = Fkj - F_lmo - Fkj_step2
+        print(f"  FKJ_DBG: Step1 [0,1]={step1_only[0,1]:.12e} [1,0]={step1_only[1,0]:.12e}", flush=True)
+        print(f"  FKJ_DBG: Step2 [0,1]={Fkj_step2[0,1]:.12e} [1,0]={Fkj_step2[1,0]:.12e}", flush=True)
+        print(f"  FKJ_DBG: Total [0,1]={(Fkj-F_lmo)[0,1]:.12e} [1,0]={(Fkj-F_lmo)[1,0]:.12e}", flush=True)
 
     foo_t1 = Fkj - F_lmo
     # NOTE: Psi4's Fkj_ does NOT include foo_t2. The T2 contribution to G_tilde
@@ -430,7 +473,6 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
                 t1_pno, k, key, S_pno_cache, pno_spaces)
     t1_i = T1_all[i]
     t1_j = T1_all[j]
-    tau = t2_pno_all[key] + np.outer(t1_i, t1_j)
 
     # i_Qk_t1[Q, k] = i_Qk[Q,k] + Σ_a Qma[Q,k,a] * t1_i[a]
     i_Qk_t1 = ci['i_Qk'].copy()  # (n_local, nocc)
@@ -442,14 +484,11 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
     # J_oo_dressed[k,l] = i_Qk_t1[Q,k] * j_Qk_t1[Q,l]
     B_tilde = i_Qk_t1.T @ j_Qk_t1  # (nocc, nocc)
 
-    # voov: B[k,l] += Σ_{a,b,Q} tau[a,b] * ovL_k[a,Q] * ovL_l[b,Q]
-    # Vectorized: P[k,b,Q] = Σ_a tau[a,b] * Qma[Q,k,a] = (Qma * tau).sum
-    # B[k,l] = Σ_{b,Q} P[k,b,Q] * Qma[Q,l,b]
-    # Qma is (n_local, nocc, npno)
-    # P[k,b,Q] = einsum('ab,Qka->kbQ', tau, Qma)
-    # B[k,l] = einsum('kbQ,Qlb->kl', P, Qma)
+    # voov: B[k,l] += Σ_{Q} Qma[Q,k,:] @ T2 @ Qma[Q,l,:].T
+    # Psi4 ccsd.cc line 1685: uses bare T_iajb, NOT tau
+    T2_ij = t2_pno_all[key]
     Qma_arr = ci['Qma']  # (n_local, nocc, npno)
-    P = np.einsum('ab,Qka->kbQ', tau, Qma_arr)  # (nocc, npno, n_local)
+    P = np.einsum('ab,Qka->kbQ', T2_ij, Qma_arr)  # (nocc, npno, n_local)
     B_tilde += np.einsum('kbQ,Qlb->kl', P, Qma_arr)
 
     return B_tilde
@@ -487,8 +526,15 @@ def compute_ladder(cc_ints, t2_pno_all, t1_pno, pno_spaces,
     # So Qab_t1[Q] = Qab[Q] - T1_all.T @ Qma[Q]
     # Vectorized: Qab_t1 = Qab - einsum('na,Qnb->Qab', T1_all, Qma)
     Qab_t1 = Qab - np.einsum('na,Qnb->Qab', T1_all, Qma)
+    if getattr(compute_ladder, '_dump_debug', False) and (i,j) in [(0,1),(2,3)]:
+        t1_norm = np.linalg.norm(T1_all)
+        t2_norm = np.linalg.norm(T2_ij)
+        ladder_norm = np.linalg.norm(Qab_t1)
+        print(f"  LADDER_DBG pair({i},{j}): |T1|={t1_norm:.10f} "
+              f"|T2|={t2_norm:.10f} |Qab_t1|={ladder_norm:.10f} "
+              f"T2[0,0]={T2_ij[0,0]:.12e} T2[0,1]={T2_ij[0,1]:.12e} T2[1,1]={T2_ij[1,1]:.12e}",
+              flush=True)
     # ladder = Σ_Q Qab_t1[Q] @ T2 @ Qab_t1[Q].T
-    # = einsum('Qac,cd,Qbd->ab', Qab_t1, T2, Qab_t1)
-    X = np.einsum('Qac,cd->Qad', Qab_t1, T2_ij)  # (n_local, npno, npno)
+    X = np.einsum('Qac,cd->Qad', Qab_t1, T2_ij)
     ladder = np.einsum('Qad,Qbd->ab', X, Qab_t1)
     return ladder
