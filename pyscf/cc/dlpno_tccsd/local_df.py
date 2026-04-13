@@ -106,6 +106,18 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
     raw_oo = raw_oo.transpose(0, 2, 1)  # (nocc, nocc, naux) = raw(k, l, Q)
     del tmp_oo
 
+    # Precompute tmp_pno[key] = (raw_3c @ C_pno_key) once per unique key.
+    # Reused as the host pair's tmp_pno AND for cross-pair tmp_kj/tmp_ki below.
+    # This avoids recomputing the same tensordot ~13 times per outer pair.
+    tmp_pno_cache = {}
+    for key in keys:
+        if key not in pair_aux_idx:
+            continue
+        C_pno_k = pno_spaces[key]['C_pno']
+        if C_pno_k.shape[1] == 0:
+            continue
+        tmp_pno_cache[key] = np.tensordot(raw_3c, C_pno_k, axes=([1], [0]))
+
     cc_ints = {}
     for key in keys:
         i, j = key
@@ -128,7 +140,7 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
         jhi = (eigvecs[:, keep] * (1.0 / np.sqrt(eigvals[keep]))) @ eigvecs[:, keep].T
 
         # Half-transform raw_3c with C_pno: tmp[mu, Q, a] = raw_3c @ C_pno
-        tmp_pno = np.tensordot(raw_3c, C_pno, axes=([1], [0]))  # (nao, naux, npno)
+        tmp_pno = tmp_pno_cache[key]  # (nao, naux, npno)
 
         # --- Build raw integrals and apply local J^{-1/2} ---
 
@@ -157,7 +169,7 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
         for a in range(npno):
             Qab[:, a, :] = jhi @ raw_ab[a, aux_idx, :]
 
-        del tmp_pno, raw_iv, raw_jv, raw_ma, raw_ab
+        del raw_iv, raw_jv, raw_ma, raw_ab
 
         # --- Build 2-index intermediates ---
         K_iajb = q_iv.T @ q_jv           # (npno, npno)
@@ -182,9 +194,8 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
             if n_kj == 0:
                 continue
 
-            # Cross-pair vvL: C_pno_kj^T @ tmp_pno_for_ij → but tmp_pno is deleted
-            # Recompute cross vvL from raw_3c
-            tmp_kj = np.tensordot(raw_3c, C_pno_kj, axes=([1], [0]))  # (nao, naux, n_kj)
+            # Cross-pair vvL: reuse cached tmp_pno_kj = raw_3c @ C_pno_kj
+            tmp_kj = tmp_pno_cache[key_kj]  # (nao, naux, n_kj)
             raw_cross = np.tensordot(C_pno, tmp_kj, axes=([0], [0]))   # (npno, naux, n_kj)
             # J: Σ_Q ooL_fitted[i,k,Q] * cross_fitted[Q, a, c]
             cross_local = jhi @ raw_cross[:, aux_idx, :].transpose(1, 0, 2).reshape(
@@ -199,11 +210,11 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
             raw_kv_kj = np.tensordot(C_lmo[:, k], tmp_kj, axes=([0], [0]))  # (naux, n_kj)
             q_kv_kj = jhi @ raw_kv_kj[aux_idx]  # (n_local, n_kj)
             K_ij_kj_dict[(key, k)] = q_iv.T @ q_kv_kj  # (npno, n_kj)
-            del tmp_kj, raw_cross
+            del raw_cross
 
-        # Also build cross-pair integrals from j-side: (j*a_ij | k*c_ki)
+        # Build cross-pair integrals from j-side: (j*a_ij | k*c_ki)
         # Needed for D_ji bold term, matching Psi4's K_ij_kj_[ji][k].
-        # These use pair (i,j)'s local fitting (same J^{-1/2}).
+        # Reuse the tmp_ki computation by caching.
         J_ji_ki = {}
         K_ji_ki_dict = {}
         for k in range(nocc):
@@ -214,7 +225,8 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
             n_ki = C_pno_ki.shape[1]
             if n_ki == 0:
                 continue
-            tmp_ki = np.tensordot(raw_3c, C_pno_ki, axes=([1], [0]))
+            # Build cross 3-index: reuse cached tmp_pno_ki = raw_3c @ C_pno_ki
+            tmp_ki = tmp_pno_cache[key_ki]
             raw_cross_ji = np.tensordot(C_pno, tmp_ki, axes=([0], [0]))
             cross_local_ji = jhi @ raw_cross_ji[:, aux_idx, :].transpose(1, 0, 2).reshape(
                 len(aux_idx), npno * n_ki)
@@ -223,8 +235,8 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
             J_ji_ki[(key, k)] = np.einsum('Q,Qac->ac', q_jk, cross_fitted_ji)
             raw_kv_ki = np.tensordot(C_lmo[:, k], tmp_ki, axes=([0], [0]))
             q_kv_ki = jhi @ raw_kv_ki[aux_idx]
-            K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki  # (npno, n_ki)
-            del tmp_ki, raw_cross_ji
+            K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki
+            del raw_cross_ji
 
         cc_ints[key] = {
             'K_iajb': K_iajb,
@@ -235,7 +247,7 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
             'J_ijab': J_ijab,
             'J_ij_kj': J_ij_kj,
             'K_ij_kj': K_ij_kj_dict,
-            'J_ji_ki': J_ji_ki,       # j-side cross-pair: (j*a_ij | k*c_ki)
+            'J_ji_ki': J_ji_ki,
             'K_ji_ki': K_ji_ki_dict,
             # 3-index (stored for T1 dressing and Term A)
             'i_Qa': q_iv.copy(),     # (n_local, npno) — Psi4 convention
@@ -248,7 +260,7 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
             'aux_idx': aux_idx,
         }
 
-    del raw_3c, raw_oo
+    del raw_3c, raw_oo, tmp_pno_cache
     return cc_ints
 
 

@@ -117,7 +117,8 @@ def build_dressed_ovL_cache(ovL_pno_bare, ooL_bare, t1_pno, pno_spaces,
 
 def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                     ovL_pno_bare, ooL_bare, S_pno_cache, with_df,
-                    _term2_precomputed=None, cc_ints=None):
+                    _term2_precomputed=None, cc_ints=None,
+                    pair_lmo_idx=None):
     """Compute C_tilde (gamma intermediate, Eq 83) for all pairs.
 
     C_tilde[ki][a_ki, c_ki] = gamma_{ki}^{ac} =
@@ -225,10 +226,24 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                 ovL_l_ki = ovL_pno_bare.get((key_ki, ll))
                 if ovL_l_ki is not None:
                     K_bar_chem[ll] = ovL_l_ki @ ooL_ki
+        # Psi4 line 1722 restricts the contraction over l to lmopair_to_lmos_[ki]
+        # (T_n_ij_[ki] has shape (nlmo_ki, npno_ki)).
+        _domain_ki = (set(pair_lmo_idx[key_ki].tolist())
+                      if pair_lmo_idx is not None and key_ki in pair_lmo_idx
+                      else set(range(nocc)))
+        if _domain_ki != set(range(nocc)):
+            _mask = np.zeros(nocc, dtype=bool)
+            for _l in _domain_ki:
+                _mask[_l] = True
+            T1_all_ki[~_mask] = 0.0
+            K_bar_chem[~_mask] = 0.0
         C_tilde_ki -= T1_all_ki.T @ K_bar_chem  # (n_ki, n_ki)
 
         # --- Term 3: -Σ_l T1_l^a · (S @ K_kl @ T1_i_kl) ---
+        # Psi4 restricts l to lmopair_to_lmos_[ki] (ccsd.cc:1724)
         for ll in range(nocc):
+            if ll not in _domain_ki:
+                continue
             key_kl = (min(k, ll), max(k, ll))
             if key_kl not in pno_spaces:
                 continue
@@ -275,7 +290,10 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             C_tilde_ki -= np.outer(t1_l_ki, Kt1_ki)
 
         # --- Term 4: -(1/2) Σ_l S @ t2_li @ S @ K_kl @ S ---
+        # Psi4 restricts l to lmopair_to_lmos_[ki] (ccsd.cc:1736)
         for ll in range(nocc):
+            if ll not in _domain_ki:
+                continue
             key_li = (min(ll, i), max(ll, i))
             key_kl = (min(k, ll), max(k, ll))
             if key_li not in t2_pno_all or key_kl not in pno_spaces:

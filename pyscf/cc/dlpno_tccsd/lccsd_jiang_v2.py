@@ -40,6 +40,7 @@ def compute_residual_v2(
         ladder_precomputed=None,
         K_dressed_override=None,
         cc_ints=None,
+        pair_domain=None,
 ):
     """Compute T2 residual following Psi4 ccsd.cc lines 2052-2221 exactly.
 
@@ -72,10 +73,17 @@ def compute_residual_v2(
 
     t2_ij = t2_pno_all[key]
 
+    # Pair LMO domain: Psi4 restricts k/l loops to lmopair_to_lmos_[ij]
+    if pair_domain is not None:
+        _domain_set = set(pair_domain)
+    else:
+        _domain_set = set(range(nocc))
+
     # === Symmetric buffer (K̃, A, B, E) ===
     R_sym = np.zeros((n_pno, n_pno))
     _DEBUG_PTERM = getattr(compute_residual_v2, '_debug_pterm', False) or \
                    getattr(compute_residual_v2, '_debug_pterm_all', False)
+    _ITER = getattr(compute_residual_v2, '_iter', 0)
 
     def _rms(M):
         return float(np.sqrt(np.mean(M*M)))
@@ -91,7 +99,7 @@ def compute_residual_v2(
             K_term += ovL_i_d @ ovL_j_d.T
     R_sym += K_term
     if _DEBUG_PTERM:
-        print(f"  PTERM pair({i},{j}): K_rms={_rms(K_term):.12f} R_K={_rms(R_sym):.12f}")
+        print(f"  PTERM iter {_ITER} pair({i},{j}): K_rms={_rms(K_term):.12f} R_K={_rms(R_sym):.12f}")
 
     # --- A (Eq 76): dressed ladder ---
     # B̃_{ab} = B_{ab} - Σ_k T1_all[k,a]*ovL_k[b,Q] (Eq 93)
@@ -133,7 +141,7 @@ def compute_residual_v2(
         R_sym += ladder
         A_term = ladder
     if _DEBUG_PTERM:
-        print(f"  PTERM pair({i},{j}): A_rms={_rms(A_term):.12f} R_KA={_rms(R_sym):.12f}")
+        print(f"  PTERM iter {_ITER} pair({i},{j}): A_rms={_rms(A_term):.12f} R_KA={_rms(R_sym):.12f}")
 
     # --- B (Eq 77/82): Woooo with dressed β ---
     # Psi4 uses BARE T2 (T_iajb_), NOT tau. See ccsd.cc line 2137.
@@ -142,6 +150,8 @@ def compute_residual_v2(
         if t2_kl is None or t2_kl.shape[0] == 0:
             continue
         k, l = key_kl
+        if k not in _domain_set or l not in _domain_set:
+            continue
 
         S_proj = _get_S(key_kl)
         t2_kl_proj = S_proj @ t2_kl @ S_proj.T
@@ -154,7 +164,7 @@ def compute_residual_v2(
             B_term += beta_kl * t2_kl_proj
     R_sym += B_term
     if _DEBUG_PTERM:
-        print(f"  PTERM pair({i},{j}): B_rms={_rms(B_term):.12f} R_KAB={_rms(R_sym):.12f}")
+        print(f"  PTERM iter {_ITER} pair({i},{j}): B_rms={_rms(B_term):.12f} R_KAB={_rms(R_sym):.12f}")
 
     # --- E (Eq 80): t2 × F̃̃_{ab} ---
     # E_tilde = Fab_[ij] - Σ_kl S @ u_kl × K_kl @ S
@@ -176,24 +186,16 @@ def compute_residual_v2(
         if t2_kl is None or t2_kl.shape[0] == 0:
             continue
         k, l = key_kl
+        if k not in _domain_set or l not in _domain_set:
+            continue
         u_kl = 2.0 * t2_kl - t2_kl.T
-        if cc_ints is not None:
-            from pyscf.cc.dlpno_tccsd.local_df import get_local_K
-            _K = get_local_K(cc_ints, key_kl, k, l)
-            if _K is not None:
-                K_kl = _K
-            else:
-                ovL_k_kl = ovL_bare.get((key_kl, k))
-                ovL_l_kl = ovL_bare.get((key_kl, l))
-                if ovL_k_kl is None or ovL_l_kl is None:
-                    continue
-                K_kl = ovL_k_kl @ ovL_l_kl.T
-        else:
-            ovL_k_kl = ovL_bare.get((key_kl, k))
-            ovL_l_kl = ovL_bare.get((key_kl, l))
-            if ovL_k_kl is None or ovL_l_kl is None:
-                continue
-            K_kl = ovL_k_kl @ ovL_l_kl.T
+        # Use ONLY local DF — Psi4's K_iajb is always local DF
+        from pyscf.cc.dlpno_tccsd.local_df import get_local_K
+        _K = get_local_K(cc_ints, key_kl, k, l) if cc_ints is not None else None
+        if _K is None:
+            print(f"WARN: No local DF K for pair {key_kl}, skipping E contribution")
+            continue
+        K_kl = _K
         S_kl_ij = _get_S(key_kl)
         # (k,l) contribution
         E_tilde -= S_kl_ij @ (u_kl @ K_kl.T) @ S_kl_ij.T
@@ -202,7 +204,7 @@ def compute_residual_v2(
             E_tilde -= S_kl_ij @ ((2.0*t2_kl.T - t2_kl) @ K_kl) @ S_kl_ij.T
 
     if _DEBUG_PTERM:
-        print(f"  PTERM pair({i},{j}): Etilde_rms={_rms(E_tilde):.12f}")
+        print(f"  PTERM iter {_ITER} pair({i},{j}): Etilde_rms={_rms(E_tilde):.12f}")
         # Decompose: Fab and the subtraction
         E_tilde_diag = np.diag(E_tilde)
         Fab_diag = np.diag(Fab_ij)
@@ -213,7 +215,7 @@ def compute_residual_v2(
     E_term = t2_ij @ E_tilde.T + E_tilde @ t2_ij
     R_sym += E_term
     if _DEBUG_PTERM:
-        print(f"  PTERM pair({i},{j}): E_rms={_rms(E_term):.12f} R_KABE={_rms(R_sym):.12f}")
+        print(f"  PTERM iter {_ITER} pair({i},{j}): E_rms={_rms(E_term):.12f} R_KABE={_rms(R_sym):.12f}")
 
     # === Non-symmetric terms (C, D, G) ===
     # Compute C_ij and C_ji in one pass, then form the full P̂ result.
@@ -226,7 +228,7 @@ def compute_residual_v2(
     if C_tilde_cache is not None and not _SKIP_C:
         C_ij = np.zeros((n_pno, n_pno))
         C_ji = np.zeros((n_pno, n_pno))
-        for k in range(nocc):
+        for k in sorted(_domain_set):
             # --- C_ij: gamma(ki) × t2(kj) ---
             key_ik = (min(i, k), max(i, k))
             key_kj = (min(k, j), max(k, j))
@@ -260,8 +262,17 @@ def compute_residual_v2(
                     t2_ki = t2_ki_raw.T if k > i else t2_ki_raw
                     n_ki = t2_ki.shape[0]
                     gamma_ji = np.zeros((n_pno, n_ki))
-                    # Bold: J(jk|a_ij c_ki) = KC[(key_ij, key_ki, j, k)]
-                    if K_coul_cache:
+                    # Bold: J(jk|a_ij c_ki) — use LOCAL DF (J_ji_ki) when
+                    # available so it matches Psi4's J_ij_kj_[(j,i)][k_ij]
+                    # (fitted with pair ij's local aux metric).  Falling back
+                    # to global DF (K_coul_cache) introduces small systematic
+                    # differences vs the other bold terms which use local DF.
+                    _ci_ij_c = cc_ints.get(key) if cc_ints is not None else None
+                    J_ji_local_c = (_ci_ij_c.get('J_ji_ki', {}).get((key, k))
+                                    if _ci_ij_c else None)
+                    if J_ji_local_c is not None:
+                        gamma_ji += J_ji_local_c
+                    elif K_coul_cache:
                         J_b_ji = K_coul_cache.get((key, key_ki, j, k))
                         if J_b_ji is not None:
                             gamma_ji += J_b_ji
@@ -283,7 +294,7 @@ def compute_residual_v2(
         if _DEBUG_PTERM:
             # Print C_ij and C_ji separately to compare with Psi4 (which prints
             # the unsymmetrized C_ij per ordered pair).
-            print(f"  PTERM pair({i},{j}): C_ij_unsym_rms={_rms(C_ij):.12f} C_ji_unsym_rms={_rms(C_ji):.12f}")
+            print(f"  PTERM iter {_ITER} pair({i},{j}): C_ij_unsym_rms={_rms(C_ij):.12f} C_ji_unsym_rms={_rms(C_ji):.12f}")
     else:
         C_term = np.zeros((n_pno, n_pno))
 
@@ -292,7 +303,7 @@ def compute_residual_v2(
     if D_tilde_cache is not None and not _SKIP_D:
         D_ij = np.zeros((n_pno, n_pno))
         D_ji = np.zeros((n_pno, n_pno))
-        for k in range(nocc):
+        for k in sorted(_domain_set):
             key_ik = (min(i, k), max(i, k))
             key_jk = (min(j, k), max(j, k))
 
@@ -334,26 +345,18 @@ def compute_residual_v2(
                             S_ij_jk2 = _get_S(key_jk)
                             D_temp_j += S_ij_jk2 @ dt_j @ U_ik_proj.T
                         # Bold for D_ji: L(jk|a_ij c_ik) = 2K-J cross-domain
-                        # Use local DF cross-integrals (J_ji_ki, K_ji_ki) when available
+                        # Use ONLY local DF cross-integrals (J_ji_ki, K_ji_ki)
                         _ci_ij = cc_ints.get(key) if cc_ints is not None else None
                         K_ji_local = _ci_ij.get('K_ji_ki', {}).get((key, k)) if _ci_ij else None
                         J_ji_local = _ci_ij.get('J_ji_ki', {}).get((key, k)) if _ci_ij else None
                         if K_ji_local is not None and J_ji_local is not None:
                             D_temp_j += (2.0*K_ji_local - J_ji_local) @ u_ik.T @ S_ij_ik2.T
-                        else:
-                            # Fallback to global DF
-                            ovL_j_d = ovL_bare.get((key, j))
-                            ovL_k_ik_d = ovL_bare.get((key_ik, k))
-                            J_ji = K_coul_cache.get((key, key_ik, j, k)) if K_coul_cache else None
-                            if ovL_j_d is not None and ovL_k_ik_d is not None and J_ji is not None:
-                                K_ji = ovL_j_d @ ovL_k_ik_d.T
-                                D_temp_j += (2.0*K_ji - J_ji) @ u_ik.T @ S_ij_ik2.T
                         D_ji += 0.5 * D_temp_j
 
         D_term = D_ij + D_ji.T
         Rn_ij += D_term
         if _DEBUG_PTERM:
-            print(f"  PTERM pair({i},{j}): D_ij_unsym_rms={_rms(D_ij):.12f} D_ji_unsym_rms={_rms(D_ji):.12f}")
+            print(f"  PTERM iter {_ITER} pair({i},{j}): D_ij_unsym_rms={_rms(D_ij):.12f} D_ji_unsym_rms={_rms(D_ji):.12f}")
     else:
         D_term = np.zeros((n_pno, n_pno))
 
@@ -380,9 +383,9 @@ def compute_residual_v2(
     Rn_ij += G_term
 
     if _DEBUG_PTERM:
-        print(f"  PTERM pair({i},{j}): G_ij_unsym_rms={_rms(G_ij):.12f} G_ji_unsym_rms={_rms(G_ji):.12f}")
+        print(f"  PTERM iter {_ITER} pair({i},{j}): G_ij_unsym_rms={_rms(G_ij):.12f} G_ji_unsym_rms={_rms(G_ji):.12f}")
         R_total = R_sym + Rn_ij
-        print(f"  PTERM pair({i},{j}): Rn={_rms(Rn_ij):.12f} R_total={_rms(R_total):.12f}")
+        print(f"  PTERM iter {_ITER} pair({i},{j}): Rn={_rms(Rn_ij):.12f} R_total={_rms(R_total):.12f}")
     if _DEBUG_PTERM and not getattr(compute_residual_v2, '_dump_done', False) and \
        not getattr(compute_residual_v2, '_debug_pterm_all', False):
         if i == 0 and j == 0:

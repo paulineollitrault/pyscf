@@ -115,21 +115,30 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
     return G
 
 
-def _build_Fia_bar(t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pair_key):
+def _build_Fia_bar(t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pair_key,
+                    pair_lmo_idx=None):
     """Build T1-dressed ov Fock Fia_bar for a specific pair.
 
     Fia_bar[k, a] = Σ_Q [2*gamma_Q * ovL_k[a,Q] - (ovL_k @ T_n.T @ ovL_k)[k,a]]
     where gamma_Q = Σ_{m,c} T1_all[m,c] * ovL_m[c,Q]
 
     Returns (nocc, n_pno) matrix. Psi4 lines 1544-1571.
+    The contractions over m,n are restricted to lmopair_to_lmos_[pair] (Psi4
+    uses T_n_ij_[ij] of shape (nlmo_ij, npno_ij)).
     """
     n_pno = pno_spaces[pair_key]['C_pno'].shape[1]
     if n_pno == 0:
         return np.zeros((nocc, 0))
 
-    # Build T1_all projected to this pair's PNO basis
+    # Build T1_all projected to this pair's PNO basis, but ZERO outside
+    # the pair's LMO domain (Psi4 uses T_n_ij_[ij] of shape (nlmo_ij, ...))
+    _domain = (set(pair_lmo_idx[pair_key].tolist())
+               if pair_lmo_idx is not None and pair_key in pair_lmo_idx
+               else set(range(nocc)))
     T1_all = np.zeros((nocc, n_pno))
     for m in range(nocc):
+        if m not in _domain:
+            continue
         T1_all[m] = _project_t1_to_pair(
             t1_pno, m, pair_key, S_pno_cache, pno_spaces)
 
@@ -170,7 +179,8 @@ def _build_Fia_bar(t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pair_key):
 
 
 def build_Fkj(F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
-              ovL_bare, ooL_bare, S_pno_cache, foo_t2):
+              ovL_bare, ooL_bare, S_pno_cache, foo_t2,
+              pair_lmo_idx=None, pair_keys_set=None):
     """Build F̃_{kj} = dressed Fock oo (Eqs 94, 98).
 
     F̃_{kj} = F̄_{kj} + F̄_{kc}·t_j^c (Eq 94)
@@ -192,18 +202,33 @@ def build_Fkj(F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
     # Eq 94: F̃_{kj} += Σ_a F̄_{ka}(jj) · t̃_j^a
     # F̄_{ka} = fov_bare + [2J-K]·T1 (Fia_bar)
     # Psi4 line 1618-1622: Fkj(i,j) += Fia_bar[jj](i,:) · T1_j
+    # Psi4 only updates Fkj(i,j) for (i,j) ∈ valid LMO pairs AND requires
+    # i ∈ lmopair_to_lmos_[jj] (otherwise i_jj == -1).
     for j_idx in range(nocc):
         key_jj = (j_idx, j_idx)
         if key_jj not in pno_spaces or t1_pno[j_idx].size == 0:
             continue
         t1_j = t1_pno[j_idx]
 
-        # Build full Fia_bar for diagonal pair (j,j)
+        # Build full Fia_bar for diagonal pair (j,j) — restricted internally
+        # to lmopair_to_lmos_[jj] when pair_lmo_idx is provided.
         Fia_bar_jj = _build_Fia_bar(
-            t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, key_jj)
+            t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, key_jj,
+            pair_lmo_idx=pair_lmo_idx)
+
+        _domain_jj = (set(pair_lmo_idx[key_jj].tolist())
+                      if pair_lmo_idx is not None and key_jj in pair_lmo_idx
+                      else set(range(nocc)))
 
         # Add bare fov contribution (not in Fia_bar which starts from zero)
         for i_idx in range(nocc):
+            # Psi4 requires (i,j) in valid pair list AND i in lmopair_to_lmos_[jj]
+            if i_idx not in _domain_jj:
+                continue
+            if pair_keys_set is not None:
+                key_ij = (min(i_idx, j_idx), max(i_idx, j_idx))
+                if key_ij not in pair_keys_set:
+                    continue
             fov_i_jj = _project_t1_to_pair(
                 fov_pno, i_idx, key_jj, S_pno_cache, pno_spaces)
             Fkj[i_idx, j_idx] += np.dot(fov_i_jj + Fia_bar_jj[i_idx], t1_j)
@@ -212,7 +237,8 @@ def build_Fkj(F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
 
 
 def build_Fab(t1_pno, fov_pno, pno_spaces, nocc,
-              ovL_bare, S_pno_cache, with_df, pair_key):
+              ovL_bare, S_pno_cache, with_df, pair_key,
+              pair_lmo_idx=None):
     """Build F̃̃_{ab} (Eqs 85, 97, 101) for a specific pair.
 
     F̃̃_{ab} = F̃_{ab} - Σ_kl S·u_kl·K_kl·S (Eq 85)
@@ -239,16 +265,21 @@ def build_Fab(t1_pno, fov_pno, pno_spaces, nocc,
 
     # Eq 97: F̃_{ab} = F̄_{ab} - Σ_k t̃_k^a · F̄_{kb}
     # Psi4 line 1640: Fab -= T_n_ij.T @ Fia_bar
-    # F̄_{kb} = fov_bare + [2J-K]·T1 (full Fia_bar)
+    # Both T_n_ij and Fia_bar have first axis of size nlmo_ij — restrict
+    # the contraction over k to lmopair_to_lmos_[ij].
     Fia_bar_ij = _build_Fia_bar(
-        t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pair_key)
+        t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pair_key,
+        pair_lmo_idx=pair_lmo_idx)
+    _domain = (set(pair_lmo_idx[pair_key].tolist())
+               if pair_lmo_idx is not None and pair_key in pair_lmo_idx
+               else set(range(nocc)))
     T1_all = np.zeros((nocc, n_pno))
-    for kk in range(nocc):
-        T1_all[kk] = _project_t1_to_pair(
-            t1_pno, kk, pair_key, S_pno_cache, pno_spaces)
-    # fov_bare for all occ in this pair's PNO domain
     fov_all = np.zeros((nocc, n_pno))
     for kk in range(nocc):
+        if kk not in _domain:
+            continue
+        T1_all[kk] = _project_t1_to_pair(
+            t1_pno, kk, pair_key, S_pno_cache, pno_spaces)
         fov_all[kk] = _project_t1_to_pair(
             fov_pno, kk, pair_key, S_pno_cache, pno_spaces)
     # Fab -= T1_all.T @ (fov_all + Fia_bar)
@@ -259,7 +290,7 @@ def build_Fab(t1_pno, fov_pno, pno_spaces, nocc,
 
 def build_Fab_all(t1_pno, fov_pno, pno_spaces, nocc,
                   ovL_bare, S_pno_cache, with_df, pair_keys,
-                  _fvv_t1_precomputed=None):
+                  _fvv_t1_precomputed=None, pair_lmo_idx=None):
     """Precompute Fab for ALL pairs in a single DF pass.
 
     Replaces per-pair build_Fab() calls, avoiding redundant DF reads and
@@ -287,13 +318,27 @@ def build_Fab_all(t1_pno, fov_pno, pno_spaces, nocc,
         Fab = np.diag(e_pno) + fvv_t1_all[pk]
 
         # Eq 97: F̃_{ab} = F̄_{ab} - Σ_k t̃_k^a · F̄_{kb}
+        # Restrict k loop to lmopair_to_lmos_[pk] (Psi4 T_n_ij_[pk] shape).
         Fia_bar_ij = _build_Fia_bar(
-            t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pk)
+            t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pk,
+            pair_lmo_idx=pair_lmo_idx)
         T1_all = _build_T1_all(t1_pno, pk, nocc, S_pno_cache, pno_spaces)
         fov_all = np.zeros((nocc, n_pno))
+        _dom = (set(pair_lmo_idx[pk].tolist())
+                if pair_lmo_idx is not None and pk in pair_lmo_idx
+                else set(range(nocc)))
         for kk in range(nocc):
+            if kk not in _dom:
+                continue
             fov_all[kk] = _project_t1_to_pair(
                 fov_pno, kk, pk, S_pno_cache, pno_spaces)
+        # Zero T1_all rows outside domain too.
+        if _dom != set(range(nocc)):
+            _mask = np.zeros(nocc, dtype=bool)
+            for _l in _dom:
+                _mask[_l] = True
+            T1_all = T1_all.copy()
+            T1_all[~_mask] = 0.0
         Fab -= T1_all.T @ (fov_all + Fia_bar_ij)
 
         Fab_all[pk] = Fab
@@ -303,7 +348,8 @@ def build_Fab_all(t1_pno, fov_pno, pno_spaces, nocc,
 
 def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                   ovL_bare, ooL_bare, S_pno_cache, with_df,
-                  _term2_precomputed=None, cc_ints=None):
+                  _term2_precomputed=None, cc_ints=None,
+                  pair_lmo_idx=None):
     """Build D_tilde (delta, Eq 84) for all ordered (i,k) pairs.
 
     delta_{ik}^{ac} = Terms 1-4 of Eq 84, using M/L integrals.
@@ -409,9 +455,15 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
         # M_{ik}^{lc} = 2*(il|kc) - (ik|lc)
         # (il|kc) = Σ_Q ooL[i,l,Q]*ovL_k_ik[c,Q] → K_bar-like
         # (ik|lc) = Σ_Q ooL[i,k,Q]*ovL_l_ik[c,Q] → K_bar_chem-like
+        # Psi4 (ccsd.cc:1790) restricts l to lmopair_to_lmos_[ik]
+        _domain_ik_t1 = (set(pair_lmo_idx[key_ik].tolist())
+                         if pair_lmo_idx is not None and key_ik in pair_lmo_idx
+                         else set(range(nocc)))
         _use_local_d1 = (cc_ints is not None and key_ik in cc_ints
                          and cc_ints[key_ik] is not None)
         for ll in range(nocc):
+            if ll not in _domain_ik_t1:
+                continue
             if _use_local_d1:
                 from pyscf.cc.dlpno_tccsd.local_df import (
                     get_local_ovL, get_local_ooL_vec)
@@ -440,7 +492,13 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
 
         # --- Term 3: -Σ_l T1_l^a · (L_lk × T1_i) ---
         # L_lk[a,b] = 2*(la|kb) - (lb|ka) in PNO_lk
+        # Psi4 restricts l to lmopair_to_lmos_[ik] (ccsd.cc:1792)
+        _domain_ik = (set(pair_lmo_idx[key_ik].tolist())
+                      if pair_lmo_idx is not None and key_ik in pair_lmo_idx
+                      else set(range(nocc)))
         for ll in range(nocc):
+            if ll not in _domain_ik:
+                continue
             key_lk = (min(ll, k_idx), max(ll, k_idx))
             if key_lk not in pno_spaces:
                 continue
@@ -480,7 +538,10 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             D_tilde_ik -= np.outer(t1_l_ik, Lt1_ik)
 
         # --- Term 4: +(1/2) Σ_l S@u_il@S @ L_kl @ S ---
+        # Psi4 restricts l to lmopair_to_lmos_[ik] (ccsd.cc:1803)
         for ll in range(nocc):
+            if ll not in _domain_ik:
+                continue
             key_il = (min(i_idx, ll), max(i_idx, ll))
             key_lk = (min(ll, k_idx), max(ll, k_idx))
             if key_il not in t2_pno_all or key_lk not in pno_spaces:

@@ -1,0 +1,236 @@
+
+Host: ip-172-31-66-255.ec2.internal
+
+Timers On : Mon Apr 13 08:09:06 2026
+Timers Off: Mon Apr 13 08:09:13 2026
+
+Wall Time:        6.99 seconds
+
+                                                       Time (seconds)
+Module                                       User      System        Wall        Calls
+Total PK formation time             :      2.333u      0.267s      1.549w      1 calls
+Libint2ERI::Libint2ERI              :      0.050u      0.000s      0.041w      7 calls
+HF: Form core H                     :      0.000u      0.000s      0.003w      1 calls
+HF: Form S/X                        :      0.000u      0.000s      0.002w      1 calls
+HF: Guess                           :      0.050u      0.000s      0.029w      1 calls
+SAD Guess                           :      0.050u      0.000s      0.028w      1 calls
+HF: Form G                          :      1.317u      0.000s      0.775w     10 calls
+JK: D                               :      0.000u      0.000s      0.000w     10 calls
+JK: USO2AO                          :      0.000u      0.000s      0.000w     10 calls
+JK: JK                              :      1.317u      0.000s      0.774w     10 calls
+PK computes JK                      :      1.317u      0.000s      0.774w     10 calls
+JK: AO2USO                          :      0.000u      0.000s      0.000w     10 calls
+HF: Form F                          :      0.000u      0.000s      0.000w     10 calls
+HF: Form D                          :      0.000u      0.000s      0.000w     10 calls
+HF: DIIS                            :      0.117u      0.000s      0.074w      9 calls
+HF: Form C                          :      0.017u      0.000s      0.013w      9 calls
+DLPNO-CCSD                          :      6.567u      0.183s      4.053w      1 calls
+Setup Orbitals                      :      0.000u      0.000s      0.005w      1 calls
+Local MOs                           :      0.000u      0.000s      0.001w      1 calls
+Projected AOs                       :      0.000u      0.000s      0.000w      1 calls
+Overlap Ints                        :      0.033u      0.000s      0.017w      1 calls
+Construct Grid                      :      0.017u      0.000s      0.006w      1 calls
+build grid                          :      0.017u      0.000s      0.005w      1 calls
+post-process grid                   :      0.000u      0.000s      0.001w      1 calls
+Integration                         :      0.017u      0.000s      0.010w      1 calls
+Dipole Ints                         :      0.000u      0.000s      0.008w      1 calls
+Compute Metric                      :      0.017u      0.000s      0.002w      1 calls
+(K|L)                               :      0.017u      0.000s      0.002w      1 calls
+Sparsity                            :      0.017u      0.000s      0.010w      3 calls
+Crude DF Ints                       :      0.100u      0.000s      0.061w      1 calls
+(mn|K) -> (ia|K)                    :      0.217u      0.000s      0.121w      2 calls
+Crude Pair Prescreening             :      0.050u      0.000s      0.037w      1 calls
+Refined DF Ints                     :      0.117u      0.000s      0.060w      1 calls
+Refined Pair Prescreening           :      0.117u      0.000s      0.074w      1 calls
+PNO-LMP2 Iterations                 :      0.150u      0.000s      0.101w      1 calls
+DF Ints                             :      0.250u      0.000s      0.148w      1 calls
+(mn|K)->(ij|K)                      :      0.100u      0.000s      0.056w      1 calls
+(mn|K)->(ab|K)                      :      0.150u      0.000s      0.092w      1 calls
+CC Integrals                        :      2.417u      0.150s      1.546w      1 calls
+PNO Overlaps                        :      0.017u      0.000s      0.010w      1 calls
+LCCSD                               :      3.283u      0.033s      1.973w      1 calls
+DLPNO-CCSD: T1 Ints                 :      0.483u      0.000s      0.295w      8 calls
+DLPNO-CCSD: T1 Fock                 :      0.583u      0.000s      0.345w      8 calls
+DLPNO-CCSD: B tilde                 :      0.133u      0.000s      0.080w      8 calls
+DLPNO-CCSD: C tilde                 :      0.100u      0.000s      0.059w      8 calls
+DLPNO-CCSD: D tilde                 :      0.250u      0.017s      0.159w      8 calls
+DLPNO-CCSD: G tilde                 :      0.033u      0.000s      0.019w      8 calls
+DLPNO-CCSD: Compute R1              :      0.117u      0.000s      0.068w      8 calls
+DLPNO-CCSD: Compute R2              :      1.517u      0.000s      0.920w      8 calls
+
+--------------------------------------------------------------------------------------
+Total PK formation time             :      2.333u      0.267s      1.549w      1 calls
+| Libint2ERI::Libint2ERI            :      0.033u      0.000s      0.019w      2 calls
+HF: Form core H                     :      0.000u      0.000s      0.003w      1 calls
+HF: Form S/X                        :      0.000u      0.000s      0.002w      1 calls
+HF: Guess                           :      0.050u      0.000s      0.029w      1 calls
+| SAD Guess                         :      0.050u      0.000s      0.028w      1 calls
+HF: Form G                          :      1.317u      0.000s      0.775w     10 calls
+| JK: D                             :      0.000u      0.000s      0.000w     10 calls
+| JK: USO2AO                        :      0.000u      0.000s      0.000w     10 calls
+| JK: JK                            :      1.317u      0.000s      0.774w     10 calls
+| | PK computes JK                  :      1.317u      0.000s      0.774w     10 calls
+| JK: AO2USO                        :      0.000u      0.000s      0.000w     10 calls
+HF: Form F                          :      0.000u      0.000s      0.000w     10 calls
+HF: Form D                          :      0.000u      0.000s      0.000w     10 calls
+HF: DIIS                            :      0.117u      0.000s      0.074w      9 calls
+HF: Form C                          :      0.017u      0.000s      0.013w      9 calls
+DLPNO-CCSD                          :      6.567u      0.183s      4.053w      1 calls
+| Setup Orbitals                    :      0.000u      0.000s      0.005w      1 calls
+| | Local MOs                       :      0.000u      0.000s      0.001w      1 calls
+| | Projected AOs                   :      0.000u      0.000s      0.000w      1 calls
+| Overlap Ints                      :      0.033u      0.000s      0.017w      1 calls
+| | Construct Grid                  :      0.017u      0.000s      0.006w      1 calls
+| | | build grid                    :      0.017u      0.000s      0.005w      1 calls
+| | | post-process grid             :      0.000u      0.000s      0.001w      1 calls
+| | Integration                     :      0.017u      0.000s      0.010w      1 calls
+| Dipole Ints                       :      0.000u      0.000s      0.008w      1 calls
+| Compute Metric                    :      0.017u      0.000s      0.002w      1 calls
+| | (K|L)                           :      0.017u      0.000s      0.002w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.000u      0.000s      0.000w      1 calls
+| Sparsity                          :      0.017u      0.000s      0.010w      3 calls
+| Crude DF Ints                     :      0.100u      0.000s      0.061w      1 calls
+| | (mn|K) -> (ia|K)                :      0.100u      0.000s      0.060w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.000u      0.000s      0.006w      1 calls
+| Crude Pair Prescreening           :      0.050u      0.000s      0.037w      1 calls
+| Refined DF Ints                   :      0.117u      0.000s      0.060w      1 calls
+| | (mn|K) -> (ia|K)                :      0.117u      0.000s      0.060w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.000u      0.000s      0.007w      1 calls
+| Refined Pair Prescreening         :      0.117u      0.000s      0.074w      1 calls
+| PNO-LMP2 Iterations               :      0.150u      0.000s      0.101w      1 calls
+| DF Ints                           :      0.250u      0.000s      0.148w      1 calls
+| | (mn|K)->(ij|K)                  :      0.100u      0.000s      0.056w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.017u      0.000s      0.005w      1 calls
+| | (mn|K)->(ab|K)                  :      0.150u      0.000s      0.092w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.000u      0.000s      0.005w      1 calls
+| CC Integrals                      :      2.417u      0.150s      1.546w      1 calls
+| PNO Overlaps                      :      0.017u      0.000s      0.010w      1 calls
+| LCCSD                             :      3.283u      0.033s      1.973w      1 calls
+| | DLPNO-CCSD: T1 Ints             :      0.483u      0.000s      0.295w      8 calls
+| | DLPNO-CCSD: T1 Fock             :      0.583u      0.000s      0.345w      8 calls
+| | DLPNO-CCSD: B tilde             :      0.133u      0.000s      0.080w      8 calls
+| | DLPNO-CCSD: C tilde             :      0.100u      0.000s      0.059w      8 calls
+| | DLPNO-CCSD: D tilde             :      0.250u      0.017s      0.159w      8 calls
+| | DLPNO-CCSD: G tilde             :      0.033u      0.000s      0.019w      8 calls
+| | DLPNO-CCSD: Compute R1          :      0.117u      0.000s      0.068w      8 calls
+| | DLPNO-CCSD: Compute R2          :      1.517u      0.000s      0.920w      8 calls
+
+**************************************************************************************
+
+Host: ip-172-31-66-255.ec2.internal
+
+Timers On : Mon Apr 13 08:21:41 2026
+Timers Off: Mon Apr 13 08:22:11 2026
+
+Wall Time:       29.82 seconds
+
+                                                       Time (seconds)
+Module                                       User      System        Wall        Calls
+Total PK formation time             :      4.067u      0.367s      2.665w      1 calls
+Libint2ERI::Libint2ERI              :      0.083u      0.000s      0.063w      7 calls
+HF: Form core H                     :      0.017u      0.000s      0.004w      1 calls
+HF: Form S/X                        :      0.000u      0.000s      0.002w      1 calls
+HF: Guess                           :      0.017u      0.033s      0.028w      1 calls
+SAD Guess                           :      0.017u      0.033s      0.027w      1 calls
+HF: Form G                          :      3.333u      0.000s      2.022w     16 calls
+JK: D                               :      0.000u      0.000s      0.000w     16 calls
+JK: USO2AO                          :      0.000u      0.000s      0.000w     16 calls
+JK: JK                              :      3.333u      0.000s      2.020w     16 calls
+PK computes JK                      :      3.333u      0.000s      2.020w     16 calls
+JK: AO2USO                          :      0.000u      0.000s      0.000w     16 calls
+HF: Form F                          :      0.000u      0.000s      0.000w     16 calls
+HF: Form D                          :      0.000u      0.000s      0.000w     16 calls
+HF: DIIS                            :      0.167u      0.000s      0.094w     15 calls
+HF: Form C                          :      0.050u      0.000s      0.026w     15 calls
+DLPNO-CCSD                          :     40.267u      0.483s     24.461w      1 calls
+Setup Orbitals                      :      0.000u      0.000s      0.007w      1 calls
+Local MOs                           :      0.000u      0.000s      0.002w      1 calls
+Projected AOs                       :      0.000u      0.000s      0.001w      1 calls
+Overlap Ints                        :      0.033u      0.000s      0.019w      1 calls
+Construct Grid                      :      0.017u      0.000s      0.006w      1 calls
+build grid                          :      0.017u      0.000s      0.005w      1 calls
+post-process grid                   :      0.000u      0.000s      0.001w      1 calls
+Integration                         :      0.017u      0.000s      0.012w      1 calls
+Dipole Ints                         :      0.033u      0.000s      0.017w      1 calls
+Compute Metric                      :      0.000u      0.000s      0.003w      1 calls
+(K|L)                               :      0.000u      0.000s      0.003w      1 calls
+Sparsity                            :      0.050u      0.000s      0.016w      3 calls
+Crude DF Ints                       :      0.167u      0.000s      0.094w      1 calls
+(mn|K) -> (ia|K)                    :      0.317u      0.000s      0.188w      2 calls
+Crude Pair Prescreening             :      0.167u      0.000s      0.107w      1 calls
+Refined DF Ints                     :      0.150u      0.000s      0.093w      1 calls
+Refined Pair Prescreening           :      0.350u      0.000s      0.214w      1 calls
+PNO-LMP2 Iterations                 :      0.933u      0.067s      0.600w      1 calls
+DF Ints                             :      0.333u      0.033s      0.226w      1 calls
+(mn|K)->(ij|K)                      :      0.133u      0.000s      0.088w      1 calls
+(mn|K)->(ab|K)                      :      0.200u      0.033s      0.138w      1 calls
+CC Integrals                        :      9.317u      0.367s      5.812w      1 calls
+PNO Overlaps                        :      0.100u      0.000s      0.058w      1 calls
+LCCSD                               :     28.633u      0.017s     17.196w      1 calls
+DLPNO-CCSD: T1 Ints                 :      4.567u      0.000s      2.722w     19 calls
+DLPNO-CCSD: T1 Fock                 :      4.800u      0.000s      2.905w     19 calls
+DLPNO-CCSD: B tilde                 :      1.167u      0.000s      0.695w     19 calls
+DLPNO-CCSD: C tilde                 :      0.917u      0.000s      0.559w     19 calls
+DLPNO-CCSD: D tilde                 :      2.117u      0.017s      1.249w     19 calls
+DLPNO-CCSD: G tilde                 :      0.233u      0.000s      0.170w     19 calls
+DLPNO-CCSD: Compute R1              :      0.900u      0.000s      0.507w     19 calls
+DLPNO-CCSD: Compute R2              :     13.533u      0.000s      8.155w     19 calls
+
+--------------------------------------------------------------------------------------
+Total PK formation time             :      4.067u      0.367s      2.665w      1 calls
+| Libint2ERI::Libint2ERI            :      0.033u      0.000s      0.026w      2 calls
+HF: Form core H                     :      0.017u      0.000s      0.004w      1 calls
+HF: Form S/X                        :      0.000u      0.000s      0.002w      1 calls
+HF: Guess                           :      0.017u      0.033s      0.028w      1 calls
+| SAD Guess                         :      0.017u      0.033s      0.027w      1 calls
+HF: Form G                          :      3.333u      0.000s      2.022w     16 calls
+| JK: D                             :      0.000u      0.000s      0.000w     16 calls
+| JK: USO2AO                        :      0.000u      0.000s      0.000w     16 calls
+| JK: JK                            :      3.333u      0.000s      2.020w     16 calls
+| | PK computes JK                  :      3.333u      0.000s      2.020w     16 calls
+| JK: AO2USO                        :      0.000u      0.000s      0.000w     16 calls
+HF: Form F                          :      0.000u      0.000s      0.000w     16 calls
+HF: Form D                          :      0.000u      0.000s      0.000w     16 calls
+HF: DIIS                            :      0.167u      0.000s      0.094w     15 calls
+HF: Form C                          :      0.050u      0.000s      0.026w     15 calls
+DLPNO-CCSD                          :     40.267u      0.483s     24.461w      1 calls
+| Setup Orbitals                    :      0.000u      0.000s      0.007w      1 calls
+| | Local MOs                       :      0.000u      0.000s      0.002w      1 calls
+| | Projected AOs                   :      0.000u      0.000s      0.001w      1 calls
+| Overlap Ints                      :      0.033u      0.000s      0.019w      1 calls
+| | Construct Grid                  :      0.017u      0.000s      0.006w      1 calls
+| | | build grid                    :      0.017u      0.000s      0.005w      1 calls
+| | | post-process grid             :      0.000u      0.000s      0.001w      1 calls
+| | Integration                     :      0.017u      0.000s      0.012w      1 calls
+| Dipole Ints                       :      0.033u      0.000s      0.017w      1 calls
+| Compute Metric                    :      0.000u      0.000s      0.003w      1 calls
+| | (K|L)                           :      0.000u      0.000s      0.003w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.000u      0.000s      0.000w      1 calls
+| Sparsity                          :      0.050u      0.000s      0.016w      3 calls
+| Crude DF Ints                     :      0.167u      0.000s      0.094w      1 calls
+| | (mn|K) -> (ia|K)                :      0.167u      0.000s      0.094w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.017u      0.000s      0.010w      1 calls
+| Crude Pair Prescreening           :      0.167u      0.000s      0.107w      1 calls
+| Refined DF Ints                   :      0.150u      0.000s      0.093w      1 calls
+| | (mn|K) -> (ia|K)                :      0.150u      0.000s      0.093w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.017u      0.000s      0.010w      1 calls
+| Refined Pair Prescreening         :      0.350u      0.000s      0.214w      1 calls
+| PNO-LMP2 Iterations               :      0.933u      0.067s      0.600w      1 calls
+| DF Ints                           :      0.333u      0.033s      0.226w      1 calls
+| | (mn|K)->(ij|K)                  :      0.133u      0.000s      0.088w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.017u      0.000s      0.008w      1 calls
+| | (mn|K)->(ab|K)                  :      0.200u      0.033s      0.138w      1 calls
+| | | Libint2ERI::Libint2ERI        :      0.000u      0.000s      0.008w      1 calls
+| CC Integrals                      :      9.317u      0.367s      5.812w      1 calls
+| PNO Overlaps                      :      0.100u      0.000s      0.058w      1 calls
+| LCCSD                             :     28.633u      0.017s     17.196w      1 calls
+| | DLPNO-CCSD: T1 Ints             :      4.567u      0.000s      2.722w     19 calls
+| | DLPNO-CCSD: T1 Fock             :      4.800u      0.000s      2.905w     19 calls
+| | DLPNO-CCSD: B tilde             :      1.167u      0.000s      0.695w     19 calls
+| | DLPNO-CCSD: C tilde             :      0.917u      0.000s      0.559w     19 calls
+| | DLPNO-CCSD: D tilde             :      2.117u      0.017s      1.249w     19 calls
+| | DLPNO-CCSD: G tilde             :      0.233u      0.000s      0.170w     19 calls
+| | DLPNO-CCSD: Compute R1          :      0.900u      0.000s      0.507w     19 calls
+| | DLPNO-CCSD: Compute R2          :     13.533u      0.000s      8.155w     19 calls
+
+**************************************************************************************

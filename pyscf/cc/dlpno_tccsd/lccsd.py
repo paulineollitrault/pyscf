@@ -756,6 +756,10 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             continue
         n_ii = pno_spaces[key_ii]['C_pno'].shape[1]
 
+        _weak_skip_A = getattr(_compute_t1_residual_psi4,
+                                '_skip_weak_in_A', False)
+        _strong_set = getattr(_compute_t1_residual_psi4,
+                              '_strong_pair_keys', None)
         for k in range(nocc):
             ki_data = _get_ki_data(k, i)
             if ki_data is None:
@@ -765,7 +769,14 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             k_Qa = ki_data['k_Qa']
             Qab_ki = ki_data['Qab']
 
+            # Optionally skip weak pairs from A term (Eq 88) to match Psi4
+            # which only builds K_tilde_chem_ for strong pairs.
+            if _weak_skip_A and _strong_set is not None and key_ki not in _strong_set:
+                continue
+
             # Get T2 for ordered pair (k, i): Tt_ki[a, c]
+            if key_ki not in t2_pno_all:
+                continue  # weak pair — no T2 amplitudes
             t2_canon = t2_pno_all[key_ki]
             if k <= i:
                 # canonical key = (k, i), storage in (k,i) order
@@ -794,6 +805,14 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                 r1_pno[i] += A_contrib
                 if _do_debug:
                     R_A[i] += A_contrib
+                # Per-(k, i) A contribution dump (LMO 0 only, iter 0 only)
+                if (i == 0 and getattr(_compute_t1_residual_psi4, '_iter', 0) == 0
+                        and getattr(_compute_t1_residual_psi4, '_dump_A_perk', False)):
+                    a_norm = float(np.sqrt(np.dot(A_contrib, A_contrib)))
+                    a_sum = float(np.sum(A_contrib))
+                    print(f"  A_PERK iter 0 i=0 k={k} key_ki={key_ki}: "
+                          f"|A|={a_norm:.12e} sum={a_sum:.12e} npno_ki={n_ki}",
+                          flush=True)
 
             # ----- C term -----
             # C_i^a = Σ_k S(ik,ii)^T @ Tt[ik] @ Fkc[ki]^T
@@ -998,17 +1017,16 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                 continue
             print(f"  OUR iter {_iter_n}: R1[{i}] norm={float(np.linalg.norm(r1_pno[i])):.10f}", flush=True)
         print(f"  OUR iter {_iter_n}: |R1_total|={r1_total:.10f}", flush=True)
-        if not _DUMP_ALL:
-            # Also dump per-term breakdown at iter 0
-            for i in range(nocc):
-                if i not in r1_pno or r1_pno[i].size == 0:
-                    continue
-                print(f"  OUR_R1_TERMS i={i}: Fai={float(np.linalg.norm(fov_pno[i])):.10f} "
-                      f"A={float(np.linalg.norm(R_A[i])):.10f} "
-                      f"C={float(np.linalg.norm(R_C[i])):.10f} "
-                      f"B={float(np.linalg.norm(R_B[i])):.10f} "
-                      f"A2={float(np.linalg.norm(R_A2[i])):.10f} "
-                      f"R1tot={float(np.linalg.norm(r1_pno[i])):.10f}")
+        # Always dump per-term breakdown when debug is on (any iter)
+        for i in range(nocc):
+            if i not in r1_pno or r1_pno[i].size == 0:
+                continue
+            print(f"  R1_TERMS iter {_iter_n} lmo({i}): "
+                  f"A_rms={float(np.sqrt(np.mean(R_A[i]*R_A[i]))):.12e} "
+                  f"C_rms={float(np.sqrt(np.mean(R_C[i]*R_C[i]))):.12e} "
+                  f"B_rms={float(np.sqrt(np.mean(R_B[i]*R_B[i]))):.12e} "
+                  f"A2_rms={float(np.sqrt(np.mean(R_A2[i]*R_A2[i]))):.12e}",
+                  flush=True)
         _compute_t1_residual_psi4._dumped = True
         _compute_t1_residual_psi4._iter_count = _iter_n + 1
 
@@ -3079,7 +3097,21 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             cas_sl, t2c = cas_blocks[key]
             t2_pno_all[key][cas_sl, cas_sl] = t2c
 
-    keys_sorted = sorted(t2_pno_all.keys())
+    # Add weak-pair MP2 T2 amplitudes so dressing builders (G_tilde, C_tilde,
+    # D_tilde, B_tilde) see them, matching Psi4 which keeps T_iajb_ for ALL
+    # pairs (strong + weak).  These weak amplitudes are NOT iterated, but
+    # they DO contribute to the dressing of strong-pair residuals.
+    keys_sorted = sorted(t2_pno_all.keys())  # strong-pair keys (unchanged)
+    _strong_keys_set = set(keys_sorted)
+    for key_w, data_w in pno_spaces.items():
+        if key_w in _strong_keys_set:
+            continue
+        if data_w['C_pno'].shape[1] == 0:
+            continue
+        T2_w = data_w.get('T2_pno')
+        if T2_w is not None:
+            t2_pno_all[key_w] = T2_w.copy()
+
     n_active = len(keys_sorted)
     print(f'  DLPNO-CCSD: {n_active} pairs, CAS freeze = {len(cas_blocks)} pairs',
           flush=True)
@@ -3168,22 +3200,24 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _lmo_atom_set.append(set(atoms_in.tolist()))
 
         # Pair aux domain = union of LMO i and LMO j aux domains
+        # Include ALL pairs in pno_spaces (strong + weak + diagonal)
         _all_keys_init = list(keys_sorted)
-        for i in range(nocc):
-            key_ii = (i, i)
-            if key_ii not in _all_keys_init and key_ii in pno_spaces:
-                _all_keys_init.append(key_ii)
+        for key_w in pno_spaces:
+            if key_w not in _all_keys_init and pno_spaces[key_w]['C_pno'].shape[1] > 0:
+                _all_keys_init.append(key_w)
 
-        # Pair LMO domain: m is in pair (i,j)'s domain if m's atom set
-        # has any overlap with (i ∪ j)'s atom set (matching Psi4's
-        # lmopair_to_lmos_ convention).
+        # Pair LMO domain: m is in pair (i,j)'s domain if pairs (i,m)
+        # AND (j,m) both exist in pno_spaces.  This matches Psi4's
+        # lmopair_to_lmos_ (dlpnobase.cc line 774-782).
         pair_lmo_idx = {}  # pair_key -> np.array of LMO indices in domain
+        _all_pair_keys_set = set(_all_keys_init)
         for key in _all_keys_init:
             i, j = key
-            pair_atoms = _lmo_atom_set[i] | _lmo_atom_set[j]
             domain_lmos = []
             for m in range(nocc):
-                if _lmo_atom_set[m] & pair_atoms:
+                key_im = (min(i, m), max(i, m))
+                key_jm = (min(j, m), max(j, m))
+                if key_im in _all_pair_keys_set and key_jm in _all_pair_keys_set:
                     domain_lmos.append(m)
             pair_lmo_idx[key] = np.array(domain_lmos)
 
@@ -3235,11 +3269,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         else:
             _auxmol = with_df.auxmol
         _j2c = _auxmol.intor('int2c2e')
-        _all_keys_cc = list(keys_sorted)
-        for ii in range(nocc):
-            kii = (ii, ii)
-            if kii not in _all_keys_cc and kii in pno_spaces:
-                _all_keys_cc.append(kii)
+        # Include ALL pairs with PNOs (strong + weak), matching Psi4 which
+        # builds cc_integrals for all unscreened pairs (0 screened for TightPNO).
+        _all_keys_cc = list(keys_sorted)  # strong pairs
+        for key_w in pno_spaces:
+            if key_w not in _all_keys_cc:
+                if pno_spaces[key_w]['C_pno'].shape[1] > 0 and key_w in pair_aux_idx:
+                    _all_keys_cc.append(key_w)
         _cc_ints = compute_cc_integrals(
             mf.mol, _auxmol, C_lmo, pno_spaces, pair_aux_idx,
             _j2c, _all_keys_cc, nocc)
@@ -3416,6 +3452,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _t_cycle_start = _time.perf_counter()
             t2_new = {}
             t1_pno_old = {i: t1_pno[i].copy() for i in range(nocc)}
+            # Tell compute_residual_v2 the current iteration so PTERM dumps
+            # can be filtered/labeled per iter.
+            from pyscf.cc.dlpno_tccsd.lccsd_jiang_v2 import compute_residual_v2 as _crv2
+            _crv2._iter = cycle
+            _crv2._debug_pterm_all = (cycle <= 2) and getattr(_run_dlpno_lccsd, '_debug_pterm_iters', False)
+            # Pass strong-pair set to T1 residual so it can optionally skip
+            # weak pairs in Eq 88's k-loop (matching Psi4).
+            _compute_t1_residual_psi4._iter = cycle
+            _compute_t1_residual_psi4._strong_pair_keys = set(keys_sorted)
+            _compute_t1_residual_psi4._skip_weak_in_A = getattr(
+                _run_dlpno_lccsd, '_skip_weak_in_A', False)
 
             # ---- T1-transformed MOs or bare integrals ----
             if use_t1_transform:
@@ -3523,21 +3570,25 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     t1_pno, t2_pno_all, pno_spaces, nocc,
                     ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                     _term2_precomputed=_c_t2_pre,
-                    cc_ints=_cc_ints)
+                    cc_ints=_cc_ints,
+                    pair_lmo_idx=pair_lmo_idx)
                 _tj_C = _time.perf_counter() - _tj0
                 _tj0 = _time.perf_counter()
                 _jiang_D = build_D_tilde(
                     t1_pno, t2_pno_all, pno_spaces, nocc,
                     ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                     _term2_precomputed=_d_t2_pre,
-                    cc_ints=_cc_ints)
+                    cc_ints=_cc_ints,
+                    pair_lmo_idx=pair_lmo_idx)
                 _tj_D = _time.perf_counter() - _tj0
 
                 # Fkj / G_tilde (Eqs 94, 86)
                 _tj0 = _time.perf_counter()
                 _jiang_Fkj, _jiang_foo_t1 = build_Fkj(
                     F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache, foo_total)
+                    ovL_pno_cache, ooL_3idx, S_pno_cache, foo_total,
+                    pair_lmo_idx=pair_lmo_idx,
+                    pair_keys_set=set(pair_lmo_idx.keys()) if pair_lmo_idx else None)
                 _jiang_G = build_G_tilde(
                     t2_pno_all, t1_pno, pno_spaces, nocc,
                     ovL_pno_cache, ooL_3idx, S_pno_cache,
@@ -3566,7 +3617,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _jiang_Fab_all = build_Fab_all(
                     t1_pno, fov_pno, pno_spaces, nocc,
                     ovL_pno_cache, S_pno_cache, with_df, keys_sorted,
-                    _fvv_t1_precomputed=_fvv_t1_pre)
+                    _fvv_t1_precomputed=_fvv_t1_pre,
+                    pair_lmo_idx=pair_lmo_idx)
                 _tj_Fab = _time.perf_counter() - _tj0
 
                 # Local DF Fkj, Fab, G_tilde (computed once per iteration)
@@ -3756,7 +3808,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                             if _ladder_local is not None
                             else jc.get('ladder_all')),
                         K_dressed_override=_K_dressed_local,
-                        cc_ints=_cc_ints)
+                        cc_ints=_cc_ints,
+                        pair_domain=pair_lmo_idx.get(key) if pair_lmo_idx else None)
                     _pair_timings['resid'].append(
                         _time.perf_counter() - _tr0)
                 else:
@@ -3781,10 +3834,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 T2_old = t2_pno_all[key]
                 T2_ij_new = T2_old - R_ij / D_psi4
                 # DEBUG: dump R2 RMS per pair per iteration
-                if getattr(_run_dlpno_lccsd, '_debug_r2_all', False):
+                if getattr(_run_dlpno_lccsd, '_debug_r2_all', False) and cycle <= 2:
                     n_pno = R_ij.shape[0]
                     rms = float(np.sqrt(np.mean(R_ij * R_ij)))
-                    print(f"  OUR iter {cycle}: R2[{i},{j}] rms={rms:.12f} npno={n_pno}",
+                    print(f"  R2_CMP iter {cycle} pair({i},{j}): rms={rms:.12e} npno={n_pno}",
                           flush=True)
                 elif getattr(_run_dlpno_lccsd, '_debug_r2_iter0', False) and cycle == 0:
                     n_pno = R_ij.shape[0]
@@ -3866,6 +3919,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 Fab_precomputed=_Fab_for_t1,
                 t1_aterm_precomputed=_t1_aterm_for_t1,
                 cc_ints=_cc_ints)
+            # Dump R1 per LMO for iter <= 2 (matches Psi4's R1_DUMP)
+            if cycle <= 2 and getattr(_run_dlpno_lccsd, '_debug_t2_dump', False):
+                for ii in range(nocc):
+                    r = r1_pno.get(ii)
+                    if r is None or r.size == 0:
+                        continue
+                    rms_r1 = float(np.sqrt(np.mean(r * r)))
+                    sum_r1 = float(np.sum(r))
+                    print(f"  R1_DUMP iter {cycle} lmo({ii}): "
+                          f"rms={rms_r1:.12e} sum={sum_r1:.12e} np={r.size}",
+                          flush=True)
             t1_pno_new = {}
             for ii in range(nocc):
                 key_ii = (ii, ii)
@@ -3939,6 +4003,277 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         t2c_mp2 + scale * (t2c_dmrg_ref - t2c_mp2))
                 else:
                     t2_pno_all[key][cas_sl, cas_sl] = cb[1]
+
+            # PNO sign invariance test (ungated by t2_dump flag)
+            if cycle == 0 and getattr(_run_dlpno_lccsd, '_pno_sign_flip_done', False) is False and getattr(_run_dlpno_lccsd, '_pno_sign_flip', False):
+                import numpy as _np
+                _rng = _np.random.default_rng(42)
+                for k_test in keys_sorted:
+                    C_test = pno_spaces[k_test]['C_pno']
+                    if C_test.shape[1] == 0:
+                        continue
+                    signs = _rng.choice([-1.0, 1.0], size=C_test.shape[1])
+                    pno_spaces[k_test]['C_pno'] = C_test * signs
+                    if pno_spaces[k_test].get('K_pno') is not None:
+                        pno_spaces[k_test]['K_pno'] = pno_spaces[k_test]['K_pno'] * signs[:, None] * signs[None, :]
+                    if pno_spaces[k_test].get('T2_pno') is not None:
+                        pno_spaces[k_test]['T2_pno'] = pno_spaces[k_test]['T2_pno'] * signs[:, None] * signs[None, :]
+                    if k_test in t2_pno_all and t2_pno_all[k_test].size > 0:
+                        t2_pno_all[k_test] = t2_pno_all[k_test] * signs[:, None] * signs[None, :]
+                    if k_test in K_pno_cache:
+                        K_pno_cache[k_test] = K_pno_cache[k_test] * signs[:, None] * signs[None, :]
+                print(f"  [SIGN_FLIP_TEST] Applied random sign flips to {len(keys_sorted)} pairs; rebuilding caches.", flush=True)
+                # Rebuild S_pno_cache
+                S_pno_cache.clear()
+                for key_ij in keys_sorted:
+                    i_k, j_k = key_ij
+                    C_ij = pno_spaces[key_ij]['C_pno']
+                    if C_ij.shape[1] == 0: continue
+                    for key_kl in keys_sorted:
+                        if key_kl == key_ij: continue
+                        k_k, l_k = key_kl
+                        if i_k == k_k or i_k == l_k or j_k == k_k or j_k == l_k:
+                            C_kl = pno_spaces[key_kl]['C_pno']
+                            if C_kl.shape[1] == 0: continue
+                            S_pno_cache[(key_ij, key_kl)] = C_ij.T @ (s1e @ C_kl)
+                for i_k in range(nocc):
+                    kii = (i_k, i_k)
+                    if kii not in pno_spaces: continue
+                    C_ii = pno_spaces[kii]['C_pno']
+                    if C_ii.shape[1] == 0: continue
+                    for key_kl in keys_sorted:
+                        if key_kl == kii: continue
+                        C_kl = pno_spaces[key_kl]['C_pno']
+                        if C_kl.shape[1] == 0: continue
+                        if (kii, key_kl) not in S_pno_cache:
+                            S_pno_cache[(kii, key_kl)] = C_ii.T @ (s1e @ C_kl)
+                        if (key_kl, kii) not in S_pno_cache:
+                            S_pno_cache[(key_kl, kii)] = C_kl.T @ (s1e @ C_ii)
+                    for k in range(nocc):
+                        if k == i_k: continue
+                        kk = (k, k)
+                        if kk not in pno_spaces: continue
+                        C_kk = pno_spaces[kk]['C_pno']
+                        if C_kk.shape[1] == 0: continue
+                        if (kii, kk) not in S_pno_cache:
+                            S_pno_cache[(kii, kk)] = C_ii.T @ (s1e @ C_kk)
+                # Rebuild cc_ints
+                from pyscf.cc.dlpno_tccsd.local_df import compute_cc_integrals as _ccif
+                _cc_ints = _ccif(
+                    mf.mol, _auxmol, C_lmo, pno_spaces, pair_aux_idx,
+                    _j2c, _all_keys_cc, nocc)
+                for key in list(K_pno_cache.keys()):
+                    ci = _cc_ints.get(key)
+                    if ci is not None:
+                        K_pno_cache[key] = ci['K_iajb']
+                _run_dlpno_lccsd._pno_sign_flip_done = True
+
+            # Dump T2 RMS per pair after each iter (post-DIIS) for comparison
+            # with Psi4's T2_DUMP lines (gated by getattr flag).
+            if (cycle <= 2 and getattr(_run_dlpno_lccsd, '_debug_t2_dump', False)):
+                for k in keys_sorted:
+                    T2k = t2_pno_all[k]
+                    if T2k.size == 0:
+                        continue
+                    rms = float(np.sqrt(np.mean(T2k * T2k)))
+                    tr = float(np.trace(T2k))
+                    print(f"  T2_DUMP iter {cycle} pair({k[0]},{k[1]}): "
+                          f"rms={rms:.12e} trace={tr:.12e} npno={T2k.shape[0]}",
+                          flush=True)
+                # Also dump T1 per LMO (post-DIIS).
+                for ii in range(nocc):
+                    t1i = t1_pno[ii]
+                    if t1i.size == 0:
+                        continue
+                    rms1 = float(np.sqrt(np.mean(t1i * t1i)))
+                    s1 = float(np.sum(t1i))
+                    print(f"  T1_DUMP iter {cycle} lmo({ii}): "
+                          f"rms={rms1:.12e} sum={s1:.12e} np={t1i.size}", flush=True)
+                # PNO sign invariance test: on first cycle, flip signs on random
+                # PNO columns for select pairs and verify subsequent iterations
+                # converge to the same energy.  Set _pno_sign_flip=True to enable.
+                if cycle == 0 and getattr(_run_dlpno_lccsd, '_pno_sign_flip_done', False) is False and getattr(_run_dlpno_lccsd, '_pno_sign_flip', False):
+                    import numpy as _np
+                    _rng = _np.random.default_rng(42)
+                    for k_test in keys_sorted:
+                        C_test = pno_spaces[k_test]['C_pno']
+                        if C_test.shape[1] == 0:
+                            continue
+                        # Random ±1 signs per column
+                        signs = _rng.choice([-1.0, 1.0], size=C_test.shape[1])
+                        # Apply sign flip: C, K_pno, T2_pno rotate consistently.
+                        # Also need to re-apply to cc_ints and S_pno_cache.
+                        pno_spaces[k_test]['C_pno'] = C_test * signs
+                        if pno_spaces[k_test].get('K_pno') is not None:
+                            Kp = pno_spaces[k_test]['K_pno']
+                            pno_spaces[k_test]['K_pno'] = Kp * signs[:, None] * signs[None, :]
+                        if pno_spaces[k_test].get('T2_pno') is not None:
+                            Tp = pno_spaces[k_test]['T2_pno']
+                            pno_spaces[k_test]['T2_pno'] = Tp * signs[:, None] * signs[None, :]
+                        # t2_pno_all current amplitudes
+                        if k_test in t2_pno_all and t2_pno_all[k_test].size > 0:
+                            t2_pno_all[k_test] = t2_pno_all[k_test] * signs[:, None] * signs[None, :]
+                        # K_pno_cache
+                        if k_test in K_pno_cache:
+                            K_pno_cache[k_test] = K_pno_cache[k_test] * signs[:, None] * signs[None, :]
+                    # After flipping all pairs' PNOs, rebuild S_pno_cache and cc_ints
+                    print(f"  [SIGN_FLIP_TEST] Applied random sign flips to all PNO pairs."
+                          f" Rebuilding S_pno_cache and cc_ints.", flush=True)
+                    S_pno_cache.clear()
+                    for key_ij in keys_sorted:
+                        i_k, j_k = key_ij
+                        C_ij = pno_spaces[key_ij]['C_pno']
+                        if C_ij.shape[1] == 0:
+                            continue
+                        for key_kl in keys_sorted:
+                            if key_kl == key_ij:
+                                continue
+                            k_k, l_k = key_kl
+                            if i_k == k_k or i_k == l_k or j_k == k_k or j_k == l_k:
+                                C_kl = pno_spaces[key_kl]['C_pno']
+                                if C_kl.shape[1] == 0:
+                                    continue
+                                S_pno_cache[(key_ij, key_kl)] = C_ij.T @ (s1e @ C_kl)
+                    for i_k in range(nocc):
+                        key_ii_k = (i_k, i_k)
+                        if key_ii_k not in pno_spaces:
+                            continue
+                        C_ii = pno_spaces[key_ii_k]['C_pno']
+                        if C_ii.shape[1] == 0:
+                            continue
+                        for key_kl in keys_sorted:
+                            if key_kl == key_ii_k:
+                                continue
+                            C_kl = pno_spaces[key_kl]['C_pno']
+                            if C_kl.shape[1] == 0:
+                                continue
+                            if (key_ii_k, key_kl) not in S_pno_cache:
+                                S_pno_cache[(key_ii_k, key_kl)] = C_ii.T @ (s1e @ C_kl)
+                            if (key_kl, key_ii_k) not in S_pno_cache:
+                                S_pno_cache[(key_kl, key_ii_k)] = C_kl.T @ (s1e @ C_ii)
+                        for k in range(nocc):
+                            if k == i_k:
+                                continue
+                            kk = (k, k)
+                            if kk not in pno_spaces:
+                                continue
+                            C_kk = pno_spaces[kk]['C_pno']
+                            if C_kk.shape[1] == 0:
+                                continue
+                            if (key_ii_k, kk) not in S_pno_cache:
+                                S_pno_cache[(key_ii_k, kk)] = C_ii.T @ (s1e @ C_kk)
+                    # Rebuild cc_ints with new C_pno
+                    from pyscf.cc.dlpno_tccsd.local_df import compute_cc_integrals as _ccif
+                    _cc_ints = _ccif(
+                        mf.mol, _auxmol, C_lmo, pno_spaces, pair_aux_idx,
+                        _j2c, _all_keys_cc, nocc)
+                    for key in list(K_pno_cache.keys()):
+                        ci = _cc_ints.get(key)
+                        if ci is not None:
+                            K_pno_cache[key] = ci['K_iajb']
+                    _run_dlpno_lccsd._pno_sign_flip_done = True
+
+                # Check PNO orthonormality (iter 0 diagnostic)
+                if cycle == 0:
+                    for k in [(0, 0), (0, 1), (2, 2), (4, 4)]:
+                        if k not in pno_spaces:
+                            continue
+                        C_pno_k = pno_spaces[k]['C_pno']
+                        if C_pno_k.shape[1] == 0:
+                            continue
+                        Sk = C_pno_k.T @ (s1e @ C_pno_k)
+                        I = np.eye(C_pno_k.shape[1])
+                        err = float(np.max(np.abs(Sk - I)))
+                        print(f"  PNO_ORTH pair({k[0]},{k[1]}) npno={C_pno_k.shape[1]}: "
+                              f"max|S-I|={err:.3e}", flush=True)
+                # One-shot PNO eigenvalue + K_iajb dump at iter 0
+                if cycle == 0:
+                    for k in keys_sorted:
+                        e_pno_k = pno_spaces[k].get('e_pno')
+                        if e_pno_k is None or len(e_pno_k) == 0:
+                            continue
+                        s = " ".join(f"{v:.10e}" for v in e_pno_k)
+                        print(f"  EPNO_DUMP pair({k[0]},{k[1]}) npno={len(e_pno_k)}: {s}",
+                              flush=True)
+                        if (k[0] == 0 or k[1] == 0 or k[0] == 2 or k[1] == 2
+                                or (k[0] == 4 and k[1] == 4)):
+                            ci = _cc_ints.get(k) if _cc_ints is not None else None
+                            if ci is not None:
+                                from pyscf.cc.dlpno_tccsd.local_df import get_local_K
+                                K = get_local_K(_cc_ints, k, k[0], k[1])
+                                if K is not None:
+                                    s = " ".join(f"{v:.10e}" for v in K.ravel())
+                                    print(f"  KIAJB_DUMP pair({k[0]},{k[1]}): {s}",
+                                          flush=True)
+                        # K_ij_kj, J_ij_kj dump for pair (0,9), k=9
+                        if k == (0, 9):
+                            ci = _cc_ints.get(k) if _cc_ints is not None else None
+                            if ci is not None:
+                                Kdict = ci.get('K_ij_kj', {})
+                                Jdict = ci.get('J_ij_kj', {})
+                                Kk = Kdict.get((k, 9))
+                                Jk = Jdict.get((k, 9))
+                                if Kk is not None:
+                                    s = " ".join(f"{v:.10e}" for v in Kk.ravel())
+                                    print(f"  KIJKJ_DUMP pair(0,9) k=9 nr={Kk.shape[0]} "
+                                          f"nc={Kk.shape[1]}: {s}", flush=True)
+                                if Jk is not None:
+                                    s = " ".join(f"{v:.10e}" for v in Jk.ravel())
+                                    print(f"  JIJKJ_DUMP pair(0,9) k=9 nr={Jk.shape[0]} "
+                                          f"nc={Jk.shape[1]}: {s}", flush=True)
+                        # Aux domain dump for weak-strong cross pairs
+                        if (k[0] in (0, 2) and k[1] >= 7):
+                            aux = pair_aux_idx.get(k)
+                            if aux is not None:
+                                nlmo_k = (len(pair_lmo_idx.get(k, []))
+                                          if pair_lmo_idx else -1)
+                                npno_k = pno_spaces[k]['C_pno'].shape[1]
+                                print(f"  AUXDOMAIN pair({k[0]},{k[1]}) "
+                                      f"nlmo={nlmo_k} npno={npno_k} "
+                                      f"naux={len(aux)}: "
+                                      f"{' '.join(str(a) for a in aux)}",
+                                      flush=True)
+                        # Qma dump for pair (0,0) only
+                        if k == (0, 0):
+                            ci_qma = _cc_ints.get(k) if _cc_ints is not None else None
+                            if ci_qma is not None:
+                                Qma = ci_qma['Qma']  # (n_local, nocc, npno)
+                                n_local, npno = Qma.shape[0], Qma.shape[2]
+                                # Psi4's lmopair_to_lmos_[(0,0)] is the pair's LMO
+                                # domain.  We use pair_lmo_idx[(0,0)].
+                                pair_lmos = (pair_lmo_idx.get((0, 0))
+                                             if pair_lmo_idx else None)
+                                if pair_lmos is not None:
+                                    print(f"  QMA_STATS pair(0,0) nlmo={len(pair_lmos)} "
+                                          f"npno={npno} naux={n_local}:", flush=True)
+                                    for q in range(min(n_local, 5)):
+                                        vals = " ".join(f"{Qma[q, pair_lmos[m], a]:.10e}"
+                                                        for m in range(min(len(pair_lmos), 3))
+                                                        for a in range(min(npno, 3)))
+                                        print(f"  QMA_SLICE pair(0,0) Q={q}: {vals}",
+                                              flush=True)
+                                    print(f"  QMA_LMOLIST pair(0,0): "
+                                          f"{' '.join(str(l) for l in pair_lmos)}",
+                                          flush=True)
+                        # Qab dump for pair (0,0) only: summary slices
+                        if k == (0, 0):
+                            ci = _cc_ints.get(k) if _cc_ints is not None else None
+                            if ci is not None:
+                                Qab = ci['Qab']  # (n_local, npno, npno)
+                                n_local, npno = Qab.shape[0], Qab.shape[1]
+                                aux_idx = ci.get('aux_idx')
+                                print(f"  QAB_STATS pair(0,0) npno={npno} naux={n_local}:",
+                                      flush=True)
+                                for q in range(min(n_local, 5)):
+                                    vals = " ".join(f"{Qab[q, a, b]:.10e}"
+                                                    for a in range(min(npno, 3))
+                                                    for b in range(min(npno, 3)))
+                                    print(f"  QAB_SLICE pair(0,0) Q={q}: {vals}",
+                                          flush=True)
+                                if aux_idx is not None:
+                                    print(f"  QAB_AUXLIST pair(0,0): "
+                                          f"{' '.join(str(a) for a in aux_idx)}",
+                                          flush=True)
 
             # Compute energy for monitoring (Eq. 102 of Jiang et al.)
             # E = Σ_i F_ia t1_ia + Σ_ij K_ij^{ab} (2τ-τ^T)
