@@ -642,7 +642,25 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                        @ X_ij_slice).reshape(nQp, len(ij_u_in_Q), npno)
                 raw_ab[local_Q] = np.matmul(X_ij_slice.T, tmp)
 
-            # Cross-pair partners
+            # Cross-pair partners.
+            # Optimization: project the IJ side first ONCE per (pair, centerQ)
+            # via X_ij.T @ qab_b. Then per-partner work reduces to one 1D
+            # fancy slice + one batched matmul (nQp, npno, npp_kj) @ (npp_kj,
+            # n_kj). Empirically ~10× faster than per-partner 2D fancy index
+            # at sizes where pair_paos is large (medium systems).
+            np_full = qab_b.shape[1]
+            if len(ij_u_in_Q) > 0:
+                # qab_ij[Q, u, v] = qab_b[Q, ij_u_in_Q[u], v]
+                if len(ij_u_in_Q) == np_full and np.array_equal(
+                        ij_u_in_Q, np.arange(np_full)):
+                    qab_ij = qab_b
+                else:
+                    qab_ij = qab_b[:, ij_u_in_Q, :]      # (nQp, npp_ij, np_full)
+                # proj_ij[Q, A_ij, v] = sum_u X_ij_slice[u, A_ij] * qab_ij[Q, u, v]
+                proj_ij = np.matmul(X_ij_slice.T, qab_ij)  # (nQp, npno, np_full)
+            else:
+                proj_ij = None
+
             for k, X_kj, pp_kj, n_kj in kj_data:
                 k_s = riatom_to_lmos_ext_dense[centerQ, k]
                 kj_pao_pos = riatom_to_paos_ext_dense[centerQ, pp_kj]
@@ -655,13 +673,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 if k_s >= 0:
                     raw_kv_kj[k][local_Q] = (qia_b[:, k_s, kj_u_in_Q]
                                              @ X_kj_slice)
-                if len(ij_u_in_Q) > 0:
-                    nQp = len(local_Q)
-                    qab_pq_b = qab_b[:, ij_u_in_Q[:, None],
-                                     kj_u_in_Q[None, :]]      # (nQp, npp_ij, npp_kj)
-                    tmp = (qab_pq_b.reshape(nQp * len(ij_u_in_Q), -1)
-                           @ X_kj_slice).reshape(nQp, len(ij_u_in_Q), n_kj)
-                    raw_cross_kj[k][local_Q] = np.matmul(X_ij_slice.T, tmp)
+                if proj_ij is not None:
+                    sub = proj_ij[:, :, kj_u_in_Q]           # (nQp, npno, npp_kj)
+                    raw_cross_kj[k][local_Q] = sub @ X_kj_slice
 
             for k, X_ki, pp_ki, n_ki in ki_data:
                 k_s = riatom_to_lmos_ext_dense[centerQ, k]
@@ -675,13 +689,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 if k_s >= 0:
                     raw_kv_ki[k][local_Q] = (qia_b[:, k_s, ki_u_in_Q]
                                              @ X_ki_slice)
-                if len(ij_u_in_Q) > 0:
-                    nQp = len(local_Q)
-                    qab_pq_b = qab_b[:, ij_u_in_Q[:, None],
-                                     ki_u_in_Q[None, :]]
-                    tmp = (qab_pq_b.reshape(nQp * len(ij_u_in_Q), -1)
-                           @ X_ki_slice).reshape(nQp, len(ij_u_in_Q), n_ki)
-                    raw_cross_ji[k][local_Q] = np.matmul(X_ij_slice.T, tmp)
+                if proj_ij is not None:
+                    sub = proj_ij[:, :, ki_u_in_Q]           # (nQp, npno, npp_ki)
+                    raw_cross_ji[k][local_Q] = sub @ X_ki_slice
 
         # Apply local J^{-1/2}
         j2c_local = j2c[np.ix_(aux_idx, aux_idx)]
