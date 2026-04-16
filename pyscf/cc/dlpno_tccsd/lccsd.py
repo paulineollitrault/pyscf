@@ -524,19 +524,6 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     if cc_ints is None:
         raise ValueError("cc_ints required for Psi4-style T1 residual")
 
-    _DUMP_FAI = getattr(_compute_t1_residual_psi4, '_dump_fai', False)
-    _DUMP_ALL = getattr(_compute_t1_residual_psi4, '_dump_all_iters', False)
-
-    _DEBUG = getattr(_compute_t1_residual_psi4, '_debug', False)
-    _dumped = getattr(_compute_t1_residual_psi4, '_dumped', False)
-    _do_debug = (_DEBUG and not _dumped) or _DUMP_ALL
-    if _do_debug:
-        # Per-term accumulators for debug
-        R_A = {i: np.zeros(0) for i in range(nocc)}
-        R_C = {i: np.zeros(0) for i in range(nocc)}
-        R_B = {i: np.zeros(0) for i in range(nocc)}
-        R_A2 = {i: np.zeros(0) for i in range(nocc)}
-
     # Pre-compute Tt for all canonical pairs (in their canonical PNO basis)
     Tt_canon = {}
     for key, t2 in t2_pno_all.items():
@@ -569,11 +556,6 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             r1_pno[i] = np.zeros(0)
             continue
         r1_pno[i] = np.zeros(n_ii)
-        if _do_debug:
-            R_A[i] = np.zeros(n_ii)
-            R_C[i] = np.zeros(n_ii)
-            R_B[i] = np.zeros(n_ii)
-            R_A2[i] = np.zeros(n_ii)
 
     # ===========================================================
     # T1-dressing terms in Psi4's Fai_[i] (ccsd.cc lines 1631-1712)
@@ -606,7 +588,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     #   Fij_bar(i,j) += 2*T_n[ij] . K_bar_chem[ij] - T_n[ij] . K_bar[ji]
     Fij_bar = F_lmo.copy()
     for key_ij in t2_pno_all:
-        ci_ij = cc_ints.get(key_ij) if cc_ints is not None else None
+        ci_ij = cc_ints.get(key_ij)
         if ci_ij is None:
             continue
         i0, j0 = key_ij  # canonical (i0 <= j0)
@@ -645,7 +627,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
         t1_i = t1_pno.get(i)
         has_t1_i = t1_i is not None and t1_i.size > 0 and np.max(np.abs(t1_i)) > 1e-15
 
-        ci_ii = cc_ints.get(key_ii) if cc_ints is not None else None
+        ci_ii = cc_ints.get(key_ii)
         if ci_ii is None:
             continue
 
@@ -666,29 +648,33 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
 
         # ---- Stage 1: Fai_bar T1 dressing (ccsd.cc lines 1631-1654) ----
         if any_t1:
-            gamma = np.einsum('qmc,mc->q', Qma_ii, T_n_ii)
+            # gamma[q] = Σ_{m,c} Qma[q,m,c] * T_n[m,c]
+            gamma = Qma_ii.reshape(Qma_ii.shape[0], -1) @ T_n_ii.ravel()
             # J: r1 += 2 * Qia.T @ gamma
             r1_pno[i] += 2.0 * (Qia_ii.T @ gamma)
-            # K: r1 -= sum_{q,k} lambda[q,a,k] * Qik[q,k]
-            y = np.einsum('qk,kc->qc', Qik_ii, T_n_ii)
-            r1_pno[i] -= np.einsum('qac,qc->a', Qab_ii, y)
+            # K: r1 -= Σ_q Σ_k Qab[q,a,k] * (Σ_k' Qik[q,k'] * T_n[k',c]) ... wait
+            # Actually: y[q,c] = Σ_k Qik[q,k] * T_n[k,c]
+            y = Qik_ii @ T_n_ii                # (n_local, n_ii)
+            # r1[a] -= Σ_{q,c} Qab[q,a,c] * y[q,c] = Σ_q (Qab[q] @ y[q])[a]
+            # Flatten: (Qab * y[:,None,:]).sum((0,2)) — efficient via matmul
+            # = Σ_q,c Qab[q, :, c] * y[q, c] = Σ_q (Qab[q] @ y[q])[a]
+            r1_pno[i] -= np.einsum('qac,qc->a', Qab_ii, y, optimize=True)
 
         # ---- Stage 2 & 3: Fab_bar @ t1 and -T_n.T @ Fia_bar @ t1 ----
-        # (ccsd.cc lines 1703-1704)
-        # INCREMENT form: include FULL Fab_bar (with diagonal) since
-        # the denominator no longer absorbs it.
         if has_t1_i and any_t1:
-            W_qak = np.einsum('qab,kb->qak', Qab_ii, T_n_ii)
-            # Full Fab_bar = diag(e_pno) + J dressing + K dressing
-            Fab_bar_ii = (np.diag(e_pno_ii)
-                          + 2.0 * np.einsum('q,qab->ab', gamma, Qab_ii)
-                          - np.einsum('qak,qkc->ac', W_qak, Qma_ii))
+            # W[q, a, k] = Σ_b Qab[q,a,b] * T_n[k,b] = (Qab @ T_n.T)[q,a,k]
+            W_qak = Qab_ii @ T_n_ii.T          # (n_local, n_ii, nocc)
+            # Fab_bar = diag(e_pno) + 2*Σ_q gamma[q]*Qab[q] - Σ_{q,k} W[q,a,k]*Qma[q,k,c]
+            Fab_bar_ii = np.diag(e_pno_ii)
+            Fab_bar_ii += 2.0 * np.tensordot(gamma, Qab_ii, axes=(0, 0))
+            Fab_bar_ii -= np.tensordot(W_qak, Qma_ii, axes=((0, 2), (0, 1)))
             r1_pno[i] += Fab_bar_ii @ t1_i
 
-            # Fia_bar (nocc, n_ii)
-            Z_qmk = np.einsum('qma,ka->qmk', Qma_ii, T_n_ii)
-            Fia_bar_ii = (2.0 * np.einsum('q,qma->ma', gamma, Qma_ii)
-                          - np.einsum('qmk,qkb->mb', Z_qmk, Qma_ii))
+            # Fia_bar[m, a] = 2*Σ_q gamma[q]*Qma[q,m,a] - Σ_{q,k} Z[q,m,k]*Qma[q,k,b]
+            # Z[q, m, k] = Σ_a Qma[q,m,a] * T_n[k,a] = Qma @ T_n.T
+            Z_qmk = Qma_ii @ T_n_ii.T          # (n_local, nocc, nocc)
+            Fia_bar_ii = 2.0 * np.tensordot(gamma, Qma_ii, axes=(0, 0))
+            Fia_bar_ii -= np.tensordot(Z_qmk, Qma_ii, axes=((0, 1), (0, 1)))
             r1_pno[i] -= T_n_ii.T @ (Fia_bar_ii @ t1_i)
         elif has_t1_i:
             # No T1 dressing → bare Fab_bar = diag(e_pno)
@@ -707,25 +693,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                 continue
             r1_pno[i] -= f_dressed * t1_k_in_ii
 
-    # Dump |Fai| norm for comparison with Psi4's DEBUG iter N: |Fai|=...
-    if _DUMP_FAI:
-        fai_sq = sum(np.dot(r1_pno[ii], r1_pno[ii]) - np.dot(fov_pno[ii], fov_pno[ii])
-                     for ii in range(nocc)
-                     if ii in r1_pno and r1_pno[ii].size > 0 and fov_pno[ii].size > 0)
-        # Actually — Psi4's |Fai| is the norm of Fai_[i] (just the Fock part, before A/B/C).
-        # Our r1_pno at this point = fov + Fai_bar dressing + Fab_bar@t1 + triplet + Foo*t1
-        # = Psi4's Fai_[i].  So norm(r1_pno - A_contrib - C_contrib - B_contrib) = |Fai|.
-        # Since we haven't added A/B/C yet, r1_pno IS Fai_[i] at this point.
-        fai_norm = float(np.sqrt(sum(np.dot(r1_pno[ii], r1_pno[ii])
-                                     for ii in range(nocc) if r1_pno[ii].size > 0)))
-        t1_norm = float(np.sqrt(sum(np.dot(t1_pno.get(ii, np.zeros(0)),
-                                           t1_pno.get(ii, np.zeros(0)))
-                                    for ii in range(nocc))))
-        print(f"  OUR_FAI: |T1|={t1_norm:.10f} |Fai|={fai_norm:.10f}", flush=True)
-
     # Helper: get integral (k a_ki | c d) from cc_ints
-    # Returns ki_data with: 'k_Qa' (n_local, n_ki), 'Qab' (n_local, n_ki, n_ki),
-    # 'n_ki', or None if pair not present.
     def _get_ki_data(k, i_lmo):
         key_ki = (min(k, i_lmo), max(k, i_lmo))
         if key_ki not in pno_spaces:
@@ -736,30 +704,19 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
         n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
         if n_ki == 0:
             return None
-        # k_Qa: (Q | LMO_k * PNO_a) — pick i_Qa or j_Qa based on key ordering
-        if key_ki[0] == k:
-            k_Qa = ci['i_Qa']
-        else:
-            k_Qa = ci['j_Qa']
+        k_Qa = ci['i_Qa'] if key_ki[0] == k else ci['j_Qa']
         return {'key': key_ki, 'n_ki': n_ki, 'k_Qa': k_Qa,
                 'Qab': ci['Qab'], 'i_Qk': ci.get('i_Qk'), 'j_Qk': ci.get('j_Qk')}
 
     # ===========================================================
     # A and C terms: loop over ordered pairs (i, k) for each i
     # ===========================================================
-    # For Psi4: for each ordered pair (i, k), compute contribution to R[i].
-    # A_i^a = u_ki^cd * (kc|ad) — uses K_tilde_chem[ki] (LMO is k)
-    # C_i^a = Tt[ik] @ Fkc[ki]^T — uses Fock_ov of orbital k in PNO_ki
     for i in range(nocc):
         key_ii = (i, i)
         if key_ii not in pno_spaces or pno_spaces[key_ii]['C_pno'].shape[1] == 0:
             continue
         n_ii = pno_spaces[key_ii]['C_pno'].shape[1]
 
-        _weak_skip_A = getattr(_compute_t1_residual_psi4,
-                                '_skip_weak_in_A', False)
-        _strong_set = getattr(_compute_t1_residual_psi4,
-                              '_strong_pair_keys', None)
         for k in range(nocc):
             ki_data = _get_ki_data(k, i)
             if ki_data is None:
@@ -768,11 +725,6 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             n_ki = ki_data['n_ki']
             k_Qa = ki_data['k_Qa']
             Qab_ki = ki_data['Qab']
-
-            # Optionally skip weak pairs from A term (Eq 88) to match Psi4
-            # which only builds K_tilde_chem_ for strong pairs.
-            if _weak_skip_A and _strong_set is not None and key_ki not in _strong_set:
-                continue
 
             # Get T2 for ordered pair (k, i): Tt_ki[a, c]
             if key_ki not in t2_pno_all:
@@ -803,16 +755,6 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                     A_contrib = None
             if A_contrib is not None:
                 r1_pno[i] += A_contrib
-                if _do_debug:
-                    R_A[i] += A_contrib
-                # Per-(k, i) A contribution dump (LMO 0 only, iter 0 only)
-                if (i == 0 and getattr(_compute_t1_residual_psi4, '_iter', 0) == 0
-                        and getattr(_compute_t1_residual_psi4, '_dump_A_perk', False)):
-                    a_norm = float(np.sqrt(np.dot(A_contrib, A_contrib)))
-                    a_sum = float(np.sum(A_contrib))
-                    print(f"  A_PERK iter 0 i=0 k={k} key_ki={key_ki}: "
-                          f"|A|={a_norm:.12e} sum={a_sum:.12e} npno_ki={n_ki}",
-                          flush=True)
 
             # ----- C term -----
             # C_i^a = Σ_k S(ik,ii)^T @ Tt[ik] @ Fkc[ki]^T
@@ -847,7 +789,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                     continue
                 key_im = (min(i, m), max(i, m))
                 key_mm = (m, m)
-                ci_im = cc_ints.get(key_im) if cc_ints is not None else None
+                ci_im = cc_ints.get(key_im)
                 if ci_im is None:
                     continue
                 n_im = pno_spaces[key_im]['C_pno'].shape[1]
@@ -885,8 +827,6 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                     C_contrib = None
             if C_contrib is not None:
                 r1_pno[i] += C_contrib
-                if _do_debug:
-                    R_C[i] += C_contrib
 
     # ===========================================================
     # B and A2 terms: loop over ordered pairs (k, l)
@@ -961,10 +901,6 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                         B_contrib = None
                 if B_contrib is not None:
                     r1_pno[i] -= B_contrib
-                    if _do_debug:
-                        R_B[i] -= B_contrib
-                    if i == 0 and getattr(_compute_t1_residual_psi4, '_dump_B_per_pair', False):
-                        print(f"  B_PAIR i=0 kl=({k},{l}) |B|={float(np.linalg.norm(B_contrib)):.12f}", flush=True)
 
                 # A2 contribution (Psi4 ccsd.cc lines 2146-2152)
                 # R1[i,a] -= T_n[ii][l, a] * dot(K_iajb[kl], U_ki)
@@ -991,1959 +927,10 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                             T_n_l_ii = T_n.get((key_ii, l), np.zeros(
                                 pno_spaces[key_ii]['C_pno'].shape[1]))
                             if T_n_l_ii.size > 0:
-                                A2_contrib = scalar * T_n_l_ii
-                                r1_pno[i] -= A2_contrib
-                                if _do_debug:
-                                    R_A2[i] -= A2_contrib
-
-    if _do_debug:
-        _iter_n = getattr(_compute_t1_residual_psi4, '_iter_count', 0)
-        # Dump per-LMO R1 norms (matches Psi4 DEBUG iter N: R1[i] norm=...)
-        r1_total = float(np.sqrt(sum(np.dot(r1_pno[ii], r1_pno[ii])
-                                     for ii in range(nocc) if r1_pno[ii].size > 0)))
-        t1_norm = float(np.sqrt(sum(np.dot(t1_pno.get(ii, np.zeros(0)),
-                                           t1_pno.get(ii, np.zeros(0)))
-                                    for ii in range(nocc))))
-        # Fai norm = norm of the Fai_bar + dressing part (before A/B/C)
-        fai_norm = float(np.sqrt(sum(
-            np.dot(r1_pno[ii] - R_A.get(ii, np.zeros(0)) - R_C.get(ii, np.zeros(0))
-                   - R_B.get(ii, np.zeros(0)) - R_A2.get(ii, np.zeros(0)),
-                   r1_pno[ii] - R_A.get(ii, np.zeros(0)) - R_C.get(ii, np.zeros(0))
-                   - R_B.get(ii, np.zeros(0)) - R_A2.get(ii, np.zeros(0)))
-            for ii in range(nocc) if r1_pno[ii].size > 0)))
-        print(f"  OUR iter {_iter_n}: |T1|={t1_norm:.10f} |Fai|={fai_norm:.10f}", flush=True)
-        for i in range(nocc):
-            if i not in r1_pno or r1_pno[i].size == 0:
-                continue
-            print(f"  OUR iter {_iter_n}: R1[{i}] norm={float(np.linalg.norm(r1_pno[i])):.10f}", flush=True)
-        print(f"  OUR iter {_iter_n}: |R1_total|={r1_total:.10f}", flush=True)
-        # Always dump per-term breakdown when debug is on (any iter)
-        for i in range(nocc):
-            if i not in r1_pno or r1_pno[i].size == 0:
-                continue
-            print(f"  R1_TERMS iter {_iter_n} lmo({i}): "
-                  f"A_rms={float(np.sqrt(np.mean(R_A[i]*R_A[i]))):.12e} "
-                  f"C_rms={float(np.sqrt(np.mean(R_C[i]*R_C[i]))):.12e} "
-                  f"B_rms={float(np.sqrt(np.mean(R_B[i]*R_B[i]))):.12e} "
-                  f"A2_rms={float(np.sqrt(np.mean(R_A2[i]*R_A2[i]))):.12e}",
-                  flush=True)
-        _compute_t1_residual_psi4._dumped = True
-        _compute_t1_residual_psi4._iter_count = _iter_n + 1
+                                r1_pno[i] -= scalar * T_n_l_ii
 
     return r1_pno
 
-
-def _compute_local_t1_residual(t1_pno, t2_pno_all, pno_spaces,
-                                fov_pno, F_lmo, eps_lmo,
-                                nocc, s1e, fock_ao, C_lmo,
-                                ovL_pno_cache, S_pno_cache,
-                                foo_dressed=None,
-                                with_df=None, ooL_3idx=None,
-                                Fab_precomputed=None,
-                                t1_aterm_precomputed=None,
-                                cc_ints=None):
-    """Compute local CCSD T1 residual in diagonal PNO bases.
-
-    Implements the t1-transformed CCSD singles residual following
-    Jiang et al. JCP 2024, Eqs. 87–90, 94–101:
-
-        R_i^{a_ii} = F̃_{a_ii,i}            (dressed Fock ov, Eq. 96)
-                   + F_vv × t1              (virtual Fock dressing)
-                   - F_oo × t1              (occupied Fock dressing)
-                   + C_i^{a_ii}             (Eq. 90: T2 × Fock_ov coupling)
-                   + A_i^{a_ii}             (Eq. 88: T2 × voov)
-                   - foo_dressed × t1       (T2-dressed occupied Fock)
-
-    The T1 amplitudes live in the diagonal PNO basis of pair (i,i).
-    Inter-pair coupling uses PNO overlap matrices from S_pno_cache.
-
-    Args:
-        t1_pno (dict): i → (n_pno_ii,) T1 in diagonal PNO_{ii} basis.
-        t2_pno_all (dict): (i,j) → (n_pno_ij, n_pno_ij) T2 in PNO_{ij}.
-        pno_spaces (dict): PNO space data.
-        fov_pno (dict): i → (n_pno_ii,) Fock ov block in PNO_{ii} basis.
-        F_lmo (np.ndarray): (nocc, nocc) Fock in LMO basis.
-        eps_lmo (np.ndarray): (nocc,) diagonal LMO Fock eigenvalues.
-        nocc (int): Number of occupied LMOs.
-        s1e (np.ndarray): AO overlap matrix.
-        fock_ao (np.ndarray): AO Fock matrix.
-        C_lmo (np.ndarray): (nao, nocc) LMO coefficients.
-        ovL_pno_cache (dict): ((key, k) → (n_pno, naux)) DF 3-index tensors.
-        S_pno_cache (dict): ((key1, key2) → overlap matrix) PNO overlaps.
-        foo_dressed (np.ndarray or None): (nocc, nocc) T2-dressed occ Fock.
-
-    Returns:
-        r1_pno (dict): i → (n_pno_ii,) T1 residual in PNO_{ii} basis.
-    """
-    # Use new Psi4-style T1 residual when cc_ints is available (better accuracy)
-    if cc_ints is not None and not getattr(_compute_local_t1_residual, '_use_old', False):
-        return _compute_t1_residual_psi4(
-            t1_pno, t2_pno_all, pno_spaces, fov_pno, F_lmo, eps_lmo, nocc,
-            S_pno_cache, cc_ints, ovL_pno_cache=ovL_pno_cache,
-            pair_lmo_idx=getattr(_compute_local_t1_residual, '_pair_lmo_idx', None))
-
-    r1_pno = {}
-    import time as _t1time
-    _t1_timers = {'fov': 0, 'fvv': 0, 'foo': 0, 'foo_t1': 0, 'ct': 0, 'at': 0}
-
-    for i in range(nocc):
-        key_ii = (i, i)
-        if key_ii not in pno_spaces:
-            r1_pno[i] = np.zeros(0)
-            continue
-        data_ii = pno_spaces[key_ii]
-        C_pno_ii = data_ii['C_pno']
-        n_pno_ii = C_pno_ii.shape[1]
-        if n_pno_ii == 0:
-            r1_pno[i] = np.zeros(0)
-            continue
-        e_pno_ii = data_ii['e_pno']
-
-        _t0 = _t1time.perf_counter()
-        _DEBUG_R1 = (i == 0 and getattr(_compute_local_t1_residual, '_debug_r1_terms', False)
-                     and not getattr(_compute_local_t1_residual, '_dumped_r1_terms', False))
-        # ---- Term 1: Dressed Fock ov (Eq. 96) ----
-        # F̃_{a_ii,i} = F̄_{a_ii,i} - t̃_k^{a_ii} F̄_{ki}
-        #             + F̄_{a_ii,b_ii} t_i^{b_ii} - t̃_k^{a_ii} F̄_{kb_ii} t_i^{b_ii}
-        # Leading term: bare Fock ov
-        r1_i = fov_pno[i].copy()  # (n_pno_ii,)
-        if _DEBUG_R1:
-            print(f"  R1_TERM[i=0] after T1: {np.linalg.norm(r1_i):.10f}")
-
-        # ---- Term 1b: T1-dressed fov (PySCF ccsd.py lines 191-192) ----
-        # fov[i,a] += Σ_k t1[k,c] * [2*(ai|kc) - (ak|ic)]
-        # Using DF: Coulomb (a_ii i|k c_kk) = ovL[(ii),i] @ ovL[(kk),k].T
-        #           Exchange (a_ii k|i c_kk) = ovL[(ii),k] @ ovL[(kk),i].T
-        if ovL_pno_cache is not None:
-            ovL_ii_i = ovL_pno_cache.get((key_ii, i))
-            if ovL_ii_i is not None:
-                for k in range(nocc):
-                    key_kk = (k, k)
-                    t1_k = t1_pno.get(k)
-                    if t1_k is None or t1_k.size == 0:
-                        continue
-                    if np.max(np.abs(t1_k)) < 1e-15:
-                        continue
-                    ovL_kk_k = ovL_pno_cache.get((key_kk, k))
-                    if ovL_kk_k is None:
-                        continue
-                    # Coulomb: 2*(a_ii i|k c_kk)*t1_k[c]
-                    z_coul = ovL_kk_k.T @ t1_k  # (naux,)
-                    r1_i += 2.0 * ovL_ii_i @ z_coul
-                    # Exchange: -(a_ii k|i c_kk)*t1_k[c]
-                    ovL_ii_k = ovL_pno_cache.get((key_ii, k))
-                    ovL_kk_i = ovL_pno_cache.get((key_kk, i))
-                    if ovL_ii_k is not None and ovL_kk_i is not None:
-                        z_exch = ovL_kk_i.T @ t1_k  # (naux,)
-                        r1_i -= ovL_ii_k @ z_exch
-
-        if _DEBUG_R1:
-            print(f"  R1_TERM[i=0] after T1b: {np.linalg.norm(r1_i):.10f}")
-        _t1_timers['fov'] += _t1time.perf_counter() - _t0; _t0 = _t1time.perf_counter()
-        # ---- Term 2: F_vv × T1 (off-diagonal virtual Fock) ----
-        # Use precomputed Fab from Jiang intermediates if available.
-        # Fab already contains diag(e_pno) + T2-dressed fvv + T1-dressed fvv.
-        # We only need the OFF-DIAGONAL part (diagonal is in the denominator).
-        if Fab_precomputed is not None and key_ii in Fab_precomputed:
-            Fab_ii = Fab_precomputed[key_ii]
-            # Fab includes diag(e_pno); remove it (handled by denominator)
-            fvv_offdiag = Fab_ii - np.diag(e_pno_ii)
-            t1_i = t1_pno.get(i, np.zeros(n_pno_ii))
-            if t1_i.size > 0:
-                r1_i += fvv_offdiag @ t1_i
-        elif (ovL_pno_cache is not None and with_df is not None
-                and t1_pno.get(i) is not None and t1_pno[i].size > 0):
-            fvv_ii = np.zeros((n_pno_ii, n_pno_ii))
-            for key_mn, t2_mn_raw in t2_pno_all.items():
-                if t2_mn_raw is None or t2_mn_raw.shape[0] == 0:
-                    continue
-                mm, nn = key_mn
-                n_mn = pno_spaces[key_mn]['C_pno'].shape[1]
-                if n_mn == 0:
-                    continue
-                theta_fock_mn = 2.0 * t2_mn_raw.T - t2_mn_raw
-                S_proj = S_pno_cache.get((key_ii, key_mn))
-                if S_proj is None and key_mn == key_ii:
-                    S_proj = np.eye(n_pno_ii)
-                if S_proj is None:
-                    continue
-                # voov_mn[a_mn, b_ii] = (a_mn nn | mm b_ii)
-                _ovL_mn_nn = ovL_pno_cache.get((key_mn, nn))
-                _ovL_ii_mm = ovL_pno_cache.get((key_ii, mm))
-                if _ovL_mn_nn is not None and _ovL_ii_mm is not None:
-                    voov_mn = _ovL_mn_nn @ _ovL_ii_mm.T
-                else:
-                    voov_mn = with_df.ao2mo(
-                        [pno_spaces[key_mn]['C_pno'],
-                         C_lmo[:, [nn]], C_lmo[:, [mm]], C_pno_ii],
-                        compact=False).reshape(n_mn, n_pno_ii)
-                theta_proj = theta_fock_mn @ S_proj.T
-                fvv_ii -= theta_proj.T @ voov_mn
-                if mm != nn:
-                    theta_fock_nm = 2.0 * t2_mn_raw - t2_mn_raw.T
-                    _ovL_mn_mm = ovL_pno_cache.get((key_mn, mm))
-                    _ovL_ii_nn = ovL_pno_cache.get((key_ii, nn))
-                    if _ovL_mn_mm is not None and _ovL_ii_nn is not None:
-                        voov_nm = _ovL_mn_mm @ _ovL_ii_nn.T
-                    else:
-                        voov_nm = with_df.ao2mo(
-                            [pno_spaces[key_mn]['C_pno'],
-                             C_lmo[:, [mm]], C_lmo[:, [nn]], C_pno_ii],
-                            compact=False).reshape(n_mn, n_pno_ii)
-                    theta_proj_nm = theta_fock_nm @ S_proj.T
-                    fvv_ii -= theta_proj_nm.T @ voov_nm
-            # T1 dressing of fvv (PySCF lines 129, 332-333):
-            # fvv_t1[a,b] -= 0.5 * Σ_k t1[k,a] * fov[k,b]          (line 129)
-            # fvv_t1[a,b] += Σ_{k,c} 2*t1[k,c]*(ck|ab) - t1[k,c]*(bk|ca)  (332-333)
-            # Part 1: -0.5 * t1 @ fov  (in PNO_ii basis)
-            for k in range(nocc):
-                t1_k_in_ii = _project_t1_to_pair(
-                    t1_pno, k, key_ii, S_pno_cache, pno_spaces)
-                fov_k_in_ii = _project_t1_to_pair(
-                    fov_pno, k, key_ii, S_pno_cache, pno_spaces)
-                fvv_ii -= 0.5 * np.outer(t1_k_in_ii, fov_k_in_ii)
-
-            # Part 2: T1 × vovv (lines 332-333)
-            # fvv_t1[a,b] += Σ_{k,c} 2*t1[k,c]*(ck|ab) - t1[k,c]*(bk|ca)
-            # DF: (ck|ab) = Σ_L ovL_kk_k[c,L] * vvL_ii[a,b,L]
-            #     (bk|ca) = Σ_L ovL_ii_k[b,L] * ovL_kk_c_in_ii_a[...] — complex
-            # Alternative: contract via DF batch loop for vv in PNO_ii
-            if ooL_3idx is not None:
-                from pyscf.ao2mo import _ao2mo as _ao2mo_t1fvv
-                mo_ii = np.asfortranarray(C_pno_ii)
-                ijslice_ii = (0, n_pno_ii, 0, n_pno_ii)
-                naux = with_df.get_naoaux()
-                buf_fvv = None
-                aux_off = 0
-                for Lpq in with_df.loop():
-                    nL = Lpq.shape[0]
-                    buf_fvv = _ao2mo_t1fvv.nr_e2(
-                        Lpq, mo_ii, ijslice_ii, aosym='s2', out=buf_fvv)
-                    B_L = buf_fvv.reshape(nL, n_pno_ii, n_pno_ii)  # (L, a, b)
-                    for k in range(nocc):
-                        key_kk = (k, k)
-                        t1_k = t1_pno.get(k)
-                        if t1_k is None or t1_k.size == 0:
-                            continue
-                        if np.max(np.abs(t1_k)) < 1e-15:
-                            continue
-                        ovL_kk_k = ovL_pno_cache.get((key_kk, k))
-                        if ovL_kk_k is None:
-                            continue
-                        # z_k[L] = Σ_c t1[k,c] * ovL_kk_k[c,L]
-                        z_k_batch = t1_k @ ovL_kk_k[:, aux_off:aux_off+nL]
-                        # Coulomb: 2*(ck|ab) → 2 * z_k[L] * B_L[L,a,b]
-                        fvv_ii += 2.0 * np.einsum('L,Lab->ab', z_k_batch, B_L)
-                        # Exchange: -(bk|ca) = -(bk|ca)
-                        # ovL_ii_k[b,L] = ovL_pno_cache[(ii,k)][b,L]
-                        ovL_ii_k = ovL_pno_cache.get((key_ii, k))
-                        if ovL_ii_k is not None:
-                            ovL_ii_k_batch = ovL_ii_k[:, aux_off:aux_off+nL]
-                            # (bk|ca) = Σ_L ovL_ii_k[b,L] * (c a | L)
-                            # where (ca|L) = B_L[L,c,a] but c is in PNO_kk basis
-                            # We need (c_kk a_ii | L), different from B_L which is
-                            # (a_ii b_ii | L). So we need a mixed basis transform.
-                            # Skip this exchange term for now — the Coulomb part
-                            # should give the dominant contribution.
-                            pass
-                    aux_off += nL
-                    Lpq = None
-
-            # Apply: r1[a] += Σ_b fvv[a,b] * t1[i,b]
-            r1_i += fvv_ii @ t1_pno[i]
-
-        if _DEBUG_R1:
-            print(f"  R1_TERM[i=0] after T2(fvv): {np.linalg.norm(r1_i):.10f}")
-        _t1_timers['fvv'] += _t1time.perf_counter() - _t0; _t0 = _t1time.perf_counter()
-        # ---- Term 3: -F_oo × T1 (off-diagonal occupied Fock) ----
-        # -Σ_k F_oo_off[k,i] * t1_k projected to PNO_{ii}
-        ft_oo = F_lmo - np.diag(eps_lmo)  # off-diagonal occupied Fock
-        for k in range(nocc):
-            if abs(ft_oo[k, i]) < 1e-15:
-                continue
-            t1_k_in_ii = _project_t1_to_pair(
-                t1_pno, k, key_ii, S_pno_cache, pno_spaces)
-            r1_i -= ft_oo[k, i] * t1_k_in_ii
-
-        # ---- Term 3b: -foo_dressed × T1 ----
-        if foo_dressed is not None:
-            for k in range(nocc):
-                if abs(foo_dressed[k, i]) < 1e-15:
-                    continue
-                t1_k_in_ii = _project_t1_to_pair(
-                    t1_pno, k, key_ii, S_pno_cache, pno_spaces)
-                r1_i -= foo_dressed[k, i] * t1_k_in_ii
-
-        # ---- Term 3c: T1 dressing of foo (PySCF lines 126, 157-158) ----
-        # foo_t1[k,i] += 0.5 * Σ_a fov[k,a] * t1[i,a]         (line 126)
-        # foo_t1[k,i] += Σ_{m,c} 2*t1[m,c]*(mc|ki) - t1[m,c]*(kc|im)  (157-158)
-        # Then: r1[i,a] -= Σ_k foo_t1[k,i] * t1[k,a]
-        if ovL_pno_cache is not None and ooL_3idx is not None:
-            foo_t1 = np.zeros((nocc, nocc))
-
-            # Part 1: 0.5 * fov @ t1 (line 126)
-            # foo_t1[k,i] += 0.5 * Σ_a fov[k,a]*t1[i,a]
-            # Compute in PNO_(k,k) basis: fov[k] dot t1[i] projected to PNO_(k,k)
-            for k in range(nocc):
-                key_kk = (k, k)
-                if key_kk not in pno_spaces:
-                    continue
-                fov_k = fov_pno.get(k)
-                if fov_k is None or fov_k.size == 0:
-                    continue
-                t1_i_in_kk = _project_t1_to_pair(
-                    t1_pno, i, key_kk, S_pno_cache, pno_spaces)
-                foo_t1[k, i] += 0.5 * np.dot(fov_k, t1_i_in_kk)
-
-            # Part 2: T1 × ovoo (lines 157-158)
-            # foo_t1[k,i] += Σ_{m,c} 2*t1[m,c]*(mc|ki) - t1[m,c]*(kc|im)
-            # DF: (mc|ki) = Σ_L ovL_mm_m[c,L] * ooL[k,i,L]
-            #     (kc|im) = Σ_L ovL_mm_k[c,L] * ooL[i,m,L]
-            for m in range(nocc):
-                key_mm = (m, m)
-                t1_m = t1_pno.get(m)
-                if t1_m is None or t1_m.size == 0:
-                    continue
-                if np.max(np.abs(t1_m)) < 1e-15:
-                    continue
-                ovL_mm_m = ovL_pno_cache.get((key_mm, m))
-                if ovL_mm_m is None:
-                    continue
-                # z_m[L] = Σ_c t1[m,c] * ovL_mm_m[c,L]
-                z_m = t1_m @ ovL_mm_m  # (naux,)
-                # Coulomb: 2*(mc|ki) → 2 * z_m @ ooL[k,i,:]
-                for k in range(nocc):
-                    foo_t1[k, i] += 2.0 * np.dot(z_m, ooL_3idx[k, i])
-                # Exchange: -(kc|im) → need ovL_mm_k and ooL[i,m,:]
-                for k in range(nocc):
-                    ovL_mm_k = ovL_pno_cache.get((key_mm, k))
-                    if ovL_mm_k is None:
-                        continue
-                    z_k = t1_m @ ovL_mm_k  # (naux,)
-                    foo_t1[k, i] -= np.dot(z_k, ooL_3idx[i, m])
-
-            # Apply: r1[i,a] -= Σ_k foo_t1[k,i] * t1_k_in_ii[a]
-            for k in range(nocc):
-                if abs(foo_t1[k, i]) < 1e-15:
-                    continue
-                t1_k_in_ii = _project_t1_to_pair(
-                    t1_pno, k, key_ii, S_pno_cache, pno_spaces)
-                r1_i -= foo_t1[k, i] * t1_k_in_ii
-
-        if _DEBUG_R1:
-            print(f"  R1_TERM[i=0] after T3(foo): {np.linalg.norm(r1_i):.10f}")
-        _t1_timers['foo'] += _t1time.perf_counter() - _t0; _t0 = _t1time.perf_counter()
-        # ---- Term 4 (C-term, Eq. 90/DePrince Eq 22): T2 × Fock_ov coupling ----
-        # Psi4: C_i^a = Σ_k S(ii,ik) @ Tt[ik] @ Fkc[ki].T
-        # where Fkc[ki] = Σ_m S(ki,im) @ L[im] @ S(im,mm) @ T1_m
-        # Simplified: theta_ik @ fov_k + T1 correction through Fkc
-        for k in range(nocc):
-            key_ik = (min(i, k), max(i, k))
-            key_ki = (min(k, i), max(k, i))  # same as key_ik
-            if key_ik not in t2_pno_all:
-                continue
-            t2_ik_raw = t2_pno_all[key_ik]
-            if t2_ik_raw is None or t2_ik_raw.shape[0] == 0:
-                continue
-            # t2[i,k] from stored t2[min,max]
-            t2_ik = t2_ik_raw if i <= k else t2_ik_raw.T
-            theta_ik = 2.0 * t2_ik - t2_ik.T
-            n_ik = t2_ik.shape[0]
-
-            # fov[k] projected to PNO_{ik} basis (bare part)
-            fov_k_in_ik = _project_t1_to_pair(
-                fov_pno, k, key_ik, S_pno_cache, pno_spaces)
-
-            # Fkc T1 dressing: Σ_m S(ki,im) @ L[im] @ S(im,mm) @ T1_m
-            # For T_CutPNO=0: Fkc[c_ki] = Σ_m L_im[c,d] @ S(im,mm) @ T1_m[d]
-            # where L = 2K-K.T
-            fkc_dress = np.zeros(n_ik)
-            if ovL_pno_cache is not None:
-                for m in range(nocc):
-                    t1_m = t1_pno.get(m)
-                    if t1_m is None or t1_m.size == 0:
-                        continue
-                    if np.max(np.abs(t1_m)) < 1e-15:
-                        continue
-                    key_im = (min(i, m), max(i, m))
-                    key_mm = (m, m)
-                    if key_im not in pno_spaces or key_mm not in pno_spaces:
-                        continue
-                    n_im = pno_spaces[key_im]['C_pno'].shape[1]
-                    if n_im == 0:
-                        continue
-                    # L[im] = 2K[im] - K[im].T where K[im] = ovL_i @ ovL_m.T
-                    ovL_i_im = ovL_pno_cache.get((key_im, i))
-                    ovL_m_im = ovL_pno_cache.get((key_im, m))
-                    if ovL_i_im is None or ovL_m_im is None:
-                        continue
-                    K_im = ovL_i_im @ ovL_m_im.T
-                    L_im = 2.0 * K_im - K_im.T  # (n_im, n_im)
-
-                    # S(im, mm) @ T1_m: project T1_m to PNO_im
-                    S_im_mm = S_pno_cache.get((key_im, key_mm))
-                    if S_im_mm is None and key_im == key_mm:
-                        S_im_mm = np.eye(n_im)
-                    if S_im_mm is None:
-                        continue
-                    T1_m_in_im = S_im_mm @ t1_m  # (n_im,)
-
-                    # L_im @ T1_m_in_im: (n_im,)
-                    LT1 = L_im @ T1_m_in_im  # (n_im,)
-
-                    # Project from PNO_im to PNO_ki = PNO_ik
-                    S_ik_im = S_pno_cache.get((key_ik, key_im))
-                    if S_ik_im is None and key_ik == key_im:
-                        S_ik_im = np.eye(n_ik)
-                    if S_ik_im is None:
-                        continue
-                    fkc_dress += S_ik_im @ LT1
-
-            # Total Fkc = bare fov_k + T1 dressing
-            fkc_total = fov_k_in_ik + fkc_dress
-
-            # theta_ik @ fkc gives result in PNO_{ik} basis
-            contrib_ik = theta_ik @ fkc_total  # (n_pno_ik,)
-
-            # Project result from PNO_{ik} to PNO_{ii}
-            if key_ik == key_ii:
-                r1_i += contrib_ik
-            else:
-                S_ii_ik = S_pno_cache.get((key_ii, key_ik))
-                if S_ii_ik is not None:
-                    r1_i += S_ii_ik @ contrib_ik
-
-        if _DEBUG_R1:
-            print(f"  R1_TERM[i=0] after T4(C-term): {np.linalg.norm(r1_i):.10f}")
-        _t1_timers['ct'] += _t1time.perf_counter() - _t0; _t0 = _t1time.perf_counter()
-        # ---- Term 5 (A-term, Eq. 88): T1 × voov ----
-        if ovL_pno_cache and with_df is not None:
-            for k in range(nocc):
-                key_ik = (min(i, k), max(i, k))
-                if key_ik not in pno_spaces:
-                    continue
-                C_pno_ik = pno_spaces[key_ik]['C_pno']
-                n_pno_ik = C_pno_ik.shape[1]
-                if n_pno_ik == 0:
-                    continue
-                t1_k_in_ik = _project_t1_to_pair(
-                    t1_pno, k, key_ik, S_pno_cache, pno_spaces)
-                if np.max(np.abs(t1_k_in_ik)) < 1e-15:
-                    continue
-
-                ovL_k = ovL_pno_cache.get((key_ik, k))
-                ovL_i = ovL_pno_cache.get((key_ik, i))
-                if ovL_k is None or ovL_i is None:
-                    continue
-                # voov[p,q] = (k p | i q) → voov.T[a,e] = (ke|ia)
-                voov_ki = ovL_k @ ovL_i.T  # (n_pno_ik, n_pno_ik)
-                coul = 2.0 * voov_ki.T @ t1_k_in_ik  # 2*Σ_e (ke|ia)*t1[k,e]
-
-                # oovv: (ki|ae) via DF
-                # Exchange (ki|ae)*t1[k,e] = Σ_Q ooL_local[k,i,Q] * (Qab @ t1)[Q,a]
-                # Use local DF if available (avoids expensive ao2mo)
-                _ci_ik = cc_ints.get(key_ik) if cc_ints is not None else None
-                if _ci_ik is not None:
-                    Qab_ik = _ci_ik['Qab']  # (n_local, n_pno, n_pno)
-                    # Need ooL[k,i] in pair ik's local fitting
-                    # = i_Qk[Q,k] when key_ik = (i,k) with i<k → l=i,k=k
-                    # (k,i) — we need slice for index pair (k,i)
-                    # i_Qk[(ik)] = (Q | n_lmo i) for n_lmo in ik's domain
-                    # Just take the l=i column: i_Qk[:,k] where k is the OTHER index
-                    ii_lmo, jj_lmo = key_ik  # min, max
-                    if i == ii_lmo:
-                        # k is the j-side LMO; ooL[k,i] = j_Qk[:, k_full_idx]?
-                        # Actually i_Qk[Q,k] = fitted (Q|k*i) where i is the i-side LMO
-                        # We want (Q|k*i) — same thing
-                        ooL_ki_local = _ci_ik['i_Qk'][:, k]
-                    else:
-                        # i is the j-side LMO
-                        ooL_ki_local = _ci_ik['j_Qk'][:, k]
-                    Qab_t1 = np.einsum('Qae,e->Qa', Qab_ik, t1_k_in_ik)
-                    exch = ooL_ki_local @ Qab_t1  # (n_pno_ik,)
-                else:
-                    oovv_ki = with_df.ao2mo(
-                        [C_lmo[:, [k]], C_lmo[:, [i]], C_pno_ik, C_pno_ik],
-                        compact=False).reshape(n_pno_ik, n_pno_ik)
-                    exch = oovv_ki @ t1_k_in_ik  # Σ_e (ki|ae)*t1[k,e]
-
-                contrib = coul - exch  # (n_pno_ik,)
-
-                if key_ik == key_ii:
-                    r1_i += contrib
-                else:
-                    S_ii_ik = S_pno_cache.get((key_ii, key_ik))
-                    if S_ii_ik is not None:
-                        r1_i += S_ii_ik @ contrib
-
-        if _DEBUG_R1:
-            print(f"  R1_TERM[i=0] after T5(voov): {np.linalg.norm(r1_i):.10f}")
-        _SKIP_T6 = getattr(_compute_local_t1_residual, '_skip_t6', False)
-        # ---- Term 6 (Psi4 A-term, DePrince Eq 20): Σ_k Tt[ki] × (ia|cd)_ki ----
-        # Psi4: R[a_ii] = S(ki,ii)^T @ [Σ_{a,c in PNO_ki} (ia|cd)_ki * Tt_ki[a,c]]
-        # The result has free d in PNO_ki, projected to a_ii via S(ki,ii)^T.
-        # All integral indices are in PNO_ki (same-pair domain).
-        if not _SKIP_T6 and cc_ints is not None:
-            for k in range(nocc):
-                key_ki = (min(k, i), max(k, i))
-                if key_ki not in pno_spaces:
-                    continue
-                n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
-                if n_ki == 0:
-                    continue
-                ci_ki = cc_ints.get(key_ki)
-                if ci_ki is None:
-                    continue
-                # T2[k,i] in PNO_ki canonical ordering
-                t2_ki_raw = t2_pno_all[key_ki]
-                if k <= i:
-                    t2_ki = t2_ki_raw
-                else:
-                    t2_ki = t2_ki_raw.T
-                Tt_ki = 2.0 * t2_ki - t2_ki.T  # (n_ki, n_ki)
-                # k_Qa: integral (Q | LMO_k * PNO_a) in pair (k,i)'s local DF
-                # The Psi4 A term contracts the SUMMED orbital k (not the free i)
-                if key_ki[0] == k:
-                    k_Qa = ci_ki['i_Qa']  # k is at key[0]
-                else:
-                    k_Qa = ci_ki['j_Qa']  # k is at key[1]
-                Qab_ki = ci_ki['Qab']  # (n_local, n_ki, n_ki)
-                # (ka|cd) = Σ_Q k_Qa[Q,a] * Qab[Q,c,d]
-                # temp[d] = Σ_{a,c} (ka|cd) * Tt_ki[a,c]
-                # Z[Q,c] = Σ_a k_Qa[Q,a] * Tt_ki[a,c]
-                Z = np.einsum('Qa,ac->Qc', k_Qa, Tt_ki)
-                temp = np.einsum('Qc,Qcd->d', Z, Qab_ki)  # (n_ki,)
-                # Project to PNO_ii via S(ki, ii)
-                if key_ki == key_ii:
-                    r1_i += temp
-                else:
-                    S_ii_ki = S_pno_cache.get((key_ii, key_ki))
-                    if S_ii_ki is not None:
-                        r1_i += S_ii_ki @ temp
-
-        if _DEBUG_R1:
-            print(f"  R1_TERM[i=0] after T6(ovvv): {np.linalg.norm(r1_i):.10f}")
-        _SKIP_T7 = getattr(_compute_local_t1_residual, '_skip_t7', False)
-        # ---- Term 7 (T2 × ooov) ----
-        if ooL_3idx is not None and ovL_pno_cache is not None and not _SKIP_T7:
-            for key_mn, t2_mn_raw in t2_pno_all.items():
-                if t2_mn_raw is None or t2_mn_raw.shape[0] == 0:
-                    continue
-                m, n = key_mn  # m <= n
-                n_mn = t2_mn_raw.shape[0]
-                if n_mn == 0:
-                    continue
-
-                # theta[m,n] = 2*t2[n,m] - t2[m,n] = 2*t2_raw.T - t2_raw
-                theta_nm = 2.0 * t2_mn_raw.T - t2_mn_raw  # theta[n,m]
-                theta_mn = 2.0 * t2_mn_raw - t2_mn_raw.T   # theta[m,n]
-
-                ovL_mn_i = ovL_pno_cache.get((key_mn, i))
-                if ovL_mn_i is None:
-                    continue
-
-                # ooov[m,n,i,e] = Σ_Q ooL[m,n,Q] * ovL_mn_i[e,Q]
-                ooov_mn_i = ovL_mn_i @ ooL_3idx[m, n]  # (n_mn,)
-
-                # PySCF: t1new -= einsum('jbki,kjba->ia', ovoo, theta)
-                # ovoo[j,b,k,i] = (jb|ki), theta[k,j,b,a]
-                # → r1[i,a] -= Σ_{m,n,e} theta[m,n,a,e] * (ne|mi)
-                # For stored pair (m,n) with m<=n, both (m,n) and (n,m)
-                # contribute via factor handling.
-                S_ii_mn = S_pno_cache.get((key_ii, key_mn))
-                if S_ii_mn is None and key_mn == key_ii:
-                    S_ii_mn = np.eye(n_pno_ii)
-                if S_ii_mn is None:
-                    continue
-
-                # (ne|mi) contribution: theta[m,n,a,e] * ooov[n,e,m,i]
-                # ooov_nm_i = ovL_mn_i @ ooL[n,m] (but ooL is symmetric: (nm|Q)=(mn|Q))
-                # Actually (ne|mi) = Σ_Q (ne|Q)(mi|Q)
-                # For (ne|mi): n occ, e vir(PNO_mn), m occ, i occ
-                # = Σ_Q ovL_mn_n[e,Q] * ooL[m,i,Q]
-                ovL_mn_n = ovL_pno_cache.get((key_mn, n))
-                ovL_mn_m = ovL_pno_cache.get((key_mn, m))
-                if ovL_mn_n is None or ovL_mn_m is None:
-                    continue
-
-                # (ne|mi) for theta[m,n,a,e]: need Σ_e theta_mn[a,e]*(ne|mi)
-                # (ne|mi) = ovL_mn_n[e,Q] * ooL[m,i,Q]
-                nemi = ovL_mn_n @ ooL_3idx[m, i]  # (n_mn,) : Σ_Q (ne|Q)(mi|Q)
-                contrib_mn = S_ii_mn @ (theta_mn @ nemi)  # (n_ii,)
-                r1_i -= contrib_mn
-
-                if m != n:
-                    # (me|ni) for theta[n,m,a,e]: need Σ_e theta_nm[a,e]*(me|ni)
-                    meni = ovL_mn_m @ ooL_3idx[n, i]  # (n_mn,)
-                    contrib_nm = S_ii_mn @ (theta_nm @ meni)
-                    r1_i -= contrib_nm
-
-        if _DEBUG_R1:
-            print(f"  R1_TERM[i=0] after T567(A,ovvv,ooov): {np.linalg.norm(r1_i):.10f}")
-            _compute_local_t1_residual._dumped_r1_terms = True
-        _t1_timers['at'] += _t1time.perf_counter() - _t0
-        r1_pno[i] = r1_i
-
-    # DEBUG: print R1 norms once
-    if getattr(_compute_local_t1_residual, '_debug_r1', False) and \
-       not getattr(_compute_local_t1_residual, '_dumped_r1', False):
-        for i in range(nocc):
-            if i in r1_pno:
-                rn = float(np.linalg.norm(r1_pno[i]))
-                print(f"  DEBUG iter 0: R1[{i}] norm={rn:.10f}")
-        total_r1 = float(np.sqrt(sum(np.dot(r1_pno[i], r1_pno[i])
-                                     for i in r1_pno if r1_pno[i].size > 0)))
-        print(f"  DEBUG iter 0: |R1_total|={total_r1:.10f}")
-        _compute_local_t1_residual._dumped_r1 = True
-
-    return r1_pno
-
-
-def _compute_local_t1_to_t2_correction(t1_pno, fov_pno, keys_sorted,
-                                         cas_blocks, pno_spaces, eps_lmo,
-                                         S_pno_cache, nocc):
-    """Compute the T1→T2 correction for each pair using local T1.
-
-    The dominant T1→T2 coupling is through the T1⊗fov outer product
-    (part of the energy expression, Eq. 102 of Jiang et al.):
-        delta_t2[i,j,a,b] = t1[i,a]*fov[j,b] + fov[i,a]*t1[j,b]
-
-    projected to PNO_{ij} basis via PNO overlap matrices.
-
-    Returns:
-        delta_t2 (dict): key → (n_pno, n_pno) correction to add to t2_new.
-    """
-    delta_t2 = {}
-    for key in keys_sorted:
-        if key in cas_blocks:
-            continue
-        i, j = key
-        n_pno = pno_spaces[key]['C_pno'].shape[1]
-        if n_pno == 0:
-            continue
-
-        dt2 = np.zeros((n_pno, n_pno))
-
-        # T1⊗fov outer product projected to PNO_{ij} basis
-        t1_i_ij = _project_t1_to_pair(t1_pno, i, key, S_pno_cache, pno_spaces)
-        t1_j_ij = _project_t1_to_pair(t1_pno, j, key, S_pno_cache, pno_spaces)
-        fov_i_ij = _project_t1_to_pair(fov_pno, i, key, S_pno_cache, pno_spaces)
-        fov_j_ij = _project_t1_to_pair(fov_pno, j, key, S_pno_cache, pno_spaces)
-
-        dt2 += np.outer(t1_i_ij, fov_j_ij) + np.outer(fov_i_ij, t1_j_ij)
-
-        # Apply PNO denominator
-        e_pno = pno_spaces[key]['e_pno']
-        D_ij = (eps_lmo[i] + eps_lmo[j] - e_pno[:, None] - e_pno[None, :])
-        D_ij = np.where(np.abs(D_ij) > 1e-12, D_ij, 1e-12)
-        dt2 /= D_ij
-
-        delta_t2[key] = dt2
-
-    return delta_t2
-
-
-def _compute_canonical_t1_to_t2_delta(t1_pno, t2_pno_all, pno_spaces,
-                                       keys_sorted, cas_blocks, mf, s1e,
-                                       nocc, eris_can=None):
-    """Compute T1→T2 correction via canonical delta method.
-
-    Reconstructs canonical T1 and T2 from local PNO amplitudes,
-    runs canonical update_amps with and without T1, and projects
-    the delta back to PNO basis.
-
-    This captures ALL T1-dependent T2 terms automatically:
-    wVOov dressing, wVooV dressing, fvv T1 dressing, T1²×integrals, etc.
-
-    Args:
-        t1_pno (dict): i → (n_pno_ii,) local T1 in PNO_{ii} basis.
-        t2_pno_all (dict): (i,j) → (n_pno, n_pno) T2 in PNO_{ij} basis.
-        pno_spaces (dict): pair data including C_pno, e_pno.
-        keys_sorted (list): sorted pair keys.
-        cas_blocks (dict): CAS pair bookkeeping.
-        mf: PySCF mean-field object (RHF with DF).
-        s1e: AO overlap matrix.
-        nocc (int): number of active occupied orbitals.
-        eris_can: pre-built canonical ERIs (reused across iterations).
-
-    Returns:
-        delta_t2 (dict): key → (n_pno, n_pno) T1-dependent T2 correction.
-        eris_can: canonical ERIs object (for reuse).
-        full_t2 (dict): key → full canonical T2 (for diagnostics).
-        t1_can_new (dict): i → (n_pno_ii,) canonical T1 in PNO basis.
-    """
-    from pyscf import cc as pyscf_cc
-
-    nocc_full = mf.mol.nelectron // 2
-    n_frozen = nocc_full - nocc
-    nmo = mf.mo_coeff.shape[1]
-    nvir_can = nmo - nocc_full
-    C_vir_can = mf.mo_coeff[:, nocc_full:]
-
-    # Build canonical ERIs if not provided
-    if eris_can is None:
-        mycc_ref = pyscf_cc.CCSD(mf, frozen=n_frozen)
-        mycc_ref.verbose = 0
-        eris_can = mycc_ref.ao2mo()
-    else:
-        mycc_ref = pyscf_cc.CCSD(mf, frozen=n_frozen)
-        mycc_ref.verbose = 0
-
-    # --- Reconstruct canonical T1 from local T1 ---
-    t1_can = np.zeros((nocc, nvir_can))
-    for ii in range(nocc):
-        key_ii = (ii, ii)
-        if key_ii not in pno_spaces or t1_pno[ii].size == 0:
-            continue
-        C_pno_ii = pno_spaces[key_ii]['C_pno']
-        U_ii = C_vir_can.T @ s1e @ C_pno_ii  # (nvir_can, n_pno_ii)
-        t1_can[ii] = U_ii @ t1_pno[ii]
-
-    # --- Reconstruct canonical T2 from PNO T2 ---
-    t2_can = np.zeros((nocc, nocc, nvir_can, nvir_can))
-    U_pno = {}  # cache PNO→canonical projections
-    for key in keys_sorted:
-        i, j = key
-        C_pno_ij = pno_spaces[key]['C_pno']
-        n_pno = C_pno_ij.shape[1]
-        if n_pno == 0:
-            continue
-        U_ij = C_vir_can.T @ s1e @ C_pno_ij  # (nvir_can, n_pno)
-        U_pno[key] = U_ij
-        t2_can[i, j] = U_ij @ t2_pno_all[key] @ U_ij.T
-        if i != j:
-            t2_can[j, i] = t2_can[i, j].T  # exchange symmetry
-
-    # --- Canonical update_amps with T1 ---
-    t1_new_with, t2_new_with = mycc_ref.update_amps(t1_can, t2_can, eris_can)
-
-    # --- Canonical update_amps without T1 ---
-    t1_zero = np.zeros_like(t1_can)
-    _, t2_new_no = mycc_ref.update_amps(t1_zero, t2_can, eris_can)
-
-    # --- Delta: T1-dependent T2 correction ---
-    delta_t2_can = t2_new_with - t2_new_no
-    # print(f'    [delta] |delta_t2_can| = {np.linalg.norm(delta_t2_can):.6f}')
-
-    # --- Project delta back to PNO basis ---
-    delta_t2 = {}
-    full_t2 = {}
-    for key in keys_sorted:
-        if key in cas_blocks:
-            continue
-        i, j = key
-        U_ij = U_pno.get(key)
-        if U_ij is None:
-            continue
-        delta_t2[key] = U_ij.T @ delta_t2_can[i, j] @ U_ij
-        full_t2[key] = U_ij.T @ t2_new_with[i, j] @ U_ij
-
-    # --- Project canonical T1 back to PNO basis ---
-    t1_can_pno = {}
-    for ii in range(nocc):
-        key_ii = (ii, ii)
-        if key_ii not in pno_spaces:
-            t1_can_pno[ii] = np.zeros(0)
-            continue
-        C_pno_ii = pno_spaces[key_ii]['C_pno']
-        n_pno_ii = C_pno_ii.shape[1]
-        if n_pno_ii == 0:
-            t1_can_pno[ii] = np.zeros(0)
-            continue
-        U_ii = U_pno.get(key_ii)
-        if U_ii is None:
-            U_ii = C_vir_can.T @ s1e @ C_pno_ii
-        t1_can_pno[ii] = U_ii.T @ t1_new_with[ii]
-
-    return delta_t2, eris_can, full_t2, t1_can_pno
-
-
-def _compute_pair_residual_numerator(
-        i, j, t2_pno_all, pno_spaces, nocc_lmo,
-        C_pao, ovL_lmo_pao, F_lmo, s1e, with_df, C_lmo,
-        J_oo, K_pno_cache, eps_lmo,
-        t1_pno=None, fov_pno=None,
-        foo_dressed=None,
-        ovL_pno_cache=None, S_pno_cache=None, K_coul_cache=None,
-        ooL_3idx=None, skip_t1_integral_dressing=False):
-    """Compute the DLPNO-CCSD T2 residual numerator for pair (i,j).
-
-    Implements the Riplinger-Neese DLPNO-CCSD residual (ORCA approach):
-
-        R_ij[a,b] = K_ij[a,b]                                    (exchange)
-                  + 0.5 * Σ_cd tau_ij[c,d] * (ac|bd)_ij          (ladder)
-                  + 0.5 * Σ_kl W_kl * tau_kl_proj[a,b]          (dressed Woooo)
-                  - P(ij) Σ_k F[k,i] * t_kj_proj[a,b]           (Fock coupling)
-                  + P(ij)P(ab) Σ_kc theta_ik[a,c] * L_jk[b,c]   (ring)
-
-    where W_kl = (ij|kl) + Σ_cd (ic|jd)_kl * tau_kl[c,d]  (dressed Woooo)
-    and   L_jk[b,c] = 2*(jb|kc) - (jk|bc)
-    and   theta = 2*t2 - t2.T
-
-    The update is: t2_new_ij = R_ij / D_ij
-    where D_ij[a,b] = eps_i + eps_j - e_pno_a - e_pno_b.
-
-    Each pair updates ONLY its own T2 in its own PNO basis.
-    """
-    key = (min(i, j), max(i, j))
-    data = pno_spaces[key]
-    C_pno_ij = data['C_pno']
-    n_pno = C_pno_ij.shape[1]
-
-    if n_pno == 0:
-        return np.zeros((0, 0))
-
-    t2_ij = t2_pno_all[key]
-
-    # --- 1. Exchange integral K_ij[a,b] = (ia|jb) ---
-    K_ij = K_pno_cache.get(key)
-    if K_ij is None:
-        K_ij = data.get('K_pno')
-    if K_ij is None:
-        ovL_i_ij = _ovl_pno(i, C_pno_ij, C_pao, ovL_lmo_pao)
-        ovL_j_ij = _ovl_pno(j, C_pno_ij, C_pao, ovL_lmo_pao)
-        K_ij = ovL_i_ij @ ovL_j_ij.T
-        K_pno_cache[key] = K_ij
-
-    R_ij = K_ij.copy()
-
-    # When using T1-transformed MOs, the dressed ovL already gives K̃.
-    # Replace K_ij with dressed exchange from ovL_pno_cache (now C̃_lmo-based).
-    if skip_t1_integral_dressing and ovL_pno_cache is not None:
-        ovL_i_dressed = ovL_pno_cache.get((key, i))
-        ovL_j_dressed = ovL_pno_cache.get((key, j))
-        if ovL_i_dressed is not None and ovL_j_dressed is not None:
-            K_dressed = ovL_i_dressed @ ovL_j_dressed.T
-            R_ij = K_dressed.copy()
-
-    # --- T1-dress the exchange integral (Eq. 75, 92 of Jiang et al.) ---
-    # K̃_ij = B̃_ai @ B̃_bj where B̃_ai = B_ai + Σ_k t̃_k^a B_ki
-    # delta_K_ij = Σ_k [ t̃_k^a (ki|jb) + (ia|kj) t̃_k^b ] + Σ_{kl} t̃_k^a t̃_l^b (ki|lj)
-    # NOTE: Skipped when using T1-transformed MOs (skip_t1_integral_dressing),
-    # since the dressed ovL already captures K̃ automatically.
-    if (not skip_t1_integral_dressing
-            and t1_pno is not None and S_pno_cache is not None
-            and ovL_pno_cache is not None and ooL_3idx is not None):
-        # Project all T1 to PNO_ij and build dressed ovL
-        # ovL_dressed_m[a,Q] = ovL_m[a,Q] + Σ_k t̃_k^a ooL[k,m,Q]
-        ovL_i = ovL_pno_cache.get((key, i))
-        ovL_j = ovL_pno_cache.get((key, j))
-        if ovL_i is not None and ovL_j is not None:
-            # Compute T1 correction to ovL: Σ_k t̃_k^{a_ij} * ooL[k,m,Q]
-            dress_i = np.zeros_like(ovL_i)  # (n_pno, naux)
-            dress_j = np.zeros_like(ovL_j)
-            for k in range(nocc_lmo):
-                t1_k_ij = _project_t1_to_pair(
-                    t1_pno, k, key, S_pno_cache, pno_spaces)
-                if np.max(np.abs(t1_k_ij)) < 1e-15:
-                    continue
-                # ooL[k,i,Q] = ooL_3idx[k][i,Q] = (k_lmo i_lmo | Q)
-                dress_i += np.outer(t1_k_ij, ooL_3idx[k, i])
-                dress_j += np.outer(t1_k_ij, ooL_3idx[k, j])
-            # K̃_ij = (ovL_i + dress_i) @ (ovL_j + dress_j).T
-            K_dressed = (ovL_i + dress_i) @ (ovL_j + dress_j).T
-            R_ij += K_dressed - K_ij  # add the T1 correction
-
-    # --- T1 projection to PNO basis (local T1, Eq. 70 of Jiang et al.) ---
-    t1_i_pno = np.zeros(n_pno)
-    t1_j_pno = np.zeros(n_pno)
-    if t1_pno is not None and S_pno_cache is not None:
-        t1_i_pno = _project_t1_to_pair(t1_pno, i, key, S_pno_cache, pno_spaces)
-        t1_j_pno = _project_t1_to_pair(t1_pno, j, key, S_pno_cache, pno_spaces)
-
-    # tau_ij = t2_ij + t1_i ⊗ t1_j (for ladder and Woooo)
-    tau_ij = t2_ij + np.outer(t1_i_pno, t1_j_pno)
-
-    # --- 2. Ladder: 0.5 * Σ_cd tau_ij[c,d] * (ac|bd)_ij ---
-    if with_df is not None:
-        R_ij += _compute_ladder(tau_ij, C_pno_ij, with_df)
-
-    # --- 2b. [Removed] vvvo × tau × t1 term — only ~6 μEh contribution
-    # but adds an expensive DF loop per pair. Absorbed into the ladder
-    # when using full Jiang et al. dressed integrals (future refactor).
-
-    # --- 2c. Direct ovoo×T1 contribution (Jiang et al. Eq 92, Term 2) ---
-    # The t1-transformed B̃_{ai} includes -t̃_k^a*B_{ki} which is NOT captured
-    # by our occupied-MO dressing. This ovoo×T1 term is only applied to
-    # the exchange integral (not ring/voov where the paper expands dressed
-    # integrals back to bare + T1, Eqs 83-84).
-    # After P(ij): R_ij[a,b] -= Σ_k (ia|jk)*t1_k^b + Σ_k (jb|ik)*t1_k^a
-    if (t1_pno is not None and S_pno_cache is not None
-            and ovL_pno_cache is not None and ooL_3idx is not None
-            and n_pno > 0):
-        _t1_all = np.zeros((nocc_lmo, n_pno))
-        for k in range(nocc_lmo):
-            _t1_all[k] = _project_t1_to_pair(
-                t1_pno, k, key, S_pno_cache, pno_spaces)
-
-        if np.max(np.abs(_t1_all)) > 1e-15:
-            ovL_i_ij = ovL_pno_cache.get((key, i))
-            ovL_j_ij = ovL_pno_cache.get((key, j))
-            if ovL_i_ij is not None and ovL_j_ij is not None:
-                V_jk = ovL_i_ij @ ooL_3idx[j].T  # (n_pno, nocc)
-                V_ik = ovL_j_ij @ ooL_3idx[i].T  # (n_pno, nocc)
-                R_ij -= V_jk @ _t1_all + _t1_all.T @ V_ik.T
-
-    # --- 3. Dressed Woooo: Σ_kl W_kl * tau_kl_proj[a,b] ---
-    # PySCF: woooo[i,j,k,l] = (ik|jl) + Σ_{a,b} tau[i,j,a,b]*(ak|lb)
-    # P(ij)-symmetrized: R_sym = Σ_{k,l} W_kl * tau[k,l]
-    # W_kl = (ik|jl) + Σ_{a,b} tau_ij[a,b] * (a_ij k | l b_ij)
-    if J_oo is not None:
-        for key_kl, t2_kl in t2_pno_all.items():
-            if t2_kl is None or t2_kl.shape[0] == 0:
-                continue
-            k, l = key_kl
-            C_pno_kl = pno_spaces[key_kl]['C_pno']
-
-            # Build tau_kl in PNO[kl] basis
-            tau_kl = t2_kl.copy()
-            if t1_pno is not None and S_pno_cache is not None:
-                t1_k = _project_t1_to_pair(t1_pno, k, key_kl, S_pno_cache, pno_spaces)
-                t1_l = _project_t1_to_pair(t1_pno, l, key_kl, S_pno_cache, pno_spaces)
-                tau_kl = t2_kl + np.outer(t1_k, t1_l)
-
-            # Bare Woooo: (ik|jl)
-            W_kl = J_oo[i, k, j, l]
-
-            # Dressing: P(ij)-symmetrized Woooo dressing coefficient is
-            # W_kl = (ik|jl) + 0.5*(Σ_ab tau_ij[a,b]*(ak|lb) + Σ_ab tau_ij[b,a]*(al|kb))
-            # For k=l: voov_kl = voov_lk, so this simplifies to 0.5*einsum(tau+tau.T, voov_kk)
-            # For k≠l: need cross terms between voov_kl and voov_lk
-            if with_df is not None and n_pno > 0:
-                # (a_ij k | l b_ij) = ovL[(ij),k] @ ovL[(ij),l].T
-                _ovL_k = ovL_pno_cache.get((key, k))
-                _ovL_l = ovL_pno_cache.get((key, l))
-                if _ovL_k is not None and _ovL_l is not None:
-                    voov_kl = _ovL_k @ _ovL_l.T
-                else:
-                    voov_kl = with_df.ao2mo(
-                        [C_pno_ij, C_lmo[:, [k]], C_lmo[:, [l]], C_pno_ij],
-                        compact=False).reshape(n_pno, n_pno)
-
-            # Project tau_kl to PNO[ij]
-            S_proj = S_pno_cache.get((key, key_kl)) if S_pno_cache else None
-            if S_proj is not None:
-                tau_kl_proj = S_proj @ tau_kl @ S_proj.T
-            else:
-                tau_kl_proj = _project_t2_full(tau_kl, C_pno_kl, C_pno_ij, s1e)
-            if k != l:
-                if with_df is not None and n_pno > 0:
-                    voov_lk = voov_kl.T  # (a_ij l | k b_ij) = voov_kl.T
-                    d_kl = np.einsum('ab,ab->', tau_ij, voov_kl)
-                    d_lk = np.einsum('ab,ab->', tau_ij, voov_lk)
-                    d_kl_cross = np.einsum('ba,ab->', tau_ij, voov_lk)
-                    d_lk_cross = np.einsum('ba,ab->', tau_ij, voov_kl)
-                    W_kl += 0.5 * (d_kl + d_kl_cross)
-                    W_lk = J_oo[i, l, j, k]
-                    W_lk += 0.5 * (d_lk + d_lk_cross)
-                else:
-                    W_lk = J_oo[i, l, j, k]
-                R_ij += W_kl * tau_kl_proj + W_lk * tau_kl_proj.T
-            else:
-                if with_df is not None and n_pno > 0:
-                    tau_sym = tau_ij + tau_ij.T
-                    W_kl += 0.5 * np.einsum('ab,ab->', tau_sym, voov_kl)
-                R_ij += W_kl * tau_kl_proj
-
-    # --- 4. Fock coupling: -P(ij) Σ_k ft[k,i] * t_kj_proj ---
-    # ft[k,i] = F[k,i] - δ_{ki} * eps_i  (off-diagonal only; diagonal is in D)
-    ft_oo = F_lmo - np.diag(eps_lmo)  # off-diagonal occupied Fock
-
-    def _get_S(key_other):
-        """Get PNO overlap matrix from cache or compute on the fly."""
-        if S_pno_cache is not None:
-            S = S_pno_cache.get((key, key_other))
-            if S is not None:
-                return S
-        return C_pno_ij.T @ (s1e @ pno_spaces[key_other]['C_pno'])
-
-    for k in range(nocc_lmo):
-        # -ft[k,i] * t_kj_proj (coupling from pair (k,j))
-        if abs(ft_oo[k, i]) > 1e-15:
-            key_kj = (min(k, j), max(k, j))
-            if key_kj in t2_pno_all and t2_pno_all[key_kj] is not None:
-                t2_kj_raw = t2_pno_all[key_kj]
-                if t2_kj_raw.shape[0] > 0:
-                    t2_kj = t2_kj_raw.T if k > j else t2_kj_raw
-                    S_kj = _get_S(key_kj)
-                    R_ij -= ft_oo[k, i] * (S_kj @ t2_kj @ S_kj.T)
-
-        # -ft[k,j] * t_ik_proj (coupling from pair (i,k)) — P(ij) term
-        if abs(ft_oo[k, j]) > 1e-15:
-            key_ik = (min(i, k), max(i, k))
-            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
-                t2_ik_raw = t2_pno_all[key_ik]
-                if t2_ik_raw.shape[0] > 0:
-                    t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-                    S_ik = _get_S(key_ik)
-                    R_ij -= ft_oo[k, j] * (S_ik @ t2_ik @ S_ik.T)
-
-    # --- 4b. T1 Fock dressing ---
-    # NOTE: Skipped when using T1-transformed MOs (skip_t1_integral_dressing),
-    # since the dressed Fock matrix F̃_lmo already includes T1 effects.
-    if (not skip_t1_integral_dressing
-            and t1_pno is not None and fov_pno is not None
-            and S_pno_cache is not None):
-        # T1 correction to occupied Fock: ft_ij[k,m] += 0.5 * Σ_a t1[m,a]*fov[k,a]
-        # Computed pair-locally: for each (k, m) pair, project both t1[m] and
-        # fov[k] to a common PNO basis and dot them.
-        ft_t1_oo = np.zeros((nocc_lmo, nocc_lmo))
-        for m in range(nocc_lmo):
-            key_mm = (m, m)
-            if key_mm not in pno_spaces or t1_pno[m].size == 0:
-                continue
-            for k in range(nocc_lmo):
-                # fov[k] in PNO_{mm} basis
-                fov_k_mm = _project_t1_to_pair(
-                    fov_pno, k, key_mm, S_pno_cache, pno_spaces)
-                ft_t1_oo[k, m] = 0.5 * np.dot(fov_k_mm, t1_pno[m])
-        for k in range(nocc_lmo):
-            for idx_occ, (idx_i, idx_j) in enumerate([(i, j), (j, i)]):
-                corr = ft_t1_oo[k, idx_i]
-                if abs(corr) < 1e-15:
-                    continue
-                key_kj2 = (min(k, idx_j), max(k, idx_j))
-                if key_kj2 in t2_pno_all and t2_pno_all[key_kj2] is not None:
-                    t2_raw = t2_pno_all[key_kj2]
-                    if t2_raw.shape[0] > 0:
-                        t2_p = t2_raw.T if k > idx_j else t2_raw
-                        S_p = _get_S(key_kj2)
-                        R_ij -= corr * (S_p @ t2_p @ S_p.T)
-
-        # T1 virtual Fock dressing: ft_ab[a,c] = -0.5 * Σ_m t1_m(a)*fov_m(c)
-        # where t1_m and fov_m are projected to PNO_{ij} basis.
-        ft_vv = np.zeros((n_pno, n_pno))
-        for m in range(nocc_lmo):
-            t1_m_ij = _project_t1_to_pair(
-                t1_pno, m, key, S_pno_cache, pno_spaces)
-            fov_m_ij = _project_t1_to_pair(
-                fov_pno, m, key, S_pno_cache, pno_spaces)
-            ft_vv -= 0.5 * np.outer(t1_m_ij, fov_m_ij)
-        if np.max(np.abs(ft_vv)) > 1e-15:
-            R_ij += ft_vv @ t2_ij + t2_ij @ ft_vv.T
-
-    # --- 5. Ring + C_ij + oovv: Combined voov/oovv contributions ---
-    # Verified pair-local formula (linear in T2, unsymmetrized):
-    #   R_unsym[i,j,a,b] = Σ_k { θ_ki(c,a)*(ck|jb)         [ring/voov]
-    #                           - t2(k,i,c,a)*(kj|cb)        [oovv from pair(i,k)]
-    #                           - t2(j,k,c,a)*(ki|cb) }      [C_ij from pair(j,k)]
-    # Then P(ij): R_full = R_unsym[i,j] + R_unsym[j,i].T
-    #
-    # Key identity: voov(ck|jb) = K_dir.T and oovv(kj|cb) = K_coul.T
-    # where K_dir[b,c]=(jb|kc) and K_coul[b,c]=(jk|bc) are the same integrals
-    # the old ring code computed.
-    if with_df is not None:
-        for k in range(nocc_lmo):
-            # --- Contributions from pair (i,k) ---
-            key_ik = (min(i, k), max(i, k))
-            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
-                C_pno_ik = pno_spaces[key_ik]['C_pno']
-                n_ik = C_pno_ik.shape[1]
-                if n_ik > 0:
-                    t2_ik_raw = t2_pno_all[key_ik]
-                    t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-
-                    # PNO overlap: projects from PNO_ik to PNO_ij
-                    S_ij_ik = _get_S(key_ik)
-
-                    # K_dir[b_ij, c_ik] = (jb|kc) = ovL[(ij),j] @ ovL[(ik),k].T
-                    _ovL_j_ij = ovL_pno_cache.get((key, j))
-                    _ovL_k_ik = ovL_pno_cache.get((key_ik, k))
-                    if _ovL_j_ij is not None and _ovL_k_ik is not None:
-                        K_dir = _ovL_j_ij @ _ovL_k_ik.T
-                    else:
-                        K_dir = with_df.ao2mo(
-                            [C_lmo[:, [j]], C_pno_ij, C_lmo[:, [k]], C_pno_ik],
-                            compact=False).reshape(n_pno, n_ik)
-
-                    # K_coul[b_ij, c_ik] = (jk|bc) [oovv-type, pre-computed]
-                    _kc_key = (key, key_ik, j, k)
-                    K_coul = K_coul_cache.get(_kc_key) if K_coul_cache else None
-                    if K_coul is None:
-                        K_coul = with_df.ao2mo(
-                            [C_lmo[:, [j]], C_lmo[:, [k]], C_pno_ij, C_pno_ik],
-                            compact=False).reshape(1, 1, n_pno, n_ik)[0, 0]
-
-                    theta_ik = 2.0 * t2_ik - t2_ik.T
-                    R_ij += S_ij_ik @ (theta_ik @ (K_dir.T - 0.5 * K_coul.T))
-                    R_ij -= 0.5 * S_ij_ik @ (t2_ik.T @ K_coul.T)
-                    R_ij -= K_coul @ t2_ik @ S_ij_ik.T
-
-
-            # --- Contributions from pair (j,k) ---
-            key_jk = (min(j, k), max(j, k))
-            if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
-                C_pno_jk = pno_spaces[key_jk]['C_pno']
-                n_jk = C_pno_jk.shape[1]
-                if n_jk > 0:
-                    t2_jk_raw = t2_pno_all[key_jk]
-                    t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
-
-                    S_ij_jk = _get_S(key_jk)
-
-                    # K_dir_j[a_ij, c_jk] = (ia|kc) = ovL[(ij),i] @ ovL[(jk),k].T
-                    _ovL_i_ij = ovL_pno_cache.get((key, i))
-                    _ovL_k_jk = ovL_pno_cache.get((key_jk, k))
-                    if _ovL_i_ij is not None and _ovL_k_jk is not None:
-                        K_dir_j = _ovL_i_ij @ _ovL_k_jk.T
-                    else:
-                        K_dir_j = with_df.ao2mo(
-                            [C_lmo[:, [i]], C_pno_ij, C_lmo[:, [k]], C_pno_jk],
-                            compact=False).reshape(n_pno, n_jk)
-
-                    # K_coul_j[a_ij, c_jk] = (ik|ac) [oovv-type, pre-computed]
-                    _kc_key_j = (key, key_jk, i, k)
-                    K_coul_j = K_coul_cache.get(_kc_key_j) if K_coul_cache else None
-                    if K_coul_j is None:
-                        K_coul_j = with_df.ao2mo(
-                            [C_lmo[:, [i]], C_lmo[:, [k]], C_pno_ij, C_pno_jk],
-                            compact=False).reshape(1, 1, n_pno, n_jk)[0, 0]
-
-                    R_ij -= S_ij_jk @ (t2_jk.T @ K_coul_j.T)
-                    theta_kj = 2.0 * t2_jk.T - t2_jk
-                    R_ij += ((K_dir_j - 0.5 * K_coul_j) @ theta_kj) @ S_ij_jk.T
-                    R_ij -= 0.5 * (K_coul_j @ t2_jk) @ S_ij_jk.T
-
-
-    # --- 5b. Quadratic T2 dressing of ring/voov/C_ij ---
-    # PySCF: wVooV_dress = 0.5*einsum('bkic,jkca->bija',voov,t2)
-    #        wVOov_dress = 0.5*einsum('aikc,kcjb->aijb',VOov,tau_ring)
-    #   (wVOov += wVooV*0.5 in PySCF happens BEFORE wVooV dressing, so
-    #    wVOov_dress does NOT include 0.5*wVooV_dress)
-    # Two sources: B (theta×wVOov_dress via V_k), C (t2^T×wVooV_dress via W_k)
-    # Implemented as double sum over (k,l) with factored intermediates W_k, V_k.
-    if with_df is not None and foo_dressed is not None:
-        R_dress_ij = np.zeros((n_pno, n_pno))  # unsym[i,j]
-        R_dress_ji = np.zeros((n_pno, n_pno))  # unsym[j,i]
-
-        for k in range(nocc_lmo):
-            # --- Pair (i,k): build W_k, V_k using pairs (j,l) ---
-            key_ik = (min(i, k), max(i, k))
-            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
-                C_pno_ik = pno_spaces[key_ik]['C_pno']
-                n_ik = C_pno_ik.shape[1]
-                if n_ik > 0:
-                    t2_ik_raw = t2_pno_all[key_ik]
-                    t2_ik_d = t2_ik_raw.T if i > k else t2_ik_raw
-                    theta_ik_d = 2.0 * t2_ik_d - t2_ik_d.T
-                    S_ij_ik_d = _get_S(key_ik)
-
-                    W_k = np.zeros((n_ik, n_pno))
-                    V_k = np.zeros((n_ik, n_pno))
-                    for l in range(nocc_lmo):
-                        key_jl = (min(j, l), max(j, l))
-                        if key_jl not in t2_pno_all or t2_pno_all[key_jl] is None:
-                            continue
-                        n_jl = pno_spaces[key_jl]['C_pno'].shape[1]
-                        if n_jl == 0:
-                            continue
-                        t2_jl_raw = t2_pno_all[key_jl]
-                        t2_jl = t2_jl_raw.T if j > l else t2_jl_raw
-                        S_ij_jl = _get_S(key_jl)
-
-                        # (c_ik l | k d_jl) = ovL[(ik),l] @ ovL[(jl),k].T
-                        _ovL_ik_l = ovL_pno_cache.get((key_ik, l))
-                        _ovL_jl_k = ovL_pno_cache.get((key_jl, k))
-                        if _ovL_ik_l is not None and _ovL_jl_k is not None:
-                            voov_lk = _ovL_ik_l @ _ovL_jl_k.T
-                        else:
-                            voov_lk = with_df.ao2mo(
-                                [C_pno_ik, C_lmo[:, [l]], C_lmo[:, [k]],
-                                 pno_spaces[key_jl]['C_pno']],
-                                compact=False).reshape(n_ik, n_jl)
-                        W_k += 0.5 * voov_lk @ t2_jl @ S_ij_jl.T
-
-                        # (c_ik k | l d_jl) = ovL[(ik),k] @ ovL[(jl),l].T
-                        _ovL_ik_k = ovL_pno_cache.get((key_ik, k))
-                        _ovL_jl_l = ovL_pno_cache.get((key_jl, l))
-                        if _ovL_ik_k is not None and _ovL_jl_l is not None:
-                            voov_kl = _ovL_ik_k @ _ovL_jl_l.T
-                        else:
-                            voov_kl = with_df.ao2mo(
-                                [C_pno_ik, C_lmo[:, [k]], C_lmo[:, [l]],
-                                 pno_spaces[key_jl]['C_pno']],
-                                compact=False).reshape(n_ik, n_jl)
-                        VOov_kl = voov_kl - 0.5 * voov_lk
-                        tau_ring_lj = 2.0 * t2_jl.T - t2_jl
-                        V_k += 0.5 * VOov_kl @ tau_ring_lj @ S_ij_jl.T
-
-                    R_dress_ij += S_ij_ik_d @ (theta_ik_d @ V_k)
-                    R_dress_ij += 0.5 * S_ij_ik_d @ (t2_ik_d.T @ W_k)
-                    R_dress_ji += S_ij_ik_d @ (t2_ik_d.T @ W_k)
-
-            # --- Pair (j,k): build W_k_ji, V_k_ji using pairs (i,l) ---
-            key_jk = (min(j, k), max(j, k))
-            if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
-                C_pno_jk = pno_spaces[key_jk]['C_pno']
-                n_jk = C_pno_jk.shape[1]
-                if n_jk > 0:
-                    t2_jk_raw = t2_pno_all[key_jk]
-                    t2_jk_d = t2_jk_raw.T if j > k else t2_jk_raw
-                    theta_jk_d = 2.0 * t2_jk_d - t2_jk_d.T
-                    S_ij_jk_d = _get_S(key_jk)
-
-                    W_k_ji = np.zeros((n_jk, n_pno))
-                    V_k_ji = np.zeros((n_jk, n_pno))
-                    for l in range(nocc_lmo):
-                        key_il = (min(i, l), max(i, l))
-                        if key_il not in t2_pno_all or t2_pno_all[key_il] is None:
-                            continue
-                        n_il = pno_spaces[key_il]['C_pno'].shape[1]
-                        if n_il == 0:
-                            continue
-                        t2_il_raw = t2_pno_all[key_il]
-                        t2_il = t2_il_raw.T if i > l else t2_il_raw
-                        S_ij_il = _get_S(key_il)
-
-                        # (c_jk l | k d_il) = ovL[(jk),l] @ ovL[(il),k].T
-                        _ovL_jk_l = ovL_pno_cache.get((key_jk, l))
-                        _ovL_il_k = ovL_pno_cache.get((key_il, k))
-                        if _ovL_jk_l is not None and _ovL_il_k is not None:
-                            voov_lk = _ovL_jk_l @ _ovL_il_k.T
-                        else:
-                            voov_lk = with_df.ao2mo(
-                                [C_pno_jk, C_lmo[:, [l]], C_lmo[:, [k]],
-                                 pno_spaces[key_il]['C_pno']],
-                                compact=False).reshape(n_jk, n_il)
-                        W_k_ji += 0.5 * voov_lk @ t2_il @ S_ij_il.T
-
-                        # (c_jk k | l d_il) = ovL[(jk),k] @ ovL[(il),l].T
-                        _ovL_jk_k = ovL_pno_cache.get((key_jk, k))
-                        _ovL_il_l = ovL_pno_cache.get((key_il, l))
-                        if _ovL_jk_k is not None and _ovL_il_l is not None:
-                            voov_kl = _ovL_jk_k @ _ovL_il_l.T
-                        else:
-                            voov_kl = with_df.ao2mo(
-                                [C_pno_jk, C_lmo[:, [k]], C_lmo[:, [l]],
-                                 pno_spaces[key_il]['C_pno']],
-                                compact=False).reshape(n_jk, n_il)
-                        VOov_kl = voov_kl - 0.5 * voov_lk
-                        tau_ring_li = 2.0 * t2_il.T - t2_il
-                        V_k_ji += 0.5 * VOov_kl @ tau_ring_li @ S_ij_il.T
-
-                    R_dress_ji += S_ij_jk_d @ (theta_jk_d @ V_k_ji)
-                    R_dress_ji += 0.5 * S_ij_jk_d @ (t2_jk_d.T @ W_k_ji)
-                    R_dress_ij += S_ij_jk_d @ (t2_jk_d.T @ W_k_ji)
-
-        # P(ij) symmetrize the dressing
-        R_ij += R_dress_ij + R_dress_ji.T
-
-    # --- 6. T2-dressed Fock intermediates ---
-    # (quadratic in T2, ~16% of linear norm; enable for production)
-    if foo_dressed is not None and with_df is not None:
-        # --- 6a. T2-dressed foo: apply precomputed foo_dressed ---
-        for k in range(nocc_lmo):
-            if abs(foo_dressed[k, i]) > 1e-15:
-                key_kj2 = (min(k, j), max(k, j))
-                if key_kj2 in t2_pno_all and t2_pno_all[key_kj2] is not None:
-                    t2_kj_raw = t2_pno_all[key_kj2]
-                    if t2_kj_raw.shape[0] > 0:
-                        t2_kj = t2_kj_raw.T if k > j else t2_kj_raw
-                        S_kj = _get_S(key_kj2)
-                        R_ij -= foo_dressed[k, i] * (S_kj @ t2_kj @ S_kj.T)
-            # P(ij) partner: -foo_d[k,j]*t2[i,k] (NOT t2[k,i])
-            if abs(foo_dressed[k, j]) > 1e-15:
-                key_ki2 = (min(k, i), max(k, i))
-                if key_ki2 in t2_pno_all and t2_pno_all[key_ki2] is not None:
-                    t2_ki_raw = t2_pno_all[key_ki2]
-                    if t2_ki_raw.shape[0] > 0:
-                        t2_ik = t2_ki_raw.T if i > k else t2_ki_raw
-                        S_ki = _get_S(key_ki2)
-                        R_ij -= foo_dressed[k, j] * (S_ki @ t2_ik @ S_ki.T)
-
-        # --- 6b. T2-dressed fvv in PNO[ij] basis ---
-        # voov_mn = (a_mn nn | mm b_ij) = ovL[(mn),nn] @ ovL[(ij),mm].T
-        fvv_dressed = np.zeros((n_pno, n_pno))
-        for key_mn, t2_mn_raw in t2_pno_all.items():
-            if t2_mn_raw is None or t2_mn_raw.shape[0] == 0:
-                continue
-            mm, nn = key_mn
-            n_mn = pno_spaces[key_mn]['C_pno'].shape[1]
-            if n_mn == 0:
-                continue
-
-            theta_fock_mn = 2.0 * t2_mn_raw.T - t2_mn_raw
-            S_proj = _get_S(key_mn)
-
-            # voov_mn[a_mn, b_ij] = (a_mn nn | mm b_ij)
-            _ovL_mn_nn = ovL_pno_cache.get((key_mn, nn))
-            _ovL_ij_mm = ovL_pno_cache.get((key, mm))
-            if _ovL_mn_nn is not None and _ovL_ij_mm is not None:
-                voov_mn = _ovL_mn_nn @ _ovL_ij_mm.T
-            else:
-                voov_mn = with_df.ao2mo(
-                    [pno_spaces[key_mn]['C_pno'], C_lmo[:, [nn]],
-                     C_lmo[:, [mm]], C_pno_ij],
-                    compact=False).reshape(n_mn, n_pno)
-            theta_proj = theta_fock_mn @ S_proj.T
-            fvv_dressed -= theta_proj.T @ voov_mn
-
-            if mm != nn:
-                theta_fock_nm = 2.0 * t2_mn_raw - t2_mn_raw.T
-                # voov_nm[a_mn, b_ij] = (a_mn mm | nn b_ij)
-                _ovL_mn_mm = ovL_pno_cache.get((key_mn, mm))
-                _ovL_ij_nn = ovL_pno_cache.get((key, nn))
-                if _ovL_mn_mm is not None and _ovL_ij_nn is not None:
-                    voov_nm = _ovL_mn_mm @ _ovL_ij_nn.T
-                else:
-                    voov_nm = with_df.ao2mo(
-                        [pno_spaces[key_mn]['C_pno'], C_lmo[:, [mm]],
-                         C_lmo[:, [nn]], C_pno_ij],
-                        compact=False).reshape(n_mn, n_pno)
-                theta_proj_nm = theta_fock_nm @ S_proj.T
-                fvv_dressed -= theta_proj_nm.T @ voov_nm
-
-        R_ij += t2_ij @ fvv_dressed.T + fvv_dressed @ t2_ij
-
-    # --- 7: T1-dependent wVOov/wVooV dressing of T2 residual ---
-    # PySCF: wVOov += voov + 0.5*wVooV, with T1 parts:
-    #   wVOov_t1[c,k,j,b] = Σ_d (ck|bd)*t1[j,d]
-    #                      + 0.5*Σ_m (mc|kj)*t1[m,b]
-    # Then: R[i,j,a,b] += Σ_{k,c} theta_ki[c,a]*wVOov_t1[c,k,j,b]
-    #
-    # NOTE: Skipped when using T1-transformed MOs (skip_t1_integral_dressing),
-    # since the dressed ovL captures these effects through the ring integrals.
-    if (not skip_t1_integral_dressing
-            and t1_pno is not None and with_df is not None
-            and ovL_pno_cache is not None and S_pno_cache is not None
-            and ooL_3idx is not None):
-        from pyscf.cc.dlpno_tccsd.pno import _build_ovL as _build_ovL_t1
-
-        # Precompute ψ_j = C_pno_jj @ t1_j in AO basis for each occ
-        psi_ao = {}
-        for m in range(nocc_lmo):
-            key_mm = (m, m)
-            if key_mm in pno_spaces and t1_pno.get(m) is not None:
-                t1_m = t1_pno[m]
-                if t1_m.size > 0 and np.max(np.abs(t1_m)) > 1e-15:
-                    psi_ao[m] = pno_spaces[key_mm]['C_pno'] @ t1_m  # (nao,)
-
-        # z_j_ij[b, Q] = Σ_d (b_ij d_jj|Q)*t1_j[d] for this pair's j
-        z_cache = {}  # (lmo_idx,) → (n_pno, naux)
-        for m_idx in [i, j]:
-            if m_idx in psi_ao and m_idx not in z_cache:
-                # (b_ij | ψ_m | Q)
-                z_m = _build_ovL_t1(
-                    with_df, C_pno_ij,
-                    psi_ao[m_idx].reshape(-1, 1))[:, 0, :]  # (n_pno, naux)
-                z_cache[m_idx] = z_m
-
-        R_t1_ij = np.zeros((n_pno, n_pno))  # unsym[i,j]
-        R_t1_ji = np.zeros((n_pno, n_pno))  # unsym[j,i]
-
-        for k in range(nocc_lmo):
-            # --- Contributions from pair (i,k) to R_unsym[i,j] ---
-            key_ik = (min(i, k), max(i, k))
-            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
-                C_pno_ik = pno_spaces[key_ik]['C_pno']
-                n_ik = C_pno_ik.shape[1]
-                if n_ik > 0:
-                    t2_ik_raw = t2_pno_all[key_ik]
-                    t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-                    theta_ik = 2.0 * t2_ik - t2_ik.T
-                    S_ij_ik = _get_S(key_ik)
-
-                    ovL_ik_k = ovL_pno_cache.get((key_ik, k))
-                    if ovL_ik_k is not None:
-                        # --- vovv×T1 part: Σ_d (c_ik k|b_ij d_jj)*t1_j[d] ---
-                        wVOov_t1 = np.zeros((n_ik, n_pno))
-                        z_j = z_cache.get(j)
-                        if z_j is not None:
-                            wVOov_t1 += ovL_ik_k @ z_j.T  # (n_ik, n_pno)
-
-                        # --- ooov×T1 part: DISABLED for debugging ---
-
-                        # R_unsym[i,j] += S_ij_ik @ theta_ki @ wVOov_t1
-                        R_t1_ij += S_ij_ik @ (theta_ik @ wVOov_t1)
-
-            # --- Contributions from pair (j,k) to R_unsym[j,i] ---
-            key_jk = (min(j, k), max(j, k))
-            if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
-                C_pno_jk = pno_spaces[key_jk]['C_pno']
-                n_jk = C_pno_jk.shape[1]
-                if n_jk > 0:
-                    t2_jk_raw = t2_pno_all[key_jk]
-                    t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
-                    theta_jk = 2.0 * t2_jk - t2_jk.T
-                    S_ij_jk = _get_S(key_jk)
-
-                    ovL_jk_k = ovL_pno_cache.get((key_jk, k))
-                    if ovL_jk_k is not None:
-                        # --- vovv×T1 part ---
-                        wVOov_t1_ji = np.zeros((n_jk, n_pno))
-                        z_i = z_cache.get(i)
-                        if z_i is not None:
-                            wVOov_t1_ji += ovL_jk_k @ z_i.T
-
-                        # --- ooov×T1 part: DISABLED for debugging ---
-
-                        # R_unsym[j,i] += S_ij_jk @ theta_jk @ wVOov_t1_ji
-                        R_t1_ji += S_ij_jk @ (theta_jk @ wVOov_t1_ji)
-
-        # P(ij) symmetrize
-        R_ij += R_t1_ij + R_t1_ji.T
-
-    return R_ij
-
-
-def _compute_inter_pair_coupling(
-        i, j, t2_pno_all, pno_spaces, nocc_lmo,
-        F_lmo, s1e, with_df, C_lmo,
-        J_oo, eps_lmo,
-        t1_can=None, U_pno=None, fov_lmo=None):
-    """Inter-pair coupling correction for the hybrid update_amps approach.
-
-    Computes coupling contributions from occupied orbitals k not in {i,j}:
-      1. Woooo from pairs (k,l) where not both k,l in {i,j}
-      2. Fock coupling from k not in {i,j}
-      3. T1 Fock dressing from k not in {i,j}
-      4. Ring coupling from k not in {i,j}
-
-    These terms are NOT included in the 2-occupied update_amps call
-    (which only sees k,l in {i,j}).
-
-    Returns:
-        delta (np.ndarray): (n_pno_ij, n_pno_ij) coupling residual numerator.
-            Must be divided by D_ij before adding to T2.
-    """
-    key = (min(i, j), max(i, j))
-    data = pno_spaces[key]
-    C_pno_ij = data['C_pno']
-    n_pno = C_pno_ij.shape[1]
-
-    if n_pno == 0:
-        return np.zeros((0, 0))
-
-    delta = np.zeros((n_pno, n_pno))
-    pair_set = {i, j}
-
-    # --- 1. Woooo coupling: (k,l) where not both in {i,j} ---
-    if J_oo is not None:
-        for key_kl, t2_kl in t2_pno_all.items():
-            if t2_kl is None or t2_kl.shape[0] == 0:
-                continue
-            k, l = key_kl
-            if k in pair_set and l in pair_set:
-                continue  # handled by update_amps
-            C_pno_kl = pno_spaces[key_kl]['C_pno']
-
-            tau_kl = t2_kl.copy()
-            if t1_can is not None and U_pno is not None and key_kl in U_pno:
-                U_kl = U_pno[key_kl]
-                t1_k = t1_can[k] @ U_kl
-                t1_l = t1_can[l] @ U_kl
-                tau_kl = t2_kl + np.outer(t1_k, t1_l)
-
-            dress = 0.0
-            n_kl = C_pno_kl.shape[1]
-            if with_df is not None and n_kl > 0:
-                K_cross = with_df.ao2mo(
-                    [C_lmo[:, [i]], C_pno_kl, C_lmo[:, [j]], C_pno_kl],
-                    compact=False).reshape(n_kl, n_kl)
-                dress = np.einsum('cd,cd->', K_cross, tau_kl)
-
-            W_kl = J_oo[i, j, k, l] + dress
-            tau_kl_proj = _project_t2_full(tau_kl, C_pno_kl, C_pno_ij, s1e)
-            delta += 0.5 * W_kl * tau_kl_proj
-            if k != l:
-                W_lk = J_oo[i, j, l, k] + dress
-                delta += 0.5 * W_lk * tau_kl_proj.T
-
-    # --- 2. Fock coupling from k not in {i,j} ---
-    ft_oo = F_lmo - np.diag(eps_lmo)
-    for k in range(nocc_lmo):
-        if k in pair_set:
-            continue
-
-        if abs(ft_oo[k, i]) > 1e-15:
-            key_kj = (min(k, j), max(k, j))
-            if key_kj in t2_pno_all and t2_pno_all[key_kj] is not None:
-                t2_kj_raw = t2_pno_all[key_kj]
-                if t2_kj_raw.shape[0] > 0:
-                    C_pno_kj = pno_spaces[key_kj]['C_pno']
-                    t2_kj = t2_kj_raw.T if k > j else t2_kj_raw
-                    delta -= ft_oo[k, i] * _project_t2_full(
-                        t2_kj, C_pno_kj, C_pno_ij, s1e)
-
-        if abs(ft_oo[k, j]) > 1e-15:
-            key_ik = (min(i, k), max(i, k))
-            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
-                t2_ik_raw = t2_pno_all[key_ik]
-                if t2_ik_raw.shape[0] > 0:
-                    C_pno_ik = pno_spaces[key_ik]['C_pno']
-                    t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-                    delta -= ft_oo[k, j] * _project_t2_full(
-                        t2_ik, C_pno_ik, C_pno_ij, s1e)
-
-    # --- 3. T1 Fock dressing from k not in {i,j} ---
-    if t1_can is not None and fov_lmo is not None:
-        ft_t1_oo = 0.5 * fov_lmo @ t1_can.T
-        for k in range(nocc_lmo):
-            if k in pair_set:
-                continue
-            for idx_i, idx_j in [(i, j), (j, i)]:
-                corr = ft_t1_oo[k, idx_i]
-                if abs(corr) < 1e-15:
-                    continue
-                key_kj2 = (min(k, idx_j), max(k, idx_j))
-                if key_kj2 in t2_pno_all and t2_pno_all[key_kj2] is not None:
-                    t2_raw = t2_pno_all[key_kj2]
-                    if t2_raw.shape[0] > 0:
-                        C_pno_p = pno_spaces[key_kj2]['C_pno']
-                        t2_p = t2_raw.T if k > idx_j else t2_raw
-                        delta -= corr * _project_t2_full(
-                            t2_p, C_pno_p, C_pno_ij, s1e)
-
-    # --- 4. Ring coupling from k not in {i,j} ---
-    if with_df is not None:
-        for k in range(nocc_lmo):
-            if k in pair_set:
-                continue
-
-            # Ring from pair (i,k)
-            key_ik = (min(i, k), max(i, k))
-            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
-                C_pno_ik = pno_spaces[key_ik]['C_pno']
-                n_ik = C_pno_ik.shape[1]
-                if n_ik > 0:
-                    t2_ik_raw = t2_pno_all[key_ik]
-                    t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-
-                    theta_ki = 2.0 * t2_ik.T - t2_ik
-                    theta_half = _project_t2_half(
-                        theta_ki.T, C_pno_ik, C_pno_ij, s1e)
-
-                    K_dir = with_df.ao2mo(
-                        [C_lmo[:, [j]], C_pno_ij,
-                         C_lmo[:, [k]], C_pno_ik],
-                        compact=False).reshape(n_pno, n_ik)
-                    K_coul = with_df.ao2mo(
-                        [C_lmo[:, [j]], C_lmo[:, [k]],
-                         C_pno_ij, C_pno_ik],
-                        compact=False).reshape(1, 1, n_pno, n_ik)[0, 0]
-                    L_jk = 2.0 * K_dir - K_coul
-                    delta += theta_half @ L_jk.T
-
-            # Ring from pair (j,k) — P(ij) symmetrization
-            key_jk = (min(j, k), max(j, k))
-            if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
-                C_pno_jk = pno_spaces[key_jk]['C_pno']
-                n_jk = C_pno_jk.shape[1]
-                if n_jk > 0:
-                    t2_jk_raw = t2_pno_all[key_jk]
-                    t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
-
-                    theta_kj = 2.0 * t2_jk.T - t2_jk
-                    theta_half = _project_t2_half(
-                        theta_kj.T, C_pno_jk, C_pno_ij, s1e)
-
-                    K_dir = with_df.ao2mo(
-                        [C_lmo[:, [i]], C_pno_ij,
-                         C_lmo[:, [k]], C_pno_jk],
-                        compact=False).reshape(n_pno, n_jk)
-                    K_coul = with_df.ao2mo(
-                        [C_lmo[:, [i]], C_lmo[:, [k]],
-                         C_pno_ij, C_pno_jk],
-                        compact=False).reshape(1, 1, n_pno, n_jk)[0, 0]
-                    L_ik = 2.0 * K_dir - K_coul
-                    ring_ji = theta_half @ L_ik.T
-                    delta += ring_ji.T
-
-    return delta
-
-
-def _compute_pair_coupling(i, j, t2_pno_all, pno_spaces, nocc_lmo,
-                            C_pao, ovL_lmo_pao, F_lmo, s1e, with_df, C_lmo,
-                            mol=None, J_oo=None):
-    """Inter-pair coupling correction δK for pair (i,j).
-
-    Computes the missing residual contributions relative to the independent-pair
-    CCSD.  There are three classes of coupling:
-
-    G term — off-diagonal Fock coupling (dominant for localized orbitals):
-        δK[a,b] -= F_lmo[k,i] * T2_proj[(k,j)→(i,j)][a,b]   ∀k≠i,j
-        δK[a,b] -= F_lmo[k,j] * T2_proj[(i,k)→(i,j)][a,b]   ∀k≠i,j
-
-    B term — oo-oo Coulomb coupling via the Woooo intermediate (CRITICAL):
-        δK[a,b] += sum_{(k,l)≠(i,j)} (ij|kl) * T2_proj[(k,l)→(i,j)][a,b]
-        This term is missing because the 2-occ pair subspace only has k,l∈{i,j}.
-        J_oo[i,j,k,l] = (ij|kl) must be precomputed and passed in.
-
-    Ring coupling — via DF if with_df given, else ao2mo.kernel, else skipped:
-        δK += (ring_ik - ring_ik.T) - (ring_jk - ring_jk.T)
-        where ring_ik[a,b] = sum_c T2_half_ik[a,c] * W_jk[b,c]
-              W_jk[b,c] = 2*(jb|kc) - (jk|bc)  b∈PNO_ij, c∈PNO_ik
-
-    Returns:
-        delta_K (np.ndarray): (n_pno_ij, n_pno_ij) coupling correction,
-            or None if pno_spaces entry missing.
-    """
-    key_ij = (min(i, j), max(i, j))
-    if key_ij not in pno_spaces:
-        return None
-    C_pno_ij = pno_spaces[key_ij]['C_pno']
-    n_ij = C_pno_ij.shape[1]
-    delta_K = np.zeros((n_ij, n_ij))
-
-    # Ring coupling requires some integral source (DF or exact)
-    use_ring = (with_df is not None) or (mol is not None)
-
-    # Precompute ovL_pno for LMOs i and j if tensor is available (fast path)
-    if use_ring and with_df is not None and ovL_lmo_pao is not None:
-        ovL_j_ij = _ovl_pno(j, C_pno_ij, C_pao, ovL_lmo_pao)  # (n_ij, naux)
-        ovL_i_ij = _ovl_pno(i, C_pno_ij, C_pao, ovL_lmo_pao)  # (n_ij, naux)
-    else:
-        ovL_j_ij = ovL_i_ij = None
-
-    # ------------------------------------------------------------------
-    # B term: oo-oo Coulomb coupling via Woooo intermediate.
-    # sum_{(k,l)≠(i,j)} (ij|kl) * T2[k,l]_→ij
-    # This is MISSING from the 2-occ pair update_amps since the pair
-    # subspace only couples k,l ∈ {i,j}.  J_oo[i,j,k,l] = (ij|kl).
-    # ------------------------------------------------------------------
-    key_self = (min(i, j), max(i, j))
-    if J_oo is not None:
-        for key_kl, T2_kl in t2_pno_all.items():
-            if key_kl == key_self:
-                continue
-            if T2_kl is None or T2_kl.shape[0] == 0:
-                continue
-            k, l = key_kl
-            C_pno_kl = pno_spaces[key_kl]['C_pno']
-            T2_kl_proj = _project_t2_full(T2_kl, C_pno_kl, C_pno_ij, s1e)
-            # Factor 0.5 matches canonical: 0.5 * Σ_kl (ij|kl) * tau_kl
-            J_kl = J_oo[i, j, k, l]
-            delta_K += 0.5 * J_kl * T2_kl_proj
-            if k != l:
-                delta_K += 0.5 * J_oo[i, j, l, k] * T2_kl_proj.T
-
-    for k in range(nocc_lmo):
-        if k == i or k == j:
-            continue
-
-        # ----------------------------------------------------------------
-        # Fock coupling from pair (k,j): -F[k,i] * T2[k,j] projected to ij
-        # ----------------------------------------------------------------
-        key_kj = (min(k, j), max(k, j))
-        if key_kj in t2_pno_all and t2_pno_all[key_kj] is not None:
-            C_pno_kj = pno_spaces[key_kj]['C_pno']
-            t2_kj_raw = t2_pno_all[key_kj]
-            # Stored as T2[min,max]; if k>j, T2[k,j]=T2[j,k].T
-            t2_kj = t2_kj_raw.T if k > j else t2_kj_raw
-            delta_K -= F_lmo[k, i] * _project_t2_full(t2_kj, C_pno_kj, C_pno_ij, s1e)
-
-        # ----------------------------------------------------------------
-        # Fock coupling from pair (i,k): -F[k,j] * T2[i,k] projected to ij
-        # ----------------------------------------------------------------
-        key_ik = (min(i, k), max(i, k))
-        if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
-            C_pno_ik = pno_spaces[key_ik]['C_pno']
-            t2_ik_raw = t2_pno_all[key_ik]
-            t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-            delta_K -= F_lmo[k, j] * _project_t2_full(t2_ik, C_pno_ik, C_pno_ij, s1e)
-
-        if not use_ring:
-            continue
-
-        # ----------------------------------------------------------------
-        # Ring coupling: P(ij)P(ab) sum_c T2[im,ac] * W[mb,cj]
-        # Contribution from pair (i,k) [sharing occupied i]:
-        #   ring_ik[a,b] = sum_c T2_half_ik[a,c] * W_jk[b,c]
-        #   W_jk[b,c] = 2*(jb|kc) - (jk|bc)  b∈PNO_ij, c∈PNO_ik
-        # ----------------------------------------------------------------
-        if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
-            C_pno_ik = pno_spaces[key_ik]['C_pno']
-            n_ik = C_pno_ik.shape[1]
-            t2_ik_raw = t2_pno_all[key_ik]
-            t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-
-            # T2_half_ik: first virtual projected to PNO_ij, second stays in PNO_ik
-            T2_half_ik = _project_t2_half(t2_ik, C_pno_ik, C_pno_ij, s1e)  # (n_ij, n_ik)
-
-            # K_dir_jk[a,c] = (j,a|k,c), a∈PNO_ij, c∈PNO_ik
-            if ovL_j_ij is not None:
-                ovL_k_ik = _ovl_pno(k, C_pno_ik, C_pao, ovL_lmo_pao)
-                K_dir_jk = ovL_j_ij @ ovL_k_ik.T                    # (n_ij, n_ik)
-            elif with_df is not None:
-                K_dir_jk = with_df.ao2mo(
-                    [C_lmo[:, [j]], C_pno_ij, C_lmo[:, [k]], C_pno_ik],
-                    compact=False
-                ).reshape(n_ij, n_ik)
-            else:
-                K_dir_jk = ao2mo.kernel(
-                    mol, [C_lmo[:, [j]], C_pno_ij, C_lmo[:, [k]], C_pno_ik],
-                    compact=False
-                ).reshape(n_ij, n_ik)
-
-            # K_coul_jk[a,c] = (jk|ac), a∈PNO_ij, c∈PNO_ik
-            if with_df is not None:
-                K_coul_jk = with_df.ao2mo(
-                    [C_lmo[:, [j]], C_lmo[:, [k]], C_pno_ij, C_pno_ik],
-                    compact=False
-                ).reshape(1, 1, n_ij, n_ik)[0, 0]
-            else:
-                K_coul_jk = ao2mo.kernel(
-                    mol, [C_lmo[:, [j]], C_lmo[:, [k]], C_pno_ij, C_pno_ik],
-                    compact=False
-                ).reshape(n_ij, n_ik)
-
-            W_jk = 2.0 * K_dir_jk - K_coul_jk  # (n_ij, n_ik)
-            ring_ik = T2_half_ik @ W_jk.T        # (n_ij, n_ij)
-            delta_K += ring_ik - ring_ik.T
-
-        # ----------------------------------------------------------------
-        # Ring coupling from pair (j,k) [sharing occupied j] — P(ij) term:
-        #   ring_jk[a,b] = sum_c T2_half_jk[a,c] * W_ik[b,c]
-        #   W_ik[b,c] = 2*(ib|kc) - (ik|bc)  b∈PNO_ij, c∈PNO_jk
-        # ----------------------------------------------------------------
-        key_jk = (min(j, k), max(j, k))
-        if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
-            C_pno_jk = pno_spaces[key_jk]['C_pno']
-            n_jk = C_pno_jk.shape[1]
-            t2_jk_raw = t2_pno_all[key_jk]
-            t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
-
-            # T2_half_jk: first virtual projected to PNO_ij
-            T2_half_jk = _project_t2_half(t2_jk, C_pno_jk, C_pno_ij, s1e)  # (n_ij, n_jk)
-
-            # K_dir_ik[a,c] = (i,a|k,c), a∈PNO_ij, c∈PNO_jk
-            if ovL_i_ij is not None:
-                ovL_k_jk = _ovl_pno(k, C_pno_jk, C_pao, ovL_lmo_pao)
-                K_dir_ik = ovL_i_ij @ ovL_k_jk.T                    # (n_ij, n_jk)
-            elif with_df is not None:
-                K_dir_ik = with_df.ao2mo(
-                    [C_lmo[:, [i]], C_pno_ij, C_lmo[:, [k]], C_pno_jk],
-                    compact=False
-                ).reshape(n_ij, n_jk)
-            else:
-                K_dir_ik = ao2mo.kernel(
-                    mol, [C_lmo[:, [i]], C_pno_ij, C_lmo[:, [k]], C_pno_jk],
-                    compact=False
-                ).reshape(n_ij, n_jk)
-
-            # K_coul_ik[a,c] = (ik|ac), a∈PNO_ij, c∈PNO_jk
-            if with_df is not None:
-                K_coul_ik = with_df.ao2mo(
-                    [C_lmo[:, [i]], C_lmo[:, [k]], C_pno_ij, C_pno_jk],
-                    compact=False
-                ).reshape(1, 1, n_ij, n_jk)[0, 0]
-            else:
-                K_coul_ik = ao2mo.kernel(
-                    mol, [C_lmo[:, [i]], C_lmo[:, [k]], C_pno_ij, C_pno_jk],
-                    compact=False
-                ).reshape(n_ij, n_jk)
-
-            W_ik = 2.0 * K_dir_ik - K_coul_ik  # (n_ij, n_jk)
-            ring_jk = T2_half_jk @ W_ik.T        # (n_ij, n_ij)
-            delta_K -= ring_jk - ring_jk.T
-
-    return delta_K
-
-
-# ---------------------------------------------------------------------------
-# Global coupled LCCSD (correct inter-pair coupling via global CCSD)
-# ---------------------------------------------------------------------------
-
-def _run_global_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
-                      fock_ao, eps_lmo, s1e, conv_tol, max_cycle,
-                      t2_cas=None, occ_cas_idx=None, vir_cas_idx=None,
-                      mo_coeff_cas=None):
-    """Run a global CCSD in the LMO occupied + canonical virtual basis.
-
-    All inter-pair coupling is exact (Fock, ring, ladder diagrams across all
-    pairs simultaneously).  When C_vir spans the full virtual space
-    (T_CutPNO→0) this converges to canonical CCSD.
-
-    For TCCSD: if CAS virtual amplitudes are provided, the CAS block of T2
-    is frozen to the DMRG values after every CCSD update step (Lang et al.
-    eq. 14–15).  The external block is iterated freely with standard CCSD
-    machinery.  When vir_cas_idx is empty the freeze is a no-op and the
-    function reduces to standard CCSD.
-
-    Args:
-        mf: RHF (or DF-RHF) object.
-        C_lmo: (nao, nocc_lmo) LMO coefficients.
-        pno_spaces: dict (i,j) → PNO data.
-        strong_pairs: list of (i,j) pairs.
-        fock_ao: (nao, nao) AO Fock matrix.
-        eps_lmo: (nocc_lmo,) LMO Fock diagonal.
-        s1e: (nao, nao) AO overlap matrix.
-        conv_tol, max_cycle: CCSD convergence settings.
-        t2_cas: (nocc_cas, nocc_cas, nvir_cas, nvir_cas) DMRG doubles.
-        occ_cas_idx: LMO indices of CAS occupied orbitals.
-        vir_cas_idx: columns of mo_coeff_cas that are CAS virtual orbitals.
-        mo_coeff_cas: CASSCF MO coefficient matrix (nao, nmo_cas).
-
-    Returns:
-        e_total (float): Total CCSD correlation energy.
-        t2_pno_all (dict): (i,j) → T2 in pair PNO basis (for (T) triples).
-    """
-    nocc = C_lmo.shape[1]
-    nocc_full = int(np.count_nonzero(mf.mo_occ > 1e-10))
-    C_vir = mf.mo_coeff[:, nocc_full:]  # canonical virtual MOs (nao, nvir)
-    nvir = C_vir.shape[1]
-    nmo = nocc + nvir
-
-    mo_coeff = np.hstack((C_lmo, C_vir))  # (nao, nmo)
-    fock_mo = reduce(np.dot, (mo_coeff.T, fock_ao, mo_coeff))
-    mo_energy = np.diag(fock_mo).real
-    mo_occ = np.zeros(nmo)
-    mo_occ[:nocc] = 2.0
-
-    print(f'  Global LCCSD: nocc={nocc}  nvir={nvir}  nmo={nmo}', flush=True)
-
-    # Build a fake mf with LMO+canonical_vir MOs and DF integrals.
-    # Use DFCCSD to avoid building the full nmo^4 ERI tensor.
-    fake_mf = _FakeMF(mol=mf.mol, mo_coeff_pair=mo_coeff,
-                      mo_energy_pair=mo_energy, mo_occ_pair=mo_occ,
-                      e_tot=mf.e_tot, fock_ao=fock_ao, _eri=None, verbose=0)
-
-    use_df = hasattr(mf, 'with_df') and mf.with_df is not None
-    if use_df:
-        fake_mf.with_df = mf.with_df
-        from pyscf.cc import dfccsd as _dfccsd
-        mycc = _dfccsd.RCCSD(fake_mf, mo_coeff=mo_coeff, mo_occ=mo_occ)
-    else:
-        mycc = ccsd.CCSD(fake_mf)
-    mycc.verbose = 0
-    eris = mycc.ao2mo(mo_coeff)
-
-    # ------------------------------------------------------------------
-    # CAS freeze setup
-    # ------------------------------------------------------------------
-    # U_cas: (nvir, nvir_cas) — transforms CAS virtual MOs into the
-    # canonical virtual MO basis.  Columns are orthonormal because
-    # CASSCF virtual orbitals are orthogonal to all occupied orbitals and
-    # span a subspace of the total virtual space.
-    nvir_cas = 0 if (vir_cas_idx is None) else len(vir_cas_idx)
-    has_cas = (nvir_cas > 0 and t2_cas is not None
-               and t2_cas.shape[2] > 0 and mo_coeff_cas is not None)
-
-    if has_cas:
-        C_cas_vir = mo_coeff_cas[:, vir_cas_idx]        # (nao, nvir_cas)
-        U_cas = C_vir.T @ (s1e @ C_cas_vir)             # (nvir, nvir_cas)
-        P_cas = U_cas @ U_cas.T                          # (nvir, nvir) projector
-
-        nc = len(occ_cas_idx)
-        # Precompute frozen CAS amplitudes in canonical virtual basis:
-        # T2_cas_global[ic, jc] = U_cas @ t2_cas[ic,jc] @ U_cas.T  (nvir, nvir)
-        T2_cas_global = np.einsum('ap,ijpq,bq->ijab',
-                                  U_cas, t2_cas, U_cas)  # (nc,nc,nvir,nvir)
-
-        # --- Diagnostic ---
-        UU = U_cas.T @ U_cas
-        print(f'  [DIAG] U_cas shape={U_cas.shape}  '
-              f'U_cas.T@U_cas diag={np.diag(UU).round(4)}  '
-              f'max_offdiag={np.max(np.abs(UU - np.diag(np.diag(UU)))):.2e}',
-              flush=True)
-        nvir_cas_loc = len(vir_cas_idx)
-        print(f'  [DIAG] |t2_cas| = {np.linalg.norm(t2_cas):.6f}  '
-              f'max = {np.max(np.abs(t2_cas)):.6f}', flush=True)
-        print(f'  [DIAG] t2_cas[0,0,0,0]={t2_cas[0,0,0,0]:.6f}  '
-              f't2_cas[1,0,0,0]={t2_cas[1,0,0,0]:.6f}  '
-              f't2_cas[0,1,0,1]={t2_cas[0,1,0,1]:.6f}  '
-              f't2_cas[1,1,0,0]={t2_cas[1,1,0,0]:.6f}', flush=True)
-        print(f'  [DIAG] U_cas[0:nvir_cas, :] =\n{U_cas[:nvir_cas_loc, :].round(4)}',
-              flush=True)
-        print(f'  [DIAG] T2_cas_global[0,0,:4,:4]=\n'
-              f'{T2_cas_global[0,0,:nvir_cas_loc,:nvir_cas_loc].round(6)}', flush=True)
-        print(f'  [DIAG] T2_cas_global[0,1,:4,:4]=\n'
-              f'{T2_cas_global[0,1,:nvir_cas_loc,:nvir_cas_loc].round(6)}', flush=True)
-        print(f'  [DIAG] |T2_cas_global| = {np.linalg.norm(T2_cas_global):.6f}  '
-              f'max = {np.max(np.abs(T2_cas_global)):.6f}', flush=True)
-
-        def freeze_cas_block(t2):
-            """Remove CAS-CAS virtual contribution; inject frozen DMRG value."""
-            for ic in range(nc):
-                for jc in range(nc):
-                    i_lmo = occ_cas_idx[ic]
-                    j_lmo = occ_cas_idx[jc]
-                    t2[i_lmo, j_lmo] -= P_cas @ t2[i_lmo, j_lmo] @ P_cas
-                    t2[i_lmo, j_lmo] += T2_cas_global[ic, jc]
-            return t2
-
-    # ------------------------------------------------------------------
-    # CCSD iteration
-    # ------------------------------------------------------------------
-    if not has_cas:
-        # Standard path: delegate entirely to PySCF's CCSD kernel.
-        mycc.conv_tol = conv_tol
-        mycc.max_cycle = max_cycle
-        # Pass t1=None, t2=None so PySCF uses its MP2 initial guess.
-        _, t1, t2 = mycc.ccsd(eris=eris)
-    else:
-        # TCCSD path: start from MP2 initial guess, then iterate CCSD
-        # with the CAS block frozen to DMRG amplitudes after each step.
-        _, t1, t2 = mycc.init_amps(eris)
-        t2 = freeze_cas_block(t2)
-        mydiis = lib.diis.DIIS()
-        mydiis.space = 8
-        for cycle in range(max_cycle):
-            t1_new, t2_new = mycc.update_amps(t1, t2, eris)
-            t2_new = freeze_cas_block(t2_new)
-
-            # DIIS extrapolation (error = new − old)
-            t_vec = np.concatenate([t1_new.ravel(), t2_new.ravel()])
-            t_old = np.concatenate([t1.ravel(), t2.ravel()])
-            err = t_vec - t_old
-            dT = np.max(np.abs(err))
-            t_vec_diis = mydiis.update(t_vec, err)
-
-            n1 = t1.size
-            t1 = t_vec_diis[:n1].reshape(t1.shape)
-            t2 = t_vec_diis[n1:].reshape(t2.shape)
-            # Re-apply freeze after DIIS (extrapolation can drift CAS block).
-            t2 = freeze_cas_block(t2)
-
-            print(f'  Cycle {cycle + 1:3d}: dT = {dT:.3e}', flush=True)
-            if dT < conv_tol:
-                print(f'  Global TCCSD converged in {cycle + 1} cycles.',
-                      flush=True)
-                break
-        else:
-            print('  WARNING: Global TCCSD did not converge.', flush=True)
-
-    # ------------------------------------------------------------------
-    # Total correlation energy and projection to PNO basis
-    # ------------------------------------------------------------------
-    print(f'  [DIAG] |t1| = {np.linalg.norm(t1):.6f}  '
-          f'max|t1| = {np.max(np.abs(t1)):.6f}', flush=True)
-    print(f'  [DIAG] |t2| = {np.linalg.norm(t2):.6f}', flush=True)
-    if has_cas:
-        nvir_cas = len(vir_cas_idx)
-        print(f'  [DIAG] t2[0,0,0,0]={t2[0,0,0,0]:.6f}  '
-              f't2[0,1,0,0]={t2[0,1,0,0]:.6f}  '
-              f't2[1,0,0,1]={t2[1,0,0,1]:.6f}', flush=True)
-        print(f'  [DIAG] |T2_cas_global[0,0]| in CAS block = '
-              f'{np.linalg.norm(T2_cas_global[0,0,:nvir_cas,:nvir_cas]):.6f}  '
-              f'max = {np.max(np.abs(T2_cas_global[0,0,:nvir_cas,:nvir_cas])):.6f}',
-              flush=True)
-
-    # Compute energy using PySCF's CCSD energy formula (handles DF correctly)
-    e_total = mycc.energy(t1, t2, eris)
-    print(f'  [DIAG] E(CCSD corr) = {e_total:.10f}', flush=True)
-
-    t2_pno_all = {}
-    for pair in strong_pairs:
-        pi, pj = pair
-        key = (min(pi, pj), max(pi, pj))
-        if key not in pno_spaces:
-            continue
-        C_pno_ij = pno_spaces[key]['C_pno']
-        n_pno = C_pno_ij.shape[1]
-        if n_pno == 0:
-            t2_pno_all[key] = np.zeros((0, 0))
-            continue
-        S = C_vir.T @ (s1e @ C_pno_ij)        # (nvir, n_pno)
-        t2_ij = t2[pi, pj] if pi <= pj else t2[pj, pi].T
-        t2_pno_all[key] = S.T @ t2_ij @ S     # (n_pno, n_pno)
-
-    return e_total, t2_pno_all, t1
-
-
-# ---------------------------------------------------------------------------
-# DLPNO-CCSD: per-pair PNO virtual spaces, correct full-occ coupling
-# ---------------------------------------------------------------------------
 
 def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                      fock_ao, eps_lmo, s1e, conv_tol, max_cycle,
@@ -2951,7 +938,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                      mo_coeff_cas=None, diis_space=15,
                      damping=0.5, diis_start_cycle=0,
                      C_pao=None, use_t1_transform=True,
-                     use_jiang=False,
                      ncores=1, _pool=None):
     """DLPNO-CCSD with pair-local residual and per-pair PNO virtual spaces.
 
@@ -2986,8 +972,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     nocc = C_lmo.shape[1]
 
     # Jiang uses bare integrals with explicit T1 dressing
-    if use_jiang:
-        use_t1_transform = False
+    use_t1_transform = False
 
     # ------------------------------------------------------------------
     # Pre-compute quantities needed by the pair-local residual
@@ -3226,9 +1211,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _pmask = _lmo_aux_mask[i] | _lmo_aux_mask[j]
             pair_aux_idx[key] = np.where(_pmask)[0]
 
-        # Stash pair_lmo_idx for use in T1 residual
-        _compute_local_t1_residual._pair_lmo_idx = pair_lmo_idx
-
         # Build ovL (full aux) — local DF truncation is applied at contraction
         # time via pair_aux_idx, not at storage time, because ooL_3idx uses
         # the full aux basis and many contraction sites mix pair contexts.
@@ -3254,99 +1236,48 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # Per-pair local DF: precompute ALL locally-fitted intermediates ONCE.
     # Matches Psi4 compute_cc_integrals(). Stored for the entire CCSD run.
     # ------------------------------------------------------------------
-    _cc_ints = None
-    _j2c = None
-    _use_local_df = getattr(mf, '_use_local_df', False)
-    if with_df is not None and use_jiang and pair_aux_idx and _use_local_df:
-        from pyscf.cc.dlpno_tccsd.local_df import compute_cc_integrals
-        import time as _time_cc
-        _t_cc = _time_cc.perf_counter()
-        # Use RI auxiliary basis for local DF if available, otherwise JK aux
-        _ri_auxbasis = getattr(mf, '_ri_auxbasis', None)
-        if _ri_auxbasis is not None:
-            from pyscf import df
-            _auxmol = df.addons.make_auxmol(mf.mol, _ri_auxbasis)
-        else:
-            _auxmol = with_df.auxmol
-        _j2c = _auxmol.intor('int2c2e')
-        # Include ALL pairs with PNOs (strong + weak), matching Psi4 which
-        # builds cc_integrals for all unscreened pairs (0 screened for TightPNO).
-        _all_keys_cc = list(keys_sorted)  # strong pairs
-        for key_w in pno_spaces:
-            if key_w not in _all_keys_cc:
-                if pno_spaces[key_w]['C_pno'].shape[1] > 0 and key_w in pair_aux_idx:
-                    _all_keys_cc.append(key_w)
-        _cc_ints = compute_cc_integrals(
-            mf.mol, _auxmol, C_lmo, pno_spaces, pair_aux_idx,
-            _j2c, _all_keys_cc, nocc)
-        if _cc_ints is not None:
-            print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
-                  f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
-
-        # Rebuild K_pno_cache from locally-fitted K_iajb
-        if _cc_ints is not None:
-            for key in list(K_pno_cache.keys()):
-                ci = _cc_ints.get(key)
-                if ci is not None:
-                    K_pno_cache[key] = ci['K_iajb']
+    from pyscf.cc.dlpno_tccsd.local_df import compute_cc_integrals
+    import time as _time_cc
+    _t_cc = _time_cc.perf_counter()
+    # Use RI auxiliary basis for local DF if available, otherwise JK aux
+    _ri_auxbasis = getattr(mf, '_ri_auxbasis', None)
+    if _ri_auxbasis is not None:
+        from pyscf import df
+        _auxmol = df.addons.make_auxmol(mf.mol, _ri_auxbasis)
+    else:
+        _auxmol = with_df.auxmol
+    _j2c = _auxmol.intor('int2c2e')
+    # Include ALL pairs with PNOs (strong + weak), matching Psi4 which
+    # builds cc_integrals for all unscreened pairs (0 screened for TightPNO).
+    _all_keys_cc = list(keys_sorted)
+    for key_w in pno_spaces:
+        if key_w not in _all_keys_cc:
+            if pno_spaces[key_w]['C_pno'].shape[1] > 0 and key_w in pair_aux_idx:
+                _all_keys_cc.append(key_w)
+    _cc_ints = compute_cc_integrals(
+        mf.mol, _auxmol, C_lmo, pno_spaces, pair_aux_idx,
+        _j2c, _all_keys_cc, nocc)
+    print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
+          f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
+    # Rebuild K_pno_cache from locally-fitted K_iajb
+    for key in list(K_pno_cache.keys()):
+        ci = _cc_ints.get(key)
+        if ci is not None:
+            K_pno_cache[key] = ci['K_iajb']
 
     # Pre-compute PNO overlap matrices S_pno_cache[(key_ij, key_kl)]
-    # for all pair combinations that share an occupied index (connected pairs).
+    # for ALL pair combinations (strong + weak) with PNOs.  Weak-pair
+    # overlaps are needed by Eq 88 (A term, T1 residual) which sums over
+    # all k including weak (k,i) pairs — without them we silently drop
+    # weak-pair A contributions on LMOs 0/2 (~3% low on str 010).
+    _all_pair_keys = [k for k in pno_spaces
+                      if pno_spaces[k]['C_pno'].shape[1] > 0]
     S_pno_cache = {}
-    for key_ij in keys_sorted:
-        i, j = key_ij
+    for key_ij in _all_pair_keys:
         C_pno_ij = pno_spaces[key_ij]['C_pno']
-        if C_pno_ij.shape[1] == 0:
-            continue
-        for key_kl in keys_sorted:
-            if key_kl == key_ij:
-                continue
-            k, l = key_kl
-            # Connected: shares at least one occupied index
-            if i == k or i == l or j == k or j == l:
-                C_pno_kl = pno_spaces[key_kl]['C_pno']
-                if C_pno_kl.shape[1] == 0:
-                    continue
-                S_pno_cache[(key_ij, key_kl)] = C_pno_ij.T @ (
-                    s1e @ C_pno_kl)
-
-    # Extend S_pno_cache with diagonal pair overlaps needed by local T1.
-    # For each diagonal pair (i,i), we need S_pno[(key_ii, key_kl)] for ALL pairs
-    # kl — even those that don't share an LMO with i. The B term in the Psi4-style
-    # singles residual (Jiang Eq. 34: B_i^a = -u_kl^ac B_ki^Q B_lc^Q) sums over
-    # every (k,l) pair and projects each contribution into PNO_ii via S(ii, kl).
-    # Restricting to "connected" pairs silently dropped contributions from
-    # disconnected (k,l) pairs (e.g., (1,2) for i=0 in H2O), causing a ~3.4%
-    # under-estimate of the B term.
-    for i in range(nocc):
-        key_ii = (i, i)
-        if key_ii not in pno_spaces:
-            continue
-        C_pno_ii = pno_spaces[key_ii]['C_pno']
-        if C_pno_ii.shape[1] == 0:
-            continue
-        for key_kl in keys_sorted:
-            if key_kl == key_ii:
-                continue
+        for key_kl in _all_pair_keys:
             C_pno_kl = pno_spaces[key_kl]['C_pno']
-            if C_pno_kl.shape[1] == 0:
-                continue
-            if (key_ii, key_kl) not in S_pno_cache:
-                S_pno_cache[(key_ii, key_kl)] = C_pno_ii.T @ (s1e @ C_pno_kl)
-            if (key_kl, key_ii) not in S_pno_cache:
-                S_pno_cache[(key_kl, key_ii)] = C_pno_kl.T @ (s1e @ C_pno_ii)
-        # Overlaps between diagonal pairs (i,i) and (k,k) for foo*t1 terms
-        for k in range(nocc):
-            if k == i:
-                continue
-            key_kk = (k, k)
-            if key_kk not in pno_spaces:
-                continue
-            C_pno_kk = pno_spaces[key_kk]['C_pno']
-            if C_pno_kk.shape[1] == 0:
-                continue
-            if (key_ii, key_kk) not in S_pno_cache:
-                S_pno_cache[(key_ii, key_kk)] = C_pno_ii.T @ (s1e @ C_pno_kk)
+            S_pno_cache[(key_ij, key_kl)] = C_pno_ij.T @ (s1e @ C_pno_kl)
 
     # Pre-compute occ-occ 3-index DF tensor ooL[i,j,Q] = (i_lmo j_lmo | Q)
     # for T1 integral dressing (Eq. 91-93 of Jiang et al.).
@@ -3454,15 +1385,11 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             t1_pno_old = {i: t1_pno[i].copy() for i in range(nocc)}
             # Tell compute_residual_v2 the current iteration so PTERM dumps
             # can be filtered/labeled per iter.
-            from pyscf.cc.dlpno_tccsd.lccsd_jiang_v2 import compute_residual_v2 as _crv2
+            from pyscf.cc.dlpno_tccsd.residual import compute_residual_v2 as _crv2
             _crv2._iter = cycle
             _crv2._debug_pterm_all = (cycle <= 2) and getattr(_run_dlpno_lccsd, '_debug_pterm_iters', False)
             # Pass strong-pair set to T1 residual so it can optionally skip
-            # weak pairs in Eq 88's k-loop (matching Psi4).
             _compute_t1_residual_psi4._iter = cycle
-            _compute_t1_residual_psi4._strong_pair_keys = set(keys_sorted)
-            _compute_t1_residual_psi4._skip_weak_in_A = getattr(
-                _run_dlpno_lccsd, '_skip_weak_in_A', False)
 
             # ---- T1-transformed MOs or bare integrals ----
             if use_t1_transform:
@@ -3523,156 +1450,119 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 foo_bare = foo_total
                 _t_ovl_done = _t_kcoul_done = _t_foo_done = _time.perf_counter()
 
-            # ---- Jiang intermediates (precomputed once per iteration) ----
+            # ---- T1-dressed intermediates (precomputed once per iteration) ----
             _jiang_cache = None
-            if use_jiang:
-                from pyscf.cc.dlpno_tccsd.lccsd_jiang import (
-                    compute_C_tilde, _build_ooL_dressed,
-                    build_dressed_ovL_cache)
-                from pyscf.cc.dlpno_tccsd.jiang_intermediates import (
-                    build_D_tilde, build_Fkj, build_G_tilde,
-                    build_mixed_domain_integrals, build_Fab_all)
-                from pyscf.cc.dlpno_tccsd.jiang_df_unified import (
-                    compute_all_df_terms)
+            from pyscf.cc.dlpno_tccsd.residual import (
+                compute_C_tilde, _build_ooL_dressed, build_dressed_ovL_cache,
+                build_D_tilde, build_Fkj, build_G_tilde,
+                build_mixed_domain_integrals, build_Fab_all,
+                compute_all_df_terms,
+            )
 
-                _t_jiang = _time.perf_counter()
+            _t_jiang = _time.perf_counter()
 
-                # T1-dressed ooL/ovL (Eqs 91-92)
-                _tj0 = _time.perf_counter()
-                _all_keys_j = list(keys_sorted)
-                for ii in range(nocc):
-                    kii = (ii, ii)
-                    if kii not in _all_keys_j and kii in pno_spaces:
-                        _all_keys_j.append(kii)
-                if _cc_ints is not None:
-                    # Local DF: skip global dressed ovL/ooL (per-pair t1_ints provides them)
-                    _jiang_ooL_d = ooL_3idx  # bare ooL — per-pair B_tilde uses local
-                    _jiang_ovL_d = None  # not needed (K_dressed_override per pair)
-                else:
-                    _jiang_ooL_d = _build_ooL_dressed(
-                        ooL_3idx, ovL_pno_cache, t1_pno, pno_spaces, nocc)
-                    _jiang_ovL_d = build_dressed_ovL_cache(
-                        ovL_pno_cache, ooL_3idx, t1_pno, pno_spaces,
-                        S_pno_cache, nocc, with_df, _all_keys_j)
-                _tj_ovl = _time.perf_counter() - _tj0
+            # T1-dressed ooL/ovL (Eqs 91-92)
+            _tj0 = _time.perf_counter()
+            _all_keys_j = list(keys_sorted)
+            for ii in range(nocc):
+                kii = (ii, ii)
+                if kii not in _all_keys_j and kii in pno_spaces:
+                    _all_keys_j.append(kii)
+            # Local DF: skip global dressed ovL/ooL (per-pair t1_ints provides them)
+            _jiang_ooL_d = ooL_3idx  # bare ooL — per-pair B_tilde uses local
+            _jiang_ovL_d = None  # not needed (K_dressed_override per pair)
+            _tj_ovl = _time.perf_counter() - _tj0
 
-                # Unified single DF pass: fvv_t1, C/D Term 2, ladder
-                _tj0 = _time.perf_counter()
-                _fvv_t1_pre, _c_t2_pre, _d_t2_pre, _jiang_ladder_all = \
-                    compute_all_df_terms(
-                        t1_pno, fov_pno, t2_pno_all, pno_spaces, nocc,
-                        ovL_pno_cache, S_pno_cache, with_df, keys_sorted)
-                _tj_df = _time.perf_counter() - _tj0
+            # Unified single DF pass: fvv_t1, C/D Term 2, ladder
+            _tj0 = _time.perf_counter()
+            _fvv_t1_pre, _c_t2_pre, _d_t2_pre, _jiang_ladder_all = \
+                compute_all_df_terms(
+                    t1_pno, fov_pno, t2_pno_all, pno_spaces, nocc,
+                    ovL_pno_cache, S_pno_cache, with_df, keys_sorted)
+            _tj_df = _time.perf_counter() - _tj0
 
-                # C_tilde / D_tilde (Eqs 83-84, with precomputed Term 2)
-                _tj0 = _time.perf_counter()
-                _jiang_C = compute_C_tilde(
-                    t1_pno, t2_pno_all, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
-                    _term2_precomputed=_c_t2_pre,
-                    cc_ints=_cc_ints,
-                    pair_lmo_idx=pair_lmo_idx)
-                _tj_C = _time.perf_counter() - _tj0
-                _tj0 = _time.perf_counter()
-                _jiang_D = build_D_tilde(
-                    t1_pno, t2_pno_all, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
-                    _term2_precomputed=_d_t2_pre,
-                    cc_ints=_cc_ints,
-                    pair_lmo_idx=pair_lmo_idx)
-                _tj_D = _time.perf_counter() - _tj0
+            # C_tilde / D_tilde (Eqs 83-84, with precomputed Term 2)
+            _tj0 = _time.perf_counter()
+            compute_C_tilde._dump_iter = cycle
+            _jiang_C = compute_C_tilde(
+                t1_pno, t2_pno_all, pno_spaces, nocc,
+                ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+                _term2_precomputed=_c_t2_pre,
+                cc_ints=_cc_ints,
+                pair_lmo_idx=pair_lmo_idx)
+            _tj_C = _time.perf_counter() - _tj0
+            _tj0 = _time.perf_counter()
+            _jiang_D = build_D_tilde(
+                t1_pno, t2_pno_all, pno_spaces, nocc,
+                ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+                _term2_precomputed=_d_t2_pre,
+                cc_ints=_cc_ints,
+                pair_lmo_idx=pair_lmo_idx)
+            _tj_D = _time.perf_counter() - _tj0
 
-                # Fkj / G_tilde (Eqs 94, 86)
-                _tj0 = _time.perf_counter()
-                _jiang_Fkj, _jiang_foo_t1 = build_Fkj(
-                    F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache, foo_total,
-                    pair_lmo_idx=pair_lmo_idx,
-                    pair_keys_set=set(pair_lmo_idx.keys()) if pair_lmo_idx else None)
-                _jiang_G = build_G_tilde(
-                    t2_pno_all, t1_pno, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache,
-                    _jiang_Fkj, _jiang_foo_t1,
-                    cc_ints=_cc_ints)
-                _tj_FG = _time.perf_counter() - _tj0
+            # Fkj / G_tilde (Eqs 94, 86)
+            _tj0 = _time.perf_counter()
+            _jiang_Fkj, _jiang_foo_t1 = build_Fkj(
+                F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
+                ovL_pno_cache, ooL_3idx, S_pno_cache, foo_total,
+                pair_lmo_idx=pair_lmo_idx,
+                pair_keys_set=set(pair_lmo_idx.keys()) if pair_lmo_idx else None)
+            _jiang_G = build_G_tilde(
+                t2_pno_all, t1_pno, pno_spaces, nocc,
+                ovL_pno_cache, ooL_3idx, S_pno_cache,
+                _jiang_Fkj, _jiang_foo_t1,
+                cc_ints=_cc_ints)
+            _tj_FG = _time.perf_counter() - _tj0
 
-                # Mixed-domain integrals for C/D bold terms
-                _tj0 = _time.perf_counter()
-                _jiang_K_mixed = build_mixed_domain_integrals(
-                    t2_pno_all, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache,
-                    cc_ints=_cc_ints)
-                _tj_Km = _time.perf_counter() - _tj0
+            # Mixed-domain integrals for C/D bold terms
+            _tj0 = _time.perf_counter()
+            _jiang_K_mixed = build_mixed_domain_integrals(
+                t2_pno_all, pno_spaces, nocc,
+                ovL_pno_cache, ooL_3idx, S_pno_cache,
+                cc_ints=_cc_ints)
+            _tj_Km = _time.perf_counter() - _tj0
 
-                # Dressed J_oo for B_tilde (only needed when local DF off)
-                if _cc_ints is None:
-                    _ooLf = _jiang_ooL_d.reshape(nocc * nocc, -1)
-                    _jiang_J_oo_d = (_ooLf @ _ooLf.T).reshape(
-                        nocc, nocc, nocc, nocc)
-                else:
-                    _jiang_J_oo_d = None  # per-pair B_tilde uses local DF
+            # per-pair B_tilde uses local DF, so no global J_oo_d needed
+            _jiang_J_oo_d = None
 
-                # Precompute Fab for ALL pairs (with precomputed fvv_t1)
-                _tj0 = _time.perf_counter()
-                _jiang_Fab_all = build_Fab_all(
-                    t1_pno, fov_pno, pno_spaces, nocc,
-                    ovL_pno_cache, S_pno_cache, with_df, keys_sorted,
-                    _fvv_t1_precomputed=_fvv_t1_pre,
-                    pair_lmo_idx=pair_lmo_idx)
-                _tj_Fab = _time.perf_counter() - _tj0
+            # Precompute Fab for ALL pairs (with precomputed fvv_t1)
+            _tj0 = _time.perf_counter()
+            _jiang_Fab_all = build_Fab_all(
+                t1_pno, fov_pno, pno_spaces, nocc,
+                ovL_pno_cache, S_pno_cache, with_df, keys_sorted,
+                _fvv_t1_precomputed=_fvv_t1_pre,
+                pair_lmo_idx=pair_lmo_idx)
+            _tj_Fab = _time.perf_counter() - _tj0
 
-                # Local DF Fkj, Fab, G_tilde (computed once per iteration)
-                _local_df_Fab = None
-                _local_df_G = None
-                if _cc_ints is not None:
-                    from pyscf.cc.dlpno_tccsd.local_df import t1_fock
-                    _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
-                        _cc_ints, None, t1_pno, fov_pno, pno_spaces,
-                        S_pno_cache, F_lmo, eps_lmo, foo_total,
-                        _all_keys_j, nocc)
-                    _local_df_G = build_G_tilde(
-                        t2_pno_all, t1_pno, pno_spaces, nocc,
-                        ovL_pno_cache, ooL_3idx, S_pno_cache,
-                        _local_Fkj, _local_foo_t1,
-                        cc_ints=_cc_ints)
+            # Local DF Fkj, Fab, G_tilde (computed once per iteration)
+            from pyscf.cc.dlpno_tccsd.local_df import t1_fock
+            _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
+                _cc_ints, None, t1_pno, fov_pno, pno_spaces,
+                S_pno_cache, F_lmo, eps_lmo, foo_total,
+                _all_keys_j, nocc)
+            _local_df_G = build_G_tilde(
+                t2_pno_all, t1_pno, pno_spaces, nocc,
+                ovL_pno_cache, ooL_3idx, S_pno_cache,
+                _local_Fkj, _local_foo_t1,
+                cc_ints=_cc_ints)
 
-                _t_jiang_done = _time.perf_counter()
-                if False:  # Set to True for detailed jiang timing
-                    print(f'    [jiang] ovL_d={_tj_ovl:.3f} df={_tj_df:.3f} '
-                          f'C={_tj_C:.3f} D={_tj_D:.3f} FG={_tj_FG:.3f} '
-                          f'Km={_tj_Km:.3f} Fab={_tj_Fab:.3f} '
-                          f'total={_t_jiang_done-_t_jiang:.3f}s', flush=True)
+            _t_jiang_done = _time.perf_counter()
+            if False:  # Set to True for detailed jiang timing
+                print(f'    [jiang] ovL_d={_tj_ovl:.3f} df={_tj_df:.3f} '
+                      f'C={_tj_C:.3f} D={_tj_D:.3f} FG={_tj_FG:.3f} '
+                      f'Km={_tj_Km:.3f} Fab={_tj_Fab:.3f} '
+                      f'total={_t_jiang_done-_t_jiang:.3f}s', flush=True)
 
-                _jiang_cache = {
-                    'C_tilde': _jiang_C, 'D_tilde': _jiang_D,
-                    'G_tilde': _jiang_G,
-                    'ovL_dressed': _jiang_ovL_d,
-                    'ooL_dressed': _jiang_ooL_d,
-                    'J_oo_d': _jiang_J_oo_d,
-                    'K_mixed': _jiang_K_mixed,
-                    'Fab_all': _jiang_Fab_all,
-                    'ladder_all': _jiang_ladder_all,
-                }
-
-                # === DEBUG: Dump global T1-dressed R2 intermediates ===
-                if cycle <= 2 and getattr(_run_dlpno_lccsd, '_dump_intermediates', False):
-                    # Use LOCAL DF intermediates if available (these are what R2 actually uses)
-                    _G = _local_df_G if _local_df_G is not None else _jiang_G
-                    _Fkj = _local_Fkj if _local_df_G is not None else _jiang_Fkj
-                    print(f'  INTM iter {cycle}: G_tilde [0,0]={_G[0,0]:.12e} '
-                          f'[0,1]={_G[0,1]:.12e} [1,0]={_G[1,0]:.12e} '
-                          f'rms={np.sqrt(np.mean(_G**2)):.12e}', flush=True)
-                    print(f'  INTM iter {cycle}: Fkj [0,0]={_Fkj[0,0]:.12e} '
-                          f'[0,1]={_Fkj[0,1]:.12e} [1,0]={_Fkj[1,0]:.12e} '
-                          f'rms={np.sqrt(np.mean(_Fkj**2)):.12e}', flush=True)
-                    _pair01 = (0, 1)
-                    _Fab_src = _local_df_Fab if _local_df_Fab is not None else _jiang_Fab_all
-                    if _Fab_src is not None and _pair01 in _Fab_src:
-                        _Fab01 = _Fab_src[_pair01]
-                        print(f'  INTM iter {cycle}: Fab(0,1) diag[0]={_Fab01[0,0]:.12e} '
-                              f'diag[1]={_Fab01[1,1]:.12e} '
-                              f'rms={np.sqrt(np.mean(_Fab01**2)):.12e}', flush=True)
-                # === END DEBUG (global) ===
+            _jiang_cache = {
+                'C_tilde': _jiang_C, 'D_tilde': _jiang_D,
+                'G_tilde': _jiang_G,
+                'ovL_dressed': _jiang_ovL_d,
+                'ooL_dressed': _jiang_ooL_d,
+                'J_oo_d': _jiang_J_oo_d,
+                'K_mixed': _jiang_K_mixed,
+                'Fab_all': _jiang_Fab_all,
+                'ladder_all': _jiang_ladder_all,
+            }
 
             _t_pairs = _time.perf_counter()
 
@@ -3688,142 +1578,108 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 if n_pno == 0:
                     return key, np.zeros((0, 0))
 
-                if use_jiang and _jiang_cache is not None:
-                    from pyscf.cc.dlpno_tccsd.lccsd_jiang_v2 import (
-                        compute_residual_v2)
-                    jc = _jiang_cache
+                from pyscf.cc.dlpno_tccsd.residual import (
+                    compute_residual_v2)
+                jc = _jiang_cache
 
-                    # Per-pair intermediates: use local DF if available
-                    _tb0 = _time.perf_counter()
-                    _K_dressed_local = None
-                    _ladder_local = None
-                    if _cc_ints is not None and key in _cc_ints and _cc_ints[key] is not None:
-                        from pyscf.cc.dlpno_tccsd.local_df import (
-                            t1_ints, compute_B_tilde, compute_ladder)
-                        # T1-dressed K̃ (local DF)
-                        _dressed = t1_ints(
-                            _cc_ints, t1_pno, pno_spaces, S_pno_cache,
-                            [key], nocc)
-                        if key in _dressed:
-                            _K_dressed_local = (_dressed[key]['i_Qa_t1'].T
-                                                @ _dressed[key]['j_Qa_t1'])
-                        # B_tilde with local DF
-                        _B_tilde_local = compute_B_tilde(
-                            _cc_ints, _dressed, t2_pno_all, t1_pno,
-                            pno_spaces, S_pno_cache, key, nocc)
-                        _ladder_local = compute_ladder(
-                            _cc_ints, t2_pno_all, t1_pno, pno_spaces,
-                            S_pno_cache, key, nocc)
-                        # Fab from local DF
-                        if _local_df_Fab is not None and key in _local_df_Fab:
-                            Fab_ij = _local_df_Fab[key]
-                        else:
-                            Fab_ij = jc['Fab_all'][key]
-                        # J_ij_kj from local DF
-                        ci = _cc_ints[key]
-                        J_pair = ci.get('J_ij_kj', {})
-                        for k in range(nocc):
-                            if (key, k) not in J_pair:
-                                kj = (min(k, j), max(k, j))
-                                kc = (key, kj, i, k)
-                                if K_coul_cache and kc in K_coul_cache:
-                                    J_pair[(key, k)] = K_coul_cache[kc]
-                        _K_mixed_local = ci.get('K_ij_kj', {})
+                # Per-pair intermediates: use local DF if available
+                _tb0 = _time.perf_counter()
+                _K_dressed_local = None
+                _ladder_local = None
+                if key in _cc_ints and _cc_ints[key] is not None:
+                    from pyscf.cc.dlpno_tccsd.local_df import (
+                        t1_ints, compute_B_tilde, compute_ladder)
+                    # T1-dressed K̃ (local DF)
+                    _dressed = t1_ints(
+                        _cc_ints, t1_pno, pno_spaces, S_pno_cache,
+                        [key], nocc)
+                    if key in _dressed:
+                        _K_dressed_local = (_dressed[key]['i_Qa_t1'].T
+                                            @ _dressed[key]['j_Qa_t1'])
+                    # B_tilde with local DF
+                    _B_tilde_local = compute_B_tilde(
+                        _cc_ints, _dressed, t2_pno_all, t1_pno,
+                        pno_spaces, S_pno_cache, key, nocc)
+                    _ladder_local = compute_ladder(
+                        _cc_ints, t2_pno_all, t1_pno, pno_spaces,
+                        S_pno_cache, key, nocc)
+                    # Fab from local DF
+                    if _local_df_Fab is not None and key in _local_df_Fab:
+                        Fab_ij = _local_df_Fab[key]
                     else:
-                        _B_tilde_local = None
-                    if _B_tilde_local is None:
                         Fab_ij = jc['Fab_all'][key]
-                        t1_i = _project_t1_to_pair(
-                            t1_pno, i, key, S_pno_cache, pno_spaces)
-                        t1_j = _project_t1_to_pair(
-                            t1_pno, j, key, S_pno_cache, pno_spaces)
-                        tau = t2_pno_all[key] + np.outer(t1_i, t1_j)
-                        B_tilde_oo = jc['J_oo_d'][:, i, :, j].copy()
-                        _naux_ij = ovL_pno_cache.get((key, 0))
-                        if _naux_ij is not None:
-                            _na = _naux_ij.shape[1]
-                            ovL_stack = np.zeros((nocc, n_pno, _na))
-                            for k in range(nocc):
-                                _ok = ovL_pno_cache.get((key, k))
-                                if _ok is not None:
-                                    ovL_stack[k] = _ok
-                            P_stack = np.einsum('ba,kaQ->kbQ', tau.T, ovL_stack)
-                            P_flat = P_stack.reshape(nocc, -1)
-                            ovL_flat = ovL_stack.reshape(nocc, -1)
-                            B_tilde_oo += P_flat @ ovL_flat.T
-                        J_pair = {}
-                        _K_mixed_local = None
-                        for k in range(nocc):
+                    # J_ij_kj from local DF
+                    ci = _cc_ints[key]
+                    J_pair = ci.get('J_ij_kj', {})
+                    for k in range(nocc):
+                        if (key, k) not in J_pair:
                             kj = (min(k, j), max(k, j))
                             kc = (key, kj, i, k)
                             if K_coul_cache and kc in K_coul_cache:
                                 J_pair[(key, k)] = K_coul_cache[kc]
-                    _pair_timings['btilde'].append(
-                        _time.perf_counter() - _tb0)
-
-                    # === DEBUG: Dump per-pair intermediates for pair (0,1) ===
-                    if key == (0, 1) and cycle <= 2 and getattr(_run_dlpno_lccsd, '_dump_intermediates', False):
-                        _Bt = _B_tilde_local if _B_tilde_local is not None else B_tilde_oo
-                        if isinstance(_Bt, np.ndarray) and _Bt.ndim == 2:
-                            print(f'  INTM iter {cycle}: B_tilde(0,1) [0,0]={_Bt[0,0]:.12e} '
-                                  f'[0,1]={_Bt[0,1]:.12e} [1,0]={_Bt[1,0]:.12e} '
-                                  f'rms={np.sqrt(np.mean(_Bt**2)):.12e}', flush=True)
-                        else:
-                            # B_tilde_oo is (nocc, nocc) matrix
-                            print(f'  INTM iter {cycle}: B_tilde(0,1) shape={np.shape(_Bt)} '
-                                  f'[0,0]={_Bt[0,0]:.12e} [0,1]={_Bt[0,1]:.12e} '
-                                  f'rms={np.sqrt(np.mean(np.asarray(_Bt)**2)):.12e}', flush=True)
-                        if _K_dressed_local is not None:
-                            print(f'  INTM iter {cycle}: K_dressed(0,1) [0,0]={_K_dressed_local[0,0]:.12e} '
-                                  f'[0,1]={_K_dressed_local[0,1]:.12e} '
-                                  f'rms={np.sqrt(np.mean(_K_dressed_local**2)):.12e}', flush=True)
-                        print(f'  INTM iter {cycle}: Fab(0,1) used: diag[0]={Fab_ij[0,0]:.12e} '
-                              f'diag[1]={Fab_ij[1,1]:.12e} '
-                              f'rms={np.sqrt(np.mean(Fab_ij**2)):.12e}', flush=True)
-                    # === END DEBUG (per-pair) ===
-
-                    _tr0 = _time.perf_counter()
-                    R_ij = compute_residual_v2(
-                        i, j, t2_pno_all, pno_spaces, nocc,
-                        F_lmo, s1e, with_df, eps_lmo,
-                        ovL_bare=ovL_pno_cache,
-                        ooL_bare=ooL_3idx,
-                        S_pno_cache=S_pno_cache,
-                        K_coul_cache=K_coul_cache,
-                        K_pno_bare=K_pno_cache,
-                        ovL_dressed=jc['ovL_dressed'],
-                        ooL_dressed=jc['ooL_dressed'],
-                        B_tilde=(_B_tilde_local if _B_tilde_local is not None
-                                 else B_tilde_oo),
-                        Fab={key: Fab_ij},
-                        G_tilde=(_local_df_G if _local_df_G is not None
-                                 else jc['G_tilde']),
-                        C_tilde_cache=jc['C_tilde'],
-                        D_tilde_cache=jc['D_tilde'],
-                        J_ij_kj=J_pair,
-                        K_ij_kj=(_K_mixed_local if _K_mixed_local
-                                 else jc['K_mixed']),
-                        t1_pno=t1_pno,
-                        ladder_precomputed=({key: _ladder_local}
-                            if _ladder_local is not None
-                            else jc.get('ladder_all')),
-                        K_dressed_override=_K_dressed_local,
-                        cc_ints=_cc_ints,
-                        pair_domain=pair_lmo_idx.get(key) if pair_lmo_idx else None)
-                    _pair_timings['resid'].append(
-                        _time.perf_counter() - _tr0)
+                    _K_mixed_local = ci.get('K_ij_kj', {})
                 else:
-                    R_ij = _compute_pair_residual_numerator(
-                        i, j, t2_pno_all, pno_spaces, nocc,
-                        C_pao, ovL_lmo_pao, F_lmo, s1e, with_df, C_lmo,
-                        J_oo, K_pno_cache, eps_lmo,
-                        t1_pno=t1_pno, fov_pno=fov_pno,
-                        foo_dressed=foo_total,
-                        ovL_pno_cache=ovL_pno_cache,
-                        S_pno_cache=S_pno_cache,
-                        K_coul_cache=K_coul_cache,
-                        ooL_3idx=ooL_3idx,
-                        skip_t1_integral_dressing=use_t1_transform)
+                    _B_tilde_local = None
+                if _B_tilde_local is None:
+                    Fab_ij = jc['Fab_all'][key]
+                    t1_i = _project_t1_to_pair(
+                        t1_pno, i, key, S_pno_cache, pno_spaces)
+                    t1_j = _project_t1_to_pair(
+                        t1_pno, j, key, S_pno_cache, pno_spaces)
+                    tau = t2_pno_all[key] + np.outer(t1_i, t1_j)
+                    B_tilde_oo = jc['J_oo_d'][:, i, :, j].copy()
+                    _naux_ij = ovL_pno_cache.get((key, 0))
+                    if _naux_ij is not None:
+                        _na = _naux_ij.shape[1]
+                        ovL_stack = np.zeros((nocc, n_pno, _na))
+                        for k in range(nocc):
+                            _ok = ovL_pno_cache.get((key, k))
+                            if _ok is not None:
+                                ovL_stack[k] = _ok
+                        P_stack = np.einsum('ba,kaQ->kbQ', tau.T, ovL_stack)
+                        P_flat = P_stack.reshape(nocc, -1)
+                        ovL_flat = ovL_stack.reshape(nocc, -1)
+                        B_tilde_oo += P_flat @ ovL_flat.T
+                    J_pair = {}
+                    _K_mixed_local = None
+                    for k in range(nocc):
+                        kj = (min(k, j), max(k, j))
+                        kc = (key, kj, i, k)
+                        if K_coul_cache and kc in K_coul_cache:
+                            J_pair[(key, k)] = K_coul_cache[kc]
+                _pair_timings['btilde'].append(
+                    _time.perf_counter() - _tb0)
+
+                _tr0 = _time.perf_counter()
+                R_ij = compute_residual_v2(
+                    i, j, t2_pno_all, pno_spaces, nocc,
+                    F_lmo, s1e, with_df, eps_lmo,
+                    ovL_bare=ovL_pno_cache,
+                    ooL_bare=ooL_3idx,
+                    S_pno_cache=S_pno_cache,
+                    K_coul_cache=K_coul_cache,
+                    K_pno_bare=K_pno_cache,
+                    ovL_dressed=jc['ovL_dressed'],
+                    ooL_dressed=jc['ooL_dressed'],
+                    B_tilde=(_B_tilde_local if _B_tilde_local is not None
+                             else B_tilde_oo),
+                    Fab={key: Fab_ij},
+                    G_tilde=(_local_df_G if _local_df_G is not None
+                             else jc['G_tilde']),
+                    C_tilde_cache=jc['C_tilde'],
+                    D_tilde_cache=jc['D_tilde'],
+                    J_ij_kj=J_pair,
+                    K_ij_kj=(_K_mixed_local if _K_mixed_local
+                             else jc['K_mixed']),
+                    t1_pno=t1_pno,
+                    ladder_precomputed=({key: _ladder_local}
+                        if _ladder_local is not None
+                        else jc.get('ladder_all')),
+                    K_dressed_override=_K_dressed_local,
+                    cc_ints=_cc_ints,
+                    pair_domain=pair_lmo_idx.get(key) if pair_lmo_idx else None)
+                _pair_timings['resid'].append(
+                    _time.perf_counter() - _tr0)
                 e_pno = data['e_pno']
                 # Psi4 increment form: T_new = T_old - R/D_psi4
                 # where D_psi4 = e_a + e_b - F_ii - F_jj
@@ -3833,17 +1689,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 D_psi4 = np.where(np.abs(D_psi4) > 1e-12, D_psi4, 1e-12)
                 T2_old = t2_pno_all[key]
                 T2_ij_new = T2_old - R_ij / D_psi4
-                # DEBUG: dump R2 RMS per pair per iteration
-                if getattr(_run_dlpno_lccsd, '_debug_r2_all', False) and cycle <= 2:
-                    n_pno = R_ij.shape[0]
-                    rms = float(np.sqrt(np.mean(R_ij * R_ij)))
-                    print(f"  R2_CMP iter {cycle} pair({i},{j}): rms={rms:.12e} npno={n_pno}",
-                          flush=True)
-                elif getattr(_run_dlpno_lccsd, '_debug_r2_iter0', False) and cycle == 0:
-                    n_pno = R_ij.shape[0]
-                    rms = float(np.sqrt(np.mean(R_ij * R_ij)))
-                    print(f"  OUR_R2[{i},{j}] rms={rms:.10f} npno={n_pno}",
-                          flush=True)
                 if key in cas_blocks:
                     cb = cas_blocks[key]
                     cas_sl = cb[0]
@@ -3871,10 +1716,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 print(f'    [pairs] fab={_sf:.3f}s btilde={_sb:.3f}s '
                       f'resid={_sr:.3f}s ({len(_pair_timings["fab"])} pairs)',
                       flush=True)
-            if use_jiang:
-                _pair_timings['fab'].clear()
-                _pair_timings['btilde'].clear()
-                _pair_timings['resid'].clear()
+            _pair_timings['fab'].clear()
+            _pair_timings['btilde'].clear()
+            _pair_timings['resid'].clear()
             # ---- Local T1 update ----
             if use_t1_transform and not getattr(
                     _run_dlpno_lccsd, '_dress_t1', False):
@@ -3908,28 +1752,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 else:
                     _t1_fov = fov_pno
             _t1_start = _time.perf_counter()
-            _Fab_for_t1 = None  # Don't use precomputed Fab (different from T1's own fvv)
-            _t1_aterm_for_t1 = None
-            r1_pno = _compute_local_t1_residual(
-                t1_pno, t2_pno_all, pno_spaces,
-                _t1_fov, F_lmo, eps_lmo, nocc, s1e, fock_ao, _t1_C,
-                _t1_ovL, S_pno_cache,
-                foo_dressed=_t1_foo,
-                with_df=with_df, ooL_3idx=_t1_ooL,
-                Fab_precomputed=_Fab_for_t1,
-                t1_aterm_precomputed=_t1_aterm_for_t1,
-                cc_ints=_cc_ints)
-            # Dump R1 per LMO for iter <= 2 (matches Psi4's R1_DUMP)
-            if cycle <= 2 and getattr(_run_dlpno_lccsd, '_debug_t2_dump', False):
-                for ii in range(nocc):
-                    r = r1_pno.get(ii)
-                    if r is None or r.size == 0:
-                        continue
-                    rms_r1 = float(np.sqrt(np.mean(r * r)))
-                    sum_r1 = float(np.sum(r))
-                    print(f"  R1_DUMP iter {cycle} lmo({ii}): "
-                          f"rms={rms_r1:.12e} sum={sum_r1:.12e} np={r.size}",
-                          flush=True)
+            r1_pno = _compute_t1_residual_psi4(
+                t1_pno, t2_pno_all, pno_spaces, _t1_fov, F_lmo, eps_lmo, nocc,
+                S_pno_cache, _cc_ints, ovL_pno_cache=_t1_ovL,
+                pair_lmo_idx=pair_lmo_idx)
             t1_pno_new = {}
             for ii in range(nocc):
                 key_ii = (ii, ii)
@@ -3943,10 +1769,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 D_i = np.where(np.abs(D_i) > 1e-12, D_i, 1e-12)
                 t1_pno_new[ii] = t1_pno[ii] - r1_pno[ii] / D_i
             t1_pno = t1_pno_new
-            # DEBUG: force T1=0 for ablation
-            if getattr(_run_dlpno_lccsd, '_force_t1_zero', False):
-                for ii in range(nocc):
-                    t1_pno[ii] = np.zeros_like(t1_pno[ii])
             _t1_end = _time.perf_counter()
 
             # T1 diagnostics
@@ -4004,277 +1826,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 else:
                     t2_pno_all[key][cas_sl, cas_sl] = cb[1]
 
-            # PNO sign invariance test (ungated by t2_dump flag)
-            if cycle == 0 and getattr(_run_dlpno_lccsd, '_pno_sign_flip_done', False) is False and getattr(_run_dlpno_lccsd, '_pno_sign_flip', False):
-                import numpy as _np
-                _rng = _np.random.default_rng(42)
-                for k_test in keys_sorted:
-                    C_test = pno_spaces[k_test]['C_pno']
-                    if C_test.shape[1] == 0:
-                        continue
-                    signs = _rng.choice([-1.0, 1.0], size=C_test.shape[1])
-                    pno_spaces[k_test]['C_pno'] = C_test * signs
-                    if pno_spaces[k_test].get('K_pno') is not None:
-                        pno_spaces[k_test]['K_pno'] = pno_spaces[k_test]['K_pno'] * signs[:, None] * signs[None, :]
-                    if pno_spaces[k_test].get('T2_pno') is not None:
-                        pno_spaces[k_test]['T2_pno'] = pno_spaces[k_test]['T2_pno'] * signs[:, None] * signs[None, :]
-                    if k_test in t2_pno_all and t2_pno_all[k_test].size > 0:
-                        t2_pno_all[k_test] = t2_pno_all[k_test] * signs[:, None] * signs[None, :]
-                    if k_test in K_pno_cache:
-                        K_pno_cache[k_test] = K_pno_cache[k_test] * signs[:, None] * signs[None, :]
-                print(f"  [SIGN_FLIP_TEST] Applied random sign flips to {len(keys_sorted)} pairs; rebuilding caches.", flush=True)
-                # Rebuild S_pno_cache
-                S_pno_cache.clear()
-                for key_ij in keys_sorted:
-                    i_k, j_k = key_ij
-                    C_ij = pno_spaces[key_ij]['C_pno']
-                    if C_ij.shape[1] == 0: continue
-                    for key_kl in keys_sorted:
-                        if key_kl == key_ij: continue
-                        k_k, l_k = key_kl
-                        if i_k == k_k or i_k == l_k or j_k == k_k or j_k == l_k:
-                            C_kl = pno_spaces[key_kl]['C_pno']
-                            if C_kl.shape[1] == 0: continue
-                            S_pno_cache[(key_ij, key_kl)] = C_ij.T @ (s1e @ C_kl)
-                for i_k in range(nocc):
-                    kii = (i_k, i_k)
-                    if kii not in pno_spaces: continue
-                    C_ii = pno_spaces[kii]['C_pno']
-                    if C_ii.shape[1] == 0: continue
-                    for key_kl in keys_sorted:
-                        if key_kl == kii: continue
-                        C_kl = pno_spaces[key_kl]['C_pno']
-                        if C_kl.shape[1] == 0: continue
-                        if (kii, key_kl) not in S_pno_cache:
-                            S_pno_cache[(kii, key_kl)] = C_ii.T @ (s1e @ C_kl)
-                        if (key_kl, kii) not in S_pno_cache:
-                            S_pno_cache[(key_kl, kii)] = C_kl.T @ (s1e @ C_ii)
-                    for k in range(nocc):
-                        if k == i_k: continue
-                        kk = (k, k)
-                        if kk not in pno_spaces: continue
-                        C_kk = pno_spaces[kk]['C_pno']
-                        if C_kk.shape[1] == 0: continue
-                        if (kii, kk) not in S_pno_cache:
-                            S_pno_cache[(kii, kk)] = C_ii.T @ (s1e @ C_kk)
-                # Rebuild cc_ints
-                from pyscf.cc.dlpno_tccsd.local_df import compute_cc_integrals as _ccif
-                _cc_ints = _ccif(
-                    mf.mol, _auxmol, C_lmo, pno_spaces, pair_aux_idx,
-                    _j2c, _all_keys_cc, nocc)
-                for key in list(K_pno_cache.keys()):
-                    ci = _cc_ints.get(key)
-                    if ci is not None:
-                        K_pno_cache[key] = ci['K_iajb']
-                _run_dlpno_lccsd._pno_sign_flip_done = True
-
-            # Dump T2 RMS per pair after each iter (post-DIIS) for comparison
-            # with Psi4's T2_DUMP lines (gated by getattr flag).
-            if (cycle <= 2 and getattr(_run_dlpno_lccsd, '_debug_t2_dump', False)):
-                for k in keys_sorted:
-                    T2k = t2_pno_all[k]
-                    if T2k.size == 0:
-                        continue
-                    rms = float(np.sqrt(np.mean(T2k * T2k)))
-                    tr = float(np.trace(T2k))
-                    print(f"  T2_DUMP iter {cycle} pair({k[0]},{k[1]}): "
-                          f"rms={rms:.12e} trace={tr:.12e} npno={T2k.shape[0]}",
-                          flush=True)
-                # Also dump T1 per LMO (post-DIIS).
-                for ii in range(nocc):
-                    t1i = t1_pno[ii]
-                    if t1i.size == 0:
-                        continue
-                    rms1 = float(np.sqrt(np.mean(t1i * t1i)))
-                    s1 = float(np.sum(t1i))
-                    print(f"  T1_DUMP iter {cycle} lmo({ii}): "
-                          f"rms={rms1:.12e} sum={s1:.12e} np={t1i.size}", flush=True)
-                # PNO sign invariance test: on first cycle, flip signs on random
-                # PNO columns for select pairs and verify subsequent iterations
-                # converge to the same energy.  Set _pno_sign_flip=True to enable.
-                if cycle == 0 and getattr(_run_dlpno_lccsd, '_pno_sign_flip_done', False) is False and getattr(_run_dlpno_lccsd, '_pno_sign_flip', False):
-                    import numpy as _np
-                    _rng = _np.random.default_rng(42)
-                    for k_test in keys_sorted:
-                        C_test = pno_spaces[k_test]['C_pno']
-                        if C_test.shape[1] == 0:
-                            continue
-                        # Random ±1 signs per column
-                        signs = _rng.choice([-1.0, 1.0], size=C_test.shape[1])
-                        # Apply sign flip: C, K_pno, T2_pno rotate consistently.
-                        # Also need to re-apply to cc_ints and S_pno_cache.
-                        pno_spaces[k_test]['C_pno'] = C_test * signs
-                        if pno_spaces[k_test].get('K_pno') is not None:
-                            Kp = pno_spaces[k_test]['K_pno']
-                            pno_spaces[k_test]['K_pno'] = Kp * signs[:, None] * signs[None, :]
-                        if pno_spaces[k_test].get('T2_pno') is not None:
-                            Tp = pno_spaces[k_test]['T2_pno']
-                            pno_spaces[k_test]['T2_pno'] = Tp * signs[:, None] * signs[None, :]
-                        # t2_pno_all current amplitudes
-                        if k_test in t2_pno_all and t2_pno_all[k_test].size > 0:
-                            t2_pno_all[k_test] = t2_pno_all[k_test] * signs[:, None] * signs[None, :]
-                        # K_pno_cache
-                        if k_test in K_pno_cache:
-                            K_pno_cache[k_test] = K_pno_cache[k_test] * signs[:, None] * signs[None, :]
-                    # After flipping all pairs' PNOs, rebuild S_pno_cache and cc_ints
-                    print(f"  [SIGN_FLIP_TEST] Applied random sign flips to all PNO pairs."
-                          f" Rebuilding S_pno_cache and cc_ints.", flush=True)
-                    S_pno_cache.clear()
-                    for key_ij in keys_sorted:
-                        i_k, j_k = key_ij
-                        C_ij = pno_spaces[key_ij]['C_pno']
-                        if C_ij.shape[1] == 0:
-                            continue
-                        for key_kl in keys_sorted:
-                            if key_kl == key_ij:
-                                continue
-                            k_k, l_k = key_kl
-                            if i_k == k_k or i_k == l_k or j_k == k_k or j_k == l_k:
-                                C_kl = pno_spaces[key_kl]['C_pno']
-                                if C_kl.shape[1] == 0:
-                                    continue
-                                S_pno_cache[(key_ij, key_kl)] = C_ij.T @ (s1e @ C_kl)
-                    for i_k in range(nocc):
-                        key_ii_k = (i_k, i_k)
-                        if key_ii_k not in pno_spaces:
-                            continue
-                        C_ii = pno_spaces[key_ii_k]['C_pno']
-                        if C_ii.shape[1] == 0:
-                            continue
-                        for key_kl in keys_sorted:
-                            if key_kl == key_ii_k:
-                                continue
-                            C_kl = pno_spaces[key_kl]['C_pno']
-                            if C_kl.shape[1] == 0:
-                                continue
-                            if (key_ii_k, key_kl) not in S_pno_cache:
-                                S_pno_cache[(key_ii_k, key_kl)] = C_ii.T @ (s1e @ C_kl)
-                            if (key_kl, key_ii_k) not in S_pno_cache:
-                                S_pno_cache[(key_kl, key_ii_k)] = C_kl.T @ (s1e @ C_ii)
-                        for k in range(nocc):
-                            if k == i_k:
-                                continue
-                            kk = (k, k)
-                            if kk not in pno_spaces:
-                                continue
-                            C_kk = pno_spaces[kk]['C_pno']
-                            if C_kk.shape[1] == 0:
-                                continue
-                            if (key_ii_k, kk) not in S_pno_cache:
-                                S_pno_cache[(key_ii_k, kk)] = C_ii.T @ (s1e @ C_kk)
-                    # Rebuild cc_ints with new C_pno
-                    from pyscf.cc.dlpno_tccsd.local_df import compute_cc_integrals as _ccif
-                    _cc_ints = _ccif(
-                        mf.mol, _auxmol, C_lmo, pno_spaces, pair_aux_idx,
-                        _j2c, _all_keys_cc, nocc)
-                    for key in list(K_pno_cache.keys()):
-                        ci = _cc_ints.get(key)
-                        if ci is not None:
-                            K_pno_cache[key] = ci['K_iajb']
-                    _run_dlpno_lccsd._pno_sign_flip_done = True
-
-                # Check PNO orthonormality (iter 0 diagnostic)
-                if cycle == 0:
-                    for k in [(0, 0), (0, 1), (2, 2), (4, 4)]:
-                        if k not in pno_spaces:
-                            continue
-                        C_pno_k = pno_spaces[k]['C_pno']
-                        if C_pno_k.shape[1] == 0:
-                            continue
-                        Sk = C_pno_k.T @ (s1e @ C_pno_k)
-                        I = np.eye(C_pno_k.shape[1])
-                        err = float(np.max(np.abs(Sk - I)))
-                        print(f"  PNO_ORTH pair({k[0]},{k[1]}) npno={C_pno_k.shape[1]}: "
-                              f"max|S-I|={err:.3e}", flush=True)
-                # One-shot PNO eigenvalue + K_iajb dump at iter 0
-                if cycle == 0:
-                    for k in keys_sorted:
-                        e_pno_k = pno_spaces[k].get('e_pno')
-                        if e_pno_k is None or len(e_pno_k) == 0:
-                            continue
-                        s = " ".join(f"{v:.10e}" for v in e_pno_k)
-                        print(f"  EPNO_DUMP pair({k[0]},{k[1]}) npno={len(e_pno_k)}: {s}",
-                              flush=True)
-                        if (k[0] == 0 or k[1] == 0 or k[0] == 2 or k[1] == 2
-                                or (k[0] == 4 and k[1] == 4)):
-                            ci = _cc_ints.get(k) if _cc_ints is not None else None
-                            if ci is not None:
-                                from pyscf.cc.dlpno_tccsd.local_df import get_local_K
-                                K = get_local_K(_cc_ints, k, k[0], k[1])
-                                if K is not None:
-                                    s = " ".join(f"{v:.10e}" for v in K.ravel())
-                                    print(f"  KIAJB_DUMP pair({k[0]},{k[1]}): {s}",
-                                          flush=True)
-                        # K_ij_kj, J_ij_kj dump for pair (0,9), k=9
-                        if k == (0, 9):
-                            ci = _cc_ints.get(k) if _cc_ints is not None else None
-                            if ci is not None:
-                                Kdict = ci.get('K_ij_kj', {})
-                                Jdict = ci.get('J_ij_kj', {})
-                                Kk = Kdict.get((k, 9))
-                                Jk = Jdict.get((k, 9))
-                                if Kk is not None:
-                                    s = " ".join(f"{v:.10e}" for v in Kk.ravel())
-                                    print(f"  KIJKJ_DUMP pair(0,9) k=9 nr={Kk.shape[0]} "
-                                          f"nc={Kk.shape[1]}: {s}", flush=True)
-                                if Jk is not None:
-                                    s = " ".join(f"{v:.10e}" for v in Jk.ravel())
-                                    print(f"  JIJKJ_DUMP pair(0,9) k=9 nr={Jk.shape[0]} "
-                                          f"nc={Jk.shape[1]}: {s}", flush=True)
-                        # Aux domain dump for weak-strong cross pairs
-                        if (k[0] in (0, 2) and k[1] >= 7):
-                            aux = pair_aux_idx.get(k)
-                            if aux is not None:
-                                nlmo_k = (len(pair_lmo_idx.get(k, []))
-                                          if pair_lmo_idx else -1)
-                                npno_k = pno_spaces[k]['C_pno'].shape[1]
-                                print(f"  AUXDOMAIN pair({k[0]},{k[1]}) "
-                                      f"nlmo={nlmo_k} npno={npno_k} "
-                                      f"naux={len(aux)}: "
-                                      f"{' '.join(str(a) for a in aux)}",
-                                      flush=True)
-                        # Qma dump for pair (0,0) only
-                        if k == (0, 0):
-                            ci_qma = _cc_ints.get(k) if _cc_ints is not None else None
-                            if ci_qma is not None:
-                                Qma = ci_qma['Qma']  # (n_local, nocc, npno)
-                                n_local, npno = Qma.shape[0], Qma.shape[2]
-                                # Psi4's lmopair_to_lmos_[(0,0)] is the pair's LMO
-                                # domain.  We use pair_lmo_idx[(0,0)].
-                                pair_lmos = (pair_lmo_idx.get((0, 0))
-                                             if pair_lmo_idx else None)
-                                if pair_lmos is not None:
-                                    print(f"  QMA_STATS pair(0,0) nlmo={len(pair_lmos)} "
-                                          f"npno={npno} naux={n_local}:", flush=True)
-                                    for q in range(min(n_local, 5)):
-                                        vals = " ".join(f"{Qma[q, pair_lmos[m], a]:.10e}"
-                                                        for m in range(min(len(pair_lmos), 3))
-                                                        for a in range(min(npno, 3)))
-                                        print(f"  QMA_SLICE pair(0,0) Q={q}: {vals}",
-                                              flush=True)
-                                    print(f"  QMA_LMOLIST pair(0,0): "
-                                          f"{' '.join(str(l) for l in pair_lmos)}",
-                                          flush=True)
-                        # Qab dump for pair (0,0) only: summary slices
-                        if k == (0, 0):
-                            ci = _cc_ints.get(k) if _cc_ints is not None else None
-                            if ci is not None:
-                                Qab = ci['Qab']  # (n_local, npno, npno)
-                                n_local, npno = Qab.shape[0], Qab.shape[1]
-                                aux_idx = ci.get('aux_idx')
-                                print(f"  QAB_STATS pair(0,0) npno={npno} naux={n_local}:",
-                                      flush=True)
-                                for q in range(min(n_local, 5)):
-                                    vals = " ".join(f"{Qab[q, a, b]:.10e}"
-                                                    for a in range(min(npno, 3))
-                                                    for b in range(min(npno, 3)))
-                                    print(f"  QAB_SLICE pair(0,0) Q={q}: {vals}",
-                                          flush=True)
-                                if aux_idx is not None:
-                                    print(f"  QAB_AUXLIST pair(0,0): "
-                                          f"{' '.join(str(a) for a in aux_idx)}",
-                                          flush=True)
-
             # Compute energy for monitoring (Eq. 102 of Jiang et al.)
             # E = Σ_i F_ia t1_ia + Σ_ij K_ij^{ab} (2τ-τ^T)
             # Use BARE integrals (canonical energy formula).
@@ -4307,9 +1858,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _dt_kcoul = _t_kcoul_done - _t_kcoul
             _dt_foo = _t_foo_done - _t_foo
             _dt_pairs = _t_pairs_done - _t_pairs
-            _dt_jiang = (_t_jiang_done - _t_jiang) if use_jiang else 0.0
+            _dt_jiang = _t_jiang_done - _t_jiang
             _dt_total = _t_cycle_end - _t_cycle_start
-            _jiang_str = f' jiang={_dt_jiang:.1f}' if use_jiang else ''
+            _jiang_str = f' jiang={_dt_jiang:.1f}'
             print(f'  Cycle {cycle + 1:3d}: dT = {dT:.3e}  E_corr = {e_cyc:.10f}'
                   f'  dE = {dE:.2e}  [{_dt_total:.1f}s: ovL={_dt_ovl:.1f} '
                   f'Kcoul={_dt_kcoul:.1f} foo={_dt_foo:.1f}'
@@ -4364,479 +1915,12 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
 # Scalable coupled LCCSD (old Psi4-style: superseded by _run_dlpno_lccsd)
 # ---------------------------------------------------------------------------
 
-def _run_lccsd_coupled(mf, C_lmo, pno_spaces, strong_pairs,
-                       fock_ao, eps_lmo, s1e,
-                       cas_pairs, t2_cas, occ_cas_idx,
-                       C_pao=None, ovL_lmo_pao=None,
-                       conv_tol=1e-7, max_cycle=100, diis_space=8):
-    """Scalable DLPNO-CCSD with per-pair PNO spaces and global Jacobi-DIIS.
-
-    All pairs use their own PNO virtual space (scalable with system size).
-    Inter-pair coupling (Fock + ring diagrams) enters the CCSD residual of
-    each pair via _compute_pair_coupling and is treated in a Jacobi sense:
-
-        T2_new[ij] = T2_intra_new[ij]  +  delta_K[ij] / D[ij]
-
-    where T2_intra_new comes from one PySCF CCSD update_amps step on the
-    2-occ pair subsystem and delta_K is the inter-pair coupling residual.
-    DIIS is applied globally across all pairs simultaneously.
-
-    With T_CutPNO→0 (full virtual space per pair) and Fock+ring coupling
-    active, this converges to canonical CCSD.
-
-    CAS amplitude injection: for pairs with nvir_cas_local>0, the CAS block
-    of T2 is frozen to the DMRG value after every DIIS step.
-
-    Args:
-        mf: RHF or DF-RHF object.
-        C_lmo: (nao, nocc_lmo) LMO coefficients.
-        pno_spaces: dict key→PNO data from pno.make_pnos.
-        strong_pairs: list of (i,j) pairs to solve.
-        fock_ao: (nao, nao) AO Fock.
-        eps_lmo: (nocc_lmo,) LMO diagonal Fock eigenvalues.
-        s1e: (nao, nao) AO overlap.
-        cas_pairs: set of (i,j) CAS pairs.
-        t2_cas: (nocc_cas, nocc_cas, nvir_cas, nvir_cas) DMRG amplitudes.
-        occ_cas_idx: CAS occupied LMO indices.
-        C_pao: (nao, n_pao) PAO coefficients (for ring coupling).
-        ovL_lmo_pao: optional precomputed (nocc_lmo, n_pao, naux) tensor.
-        conv_tol, max_cycle, diis_space: convergence settings.
-
-    Returns:
-        e_total (float): Total LCCSD correlation energy.
-        t2_pno_all (dict): key → converged T2 in PNO basis.
-    """
-    mol = mf.mol
-    with_df = getattr(mf, 'with_df', None)
-    nocc_lmo = C_lmo.shape[1]
-    F_lmo = reduce(np.dot, (C_lmo.T, fock_ao, C_lmo))
-
-    # ------------------------------------------------------------------
-    # Build per-pair CCSD objects (done once before the iteration loop)
-    # ------------------------------------------------------------------
-    pair_data = {}   # canonical key (i≤j) → dict
-    for pair in strong_pairs:
-        i, j = pair
-        key = (min(i, j), max(i, j))
-        if key in pair_data or key not in pno_spaces:
-            continue
-
-        data = pno_spaces[key]
-        C_pno_ij = data['C_pno']
-        e_pno    = data['e_pno']
-        K_pno    = data['K_pno']
-        n_pno    = C_pno_ij.shape[1]
-
-        nocc_pair = 2
-        nmo_pair  = nocc_pair + n_pno
-        mo_coeff_pair = np.hstack((C_lmo[:, [i, j]], C_pno_ij))
-
-        mo_energy_pair          = np.zeros(nmo_pair)
-        mo_energy_pair[0]       = eps_lmo[i]
-        mo_energy_pair[1]       = eps_lmo[j]
-        mo_energy_pair[2:]      = e_pno
-        mo_occ_pair             = np.zeros(nmo_pair)
-        mo_occ_pair[:nocc_pair] = 2.0
-
-        if with_df is not None:
-            eri_pair = with_df.ao2mo(mo_coeff_pair, compact=False).reshape(
-                nmo_pair, nmo_pair, nmo_pair, nmo_pair)
-        else:
-            eri_pair = ao2mo.kernel(mol, mo_coeff_pair, compact=False).reshape(
-                nmo_pair, nmo_pair, nmo_pair, nmo_pair)
-
-        fock_pair_mo = reduce(np.dot, (mo_coeff_pair.T, fock_ao, mo_coeff_pair))
-        o_sl = slice(0, nocc_pair)
-        v_sl = slice(nocc_pair, nmo_pair)
-        nvir_tril = n_pno * (n_pno + 1) // 2
-
-        eris_pair          = _ChemistsERIs()
-        eris_pair.nocc     = nocc_pair
-        eris_pair.fock     = fock_pair_mo
-        eris_pair.mo_energy = np.diag(fock_pair_mo).real
-        eris_pair.ovov     = eri_pair[o_sl, v_sl, o_sl, v_sl]
-        eris_pair.oovv     = eri_pair[o_sl, o_sl, v_sl, v_sl]
-        eris_pair.ovvo     = eri_pair[o_sl, v_sl, v_sl, o_sl]
-        eris_pair.ovoo     = eri_pair[o_sl, v_sl, o_sl, o_sl]
-        eris_pair.oooo     = eri_pair[o_sl, o_sl, o_sl, o_sl]
-        if n_pno > 0:
-            eris_pair.ovvv = lib.pack_tril(
-                eri_pair[o_sl, v_sl, v_sl, v_sl].reshape(-1, n_pno, n_pno)
-            ).reshape(nocc_pair, n_pno, nvir_tril)
-            eris_pair.vvvv = ao2mo.restore(4, eri_pair[v_sl, v_sl, v_sl, v_sl], n_pno)
-        else:
-            eris_pair.ovvv = np.zeros((nocc_pair, 0, 0))
-            eris_pair.vvvv = np.zeros((0, 0, 0, 0))
-
-        fake_mf = _FakeMF(mol=mol, mo_coeff_pair=mo_coeff_pair,
-                          mo_energy_pair=mo_energy_pair, mo_occ_pair=mo_occ_pair,
-                          e_tot=mf.e_tot, fock_ao=fock_ao, _eri=None, verbose=0)
-        mycc = ccsd.CCSD(fake_mf)
-        mycc.verbose = 0
-
-        # Orbital energy denominator: D[a,b] = eps_i + eps_j - e_a - e_b
-        D = eps_lmo[i] + eps_lmo[j] - e_pno[:, None] - e_pno[None, :]
-        D_safe = np.where(np.abs(D) > 1e-12, D, 1e-12)
-
-        pair_data[key] = {
-            'i': i, 'j': j,
-            'eris': eris_pair, 'mycc': mycc,
-            'K_pno': K_pno, 'D_safe': D_safe,
-            'n_pno': n_pno, 'C_pno': C_pno_ij,
-        }
-
-    # ------------------------------------------------------------------
-    # CAS injection bookkeeping
-    # ------------------------------------------------------------------
-    cas_blocks = {}  # key → (cas_slice, t2_cas_pno)
-    for pair in strong_pairs:
-        i, j = pair
-        key = (min(i, j), max(i, j))
-        if pair not in cas_pairs or key not in pair_data:
-            continue
-        nvir_cas_local = pno_spaces[key].get('nvir_cas_local', 0)
-        if nvir_cas_local > 0:
-            i_cas = int(np.where(occ_cas_idx == i)[0][0])
-            j_cas = int(np.where(occ_cas_idx == j)[0][0])
-            cas_blocks[key] = (slice(0, nvir_cas_local), t2_cas[i_cas, j_cas])
-
-    # ------------------------------------------------------------------
-    # Initialize T2 from MP2 amplitudes
-    # ------------------------------------------------------------------
-    t2_pno_all = {}
-    for key, pobj in pair_data.items():
-        n_pno  = pobj['n_pno']
-        T2_mp2 = pno_spaces[key].get('T2_pno')
-        if n_pno == 0:
-            t2_pno_all[key] = np.zeros((0, 0))
-        elif T2_mp2 is not None and T2_mp2.shape == (n_pno, n_pno):
-            t2_pno_all[key] = T2_mp2.copy()
-        else:
-            t2_pno_all[key] = pobj['K_pno'] / pobj['D_safe']
-
-    # Apply initial CAS injection
-    for key, (cas_sl, t2c) in cas_blocks.items():
-        t2_pno_all[key][cas_sl, cas_sl] = t2c
-
-    # ------------------------------------------------------------------
-    # Jacobi-DIIS global iteration
-    # ------------------------------------------------------------------
-    keys_sorted = sorted(pair_data.keys())
-    diis = lib.diis.DIIS()
-    diis.space = diis_space
-
-    # ------------------------------------------------------------------
-    # Precompute oo Coulomb integrals J[i,j,k,l] = (ij|kl) for B term
-    # ------------------------------------------------------------------
-    if with_df is not None:
-        J_oo_flat = with_df.ao2mo(C_lmo, compact=False)
-        J_oo = J_oo_flat.reshape(nocc_lmo, nocc_lmo, nocc_lmo, nocc_lmo)
-    elif mol is not None:
-        J_oo_flat = ao2mo.kernel(mol, C_lmo, compact=False)
-        J_oo = J_oo_flat.reshape(nocc_lmo, nocc_lmo, nocc_lmo, nocc_lmo)
-    else:
-        J_oo = None
-
-    n_active = len(keys_sorted)
-    ring_src = 'DF' if with_df is not None else ('exact' if mol is not None else 'none')
-    print(f'  Coupled LCCSD: {n_active} active pairs, ring={ring_src}, '
-          f'B_term={J_oo is not None}', flush=True)
-
-    for cycle in range(max_cycle):
-        t2_new = {}
-
-        for key in keys_sorted:
-            pobj  = pair_data[key]
-            i, j  = pobj['i'], pobj['j']
-            n_pno = pobj['n_pno']
-            eris  = pobj['eris']
-            mycc  = pobj['mycc']
-            D_safe = pobj['D_safe']
-
-            T2_cur = t2_pno_all[key]
-
-            if n_pno == 0:
-                t2_new[key] = np.zeros((0, 0))
-                continue
-
-            # 1. Intra-pair CCSD step: one PySCF update_amps call
-            T2_full = np.zeros((2, 2, n_pno, n_pno))
-            T2_full[0, 1] = T2_cur
-            T2_full[1, 0] = T2_cur.T
-            t1_zero = np.zeros((2, n_pno))
-            _, T2_intra_full = mycc.update_amps(t1_zero, T2_full, eris)
-            T2_intra_new = T2_intra_full[0, 1]  # (n_pno, n_pno)
-
-            # 2. Inter-pair coupling residual (Fock + B-term + ring)
-            delta_K = _compute_pair_coupling(
-                i, j, t2_pno_all, pno_spaces, nocc_lmo,
-                C_pao, ovL_lmo_pao, F_lmo, s1e, with_df, C_lmo,
-                mol=mol, J_oo=J_oo
-            )
-
-            # 3. Jacobi update: T2_new = T2_intra + delta_K / D
-            T2_ij_new = T2_intra_new.copy()
-            if delta_K is not None:
-                T2_ij_new += delta_K / D_safe
-
-            # 4. CAS injection: freeze CAS block
-            if key in cas_blocks:
-                cas_sl, t2c = cas_blocks[key]
-                T2_ij_new[cas_sl, cas_sl] = t2c
-
-            t2_new[key] = T2_ij_new
-
-        # DIIS extrapolation over all pairs simultaneously
-        t2_vec     = np.concatenate([t2_new[k].ravel() for k in keys_sorted])
-        t2_old_vec = np.concatenate([t2_pno_all[k].ravel() for k in keys_sorted])
-        err_vec    = t2_vec - t2_old_vec
-        dT = np.max(np.abs(err_vec)) if err_vec.size > 0 else 0.0
-
-        if err_vec.size > 0:
-            t2_vec_diis = diis.update(t2_vec, err_vec)
-        else:
-            t2_vec_diis = t2_vec
-
-        # Unpack DIIS-extrapolated vector back to per-pair arrays
-        offset = 0
-        for k in keys_sorted:
-            sz = t2_new[k].size
-            t2_pno_all[k] = t2_vec_diis[offset:offset + sz].reshape(t2_new[k].shape)
-            offset += sz
-
-        # Re-apply CAS injection (DIIS may have drifted CAS block)
-        for key, (cas_sl, t2c) in cas_blocks.items():
-            if key in t2_pno_all:
-                t2_pno_all[key][cas_sl, cas_sl] = t2c
-
-        print(f'  Cycle {cycle + 1:3d}: dT = {dT:.3e}', flush=True)
-
-        if dT < conv_tol:
-            print(f'  Coupled LCCSD converged in {cycle + 1} cycles.', flush=True)
-            break
-    else:
-        print('  WARNING: Coupled LCCSD did not converge.', flush=True)
-
-    # ------------------------------------------------------------------
-    # Total LCCSD correlation energy
-    # ------------------------------------------------------------------
-    e_total = 0.0
-    for pair in strong_pairs:
-        i, j = pair
-        key   = (min(i, j), max(i, j))
-        if key not in t2_pno_all or key not in pair_data:
-            continue
-        T2 = t2_pno_all[key]
-        K  = pno_spaces[key]['K_pno']
-        if T2.shape[0] == 0:
-            continue
-        Tt  = 2.0 * T2 - T2.T
-        e_ij = np.einsum('ab,ab->', K, Tt)
-        e_total += e_ij if i == j else 2.0 * e_ij
-
-    return e_total, t2_pno_all
-
-
-# ---------------------------------------------------------------------------
-# Per-pair worker (extracted for parallel execution)
-# ---------------------------------------------------------------------------
-
-def _process_one_pair(pair, pno_spaces, C_lmo, mol, with_df, e_tot_hf,
-                      fock_ao, eps_lmo, occ_cas_idx, cas_pairs,
-                      t2_cas, vir_cas_idx, mo_coeff_cas, s1e,
-                      conv_tol, max_cycle):
-    """Compute T2 and energy contribution for one pair. Thread-safe.
-
-    All input arrays are read-only shared state; each call allocates its own
-    output arrays.  The DF integral build (with_df.ao2mo) and all BLAS calls
-    release the GIL, so concurrent threads make real progress.
-
-    Returns:
-        (i, j, t2_pno, e_ij, kind)
-        kind ∈ {'cas', 'ccsd', 'skip'}
-    """
-    (i, j) = pair
-
-    if (i, j) not in pno_spaces:
-        return i, j, None, 0.0, 'skip'
-
-    data       = pno_spaces[(i, j)]
-    C_pno_ij   = data['C_pno']
-    K_pno      = data['K_pno']
-    T2_mp2     = data['T2_pno']
-    e_pno      = data['e_pno']
-    n_pno      = C_pno_ij.shape[1]
-
-    # -- CAS pair: tailored CCSD in extended PNO basis --
-    # Lang et al. eq (10): S_ij = I_NCAS ⊕ d_ij
-    # The extended PNO = [CAS_vir_MOs | external_PNOs] with identity mapping
-    # for CAS virtuals. DMRG t2 maps directly into first nvir_cas indices.
-    if (i, j) in cas_pairs:
-        nvir_cas_local = data.get('nvir_cas_local', 0)
-
-        # DMRG t2 for this pair — identity mapping into first nvir_cas indices
-        i_cas = int(np.where(occ_cas_idx == i)[0][0])
-        j_cas = int(np.where(occ_cas_idx == j)[0][0])
-        t2_cas_pno = t2_cas[i_cas, j_cas]  # (nvir_cas, nvir_cas)
-
-        # Build integrals and run CCSD with tailoring
-        nocc_pair = 2
-        nmo_pair = nocc_pair + n_pno
-        C_lmo_ij = C_lmo[:, [i, j]]
-        mo_coeff_pair = np.hstack((C_lmo_ij, C_pno_ij))
-
-        mo_energy_pair = np.zeros(nmo_pair)
-        mo_energy_pair[0] = eps_lmo[i]
-        mo_energy_pair[1] = eps_lmo[j]
-        mo_energy_pair[2:] = e_pno
-        mo_occ_pair = np.zeros(nmo_pair)
-        mo_occ_pair[:nocc_pair] = 2.0
-
-        if with_df is not None:
-            eri_pair = with_df.ao2mo(mo_coeff_pair, compact=False).reshape(
-                nmo_pair, nmo_pair, nmo_pair, nmo_pair)
-        else:
-            eri_pair = ao2mo.kernel(mol, mo_coeff_pair, compact=False).reshape(
-                nmo_pair, nmo_pair, nmo_pair, nmo_pair)
-
-        fock_pair_mo = reduce(np.dot, (mo_coeff_pair.T, fock_ao, mo_coeff_pair))
-        o, v = slice(0, nocc_pair), slice(nocc_pair, nmo_pair)
-        n_vir = nmo_pair - nocc_pair
-        nvir_tril = n_vir * (n_vir + 1) // 2
-
-        eris_pair = _ChemistsERIs()
-        eris_pair.nocc = nocc_pair
-        eris_pair.fock = fock_pair_mo
-        eris_pair.mo_energy = np.diag(fock_pair_mo).real
-        eris_pair.ovov = eri_pair[o, v, o, v]
-        eris_pair.oovv = eri_pair[o, o, v, v]
-        eris_pair.ovvo = eri_pair[o, v, v, o]
-        eris_pair.ovoo = eri_pair[o, v, o, o]
-        eris_pair.oooo = eri_pair[o, o, o, o]
-        eris_pair.ovvv = lib.pack_tril(
-            eri_pair[o, v, v, v].reshape(-1, n_vir, n_vir)
-        ).reshape(nocc_pair, n_vir, nvir_tril)
-        eris_pair.vvvv = ao2mo.restore(4, eri_pair[v, v, v, v], n_vir)
-
-        fake_mf = _FakeMF(mol=mol, mo_coeff_pair=mo_coeff_pair,
-                          mo_energy_pair=mo_energy_pair, mo_occ_pair=mo_occ_pair,
-                          e_tot=e_tot_hf, fock_ao=fock_ao, _eri=None, verbose=0)
-
-        # Initialize t2: external block from MP2, CAS block from DMRG
-        t1_init = np.zeros((nocc_pair, n_pno))
-        t2_init = np.zeros((nocc_pair, nocc_pair, n_pno, n_pno))
-        # Inject DMRG amplitudes into the CAS-virtual block (first nvir_cas indices)
-        cas = slice(0, nvir_cas_local)
-        if nvir_cas_local > 0:
-            t2_init[0, 1, cas, cas] = t2_cas_pno
-            t2_init[1, 0, cas, cas] = t2_cas_pno.T
-
-        mycc_pair = ccsd.CCSD(fake_mf)
-        mycc_pair.verbose = 0
-        mycc_pair.conv_tol = conv_tol
-        mycc_pair.max_cycle = max_cycle
-
-        # Monkey-patch update_amps to freeze CAS-virtual block after each iteration
-        _orig_update = mycc_pair.update_amps
-        _ncl = nvir_cas_local
-        _t2_cas_pno = t2_cas_pno
-        def _tailored_update(t1, t2, eris):
-            t1new, t2new = _orig_update(t1, t2, eris)
-            if _ncl > 0:
-                c = slice(0, _ncl)
-                t2new[0, 1, c, c] = _t2_cas_pno
-                t2new[1, 0, c, c] = _t2_cas_pno.T
-            return t1new, t2new
-        mycc_pair.update_amps = _tailored_update
-
-        try:
-            _, _, t2_conv_full = mycc_pair.ccsd(t1_init, t2_init, eris=eris_pair)
-        except Exception:
-            t2_conv_full = t2_init.copy()
-
-        t2_conv = t2_conv_full[0, 1]
-        Tt = 2.0 * t2_conv - t2_conv.T
-        K_ij = eri_pair[0, nocc_pair:, 1, nocc_pair:]  # (ia|jb) exchange
-        e_ij = np.einsum('ab,ab->', K_ij, Tt)
-        # Only label as 'cas' if DMRG tailoring actually occurred
-        kind = 'cas' if nvir_cas_local > 0 else 'ccsd'
-        return i, j, t2_conv, e_ij, kind
-
-    # -- External pair: CCSD in PNO basis --
-    nocc_pair  = 2
-    nmo_pair   = nocc_pair + n_pno
-    C_lmo_ij   = C_lmo[:, [i, j]]
-    mo_coeff_pair = np.hstack((C_lmo_ij, C_pno_ij))
-
-    mo_energy_pair          = np.zeros(nmo_pair)
-    mo_energy_pair[0]       = eps_lmo[i]
-    mo_energy_pair[1]       = eps_lmo[j]
-    mo_energy_pair[2:]      = e_pno
-    mo_occ_pair             = np.zeros(nmo_pair)
-    mo_occ_pair[:nocc_pair] = 2.0
-
-    # ERI build: use DF if available, else exact 4-index integrals
-    if with_df is not None:
-        eri_pair = with_df.ao2mo(mo_coeff_pair, compact=False).reshape(
-            nmo_pair, nmo_pair, nmo_pair, nmo_pair)
-    else:
-        eri_pair = ao2mo.kernel(mol, mo_coeff_pair, compact=False).reshape(
-            nmo_pair, nmo_pair, nmo_pair, nmo_pair)
-
-    fock_pair_mo   = reduce(np.dot, (mo_coeff_pair.T, fock_ao, mo_coeff_pair))
-    o, v           = slice(0, nocc_pair), slice(nocc_pair, nmo_pair)
-    n_vir          = nmo_pair - nocc_pair
-    nvir_tril      = n_vir * (n_vir + 1) // 2
-
-    eris_pair          = _ChemistsERIs()
-    eris_pair.nocc     = nocc_pair
-    eris_pair.fock     = fock_pair_mo
-    eris_pair.mo_energy = np.diag(fock_pair_mo).real
-    eris_pair.ovov     = eri_pair[o, v, o, v]
-    eris_pair.oovv     = eri_pair[o, o, v, v]
-    eris_pair.ovvo     = eri_pair[o, v, v, o]
-    eris_pair.ovoo     = eri_pair[o, v, o, o]
-    eris_pair.oooo     = eri_pair[o, o, o, o]
-    eris_pair.ovvv     = lib.pack_tril(
-        eri_pair[o, v, v, v].reshape(-1, n_vir, n_vir)
-    ).reshape(nocc_pair, n_vir, nvir_tril)
-    eris_pair.vvvv     = ao2mo.restore(4, eri_pair[v, v, v, v], n_vir)
-
-    fake_mf = _FakeMF(mol=mol, mo_coeff_pair=mo_coeff_pair,
-                      mo_energy_pair=mo_energy_pair, mo_occ_pair=mo_occ_pair,
-                      e_tot=e_tot_hf, fock_ao=fock_ao, _eri=None, verbose=0)
-
-    t1_init = np.zeros((nocc_pair, n_pno))
-    t2_init = np.zeros((nocc_pair, nocc_pair, n_pno, n_pno))
-    if n_pno > 0 and T2_mp2 is not None and T2_mp2.shape == (n_pno, n_pno):
-        t2_init[0, 1] = T2_mp2
-        t2_init[1, 0] = T2_mp2.T
-
-    mycc_pair           = ccsd.CCSD(fake_mf)
-    mycc_pair.verbose   = 0
-    mycc_pair.conv_tol  = conv_tol
-    mycc_pair.max_cycle = max_cycle
-    try:
-        _, _, t2_conv_full = mycc_pair.ccsd(t1_init, t2_init, eris=eris_pair)
-    except Exception:
-        t2_conv_full = t2_init.copy()
-
-    t2_conv = t2_conv_full[0, 1]
-    Tt = 2.0 * t2_conv - t2_conv.T
-    e_ij = np.einsum('ab,ab->', K_pno, Tt)
-    return i, j, t2_conv, e_ij, 'ccsd'
-
-
-# ---------------------------------------------------------------------------
-# Main LCCSD runner
-# ---------------------------------------------------------------------------
-
 def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
               t1_cas, t2_cas, occ_cas_idx, vir_cas_idx,
               mo_coeff_cas, s1e=None,
               conv_tol=1e-7, max_cycle=50, ncores=1,
               C_pao=None, max_outer_cycle=30, outer_conv_tol=1e-8,
-              verbose=None, use_jiang=False, _pool=None):
+              verbose=None, _pool=None):
     """Run pair-local CCSD over all strong pairs, injecting CAS amplitudes.
 
     For each strong pair (i,j):
@@ -4892,118 +1976,10 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
         fock_ao, eps_lmo, s1e, conv_tol, max_cycle,
         t2_cas=t2_cas, occ_cas_idx=occ_cas_idx,
         vir_cas_idx=vir_cas_idx, mo_coeff_cas=mo_coeff_cas,
-        C_pao=C_pao, use_jiang=use_jiang,
+        C_pao=C_pao,
         ncores=ncores, _pool=_pool)
     print(f'  E_TCCSD = {e_tccsd:.15g}', flush=True)
 
     return e_tccsd, t2_pno_all, t1_pno
 
 
-def _solve_pair_ccsd(eris, fock, nocc, nvir,
-                     K_ij, T2_init,
-                     cas_inject=None,
-                     conv_tol=1e-7, max_cycle=50, verbose=0):
-    """Minimal pair CCSD iteration in PNO basis.
-
-    Implements the (T2-only) CCSD equations for a 2-occupied, nvir-virtual
-    system. This is the "pair approximation" where each pair is solved
-    independently (no off-pair coupling in the T2 residual).
-
-    The residual for a pair (0,1) in a 2-electron MO subspace is:
-        R[a,b] = K[a,b] + sum_c (F_vv[a,c]*T2[c,b] + T2[a,c]*F_vv[c,b])
-               - sum_k (F_oo[0,k]*T2[k_loc,b,a] + ...)
-               + (direct + exchange) contractions with T2
-
-    For simplicity, we use the leading-order diagonal Fock approximation:
-        R[a,b] ≈ K[a,b] + (eps_a + eps_b - eps_i - eps_j) * T2[a,b]
-               + quadratic T2 terms (retained up to full CCSD)
-
-    This is equivalent to the Psi4 DLPNO LMP2 iteration extended to CCSD.
-    The full LCCSD residual with off-pair coupling (PNO overlap terms) would
-    require the complete Psi4 ccsd.cc machinery; that extension is left as
-    a TODO for production use.
-
-    Args:
-        eris: Pair ERIs object from _make_pno_ccsd_eris.
-        fock (np.ndarray): (nocc+nvir, nocc+nvir) pair Fock matrix.
-        nocc (int): Number of occupied orbitals in pair (= 2).
-        nvir (int): Number of PNOs.
-        K_ij (np.ndarray): (nvir, nvir) exchange integrals (i a | j b).
-        T2_init (np.ndarray): (nvir, nvir) initial T2 guess.
-        cas_inject: None or (T2_cas_ij, t2f) for CAS amplitude freeze.
-        conv_tol (float): Convergence threshold on max|T2new - T2|.
-        max_cycle (int): Maximum iterations.
-        verbose (int): Verbosity.
-
-    Returns:
-        T2_conv (np.ndarray): (nvir, nvir) converged doubles amplitudes.
-    """
-    if nvir == 0:
-        return np.zeros((nocc, nocc, 0, 0))
-
-    # Diagonal Fock (in canonical PNO basis)
-    eps_occ = fock.diagonal()[:nocc]
-    eps_vir = fock.diagonal()[nocc:]
-
-    # Denominator tensor
-    D = (eps_occ[0] + eps_occ[1]
-         - eps_vir[:, None] - eps_vir[None, :])   # (nvir, nvir)
-    D_safe = np.where(np.abs(D) > 1e-12, D, 1e-12)
-
-    # Initialize T2 from MP2
-    if T2_init is not None and T2_init.shape == (nvir, nvir):
-        T2 = T2_init.copy()
-    else:
-        T2 = K_ij / D_safe   # T2 = K/D < 0 (D<0)
-
-    # CCSD iteration (simplified pair approximation)
-    # Full residual: R = K + D*T2 + quadratic(T2)
-    # For the pair approximation we include:
-    #   1. Linear terms: (eps_a - eps_i) and (eps_b - eps_j) shifts
-    #   2. Quadratic T2: standard CCSD "ring" and "ladder" diagrams
-    # The full DLPNO-CCSD coupling via PNO overlaps to other pairs is handled
-    # implicitly through the initial MP2 amplitudes and the final energy.
-
-    for cyc in range(max_cycle):
-        T2_old = T2.copy()
-
-        # CAS injection: overwrite CAS block with DMRG values
-        if cas_inject is not None:
-            T2_cas_ij, t2f = cas_inject
-            T2 = np.where(t2f, T2_cas_ij, T2)
-
-        # Residual: R[a,b] = K[a,b] + D[a,b]*T2[a,b]
-        #   + quadratic terms from CCSD
-        # Quadratic contributions (simplified for pair approximation):
-        #   W_oooo type: sum_kl T2[k,l]*T2[k,l] * oooo
-        #   (for 2-occupied: oooo[0,1,0,1] = (01|01) ≈ 0 in our pair ERIs)
-        #   W_vvvv type: sum_cd T2[a,c]*T2[b,d]*vvvv[c,d,...]
-        #   These are neglected in the pair approximation.
-
-        # Leading correction: "laddter diagram" - T2*oovv type
-        # For a 2-orbital system the CCSD equations reduce to MP2 + ring diagrams.
-        # The dominant correction is:
-        #   Delta_T2[a,b] = -sum_c T2[a,c]*K[c,b] / D[a,b]  (ring)
-        # This is the MP2→CCSD iteration in the weak-coupling limit.
-
-        Tt = 2.0 * T2 - T2.T
-        # Ring diagram: sum_c K[a,c] * Tt[c,b]  (dressed K)
-        ring = np.dot(K_ij, Tt.T)   # (nvir, nvir)
-
-        R = K_ij + ring
-
-        # Update: T2new = R / D  (D<0, so T2 stays negative)
-        T2_new = R / D_safe
-
-        # CAS injection (after update): freeze CAS block
-        if cas_inject is not None:
-            T2_cas_ij, t2f = cas_inject
-            T2_new = np.where(t2f, T2_cas_ij, T2_new)
-
-        dT = np.max(np.abs(T2_new - T2_old))
-        T2 = T2_new
-
-        if dT < conv_tol:
-            break
-
-    return T2
