@@ -305,6 +305,43 @@ def _compute_ladder(t2_ij, C_pno_ij, with_df):
     return ladder
 
 
+def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints):
+    """Per-pair local-aux T2-dressed Fock occ-occ from cc_ints['Qma'].
+
+    Equivalent to _compute_foo_dressed but skips ovL_pno_cache / with_df
+    entirely. Uses cc_ints[key_mq]['Qma'] (n_local, nocc, n_pno) which
+    holds fitted (Q | m a) for all m∈nocc and a∈PNO_mq with Q in the
+    pair's local aux. The contraction is identical in structure to the
+    legacy version, just summed over local-aux instead of full naux.
+    """
+    foo = np.zeros((nocc_lmo, nocc_lmo))
+    for key_mq, t2_mq_raw in t2_pno_all.items():
+        if t2_mq_raw is None or t2_mq_raw.shape[0] == 0:
+            continue
+        ci = cc_ints.get(key_mq)
+        if ci is None:
+            continue
+        m, q = key_mq
+        Qma = ci['Qma']                  # (n_local, nocc, n_pno)
+        ovL_m = Qma[:, m, :].T           # (n_pno, n_local)
+        # theta[m,q,a,b] = 2*t2[q,m,a,b] - t2[m,q,a,b]
+        theta_mq = 2.0 * t2_mq_raw.T - t2_mq_raw
+        X_mq = theta_mq @ ovL_m          # (n_pno, n_local)
+        # foo[p, q] += Σ_{a, L} (Qma[:,p,:].T)[a,L] * X_mq[a,L]
+        # = Σ_p Σ_{a,L} Qma[L,p,a] * X_mq[a,L]
+        # = einsum('Lpa,aL->p') equivalently np.einsum('Lpa,aL->p', Qma, X_mq)
+        contrib_q = np.einsum('Lpa,aL->p', Qma, X_mq, optimize=True)
+        foo[:, q] += contrib_q
+
+        if m != q:
+            theta_qm = 2.0 * t2_mq_raw - t2_mq_raw.T
+            ovL_q = Qma[:, q, :].T
+            X_qm = theta_qm @ ovL_q
+            contrib_m = np.einsum('Lpa,aL->p', Qma, X_qm, optimize=True)
+            foo[:, m] += contrib_m
+    return foo
+
+
 def _compute_foo_dressed(t2_pno_all, pno_spaces, nocc_lmo, with_df, C_lmo, s1e,
                          ovL_pno_cache=None):
     """Compute T2-dressed occupied Fock intermediate (global, once per iteration).
@@ -1138,9 +1175,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # ovL_pno_cache[(pair_key, lmo_idx)] = (n_pno, naux_local) tensor.
     # pair_aux_idx[pair_key] = integer array of global aux indices in domain.
     # ------------------------------------------------------------------
-    from pyscf.cc.dlpno_tccsd.pno import _build_ovL, _build_ovL_batched
     T_CutMKN = 1e-3  # ORCA TightPNO default
-    ovL_pno_cache = {}
+    ovL_pno_cache = {}  # legacy/deprecated; kept as empty alias for residual
     pair_aux_idx = {}  # pair_key -> np.array of aux indices in local domain
     if with_df is not None:
         # --- Compute per-LMO local auxiliary domains (Eq 63-64) ---
@@ -1211,32 +1247,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _pmask = _lmo_aux_mask[i] | _lmo_aux_mask[j]
             pair_aux_idx[key] = np.where(_pmask)[0]
 
-        # Build ovL (full aux) — local DF truncation is applied at contraction
-        # time via pair_aux_idx, not at storage time, because ooL_3idx uses
-        # the full aux basis and many contraction sites mix pair contexts.
-        _vir_list_init = [pno_spaces[k]['C_pno'] for k in _all_keys_init]
-        _ovL_all_init = _build_ovL_batched(with_df, C_lmo, _vir_list_init)
-        for idx, key in enumerate(_all_keys_init):
-            ovL_ij = _ovL_all_init[idx]  # (nocc, n_pno, naux_full)
-            for k in range(nocc):
-                ovL_pno_cache[(key, k)] = ovL_ij[k]
-        del _ovL_all_init, _vir_list_init
-
-        _n_entries = len(ovL_pno_cache)
-        if _n_entries > 0:
-            _sample = next(iter(ovL_pno_cache.values()))
-            _mem_mb = _n_entries * _sample.nbytes / 1e6
-            _avg_local = np.mean([len(v) for v in pair_aux_idx.values()])
-            print(f'  ovL_pno cache: {_n_entries} entries, '
-                  f'{_mem_mb:.0f} MB (local DF: avg {_avg_local:.0f}/'
-                  f'{_naux_full} aux)', flush=True)
+        # ovL_pno_cache is no longer built up-front (Psi4-equivalent path).
+        # It will be populated below from cc_ints (local-aux per pair) after
+        # cc_ints is built. The full-naux _build_ovL_batched call (which used
+        # to take ~30s for str 010 and 162 MB of memory) is removed.
         del _lmo_aux_mask, _ao_labels, _atom_ids, _aux_atom_ids
 
     # ------------------------------------------------------------------
     # Per-pair local DF: precompute ALL locally-fitted intermediates ONCE.
     # Matches Psi4 compute_cc_integrals(). Stored for the entire CCSD run.
     # ------------------------------------------------------------------
-    from pyscf.cc.dlpno_tccsd.local_df import compute_cc_integrals
+    from pyscf.cc.dlpno_tccsd.local_df import compute_cc_integrals_sparse
     import time as _time_cc
     _t_cc = _time_cc.perf_counter()
     # Use RI auxiliary basis for local DF if available, otherwise JK aux
@@ -1254,9 +1275,22 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         if key_w not in _all_keys_cc:
             if pno_spaces[key_w]['C_pno'].shape[1] > 0 and key_w in pair_aux_idx:
                 _all_keys_cc.append(key_w)
-    _cc_ints = compute_cc_integrals(
-        mf.mol, _auxmol, C_lmo, pno_spaces, pair_aux_idx,
-        _j2c, _all_keys_cc, nocc)
+    # Psi4-style sparse per-aux-Q build with X_pno + pair_paos. Defaults
+    # to Psi4's TightPNO thresholds (1e-3); override via mf attributes.
+    _t_mkn = getattr(mf, '_sparse_cc_T_CUT_MKN', 1e-3)
+    _t_clmo = getattr(mf, '_sparse_cc_T_CUT_CLMO', 1e-3)
+    _pao_domains = []
+    for _i in range(nocc):
+        _ki = (_i, _i)
+        if _ki in pno_spaces and pno_spaces[_ki].get('pair_paos') is not None:
+            _pao_domains.append(np.asarray(pno_spaces[_ki]['pair_paos']))
+        else:
+            _pao_domains.append(np.zeros(0, dtype=int))
+    _cc_ints = compute_cc_integrals_sparse(
+        mf.mol, _auxmol, C_lmo, C_pao, pno_spaces, pair_aux_idx,
+        _j2c, _all_keys_cc, nocc, s1e=s1e,
+        pao_domains=_pao_domains, strong_pair_keys=_all_keys_cc,
+        T_CUT_MKN=_t_mkn, T_CUT_CLMO=_t_clmo)
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
     # Rebuild K_pno_cache from locally-fitted K_iajb
@@ -1265,74 +1299,45 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         if ci is not None:
             K_pno_cache[key] = ci['K_iajb']
 
+
     # Pre-compute PNO overlap matrices S_pno_cache[(key_ij, key_kl)]
     # for ALL pair combinations (strong + weak) with PNOs.  Weak-pair
     # overlaps are needed by Eq 88 (A term, T1 residual) which sums over
     # all k including weak (k,i) pairs — without them we silently drop
     # weak-pair A contributions on LMOs 0/2 (~3% low on str 010).
+    #
+    # Psi4-style PAO-domain build: S_pno[ij, kl] = X_pno[ij]^T
+    #     @ S_pao[pair_paos[ij]][:, pair_paos[kl]] @ X_pno[kl]
+    # — bypasses materializing C_pno in AO basis. Falls back to C_pno for
+    # CAS pairs (X_pno=None there since the basis spills past the pair
+    # PAO domain via C_cas_vir).
     _all_pair_keys = [k for k in pno_spaces
                       if pno_spaces[k]['C_pno'].shape[1] > 0]
+    S_pao_full = C_pao.T @ s1e @ C_pao
     S_pno_cache = {}
     for key_ij in _all_pair_keys:
-        C_pno_ij = pno_spaces[key_ij]['C_pno']
+        pd_ij = pno_spaces[key_ij]
+        X_ij = pd_ij.get('X_pno')
+        pp_ij = pd_ij.get('pair_paos')
         for key_kl in _all_pair_keys:
-            C_pno_kl = pno_spaces[key_kl]['C_pno']
-            S_pno_cache[(key_ij, key_kl)] = C_pno_ij.T @ (s1e @ C_pno_kl)
+            pd_kl = pno_spaces[key_kl]
+            X_kl = pd_kl.get('X_pno')
+            pp_kl = pd_kl.get('pair_paos')
+            if X_ij is None or X_kl is None:
+                # CAS-pair fallback
+                S_pno_cache[(key_ij, key_kl)] = (
+                    pd_ij['C_pno'].T @ (s1e @ pd_kl['C_pno']))
+            else:
+                S_pno_cache[(key_ij, key_kl)] = (
+                    X_ij.T @ S_pao_full[np.ix_(pp_ij, pp_kl)] @ X_kl)
 
-    # Pre-compute occ-occ 3-index DF tensor ooL[i,j,Q] = (i_lmo j_lmo | Q)
-    # for T1 integral dressing (Eq. 91-93 of Jiang et al.).
-    # With local DF, ooL_3idx stays full (nocc, nocc, naux_full) since it's
-    # used across many pair contexts. Individual contractions slice to
-    # the pair's local aux domain via pair_aux_idx.
+    # ooL_3idx (full naux occ-occ), K_coul_cache (full naux exchange) and
+    # J_oo (nocc^4) are NOT built. cc_ints['i_Qk', 'j_Qk', 'J_ij_kj',
+    # 'K_ij_kj'] supply the equivalent local-aux per-pair quantities.
     ooL_3idx = None
-    if with_df is not None:
-        from pyscf.cc.dlpno_tccsd.pno import _build_ovL as _build_ovL_fn
-        ooL_3idx = _build_ovL_fn(with_df, C_lmo, C_lmo)  # (nocc, nocc, naux_full)
-
-    # Pre-compute K_coul integrals: (jk|b_ij c_ik) [oovv-type]
-    # These cannot be factored from ovL_pno_cache, so we pre-compute them.
-    # K_coul_cache[(key_ij, key_pk, occ_bra1, occ_bra2)] = (n_pno_ij, n_pno_pk)
-    # For section 5 (ring/oovv): need (jk|b_ij c_ik) and (ik|a_ij c_jk)
     K_coul_cache = {}
-    if with_df is not None:
-        # Collect all needed K_coul keys first
-        _kcoul_keys_set = set()
-        for key_ij in keys_sorted:
-            i, j = key_ij
-            n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
-            if n_ij == 0:
-                continue
-            for k in range(nocc):
-                key_ik = (min(i, k), max(i, k))
-                if key_ik in pno_spaces and pno_spaces[key_ik]['C_pno'].shape[1] > 0:
-                    _kcoul_keys_set.add((key_ij, key_ik, j, k))
-                key_jk = (min(j, k), max(j, k))
-                if key_jk in pno_spaces and pno_spaces[key_jk]['C_pno'].shape[1] > 0:
-                    _kcoul_keys_set.add((key_ij, key_jk, i, k))
-        _kcoul_keys_list = list(_kcoul_keys_set)
-
-        from pyscf.cc.dlpno_tccsd.pno import _build_kcoul_batched
-        K_coul_cache = _build_kcoul_batched(
-            with_df, C_lmo, pno_spaces, _kcoul_keys_list,
-            ooL_3idx=ooL_3idx)
-        del _kcoul_keys_set, _kcoul_keys_list
-
-        _n_kcoul = len(K_coul_cache)
-        if _n_kcoul > 0:
-            _mem_kc = sum(v.nbytes for v in K_coul_cache.values()) / 1e6
-            print(f'  K_coul cache: {_n_kcoul} entries, '
-                  f'{_mem_kc:.0f} MB', flush=True)
-
-    # Build J_oo from ooL (avoids separate ao2mo call)
-    if ooL_3idx is not None:
-        _ooL_flat = ooL_3idx.reshape(nocc * nocc, -1)
-        J_oo = (_ooL_flat @ _ooL_flat.T).reshape(nocc, nocc, nocc, nocc)
-
-    # Keep bare copies for the T1 residual and energy evaluation.
-    # The dressed copies (ovL_pno_cache, ooL_3idx) are rebuilt each
-    # iteration with T1-transformed C̃_lmo for the T2 residual.
-    ovL_pno_bare = {k: v.copy() for k, v in ovL_pno_cache.items()}
-    ooL_bare = ooL_3idx.copy() if ooL_3idx is not None else None
+    ovL_pno_bare = ovL_pno_cache  # alias; kept as empty {} for legacy refs
+    ooL_bare = None
 
     # ------------------------------------------------------------------
     # Adiabatic turn-on of CAS amplitudes + Jacobi-DIIS loop
@@ -1401,62 +1406,30 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         C_pno_ii = pno_spaces[key_ii]['C_pno']
                         C_lmo_t1[:, ii] += C_pno_ii @ t1_pno[ii]
 
-                # Rebuild ovL_pno_cache AND ooL in a single DF pass.
-                _t_ovl = _time.perf_counter()
-                from pyscf.cc.dlpno_tccsd.pno import _build_ovL_batched
-                _all_keys = list(keys_sorted)
-                for ii in range(nocc):
-                    key_ii = (ii, ii)
-                    if key_ii not in _all_keys and key_ii in pno_spaces:
-                        _all_keys.append(key_ii)
-                _vir_list = [pno_spaces[k]['C_pno'] for k in _all_keys]
-                _vir_list.append(C_lmo_t1)  # last entry → ooL
-                _ovL_all = _build_ovL_batched(with_df, C_lmo_t1, _vir_list)
-                for idx, key in enumerate(_all_keys):
-                    ovL_ij = _ovL_all[idx]
-                    for k in range(nocc):
-                        ovL_pno_cache[(key, k)] = ovL_ij[k]
-                ooL_3idx = _ovL_all[-1]
-                del _ovL_all, _vir_list, _all_keys
-
-                ooL_flat = ooL_3idx.reshape(nocc * nocc, -1)
-                J_oo = (ooL_flat @ ooL_flat.T).reshape(nocc, nocc, nocc, nocc)
-
-                _t_ovl_done = _time.perf_counter()
-                # Rebuild K_coul_cache with dressed C̃_lmo (batched single DF pass)
-                _t_kcoul = _time.perf_counter()
-                from pyscf.cc.dlpno_tccsd.pno import _build_kcoul_batched
-                K_coul_cache = _build_kcoul_batched(
-                    with_df, C_lmo_t1, pno_spaces,
-                    list(K_coul_cache.keys()), ooL_3idx=ooL_3idx)
-
-                _t_kcoul_done = _time.perf_counter()
-                # Precompute T2-dressed foo
+                # Per-iter rebuild of full-naux ovL/ooL/J_oo/K_coul_cache
+                # is removed. cc_ints is built once up-front; t1_ints /
+                # t1_fock dress the local-aux per-pair intermediates each
+                # iteration. K_coul_cache fallback at _update_pair is now
+                # served by cc_ints['J_ij_kj'] for cross-pair Coulomb.
+                _t_ovl = _t_ovl_done = _t_kcoul = _t_kcoul_done = \
+                    _time.perf_counter()
                 _t_foo = _time.perf_counter()
-                foo_dress = _compute_foo_dressed(
-                    t2_pno_all, pno_spaces, nocc, with_df, C_lmo_t1, s1e,
-                    ovL_pno_cache=ovL_pno_cache)
-                foo_bare = _compute_foo_dressed(
-                    t2_pno_all, pno_spaces, nocc, with_df, C_lmo, s1e,
-                    ovL_pno_cache=ovL_pno_bare)
-                foo_total = foo_dress
+                foo_total = _compute_foo_dressed_local(
+                    t2_pno_all, pno_spaces, nocc, _cc_ints)
+                foo_bare = foo_total
                 _t_foo_done = _time.perf_counter()
             else:
-                # No T1 transform: use bare integrals, explicit T1 coupling
                 _t_ovl = _t_kcoul = _t_foo = _time.perf_counter()
-                foo_total = _compute_foo_dressed(
-                    t2_pno_all, pno_spaces, nocc, with_df, C_lmo, s1e,
-                    ovL_pno_cache=ovL_pno_cache)
+                foo_total = _compute_foo_dressed_local(
+                    t2_pno_all, pno_spaces, nocc, _cc_ints)
                 foo_bare = foo_total
                 _t_ovl_done = _t_kcoul_done = _t_foo_done = _time.perf_counter()
 
             # ---- T1-dressed intermediates (precomputed once per iteration) ----
             _jiang_cache = None
             from pyscf.cc.dlpno_tccsd.residual import (
-                compute_C_tilde, _build_ooL_dressed, build_dressed_ovL_cache,
-                build_D_tilde, build_Fkj, build_G_tilde,
-                build_mixed_domain_integrals, build_Fab_all,
-                compute_all_df_terms,
+                compute_C_tilde, build_D_tilde, build_G_tilde,
+                build_mixed_domain_integrals,
             )
 
             _t_jiang = _time.perf_counter()
@@ -1473,12 +1446,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _jiang_ovL_d = None  # not needed (K_dressed_override per pair)
             _tj_ovl = _time.perf_counter() - _tj0
 
-            # Unified single DF pass: fvv_t1, C/D Term 2, ladder
+            # Unified per-pair local-aux pass: fvv_t1, C/D Term 2, ladder.
+            # Reads from cc_ints['Qab', 'Qma'] (already fitted, local-aux
+            # per pair) — Psi4-equivalent. No global aux iteration.
+            from pyscf.cc.dlpno_tccsd.residual import compute_all_df_terms_local
             _tj0 = _time.perf_counter()
             _fvv_t1_pre, _c_t2_pre, _d_t2_pre, _jiang_ladder_all = \
-                compute_all_df_terms(
+                compute_all_df_terms_local(
                     t1_pno, fov_pno, t2_pno_all, pno_spaces, nocc,
-                    ovL_pno_cache, S_pno_cache, with_df, keys_sorted)
+                    _cc_ints, S_pno_cache, keys_sorted)
             _tj_df = _time.perf_counter() - _tj0
 
             # C_tilde / D_tilde (Eqs 83-84, with precomputed Term 2)
@@ -1500,19 +1476,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 pair_lmo_idx=pair_lmo_idx)
             _tj_D = _time.perf_counter() - _tj0
 
-            # Fkj / G_tilde (Eqs 94, 86)
-            _tj0 = _time.perf_counter()
-            _jiang_Fkj, _jiang_foo_t1 = build_Fkj(
-                F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
-                ovL_pno_cache, ooL_3idx, S_pno_cache, foo_total,
-                pair_lmo_idx=pair_lmo_idx,
-                pair_keys_set=set(pair_lmo_idx.keys()) if pair_lmo_idx else None)
-            _jiang_G = build_G_tilde(
-                t2_pno_all, t1_pno, pno_spaces, nocc,
-                ovL_pno_cache, ooL_3idx, S_pno_cache,
-                _jiang_Fkj, _jiang_foo_t1,
-                cc_ints=_cc_ints)
-            _tj_FG = _time.perf_counter() - _tj0
+            # Fkj / G_tilde — t1_fock (vectorized cc_ints) computes
+            # _local_Fkj / _local_foo_t1 below; full-naux build_Fkj is gone.
+            _tj_FG = 0.0
 
             # Mixed-domain integrals for C/D bold terms
             _tj0 = _time.perf_counter()
@@ -1525,14 +1491,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # per-pair B_tilde uses local DF, so no global J_oo_d needed
             _jiang_J_oo_d = None
 
-            # Precompute Fab for ALL pairs (with precomputed fvv_t1)
-            _tj0 = _time.perf_counter()
-            _jiang_Fab_all = build_Fab_all(
-                t1_pno, fov_pno, pno_spaces, nocc,
-                ovL_pno_cache, S_pno_cache, with_df, keys_sorted,
-                _fvv_t1_precomputed=_fvv_t1_pre,
-                pair_lmo_idx=pair_lmo_idx)
-            _tj_Fab = _time.perf_counter() - _tj0
+            # Fab_all — t1_fock builds _local_df_Fab (per-pair, cc_ints).
+            _tj_Fab = 0.0
 
             # Local DF Fkj, Fab, G_tilde (computed once per iteration)
             from pyscf.cc.dlpno_tccsd.local_df import t1_fock
@@ -1555,12 +1515,12 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
 
             _jiang_cache = {
                 'C_tilde': _jiang_C, 'D_tilde': _jiang_D,
-                'G_tilde': _jiang_G,
-                'ovL_dressed': _jiang_ovL_d,
-                'ooL_dressed': _jiang_ooL_d,
-                'J_oo_d': _jiang_J_oo_d,
+                'G_tilde': None,
+                'ovL_dressed': None,
+                'ooL_dressed': None,
+                'J_oo_d': None,
                 'K_mixed': _jiang_K_mixed,
-                'Fab_all': _jiang_Fab_all,
+                'Fab_all': None,
                 'ladder_all': _jiang_ladder_all,
             }
 

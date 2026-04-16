@@ -78,167 +78,6 @@ def _build_ovL(with_df, C_occ, C_vir, max_memory=4000):
     return ovL
 
 
-def _build_ovL_batched(with_df, C_occ, C_vir_list, max_memory=4000):
-    """Build (occ,vir|L) for multiple virtual spaces in a single DF pass.
-
-    Instead of calling _build_ovL once per PNO space (each iterating over
-    all DF chunks), this function reads the DF file once and does a single
-    large half-transform with all virtual spaces concatenated (one BLAS call).
-
-    Args:
-        with_df: PySCF DF object (mf.with_df).
-        C_occ (np.ndarray): (nao, nocc).
-        C_vir_list (list[np.ndarray]): List of (nao, nvir_k) arrays.
-        max_memory (int): Memory limit in MB (advisory).
-
-    Returns:
-        list[np.ndarray]: ovL_k of shape (nocc, nvir_k, naux) for each k.
-    """
-    from pyscf.lib import unpack_tril
-
-    nao, nocc = C_occ.shape
-    naux = with_df.get_naoaux()
-
-    # Build concatenated virtual matrix and track slices
-    slices = []
-    col = 0
-    c_parts = []
-    for C_vir in C_vir_list:
-        nvir = C_vir.shape[1]
-        slices.append(slice(col, col + nvir))
-        if nvir > 0:
-            c_parts.append(C_vir)
-        col += nvir
-    n_total = col
-    C_all = np.hstack(c_parts) if c_parts else np.empty((nao, 0))
-
-    # Pre-allocate outputs
-    results = []
-    for C_vir in C_vir_list:
-        nvir = C_vir.shape[1]
-        results.append(np.empty((nocc, nvir, naux)))
-
-    p1 = 0
-    for Lpq in with_df.loop():
-        nL = Lpq.shape[0]
-        p0 = p1
-        p1 = p0 + nL
-        # Half-transform to occ: L_occ[L,μ,i] = Σ_ν Lpq[L,μν] * C_occ[ν,i]
-        L_ao = unpack_tril(Lpq)              # (nL, nao, nao)
-        L_occ = np.tensordot(L_ao, C_occ, axes=([2], [0]))  # (nL, nao, nocc)
-        Lpq = L_ao = None  # free memory
-        # ONE big virtual transform with concatenated C_all:
-        # ovL_all[L,i,a] = Σ_μ L_occ[L,μ,i] * C_all[μ,a]
-        ovL_all = np.tensordot(
-            L_occ, C_all, axes=([1], [0]))  # (nL, nocc, n_total)
-        L_occ = None
-        # Split into per-space results
-        for idx, sl in enumerate(slices):
-            if sl.start == sl.stop:
-                continue
-            results[idx][:, :, p0:p1] = ovL_all[:, :, sl].transpose(1, 2, 0)
-
-    return results
-
-
-def _build_kcoul_batched(with_df, C_lmo, pno_spaces, kcoul_keys, ooL_3idx=None):
-    """Rebuild all K_coul integrals using C-level _ao2mo.nr_e2.
-
-    K_coul[(key_ij, key_ik, m1, m2)][b,c] = (m1 m2 | b_ij c_ik)
-        = Σ_L B^L_{m1,m2} · B^L_{b_ij, c_ik}
-
-    Strategy: group cross-pairs by key_ij. For each key_ij, concatenate
-    its PNOs with all cross-partner PNOs and use nr_e2 to extract the
-    cross-block in one C-level call per DF chunk. This avoids the expensive
-    Python-level unpack_tril entirely.
-
-    Args:
-        with_df: PySCF DF object.
-        C_lmo (np.ndarray): (nao, nocc) LMO coefficients (possibly T1-dressed).
-        pno_spaces (dict): pair → {'C_pno': ...}
-        kcoul_keys (list): List of (key_ij, key_ik, m1, m2) tuples.
-        ooL_3idx (np.ndarray, optional): (nocc, nocc, naux). If provided, skip
-            the extra DF pass to build it.
-
-    Returns:
-        dict: Same keys → (n_ij, n_ik) arrays.
-    """
-    from pyscf.ao2mo import _ao2mo
-
-    if not kcoul_keys:
-        return {}
-
-    nao, nocc = C_lmo.shape
-    naux = with_df.get_naoaux()
-
-    # ooL[m1,m2,L] = (m1_lmo m2_lmo | L)
-    if ooL_3idx is not None:
-        ooL = ooL_3idx
-    else:
-        ooL = _build_ovL(with_df, C_lmo, C_lmo)  # (nocc, nocc, naux)
-
-    # Group kcoul_keys by key_ij, then by cross-partner key_ik
-    from collections import defaultdict
-    # ij_to_partners[key_ij] = {key_ik: [(m1,m2), ...]}
-    ij_to_partners = defaultdict(lambda: defaultdict(list))
-    for key_ij, key_ik, m1, m2 in kcoul_keys:
-        ij_to_partners[key_ij][key_ik].append((m1, m2))
-
-    # Pre-allocate result with zeros
-    result = {}
-    for key_ij, key_ik, m1, m2 in kcoul_keys:
-        n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
-        n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
-        result[(key_ij, key_ik, m1, m2)] = np.zeros((n_ij, n_ik))
-
-    # Pre-build concatenated MO matrices and metadata for each key_ij
-    ij_data = {}  # key_ij → (C_concat, ijslice, n_ij, partner_slices)
-    for key_ij, partners in ij_to_partners.items():
-        C_ij = pno_spaces[key_ij]['C_pno']
-        n_ij = C_ij.shape[1]
-        if n_ij == 0:
-            continue
-        c_parts = [C_ij]
-        partner_slices = {}
-        col = n_ij
-        for key_ik in partners:
-            C_ik = pno_spaces[key_ik]['C_pno']
-            n_ik = C_ik.shape[1]
-            if n_ik > 0:
-                partner_slices[key_ik] = slice(col - n_ij, col - n_ij + n_ik)
-                c_parts.append(C_ik)
-                col += n_ik
-        if not partner_slices:
-            continue
-        C_concat = np.asfortranarray(np.hstack(c_parts))
-        ijslice = (0, n_ij, n_ij, col)
-        ij_data[key_ij] = (C_concat, ijslice, n_ij, partner_slices)
-
-    # Single DF pass: for each chunk, call nr_e2 once per key_ij
-    p1 = 0
-    bufs = {k: None for k in ij_data}
-    for Lpq in with_df.loop():
-        nL = Lpq.shape[0]
-        p0 = p1
-        p1 = p0 + nL
-        ooL_chunk = ooL[:, :, p0:p1]  # (nocc, nocc, nL)
-
-        for key_ij, (C_concat, ijslice, n_ij, partner_slices) in ij_data.items():
-            n_right = ijslice[3] - ijslice[2]
-            bufs[key_ij] = _ao2mo.nr_e2(
-                Lpq, C_concat, ijslice, aosym='s2', out=bufs[key_ij])
-            cross_block = bufs[key_ij].reshape(nL, n_ij, n_right)
-
-            for key_ik, occ_pairs in ij_to_partners[key_ij].items():
-                sl = partner_slices.get(key_ik)
-                if sl is None:
-                    continue
-                vvL_chunk = cross_block[:, :, sl]  # (nL, n_ij, n_ik)
-                for m1, m2 in occ_pairs:
-                    result[(key_ij, key_ik, m1, m2)] += np.tensordot(
-                        ooL_chunk[m1, m2], vvL_chunk, axes=([0], [0]))
-
-    return result
 
 
 def _pair_K_iajb(ovL_i, ovL_j):
@@ -254,70 +93,6 @@ def _pair_K_iajb(ovL_i, ovL_j):
     return np.dot(ovL_i, ovL_j.T)   # (nvir_i, nvir_j)
 
 
-def _build_raw_ovL_batched(mol, auxmol, C_occ, C_vir_list):
-    """Build raw (unfitted) 3-index integrals for multiple virtual spaces.
-
-    Like _build_ovL_batched but computes RAW integrals (no J^{-1/2} fitting).
-    Reads raw (mn|Q) from AO integral engine per aux shell.
-
-    Args:
-        mol: PySCF Mole object (orbital basis).
-        auxmol: PySCF Mole object (auxiliary basis).
-        C_occ: (nao, nocc) occupied MO coefficients.
-        C_vir_list: list of (nao, nvir_k) virtual orbital coefficient arrays.
-
-    Returns:
-        list of (nocc, nvir_k, naux) raw 3-index integral arrays.
-    """
-    nao = mol.nao_nr()
-    nocc = C_occ.shape[1]
-    naux = auxmol.nao_nr()
-
-    slices = []
-    col = 0
-    c_parts = []
-    for C_vir in C_vir_list:
-        nvir = C_vir.shape[1]
-        slices.append(slice(col, col + nvir))
-        if nvir > 0:
-            c_parts.append(C_vir)
-        col += nvir
-    C_all = np.hstack(c_parts) if c_parts else np.empty((nao, 0))
-
-    results = [np.empty((nocc, C_vir.shape[1], naux)) for C_vir in C_vir_list]
-
-    pmol = mol + auxmol
-    mol_nbas = mol.nbas
-
-    q_offset = 0
-    for q_sh in range(auxmol.nbas):
-        q_start = auxmol.ao_loc_nr()[q_sh]
-        q_end = auxmol.ao_loc_nr()[q_sh + 1]
-        nq = q_end - q_start
-
-        shls_slice = (0, mol_nbas, 0, mol_nbas,
-                      mol_nbas + q_sh, mol_nbas + q_sh + 1)
-        raw_3c = pmol.intor('int3c2e', shls_slice=shls_slice)  # (nao, nao, nq)
-
-        L_occ = np.tensordot(C_occ, raw_3c, axes=([0], [0]))  # (nocc, nao, nq)
-        raw_3c = None
-        ovL_all = np.tensordot(C_all, L_occ, axes=([0], [1]))  # (n_total, nocc, nq)
-        L_occ = None
-        ovL_all = ovL_all.transpose(1, 0, 2)  # (nocc, n_total, nq)
-
-        for idx, sl in enumerate(slices):
-            if sl.start == sl.stop:
-                continue
-            results[idx][:, :, q_offset:q_offset + nq] = ovL_all[:, sl, :]
-
-        q_offset += nq
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Iterative L-MP2 for PNO generation
-# ---------------------------------------------------------------------------
 
 def _iterative_lmp2(pair_data, F_lmo, s1e, nocc_lmo,
                     max_iter=50, e_conv=1e-7, r_conv=5e-7,
@@ -1089,8 +864,23 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
 
         is_strong = abs(e_ij) > T_CutPairs
 
+        # Psi4-style PAO-domain storage: X_pno = (|domain_ij|, npno) is the
+        # transform from raw PAO domain to PNO basis, and pair_paos lists the
+        # PAO AO indices that span the pair domain. Reconstruction:
+        #     C_pno_ij == C_pao[:, pair_paos] @ X_pno
+        # CAS pairs use the full nao basis (CAS virt extends beyond domain),
+        # so X_pno / pair_paos are not defined for them.
+        if is_cas_pair:
+            X_pno_pair = None
+            pair_paos = None
+        else:
+            X_pno_pair = pdata['X_orth'] @ X_new
+            pair_paos = domain_ij
+
         pno_spaces[(i, j)] = {
             'C_pno': C_pno_ij,
+            'X_pno': X_pno_pair,
+            'pair_paos': pair_paos,
             'n_pno': n_pno_kept,
             'e_pno': e_pno_sc,
             'K_pno': K_pno,

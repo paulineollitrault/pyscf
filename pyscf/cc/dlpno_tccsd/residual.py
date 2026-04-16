@@ -21,13 +21,6 @@ from pyscf.cc.dlpno_tccsd.local_df import (
 # =========================================================================
 
 
-def _build_T1_all(t1_pno, pair_key, nocc, S_pno_cache, pno_spaces):
-    """Build T1_all[m, a] = T1 of LMO m projected to PNO of pair_key."""
-    n = pno_spaces[pair_key]['C_pno'].shape[1]
-    T = np.zeros((nocc, n))
-    for m in range(nocc):
-        T[m] = _project_t1_to_pair(t1_pno, m, pair_key, S_pno_cache, pno_spaces)
-    return T
 
 def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                   ovL_bare, ooL_bare, S_pno_cache,
@@ -85,235 +78,8 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
     return G
 
 
-def _build_Fia_bar(t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pair_key,
-                    pair_lmo_idx=None):
-    """Build T1-dressed ov Fock Fia_bar for a specific pair.
-
-    Fia_bar[k, a] = Σ_Q [2*gamma_Q * ovL_k[a,Q] - (ovL_k @ T_n.T @ ovL_k)[k,a]]
-    where gamma_Q = Σ_{m,c} T1_all[m,c] * ovL_m[c,Q]
-
-    Returns (nocc, n_pno) matrix. Psi4 lines 1544-1571.
-    The contractions over m,n are restricted to lmopair_to_lmos_[pair] (Psi4
-    uses T_n_ij_[ij] of shape (nlmo_ij, npno_ij)).
-    """
-    n_pno = pno_spaces[pair_key]['C_pno'].shape[1]
-    if n_pno == 0:
-        return np.zeros((nocc, 0))
-
-    # Build T1_all projected to this pair's PNO basis, but ZERO outside
-    # the pair's LMO domain (Psi4 uses T_n_ij_[ij] of shape (nlmo_ij, ...))
-    _domain = (set(pair_lmo_idx[pair_key].tolist())
-               if pair_lmo_idx is not None and pair_key in pair_lmo_idx
-               else set(range(nocc)))
-    T1_all = np.zeros((nocc, n_pno))
-    for m in range(nocc):
-        if m not in _domain:
-            continue
-        T1_all[m] = _project_t1_to_pair(
-            t1_pno, m, pair_key, S_pno_cache, pno_spaces)
-
-    # z_total[Q] = Σ_{m,c} T1_all[m,c] * ovL_m[c,Q]
-    naux = 0
-    for m in range(nocc):
-        entry = ovL_bare.get((pair_key, m))
-        if entry is not None:
-            naux = entry.shape[1]
-            break
-    if naux == 0:
-        return np.zeros((nocc, n_pno))
-
-    z_total = np.zeros(naux)
-    for m in range(nocc):
-        ovL_m = ovL_bare.get((pair_key, m))
-        if ovL_m is not None and np.max(np.abs(T1_all[m])) > 1e-15:
-            z_total += T1_all[m] @ ovL_m  # (naux,)
-
-    Fia_bar = np.zeros((nocc, n_pno))
-    for k in range(nocc):
-        ovL_k = ovL_bare.get((pair_key, k))
-        if ovL_k is None:
-            continue
-        # J: 2 * gamma * ovL_k
-        Fia_bar[k] += 2.0 * ovL_k @ z_total
-        # K: -Σ_n (ovL_n @ (T1_n @ ovL_k))[a]
-        for n in range(nocc):
-            if np.max(np.abs(T1_all[n])) < 1e-15:
-                continue
-            ovL_n = ovL_bare.get((pair_key, n))
-            if ovL_n is None:
-                continue
-            z_nk = T1_all[n] @ ovL_k  # (naux,)
-            Fia_bar[k] -= ovL_n @ z_nk  # (n_pno,)
-
-    return Fia_bar
 
 
-def build_Fkj(F_lmo, eps_lmo, t1_pno, fov_pno, pno_spaces, nocc,
-              ovL_bare, ooL_bare, S_pno_cache, foo_t2,
-              pair_lmo_idx=None, pair_keys_set=None):
-    """Build F̃_{kj} = dressed Fock oo (Eqs 94, 98).
-
-    F̃_{kj} = F̄_{kj} + F̄_{kc}·t_j^c (Eq 94)
-    where F̄_{kj} = F_{kj} + [2J-K]·t̃ (Eq 98)
-
-    Combined with the T2-dressed foo contribution.
-    """
-    from pyscf.cc.dlpno_tccsd.residual import _compute_foo_t1
-
-    # F̄_{kj} = F_{kj} + T1 dressing only (Eq 98).
-    # The T2 contribution to G_tilde is added inside build_G_tilde
-    # (Σ_l Tt_lj × K_il), matching Psi4 exactly.
-    foo_t1 = _compute_foo_t1(
-        t1_pno, fov_pno, pno_spaces, nocc,
-        ovL_bare, ooL_bare, S_pno_cache)
-
-    Fkj = F_lmo + foo_t1
-
-    # Eq 94: F̃_{kj} += Σ_a F̄_{ka}(jj) · t̃_j^a
-    # F̄_{ka} = fov_bare + [2J-K]·T1 (Fia_bar)
-    # Psi4 line 1618-1622: Fkj(i,j) += Fia_bar[jj](i,:) · T1_j
-    # Psi4 only updates Fkj(i,j) for (i,j) ∈ valid LMO pairs AND requires
-    # i ∈ lmopair_to_lmos_[jj] (otherwise i_jj == -1).
-    for j_idx in range(nocc):
-        key_jj = (j_idx, j_idx)
-        if key_jj not in pno_spaces or t1_pno[j_idx].size == 0:
-            continue
-        t1_j = t1_pno[j_idx]
-
-        # Build full Fia_bar for diagonal pair (j,j) — restricted internally
-        # to lmopair_to_lmos_[jj] when pair_lmo_idx is provided.
-        Fia_bar_jj = _build_Fia_bar(
-            t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, key_jj,
-            pair_lmo_idx=pair_lmo_idx)
-
-        _domain_jj = (set(pair_lmo_idx[key_jj].tolist())
-                      if pair_lmo_idx is not None and key_jj in pair_lmo_idx
-                      else set(range(nocc)))
-
-        # Add bare fov contribution (not in Fia_bar which starts from zero)
-        for i_idx in range(nocc):
-            # Psi4 requires (i,j) in valid pair list AND i in lmopair_to_lmos_[jj]
-            if i_idx not in _domain_jj:
-                continue
-            if pair_keys_set is not None:
-                key_ij = (min(i_idx, j_idx), max(i_idx, j_idx))
-                if key_ij not in pair_keys_set:
-                    continue
-            fov_i_jj = _project_t1_to_pair(
-                fov_pno, i_idx, key_jj, S_pno_cache, pno_spaces)
-            Fkj[i_idx, j_idx] += np.dot(fov_i_jj + Fia_bar_jj[i_idx], t1_j)
-
-    return Fkj, foo_t1
-
-
-def build_Fab(t1_pno, fov_pno, pno_spaces, nocc,
-              ovL_bare, S_pno_cache, with_df, pair_key,
-              pair_lmo_idx=None):
-    """Build F̃̃_{ab} (Eqs 85, 97, 101) for a specific pair.
-
-    F̃̃_{ab} = F̃_{ab} - Σ_kl S·u_kl·K_kl·S (Eq 85)
-    F̃_{ab} = F̄_{ab} - Σ_k t̃_k^a·F̄_{kb} (Eq 97)
-    F̄_{ab} = ε_a·δ_{ab} + [2(ab|kc)-(ac|kb)]·t̃_k^c (Eq 101)
-
-    Returns (n_pno, n_pno) matrix. The T2 part (Eq 85 subtraction) is
-    handled inline in the residual following Psi4.
-    """
-    from pyscf.cc.dlpno_tccsd.residual import _compute_fvv_t1_pair
-
-    # F̄_{ab} = ε_a·δ_{ab} + T1 corrections (Eq 101)
-    n_pno = pno_spaces[pair_key]['C_pno'].shape[1]
-    e_pno = pno_spaces[pair_key]['e_pno']
-
-    # Start with PNO orbital energies
-    Fab = np.diag(e_pno)
-
-    # Add T1 corrections: [2(ab|kc)-(ac|kb)]·t̃_k^c
-    fvv_t1 = _compute_fvv_t1_pair(
-        t1_pno, fov_pno, pno_spaces, nocc,
-        ovL_bare, S_pno_cache, with_df, pair_key)
-    Fab += fvv_t1
-
-    # Eq 97: F̃_{ab} = F̄_{ab} - Σ_k t̃_k^a · F̄_{kb}
-    # Psi4 line 1640: Fab -= T_n_ij.T @ Fia_bar
-    # Both T_n_ij and Fia_bar have first axis of size nlmo_ij — restrict
-    # the contraction over k to lmopair_to_lmos_[ij].
-    Fia_bar_ij = _build_Fia_bar(
-        t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pair_key,
-        pair_lmo_idx=pair_lmo_idx)
-    _domain = (set(pair_lmo_idx[pair_key].tolist())
-               if pair_lmo_idx is not None and pair_key in pair_lmo_idx
-               else set(range(nocc)))
-    T1_all = np.zeros((nocc, n_pno))
-    fov_all = np.zeros((nocc, n_pno))
-    for kk in range(nocc):
-        if kk not in _domain:
-            continue
-        T1_all[kk] = _project_t1_to_pair(
-            t1_pno, kk, pair_key, S_pno_cache, pno_spaces)
-        fov_all[kk] = _project_t1_to_pair(
-            fov_pno, kk, pair_key, S_pno_cache, pno_spaces)
-    # Fab -= T1_all.T @ (fov_all + Fia_bar)
-    Fab -= T1_all.T @ (fov_all + Fia_bar_ij)
-
-    return Fab
-
-
-def build_Fab_all(t1_pno, fov_pno, pno_spaces, nocc,
-                  ovL_bare, S_pno_cache, with_df, pair_keys,
-                  _fvv_t1_precomputed=None, pair_lmo_idx=None):
-    """Precompute Fab for ALL pairs in a single DF pass.
-
-    Replaces per-pair build_Fab() calls, avoiding redundant DF reads and
-    the thread-safety issue with with_df.loop().
-
-    Returns dict: pair_key -> (n_pno, n_pno) Fab matrix.
-    """
-    if _fvv_t1_precomputed is not None:
-        fvv_t1_all = _fvv_t1_precomputed
-    else:
-        from pyscf.cc.dlpno_tccsd.residual import compute_fvv_t1_all_pairs
-        fvv_t1_all = compute_fvv_t1_all_pairs(
-            t1_pno, fov_pno, pno_spaces, nocc,
-            ovL_bare, S_pno_cache, with_df, pair_keys)
-
-    # Complete Fab for each pair (Eq 97: Fab -= T1.T @ (fov + Fia_bar))
-    Fab_all = {}
-    for pk in pair_keys:
-        n_pno = pno_spaces[pk]['C_pno'].shape[1]
-        if n_pno == 0:
-            Fab_all[pk] = np.zeros((0, 0))
-            continue
-
-        e_pno = pno_spaces[pk]['e_pno']
-        Fab = np.diag(e_pno) + fvv_t1_all[pk]
-
-        # Eq 97: F̃_{ab} = F̄_{ab} - Σ_k t̃_k^a · F̄_{kb}
-        # Restrict k loop to lmopair_to_lmos_[pk] (Psi4 T_n_ij_[pk] shape).
-        Fia_bar_ij = _build_Fia_bar(
-            t1_pno, pno_spaces, nocc, ovL_bare, S_pno_cache, pk,
-            pair_lmo_idx=pair_lmo_idx)
-        T1_all = _build_T1_all(t1_pno, pk, nocc, S_pno_cache, pno_spaces)
-        fov_all = np.zeros((nocc, n_pno))
-        _dom = (set(pair_lmo_idx[pk].tolist())
-                if pair_lmo_idx is not None and pk in pair_lmo_idx
-                else set(range(nocc)))
-        for kk in range(nocc):
-            if kk not in _dom:
-                continue
-            fov_all[kk] = _project_t1_to_pair(
-                fov_pno, kk, pk, S_pno_cache, pno_spaces)
-        # Zero T1_all rows outside domain too.
-        if _dom != set(range(nocc)):
-            _mask = np.zeros(nocc, dtype=bool)
-            for _l in _dom:
-                _mask[_l] = True
-            T1_all = T1_all.copy()
-            T1_all[~_mask] = 0.0
-        Fab -= T1_all.T @ (fov_all + Fia_bar_ij)
-
-        Fab_all[pk] = Fab
-
-    return Fab_all
 
 
 def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
@@ -602,96 +368,6 @@ def build_mixed_domain_integrals(t2_pno_all, pno_spaces, nocc,
 # Dressed DF integral builders (Eqs 91-93)
 # ---------------------------------------------------------------------------
 
-def _build_ooL_dressed(ooL_bare, ovL_pno_bare, t1_pno, pno_spaces, nocc):
-    """Asymmetric T1-dressed ooL (Eq 91): B̃_{ki} = B_{ki} + B_{ka}·t_i^a.
-
-    Only the second index (i) is dressed.
-    """
-    ooL_dressed = ooL_bare.copy()
-    for ii in range(nocc):
-        key_ii = (ii, ii)
-        if key_ii not in pno_spaces:
-            continue
-        t1_i = t1_pno.get(ii)
-        if t1_i is None or t1_i.size == 0:
-            continue
-        for kk in range(nocc):
-            ovL_k_ii = ovL_pno_bare.get((key_ii, kk))
-            if ovL_k_ii is not None:
-                ooL_dressed[kk, ii, :] += t1_i @ ovL_k_ii
-    return ooL_dressed
-
-
-def build_dressed_ovL_cache(ovL_pno_bare, ooL_bare, t1_pno, pno_spaces,
-                            S_pno_cache, nocc, with_df, keys):
-    """Build dressed ovL cache for ALL (pair, LMO) combinations.
-
-    B̃_{mi}^Q = B_{mi}^Q + Σ_b B_{mb_ij}^Q · t̃_i^{b_ij} - Σ_k t̃_k^{a_ij} · B_{ki}^Q
-
-    Applies Eq 92 Terms 2-3 (linear in T1) to each ovL entry.
-    Matches Psi4's i_Qa_t1_ construction (lines 1494-1495).
-
-    Returns dict same format as ovL_pno_bare but with dressed values.
-    """
-    ovL_dressed = {}
-
-    for key in keys:
-        n_pno = pno_spaces[key]['C_pno'].shape[1]
-        if n_pno == 0:
-            continue
-        C_pno_ij = pno_spaces[key]['C_pno']
-
-        # Build T1_all projected to this pair's PNO basis
-        T1_all = np.zeros((nocc, n_pno))
-        for kk in range(nocc):
-            T1_all[kk] = _project_t1_to_pair(
-                t1_pno, kk, key, S_pno_cache, pno_spaces)
-
-        # Term 2: -T1_all.T @ ooL_bare[:,m,:] for each m
-        # Precompute for all m at once
-        # delta_oo[m][a,Q] = -Σ_k T1_all[k,a]*ooL_bare[k,m,Q]
-        # = -(T1_all.T @ ooL_bare[:,m,:]) for each m
-
-        # Term 3: +vvL_ij × T1_m needs DF loop
-        # Compute Σ_b (ab|Q)*T1_m^b for all m and all Q at once
-        naux = ooL_bare.shape[2]
-
-        # For each m, T1_m projected to PNO_ij:
-        t1_proj = {}
-        for m in range(nocc):
-            t1_proj[m] = _project_t1_to_pair(
-                t1_pno, m, key, S_pno_cache, pno_spaces)
-
-        # Compute Term 3 (vvL × T1) via DF loop
-        delta_vv = {m: np.zeros((n_pno, naux)) for m in range(nocc)}
-        any_nonzero = any(np.max(np.abs(t1_proj[m])) > 1e-15 for m in range(nocc))
-        if any_nonzero:
-            mo_vv = np.asfortranarray(C_pno_ij)
-            ijslice = (0, n_pno, 0, n_pno)
-            buf = None
-            aux_off = 0
-            for Lpq in with_df.loop():
-                nL = Lpq.shape[0]
-                buf = _ao2mo.nr_e2(Lpq, mo_vv, ijslice, aosym='s2', out=buf)
-                B_L = buf.reshape(nL, n_pno, n_pno)
-                for m in range(nocc):
-                    if np.max(np.abs(t1_proj[m])) > 1e-15:
-                        delta_vv[m][:, aux_off:aux_off+nL] = np.einsum(
-                            'Lab,b->aL', B_L, t1_proj[m])
-                aux_off += nL
-
-        # Build dressed ovL for each m
-        for m in range(nocc):
-            ovL_bare_entry = ovL_pno_bare.get((key, m))
-            if ovL_bare_entry is None:
-                continue
-            # Term 2: -T1_all.T @ ooL_bare[:,m,:]
-            delta_oo = -T1_all.T @ ooL_bare[:, m, :]  # (n_pno, naux)
-
-            # Full dressed = bare + delta_vv(Term 3) + delta_oo(Term 2)
-            ovL_dressed[(key, m)] = ovL_bare_entry + delta_vv[m] + delta_oo
-
-    return ovL_dressed
 
 
 def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
@@ -927,430 +603,158 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
 # T1-dressed Fock intermediates (Eqs 94-101, 85-86)
 # ---------------------------------------------------------------------------
 
-def _compute_foo_t1(t1_pno, fov_pno, pno_spaces, nocc,
-                    ovL_pno_bare, ooL_bare, S_pno_cache):
-    """T1-dressed occupied Fock correction (Eq 98).
 
-    F̄_{ij} = F_{ij} + [2J-K]_{kc}^{ij} · t̃_k^c  [Eq 98, PySCF lines 157-158]
+def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
+                                nocc, cc_ints, S_pno_cache, pair_keys):
+    """Per-pair, local-aux-per-pair version of compute_all_df_terms.
 
-    The Eq 94 part (F̄_{kc}·t_j^c) is handled in build_Fkj via Fia_bar.
-    Returns (nocc, nocc) T1 correction to add to bare foo.
+    Drop-in replacement that reads from ``cc_ints[pk]['Qab' / 'Qma']``
+    (already fitted, local-aux per pair) instead of iterating
+    ``with_df.loop()`` over global aux blocks. Each pair's contractions
+    sum over the pair's local aux only — Psi4-equivalent and avoids the
+    per-iteration full-naux ovL rebuild (12s of `_ao2mo.nr_e2` on str 010).
+
+    Same return signature as ``compute_all_df_terms``:
+        fvv_t1_all, c_term2_all, d_term2_all, ladder_all
+
+    Args:
+        t1_pno: dict i -> (n_pno_ii,)
+        fov_pno: unused (kept for signature compat)
+        t2_pno_all: dict pk -> (n_pno, n_pno)
+        pno_spaces: dict from make_pnos
+        nocc: int
+        cc_ints: dict pk -> {'Qab': (n_local, n, n), 'Qma': (n_local, nocc, n), ...}
+        S_pno_cache: dict (key1, key2) -> (n1, n2) overlap
+        pair_keys: list of pair keys for which fvv_t1 and ladder are returned.
     """
-    foo_t1 = np.zeros((nocc, nocc))
-
-    # NOTE: The 0.5*fov·t1 term (PySCF line 126) is NOT used here.
-    # In Jiang/Psi4, this contribution enters through Eq 94 (build_Fkj)
-    # via Fia_bar @ T1, which is handled separately.
-
-    # Eq 98 / lines 157-158: F̄_{ij} += Σ_{k,c} [2(kc|ji) - (ic|jk)]·t1_k^c
-    for kk in range(nocc):
-        key_kk = (kk, kk)
-        if key_kk not in pno_spaces:
-            continue
-        t1_k = t1_pno.get(kk)
-        if t1_k is None or t1_k.size == 0:
-            continue
-        ovL_kk_k = ovL_pno_bare.get((key_kk, kk))
-        if ovL_kk_k is None:
-            continue
-        z_k = t1_k @ ovL_kk_k  # (naux,): Σ_c t1_k^c·(kc|Q)
-        # Coulomb: 2·Σ_Q z_k[Q]·ooL[j,i,Q]
-        for ii in range(nocc):
-            ooL_ji = ooL_bare[:, ii, :]  # (nocc, naux)
-            foo_t1[ii, :] += 2.0 * (ooL_ji @ z_k)
-        # Exchange: -Σ_Q z_ik[Q]·ooL[j,k,Q]
-        for ii in range(nocc):
-            ovL_ii_kk = ovL_pno_bare.get((key_kk, ii))
-            if ovL_ii_kk is None:
-                continue
-            z_ik = t1_k @ ovL_ii_kk  # (naux,)
-            foo_t1[ii, :] -= ooL_bare[:, kk, :] @ z_ik
-
-    return foo_t1
-
-
-def _compute_fvv_t1_pair(t1_pno, fov_pno, pno_spaces, nocc,
-                         ovL_pno_bare, S_pno_cache, with_df, pair_key):
-    """T1-dressed virtual Fock F̄_{ab} for pair ij (Eq 101, PySCF lines 332-333).
-
-    Computes [2(ab|kc)-(ac|kb)]·t̃_k^c part of the dressed Fock.
-    The Eq 97 part (-Σ_k t̃_k^a·F̄_{kb}) is handled in build_Fab via Fia_bar.
-    Returns (n_pno, n_pno) T1 correction to fvv in PNO_ij basis.
-    """
-    n_pno = pno_spaces[pair_key]['C_pno'].shape[1]
-    if n_pno == 0:
-        return np.zeros((0, 0))
-    C_pno_ij = pno_spaces[pair_key]['C_pno']
-    fvv_t1 = np.zeros((n_pno, n_pno))
-
-    # NOTE: The -0.5*t1@fov term (PySCF line 129) is NOT used here.
-    # In Jiang/Psi4, this contribution enters through Eq 97 (build_Fab)
-    # via -T_n.T @ Fia_bar, which is handled separately.
-
-    # Eq 98 / lines 332-333: Σ_{k,c} t1_k^c·[2(ck|ab) - (bk|ca)]
-    # Coulomb: 2·Σ_k (Σ_c t1_k^c·ovL_k[c,Q])·vvL[a,b,Q]
-    # z_total[Q] = Σ_k Σ_c t1_k_ij^c · ovL_k_ij[c,Q]
-    naux = 0
-    for m in range(nocc):
-        entry = ovL_pno_bare.get((pair_key, m))
-        if entry is not None:
-            naux = entry.shape[1]
-            break
-    if naux == 0:
-        return fvv_t1
-
-    z_total = np.zeros(naux)
-    for kk in range(nocc):
-        t1_k_ij = _project_t1_to_pair(
-            t1_pno, kk, pair_key, S_pno_cache, pno_spaces)
-        if np.max(np.abs(t1_k_ij)) < 1e-15:
-            continue
-        ovL_k_ij = ovL_pno_bare.get((pair_key, kk))
-        if ovL_k_ij is not None:
-            z_total += t1_k_ij @ ovL_k_ij
-
-    # Precompute T1 projections and ovL for exchange part
-    t1_proj_all = {}
-    ovL_k_all = {}
-    for kk in range(nocc):
-        t1_k_ij = _project_t1_to_pair(
-            t1_pno, kk, pair_key, S_pno_cache, pno_spaces)
-        if np.max(np.abs(t1_k_ij)) > 1e-15:
-            t1_proj_all[kk] = t1_k_ij
-            ovL_k = ovL_pno_bare.get((pair_key, kk))
-            if ovL_k is not None:
-                ovL_k_all[kk] = ovL_k
-
-    any_nonzero = len(t1_proj_all) > 0
-    if any_nonzero:
-        mo_vv = np.asfortranarray(C_pno_ij)
-        ijslice = (0, n_pno, 0, n_pno)
-        buf = None
-        aux_off = 0
-        for Lpq in with_df.loop():
-            nL = Lpq.shape[0]
-            buf = _ao2mo.nr_e2(Lpq, mo_vv, ijslice, aosym='s2', out=buf)
-            B_L = buf.reshape(nL, n_pno, n_pno)  # (L, c, a) = (ca|L)
-            z_batch = z_total[aux_off:aux_off + nL]
-
-            # Coulomb: 2·Σ_k z_k[L]·(ab|L) = 2·z_total[L]·B_L[L,a,b]
-            fvv_t1 += 2.0 * np.tensordot(z_batch, B_L, axes=(0, 0))
-
-            # Exchange: -Σ_{k,c} T1_k[c]·(bk|ca)
-            # (bk|ca) = Σ_L ovL_k[b,L]*B_L[L,c,a]
-            # Y_k[a,L] = Σ_c T1_k[c]*B_L[L,c,a]
-            # fvv_exch[a,b] -= Σ_k Y_k_batch @ ovL_k_batch.T
-            for kk in t1_proj_all:
-                if kk not in ovL_k_all:
-                    continue
-                Y_k = np.einsum('c,Lca->aL', t1_proj_all[kk], B_L)
-                ovL_k_batch = ovL_k_all[kk][:, aux_off:aux_off + nL]
-                fvv_t1 -= Y_k @ ovL_k_batch.T
-
-            aux_off += nL
-
-    return fvv_t1
-
-
-def compute_fvv_t1_all_pairs(t1_pno, fov_pno, pno_spaces, nocc,
-                              ovL_pno_bare, S_pno_cache, with_df,
-                              pair_keys):
-    """Batched fvv_t1 for ALL pairs in a single DF pass.
-
-    Same result as calling _compute_fvv_t1_pair per pair, but reads the
-    DF integrals only once instead of N_pairs times.
-
-    Returns dict: pair_key -> (n_pno, n_pno) fvv_t1 matrix.
-    """
-    # Precompute per-pair data: z_total, t1_projections, ovL, C_pno
-    pair_data = {}
-    for pk in pair_keys:
-        n_pno = pno_spaces[pk]['C_pno'].shape[1]
-        if n_pno == 0:
-            continue
-        C_pno_ij = pno_spaces[pk]['C_pno']
-
-        # Get naux
-        naux = 0
-        for m in range(nocc):
-            entry = ovL_pno_bare.get((pk, m))
-            if entry is not None:
-                naux = entry.shape[1]
-                break
-        if naux == 0:
-            continue
-
-        # z_total[Q] = Σ_k Σ_c t1_k^c · ovL_k[c,Q]
-        z_total = np.zeros(naux)
-        t1_proj_all = {}
-        ovL_k_all = {}
-        for kk in range(nocc):
-            t1_k_ij = _project_t1_to_pair(
-                t1_pno, kk, pk, S_pno_cache, pno_spaces)
-            if np.max(np.abs(t1_k_ij)) < 1e-15:
-                continue
-            ovL_k_ij = ovL_pno_bare.get((pk, kk))
-            if ovL_k_ij is not None:
-                z_total += t1_k_ij @ ovL_k_ij
-                t1_proj_all[kk] = t1_k_ij
-                ovL_k_all[kk] = ovL_k_ij
-
-        if len(t1_proj_all) == 0:
-            continue
-
-        pair_data[pk] = {
-            'n_pno': n_pno,
-            'C_pno': np.asfortranarray(C_pno_ij),
-            'z_total': z_total,
-            't1_proj': t1_proj_all,
-            'ovL_k': ovL_k_all,
-            'fvv_t1': np.zeros((n_pno, n_pno)),
-        }
-
-    if not pair_data:
-        return {pk: np.zeros((pno_spaces[pk]['C_pno'].shape[1],) * 2)
-                for pk in pair_keys}
-
-    # Single DF pass: loop over batches, process all pairs per batch
-    aux_off = 0
-    for Lpq in with_df.loop():
-        nL = Lpq.shape[0]
-
-        for pk, pd in pair_data.items():
-            n_pno = pd['n_pno']
-            ijslice = (0, n_pno, 0, n_pno)
-            buf = _ao2mo.nr_e2(Lpq, pd['C_pno'], ijslice, aosym='s2')
-            B_L = buf.reshape(nL, n_pno, n_pno)
-
-            # Coulomb
-            z_batch = pd['z_total'][aux_off:aux_off + nL]
-            pd['fvv_t1'] += 2.0 * np.einsum('L,Lab->ab', z_batch, B_L)
-
-            # Exchange
-            for kk, t1_k in pd['t1_proj'].items():
-                ovL_k = pd['ovL_k'].get(kk)
-                if ovL_k is None:
-                    continue
-                Y_k = np.einsum('c,Lca->aL', t1_k, B_L)
-                ovL_k_batch = ovL_k[:, aux_off:aux_off + nL]
-                pd['fvv_t1'] -= Y_k @ ovL_k_batch.T
-
-        aux_off += nL
-
-    # Build result dict
-    result = {}
-    for pk in pair_keys:
-        n_pno = pno_spaces[pk]['C_pno'].shape[1]
-        if pk in pair_data:
-            result[pk] = pair_data[pk]['fvv_t1']
-        else:
-            result[pk] = np.zeros((n_pno, n_pno))
-    return result
-
-
-# =========================================================================
-# Unified single-DF-pass for DF-dependent intermediates
-# =========================================================================
-
-
-def compute_all_df_terms(t1_pno, fov_pno, t2_pno_all, pno_spaces, nocc,
-                          ovL_bare, S_pno_cache, with_df, pair_keys):
-    """Single DF pass computing fvv_t1, C_tilde Term 2, D_tilde Term 2, ladder.
-
-    Returns:
-        fvv_t1_all: dict pair_key -> (n_pno, n_pno)
-        c_term2_all: dict (k, i) -> (n_ki, n_ki)
-        d_term2_all: dict (i, k) -> (n_ik, n_ik)
-        ladder_all: dict pair_key -> (n_pno, n_pno)
-    """
-    # ====================================================================
-    # Prepare per-computation data structures
-    # ====================================================================
-
-    # All ordered (k,i) pairs for C_tilde and D_tilde
+    # All ordered (k, i) pairs that appear in t2 (both directions).
     all_ordered = set()
     for key in t2_pno_all:
         a, b = key
         all_ordered.add((a, b))
         all_ordered.add((b, a))
 
-    # --- Fab/fvv_t1 data ---
-    fab_data = {}
+    fvv_t1_all = {}
+    c_term2_all = {}
+    d_term2_all = {}
+    ladder_all = {}
+
+    # ============================================================
+    # Per-pair: fvv_t1 + ladder + project T1 once per pair
+    # ============================================================
+    T1_all_cache = {}    # pk -> T1_all (nocc, n) projected to pk's PNO basis
+
+    def _T1_proj(pk):
+        T = T1_all_cache.get(pk)
+        if T is None:
+            n = pno_spaces[pk]['C_pno'].shape[1]
+            T = np.zeros((nocc, n))
+            for kk in range(nocc):
+                T[kk] = _project_t1_to_pair(
+                    t1_pno, kk, pk, S_pno_cache, pno_spaces)
+            T1_all_cache[pk] = T
+        return T
+
     for pk in pair_keys:
         n = pno_spaces[pk]['C_pno'].shape[1]
         if n == 0:
+            fvv_t1_all[pk] = np.zeros((n, n))
+            ladder_all[pk] = np.zeros((n, n))
             continue
-        naux = 0
-        for m in range(nocc):
-            entry = ovL_bare.get((pk, m))
-            if entry is not None:
-                naux = entry.shape[1]
-                break
-        if naux == 0:
+        ci = cc_ints.get(pk)
+        if ci is None:
+            fvv_t1_all[pk] = np.zeros((n, n))
+            ladder_all[pk] = np.zeros((n, n))
             continue
-        z_total = np.zeros(naux)
-        t1_proj = {}
-        ovL_k = {}
-        for kk in range(nocc):
-            t1_k = _project_t1_to_pair(t1_pno, kk, pk, S_pno_cache, pno_spaces)
-            if np.max(np.abs(t1_k)) < 1e-15:
-                continue
-            ovl = ovL_bare.get((pk, kk))
-            if ovl is not None:
-                z_total += t1_k @ ovl
-                t1_proj[kk] = t1_k
-                ovL_k[kk] = ovl
-        if t1_proj:
-            fab_data[pk] = {
-                'n': n, 'C': np.asfortranarray(pno_spaces[pk]['C_pno']),
-                'z': z_total, 't1': t1_proj, 'ovL': ovL_k,
-                'result': np.zeros((n, n)),
-            }
 
-    # --- C_tilde Term 2 data ---
-    c_data = {}
+        Qab = ci['Qab']         # (n_local, n, n)
+        Qma = ci['Qma']         # (n_local, nocc, n)
+        n_local = Qab.shape[0]
+        i, j = pk
+        T1_all = _T1_proj(pk)
+
+        # ---- fvv_t1[pk] ----
+        # Term A: 2 * Σ_L z[L] * Qab[L, a, b]
+        #   where z[L] = Σ_k Σ_a T1_all[k, a] * Qma[L, k, a]
+        z = np.einsum('Lka,ka->L', Qma, T1_all, optimize=True)
+        fvv = 2.0 * np.einsum('L,Lab->ab', z, Qab, optimize=True)
+
+        # Term B: -Σ_k,L Σ_b' Qab[L, a, b'] * T1_all[k, b'] * Qma[L, k, b]
+        # Vectorized: tmp[L, k, a] = Σ_b' Qab[L, a, b'] * T1_all[k, b']
+        # = einsum('Lab,kb->Lka', Qab, T1_all)  (one batched gemm)
+        # Then fvv -= einsum('Lka,Lkb->ab', tmp, Qma)
+        tmp = np.einsum('Lab,kb->Lka', Qab, T1_all, optimize=True)
+        fvv -= np.einsum('Lka,Lkb->ab', tmp, Qma, optimize=True)
+        fvv_t1_all[pk] = fvv
+
+        # ---- ladder[pk] ----
+        tau = t2_pno_all[pk] + np.outer(T1_all[i], T1_all[j])
+        # corr[L, a, b] = Σ_k T1_all[k, a] * Qma[L, k, b]
+        corr = np.einsum('ka,Lkb->Lab', T1_all, Qma, optimize=True)
+        B_tilde = Qab - corr
+        X_L = np.matmul(B_tilde, tau)              # batched (n_local, n, n)
+        # ladder[a, c] = Σ_{L, b} X_L[L, a, b] * B_tilde[L, c, b]
+        # = (X_L.transpose(1,0,2).reshape(n, -1)) @ (B_tilde.transpose(1,0,2).reshape(n, -1)).T
+        ladder_all[pk] = (X_L.transpose(1, 0, 2).reshape(n, -1) @
+                          B_tilde.transpose(1, 0, 2).reshape(n, -1).T)
+
+    # ============================================================
+    # C_tilde Term 2: per (k, i) ordered pair
+    # ============================================================
     for k, i in all_ordered:
         key_ki = (min(k, i), max(k, i))
         n = pno_spaces[key_ki]['C_pno'].shape[1]
         if n == 0:
             continue
+        ci = cc_ints.get(key_ki)
+        if ci is None:
+            continue
         t1_i = _project_t1_to_pair(t1_pno, i, key_ki, S_pno_cache, pno_spaces)
         if np.max(np.abs(t1_i)) < 1e-15:
             continue
-        ovL_i = ovL_bare.get((key_ki, i))
-        if ovL_i is None:
-            continue
-        c_data[(k, i)] = {
-            'key': key_ki, 'n': n,
-            'C': np.asfortranarray(pno_spaces[key_ki]['C_pno']),
-            't1': t1_i, 'ovL': ovL_i,
-            'result': np.zeros((n, n)),
-        }
+        Qma = ci['Qma']
+        Qab = ci['Qab']
+        # z_i[L] = Σ_a t1_i[a] * Qma[L, i, a]
+        z_i = Qma[:, i, :] @ t1_i        # (n_local,)
+        # result[a, b] = Σ_L z_i[L] * Qab[L, a, b]
+        c_term2_all[(k, i)] = np.einsum('L,Lab->ab', z_i, Qab, optimize=True)
 
-    # --- D_tilde Term 2 data ---
-    d_data = {}
+    # ============================================================
+    # D_tilde Term 2: per (i, k) ordered pair
+    # ============================================================
     for i_idx, k_idx in all_ordered:
         key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
         n = pno_spaces[key_ik]['C_pno'].shape[1]
         if n == 0:
             continue
-        t1_i = _project_t1_to_pair(t1_pno, i_idx, key_ik, S_pno_cache, pno_spaces)
+        ci = cc_ints.get(key_ik)
+        if ci is None:
+            continue
+        t1_i = _project_t1_to_pair(
+            t1_pno, i_idx, key_ik, S_pno_cache, pno_spaces)
         if np.max(np.abs(t1_i)) < 1e-15:
             continue
-        ovL_k = ovL_bare.get((key_ik, k_idx))
-        if ovL_k is None:
-            continue
-        d_data[(i_idx, k_idx)] = {
-            'key': key_ik, 'n': n,
-            'C': np.asfortranarray(pno_spaces[key_ik]['C_pno']),
-            't1': t1_i, 'ovL': ovL_k,
-            'result': np.zeros((n, n)),
-        }
+        Qma = ci['Qma']
+        Qab = ci['Qab']
+        ovL_k = Qma[:, k_idx, :].T       # (n, n_local)
+        # z_c[L, a] = Σ_b Qab[L, a, b] * t1_i[b]  → batched matvec
+        z_c = Qab @ t1_i                  # (n_local, n)
+        # y[L] = Σ_a t1_i[a] * Qma[L, k, a]
+        y = Qma[:, k_idx, :] @ t1_i       # (n_local,)
+        result = 2.0 * (ovL_k @ z_c)      # (n, n)
+        result -= np.einsum('L,Lab->ab', y, Qab, optimize=True)
+        d_term2_all[(i_idx, k_idx)] = result
 
-    # --- Ladder data ---
-    ladder_data = {}
-    for pk in pair_keys:
-        i, j = pk
-        n = pno_spaces[pk]['C_pno'].shape[1]
-        if n == 0:
-            continue
-        T1_all = np.zeros((nocc, n))
-        if t1_pno is not None:
-            for kk in range(nocc):
-                T1_all[kk] = _project_t1_to_pair(
-                    t1_pno, kk, pk, S_pno_cache, pno_spaces)
-        tau = t2_pno_all[pk] + np.outer(T1_all[i], T1_all[j])
-        ovL_stacked = np.stack(
-            [ovL_bare.get((pk, k), np.zeros((n, 0))) for k in range(nocc)])
-        naux = ovL_stacked.shape[2]
-        if naux == 0:
-            continue
-        # corr[Q, a, b] = Σ_k T1[k, a] * ovL_stacked[k, b, Q]
-        # Stored in (naux, n, n) so per-batch slicing is a contiguous view.
-        corr = np.einsum('ka,kbQ->Qab', T1_all, ovL_stacked, optimize=True)
-        ladder_data[pk] = {
-            'n': n, 'C': np.asfortranarray(pno_spaces[pk]['C_pno']),
-            'tau': tau, 'corr': corr,
-            'ladder': np.zeros((n, n)),
-        }
-
-    # ====================================================================
-    # Single DF pass: process all computations per batch
-    # ====================================================================
-    aux_off = 0
-    for Lpq in with_df.loop():
-        nL = Lpq.shape[0]
-
-        # Cache AO→MO transforms per unique pair key
-        B_L_cache = {}
-
-        def get_B_L(key, n, C):
-            if key not in B_L_cache:
-                buf = _ao2mo.nr_e2(Lpq, C, (0, n, 0, n), aosym='s2')
-                B_L_cache[key] = buf.reshape(nL, n, n)
-            return B_L_cache[key]
-
-        # --- Fab/fvv_t1 ---
-        for pk, fd in fab_data.items():
-            n = fd['n']
-            B_L = get_B_L(pk, n, fd['C'])
-            z_batch = fd['z'][aux_off:aux_off+nL]
-            # += 2 * Σ_L z[L] * B_L[L, a, b]  via gemv on flattened B_L
-            fd['result'] += 2.0 * (z_batch @ B_L.reshape(nL, -1)).reshape(n, n)
-            for kk, t1_k in fd['t1'].items():
-                ovl = fd['ovL'].get(kk)
-                if ovl is None:
-                    continue
-                # Y_k[a, L] = Σ_b B_L[L, a, b] * t1_k[b]
-                Y_k = (B_L @ t1_k).T  # (n, nL)
-                fd['result'] -= Y_k @ ovl[:, aux_off:aux_off+nL].T
-
-        # --- C_tilde Term 2 ---
-        for (k, i), cd in c_data.items():
-            B_L = get_B_L(cd['key'], cd['n'], cd['C'])
-            z_i = cd['t1'] @ cd['ovL'][:, aux_off:aux_off+nL]
-            n_ki = cd['n']
-            cd['result'] += (z_i @ B_L.reshape(nL, -1)).reshape(n_ki, n_ki)
-
-        # --- D_tilde Term 2 ---
-        for (i_idx, k_idx), dd in d_data.items():
-            n_ik = dd['n']
-            B_L = get_B_L(dd['key'], n_ik, dd['C'])
-            # z_c[L, a] = Σ_b B_L[L, a, b] * t1[b]
-            z_c = B_L @ dd['t1']                  # (nL, n)
-            y = dd['t1'] @ dd['ovL'][:, aux_off:aux_off+nL]  # (nL,)
-            dd['result'] += 2.0 * dd['ovL'][:, aux_off:aux_off+nL] @ z_c
-            dd['result'] -= (y @ B_L.reshape(nL, -1)).reshape(n_ik, n_ik)
-
-        # --- Ladder ---
-        for pk, ld in ladder_data.items():
-            n = ld['n']
-            B_L = get_B_L(pk, n, ld['C'])
-            B_tilde = B_L - ld['corr'][aux_off:aux_off+nL]
-            X_L = B_tilde @ ld['tau']
-            # ladder[a, c] = Σ_{L, b} X_L[L, a, b] * B_tilde[L, c, b]
-            ld['ladder'] += (X_L.transpose(1, 0, 2).reshape(n, -1) @
-                             B_tilde.transpose(1, 0, 2).reshape(n, -1).T)
-
-        aux_off += nL
-
-    # ====================================================================
-    # Package results
-    # ====================================================================
-    fvv_t1_all = {}
+    # Pad missing pair_keys with zeros (matching old API)
     for pk in pair_keys:
         n = pno_spaces[pk]['C_pno'].shape[1]
-        fvv_t1_all[pk] = fab_data[pk]['result'] if pk in fab_data else np.zeros((n, n))
-
-    c_term2_all = {ki: cd['result'] for ki, cd in c_data.items()}
-    d_term2_all = {ik: dd['result'] for ik, dd in d_data.items()}
-
-    ladder_all = {}
-    for pk in pair_keys:
-        n = pno_spaces[pk]['C_pno'].shape[1]
-        ladder_all[pk] = ladder_data[pk]['ladder'] if pk in ladder_data else np.zeros((n, n))
+        if pk not in fvv_t1_all:
+            fvv_t1_all[pk] = np.zeros((n, n))
+        if pk not in ladder_all:
+            ladder_all[pk] = np.zeros((n, n))
 
     return fvv_t1_all, c_term2_all, d_term2_all, ladder_all
+
 
 # =========================================================================
 # T2 residual: Psi4-compatible two-buffer formulation

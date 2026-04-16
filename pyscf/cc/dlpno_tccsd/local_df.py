@@ -384,208 +384,321 @@ def get_local_K(cc_ints, pair_key, lmo1, lmo2):
     return K
 
 
-def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
-                         j2c, keys, nocc, aux_block_size=None):
-    """Precompute ALL per-pair locally-fitted intermediates (aux-blocked).
+def pno_in_AO(pno_spaces, key, C_pao):
+    """Reconstruct C_pno in AO basis from Psi4-style PAO-domain storage.
 
-    Matches Psi4 ccsd.cc compute_cc_integrals() — processes auxiliary shells
-    in blocks, avoiding O(nao² × naux) raw_3c and O(nao × naux × npno × N_pairs)
-    tmp_pno_cache that would be prohibitive for large systems.
+    Equivalent to ``pno_spaces[key]['C_pno']`` but rebuilt on demand from
+    ``X_pno`` (|domain_ij|, npno) and ``pair_paos`` (|domain_ij|,)::
 
-    Memory scaling:
-      - Transient per-block: O(nao² × n_aux_block) + Σ_pairs O(nao × n_aux_block × npno)
-      - Per-pair persistent: O(n_aux_pair × npno²) × N_pairs (output tensors only)
+        C_pno = C_pao[:, pair_paos] @ X_pno
+
+    For CAS pairs (where the PNO basis extends beyond the pair PAO domain
+    via ``C_cas_vir``), ``X_pno`` is ``None`` and we fall back to the
+    cached AO-basis ``C_pno``.
+
+    Args:
+        pno_spaces: dict from make_pnos.
+        key: pair key (i, j).
+        C_pao: (nao, npao) PAO coefficients.
+
+    Returns:
+        np.ndarray (nao, npno) PNO coefficients in AO basis.
+    """
+    pd = pno_spaces[key]
+    X_pno = pd.get('X_pno')
+    if X_pno is None:
+        return pd['C_pno']
+    pair_paos = pd['pair_paos']
+    return C_pao[:, pair_paos] @ X_pno
+
+
+
+def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
+                                pair_aux_idx, j2c, keys, nocc, s1e=None,
+                                pao_domains=None, strong_pair_keys=None,
+                                T_CUT_MKN=1e-3, T_CUT_CLMO=1e-3,
+                                screening_maps=None, sparse_arrays=None):
+    """Per-pair fitted intermediates via sparse per-aux-Q sparse storage.
+
+    Drop-in replacement for ``compute_cc_integrals`` that uses Psi4-style
+    PAO-domain X_pno transforms. Same output schema. Shares the screening
+    maps and sparse arrays from ``build_screening_maps`` /
+    ``build_sparse_df_arrays`` (build them here if not passed in).
+
+    With T_CUT_MKN, T_CUT_CLMO → 0, sparse → dense and the per-pair tensors
+    must agree with ``compute_cc_integrals`` to BLAS noise (~1e-10).
 
     Args:
         mol, auxmol: PySCF Mole objects.
-        C_lmo: (nao, nocc) LMO coefficients.
-        pno_spaces: dict pair_key -> {'C_pno': (nao, npno)}.
-        pair_aux_idx: dict pair_key -> np.array of local aux indices.
-        j2c: (naux, naux) full Coulomb metric.
+        C_lmo: (nao, nocc) LMO coefficients (full PySCF basis).
+        C_pao: (nao, nao) PAO coefficients.
+        pno_spaces: dict from ``make_pnos`` — must carry ``X_pno`` and
+            ``pair_paos`` (Phase 1 storage).
+        pair_aux_idx: dict pair_key -> np.array of local aux-function idx.
+        j2c: (naux, naux) Coulomb metric.
         keys: list of pair keys.
-        nocc: number of active occupied orbitals.
-        aux_block_size: aux shells per block (auto-chosen if None).
+        nocc: number of correlated occupieds.
+        s1e: (nao, nao) AO overlap (computed from mol if None).
+        pao_domains: list[nocc] of np.arrays of PAO AO indices. If None,
+            reconstructed from ``pno_spaces[(i,i)]['domain_ij']``.
+        strong_pair_keys: pair list driving lmo_to_riatoms_ext extension. If
+            None, uses ``keys``.
+        T_CUT_MKN, T_CUT_CLMO: sparsity thresholds. Set very small to recover
+            dense behavior for validation.
+        screening_maps, sparse_arrays: optional pre-built outputs to avoid
+            recomputing across multiple pair sweeps.
 
     Returns:
-        cc_ints: dict pair_key -> dict of fitted intermediates (same schema
-        as Psi4-matched original implementation).
+        cc_ints (dict): same schema as ``compute_cc_integrals``.
     """
-    nao = mol.nao_nr()
+    if s1e is None:
+        s1e = mol.intor('int1e_ovlp')
+    if pao_domains is None:
+        pao_domains = []
+        for i in range(nocc):
+            key_ii = (i, i)
+            if key_ii in pno_spaces \
+                    and pno_spaces[key_ii].get('pair_paos') is not None:
+                pao_domains.append(np.asarray(pno_spaces[key_ii]['pair_paos']))
+            else:
+                pao_domains.append(np.zeros(0, dtype=int))
+    if strong_pair_keys is None:
+        strong_pair_keys = list(keys)
+
+    if screening_maps is None:
+        screening_maps = build_screening_maps(
+            mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
+            T_CUT_MKN=T_CUT_MKN, T_CUT_CLMO=T_CUT_CLMO)
+    if sparse_arrays is None:
+        sparse_arrays = build_sparse_df_arrays(
+            mol, auxmol, C_lmo, C_pao, screening_maps)
+
+    qij = sparse_arrays['qij']
+    qia = sparse_arrays['qia']
+    qab = sparse_arrays['qab']
+
+    aux_atom_ids = screening_maps['aux_atom_ids']
+    riatom_to_lmos_ext = screening_maps['riatom_to_lmos_ext']
+    riatom_to_paos_ext = screening_maps['riatom_to_paos_ext']
+    riatom_to_lmos_ext_dense = screening_maps['riatom_to_lmos_ext_dense']
+    riatom_to_paos_ext_dense = screening_maps['riatom_to_paos_ext_dense']
+    natm = screening_maps['natm']
+
+    # Per-atom stacked sparse arrays — once globally so per-pair loops can
+    # batch over all aux Q's centered on the same atom (BLAS-3 amortizes
+    # across the n_aux_at_A Q's of each atom). All Q's of the same atom
+    # share the same lmos_ext/paos_ext neighborhood, so stacking is well
+    # defined.
     naux = auxmol.nao_nr()
-    pmol = mol + auxmol
-    aux_nbas = auxmol.nbas
-    aux_ao_loc = auxmol.ao_loc_nr()
+    aux_at_atom = [np.where(aux_atom_ids == A)[0] for A in range(natm)]
+    qij_atom = [None] * natm
+    qia_atom = [None] * natm
+    qab_atom = [None] * natm
+    for A in range(natm):
+        Qs = aux_at_atom[A]
+        if len(Qs) == 0:
+            continue
+        nl = len(riatom_to_lmos_ext[A])
+        np_ = len(riatom_to_paos_ext[A])
+        if nl == 0 or np_ == 0:
+            continue
+        qij_atom[A] = np.stack([qij[Q] for Q in Qs])    # (nQA, nl, nl)
+        qia_atom[A] = np.stack([qia[Q] for Q in Qs])    # (nQA, nl, np)
+        qab_atom[A] = np.stack([qab[Q] for Q in Qs])    # (nQA, np, np)
+    # Map global Q → position within its atom's Q-stack
+    aux_pos_in_atom = -np.ones(naux, dtype=np.int64)
+    for A in range(natm):
+        for pos, Q in enumerate(aux_at_atom[A]):
+            aux_pos_in_atom[Q] = pos
 
-    # Auto-tune block size: aim for ~0.5 GB transient raw_block
-    if aux_block_size is None:
-        target_bytes = 512 * 1024 * 1024
-        bytes_per_shell = nao * nao * 8 * 5  # p shell ~5 funcs upper bound
-        aux_block_size = max(1, min(aux_nbas, target_bytes // max(bytes_per_shell, 1)))
-
-    # Initialize per-pair accumulators indexed by pair's aux_idx (small).
-    pair_data = {}
+    cc_ints = {}
     key_set = set(keys)
+
     for key in keys:
         if key not in pair_aux_idx:
+            cc_ints[key] = None
             continue
         i, j = key
-        C_pno = pno_spaces[key]['C_pno']
-        npno = C_pno.shape[1]
-        if npno == 0:
+        pd = pno_spaces[key]
+        X_pno_ij = pd.get('X_pno')
+        pair_paos_ij = pd.get('pair_paos')
+        if X_pno_ij is None or pair_paos_ij is None:
+            cc_ints[key] = None
             continue
-        aux_idx = pair_aux_idx[key]
+        npno = X_pno_ij.shape[1]
+        if npno == 0:
+            cc_ints[key] = None
+            continue
+
+        aux_idx = np.asarray(pair_aux_idx[key])
         n_local = len(aux_idx)
-        aux_inv = -np.ones(naux, dtype=np.int64)
-        aux_inv[aux_idx] = np.arange(n_local)  # global Q → local-pair Q position
-        # Cross-pair sets: kj and ki partners that are also keys
+        if n_local == 0:
+            cc_ints[key] = None
+            continue
+
+        # Cross-pair partner enumeration (skip CAS / empty PNO partners).
         kj_partners = []
         ki_partners = []
         for k in range(nocc):
             key_kj = (min(k, j), max(k, j))
-            if key_kj in key_set and key_kj in pno_spaces \
-                    and pno_spaces[key_kj]['C_pno'].shape[1] > 0:
-                kj_partners.append((k, key_kj, pno_spaces[key_kj]['C_pno'].shape[1]))
+            if key_kj in key_set and key_kj in pno_spaces:
+                Xp = pno_spaces[key_kj].get('X_pno')
+                if Xp is not None and Xp.shape[1] > 0:
+                    kj_partners.append((k, key_kj, Xp.shape[1]))
             key_ki = (min(k, i), max(k, i))
-            if key_ki in key_set and key_ki in pno_spaces \
-                    and pno_spaces[key_ki]['C_pno'].shape[1] > 0:
-                ki_partners.append((k, key_ki, pno_spaces[key_ki]['C_pno'].shape[1]))
-        pair_data[key] = {
-            'C_pno': C_pno, 'npno': npno, 'aux_idx': aux_idx,
-            'n_local': n_local, 'aux_inv': aux_inv,
-            # Raw (pre-fit) accumulators. Layout chosen to match tensordot
-            # output so block-updates use basic slicing (no strided copies).
-            #   raw_iv, raw_jv: (n_local, npno)
-            #   raw_ma:         (nocc, n_local, npno)
-            #   raw_ab:         (npno, n_local, npno)
-            'raw_iv': np.zeros((n_local, npno)),
-            'raw_jv': np.zeros((n_local, npno)),
-            'raw_ma': np.zeros((nocc, n_local, npno)),
-            'raw_ab': np.zeros((npno, n_local, npno)),
-            'raw_cross_kj': {k: np.zeros((npno, n_local, n_kj))
-                             for k, _, n_kj in kj_partners},
-            'raw_cross_ji': {k: np.zeros((npno, n_local, n_ki))
-                             for k, _, n_ki in ki_partners},
-            'raw_kv_kj': {k: np.zeros((n_local, n_kj))
-                          for k, _, n_kj in kj_partners},
-            'raw_kv_ki': {k: np.zeros((n_local, n_ki))
-                          for k, _, n_ki in ki_partners},
-            'kj_partners': kj_partners,
-            'ki_partners': ki_partners,
-        }
+            if key_ki in key_set and key_ki in pno_spaces:
+                Xp = pno_spaces[key_ki].get('X_pno')
+                if Xp is not None and Xp.shape[1] > 0:
+                    ki_partners.append((k, key_ki, Xp.shape[1]))
 
-    # raw_oo full (nocc, nocc, naux) — needs all aux for per-pair slicing
-    raw_oo = np.zeros((nocc, nocc, naux))
+        # Pre-fit accumulators
+        raw_iv = np.zeros((n_local, npno))
+        raw_jv = np.zeros((n_local, npno))
+        raw_io = np.zeros((n_local, nocc))
+        raw_jo = np.zeros((n_local, nocc))
+        raw_ma = np.zeros((n_local, nocc, npno))
+        raw_ab = np.zeros((n_local, npno, npno))
+        raw_pair = np.zeros(n_local)
+        raw_cross_kj = {k: np.zeros((n_local, npno, n_kj))
+                        for k, _, n_kj in kj_partners}
+        raw_kv_kj = {k: np.zeros((n_local, n_kj))
+                     for k, _, n_kj in kj_partners}
+        raw_cross_ji = {k: np.zeros((n_local, npno, n_ki))
+                        for k, _, n_ki in ki_partners}
+        raw_kv_ki = {k: np.zeros((n_local, n_ki))
+                     for k, _, n_ki in ki_partners}
 
-    # =============================================================
-    # Aux-blocked main loop
-    # =============================================================
-    for sh_start in range(0, aux_nbas, aux_block_size):
-        sh_end = min(sh_start + aux_block_size, aux_nbas)
-        Q0 = aux_ao_loc[sh_start]
-        Q1 = aux_ao_loc[sh_end]
+        pair_paos_ij = np.asarray(pair_paos_ij)
 
-        # (nao, nao, nQ) block
-        raw_block = pmol.intor(
-            'int3c2e',
-            shls_slice=(0, mol.nbas, 0, mol.nbas,
-                        mol.nbas + sh_start, mol.nbas + sh_end))
+        # Group pair-aux Q's by centerQ → batched per-(pair, centerQ) ops.
+        centers_of_aux = aux_atom_ids[aux_idx]
+        unique_centers = np.unique(centers_of_aux)
 
-        # raw_oo[k, l, Q∈block]
-        tmp_oo = np.tensordot(raw_block, C_lmo, axes=([1], [0]))  # (nao, nQ, nocc)
-        raw_oo[:, :, Q0:Q1] = np.tensordot(
-            C_lmo, tmp_oo, axes=([0], [0])).transpose(0, 2, 1)
-        del tmp_oo
+        # Per-partner (k, key) pre-cache of pair_paos_kj/ki & X_pno_kj/ki —
+        # so we don't do dict lookups inside the centerQ loop.
+        kj_data = []
+        for k, key_kj, n_kj in kj_partners:
+            X_kj = pno_spaces[key_kj]['X_pno']
+            pp_kj = np.asarray(pno_spaces[key_kj]['pair_paos'])
+            kj_data.append((k, X_kj, pp_kj, n_kj))
+        ki_data = []
+        for k, key_ki, n_ki in ki_partners:
+            X_ki = pno_spaces[key_ki]['X_pno']
+            pp_ki = np.asarray(pno_spaces[key_ki]['pair_paos'])
+            ki_data.append((k, X_ki, pp_ki, n_ki))
 
-        # Cache half-transformed tmp_pno per pair within this block.
-        # Populated lazily and shared between outer pair + cross-pair users.
-        tmp_pno_blocks = {}
-        Q_range = np.arange(Q0, Q1)
-
-        def _tmp_pno(key_):
-            if key_ not in tmp_pno_blocks:
-                tmp_pno_blocks[key_] = np.tensordot(
-                    raw_block, pno_spaces[key_]['C_pno'], axes=([1], [0]))
-            return tmp_pno_blocks[key_]
-
-        for key, pd in pair_data.items():
-            aux_inv = pd['aux_inv']
-            Q_to_local = aux_inv[Q_range]
-            mask = Q_to_local >= 0
-            if not mask.any():
-                # Still may need tmp_pno_blocks[key] for OTHER pairs' cross use
+        for centerQ in unique_centers:
+            ext_lmos = riatom_to_lmos_ext[centerQ]
+            if len(ext_lmos) == 0 or qij_atom[centerQ] is None:
                 continue
-            block_Q = np.where(mask)[0]
-            local_Q = Q_to_local[mask]
 
-            tmp = _tmp_pno(key)
-            tmp_sub = tmp[:, block_Q, :]
-            i, j = key
+            # Q's belonging to this centerQ that are in pair_aux:
+            mask_C = centers_of_aux == centerQ
+            local_Q = np.where(mask_C)[0]                   # positions in n_local
+            global_Q = aux_idx[local_Q]                     # global aux indices
+            atom_pos = aux_pos_in_atom[global_Q]            # positions in atom's stack
+            # Slice the per-atom stacks to just this pair's Q's
+            qij_b = qij_atom[centerQ][atom_pos]             # (nQp, nl, nl)
+            qia_b = qia_atom[centerQ][atom_pos]             # (nQp, nl, np)
+            qab_b = qab_atom[centerQ][atom_pos]             # (nQp, np, np)
 
-            pd['raw_iv'][local_Q] = np.tensordot(
-                C_lmo[:, i], tmp_sub, axes=([0], [0]))
-            pd['raw_jv'][local_Q] = np.tensordot(
-                C_lmo[:, j], tmp_sub, axes=([0], [0]))
-            # raw_ma[m, local_Q, a] = Σ_μ C_lmo[μ, m] * tmp_sub[μ, Q, a]
-            pd['raw_ma'][:, local_Q, :] = np.tensordot(
-                C_lmo, tmp_sub, axes=([0], [0]))
-            # raw_ab[a, local_Q, b] = Σ_μ C_pno[μ, a] * tmp_sub[μ, Q, b]
-            pd['raw_ab'][:, local_Q, :] = np.tensordot(
-                pd['C_pno'], tmp_sub, axes=([0], [0]))
+            # Pair (ij)'s PAOs that fall inside centerQ's PAO neighborhood
+            ij_pao_pos = riatom_to_paos_ext_dense[centerQ, pair_paos_ij]
+            ij_mask = ij_pao_pos >= 0
+            ij_u_in_pair = np.where(ij_mask)[0]
+            ij_u_in_Q = ij_pao_pos[ij_mask]
+            X_ij_slice = X_pno_ij[ij_u_in_pair]             # (|pair∩Q|, npno)
 
-            # Cross-pair
-            for k, key_kj, _ in pd['kj_partners']:
-                tmp_kj_sub = _tmp_pno(key_kj)[:, block_Q, :]
-                pd['raw_cross_kj'][k][:, local_Q, :] = np.tensordot(
-                    pd['C_pno'], tmp_kj_sub, axes=([0], [0]))
-                pd['raw_kv_kj'][k][local_Q] = np.tensordot(
-                    C_lmo[:, k], tmp_kj_sub, axes=([0], [0]))
-            for k, key_ki, _ in pd['ki_partners']:
-                tmp_ki_sub = _tmp_pno(key_ki)[:, block_Q, :]
-                pd['raw_cross_ji'][k][:, local_Q, :] = np.tensordot(
-                    pd['C_pno'], tmp_ki_sub, axes=([0], [0]))
-                pd['raw_kv_ki'][k][local_Q] = np.tensordot(
-                    C_lmo[:, k], tmp_ki_sub, axes=([0], [0]))
+            i_s = riatom_to_lmos_ext_dense[centerQ, i]
+            j_s = riatom_to_lmos_ext_dense[centerQ, j]
 
-        del tmp_pno_blocks, raw_block
+            # raw_io[local_Q, ext_lmos] = qij_b[:, i_s, :]   (batched)
+            if i_s >= 0:
+                raw_io[np.ix_(local_Q, ext_lmos)] = qij_b[:, i_s, :]
+            if j_s >= 0:
+                raw_jo[np.ix_(local_Q, ext_lmos)] = qij_b[:, j_s, :]
+            if i_s >= 0 and j_s >= 0:
+                raw_pair[local_Q] = qij_b[:, i_s, j_s]
 
-    # =============================================================
-    # Apply local J^{-1/2} per pair and build final outputs
-    # =============================================================
-    cc_ints = {}
-    for key in keys:
-        i, j = key
-        if key not in pair_data:
-            cc_ints[key] = None
-            continue
-        pd = pair_data[key]
-        npno = pd['npno']
-        aux_idx = pd['aux_idx']
-        n_local = pd['n_local']
-        C_pno = pd['C_pno']
+            if len(ij_u_in_Q) > 0:
+                # qia restricted to pair's PAOs:
+                qia_b_pp = qia_b[:, :, ij_u_in_Q]            # (nQp, nl, npp)
+                if i_s >= 0:
+                    raw_iv[local_Q] = qia_b_pp[:, i_s, :] @ X_ij_slice
+                if j_s >= 0:
+                    raw_jv[local_Q] = qia_b_pp[:, j_s, :] @ X_ij_slice
 
-        # Local J^{-1/2}
+                # raw_ma: reshape+gemm gives one big BLAS call instead of nQp
+                # small ones — much better amortization.
+                nQp = len(local_Q)
+                ma_b = (qia_b_pp.reshape(nQp * len(ext_lmos), -1) @ X_ij_slice
+                        ).reshape(nQp, len(ext_lmos), npno)
+                raw_ma[np.ix_(local_Q, ext_lmos)] = ma_b
+
+                # raw_ab: X^T qab_b_pp X — one big reshape+gemm for tmp,
+                # then batched gemm over Q for the second contraction.
+                qab_b_pp = qab_b[:, ij_u_in_Q[:, None], ij_u_in_Q[None, :]]
+                tmp = (qab_b_pp.reshape(nQp * len(ij_u_in_Q), -1)
+                       @ X_ij_slice).reshape(nQp, len(ij_u_in_Q), npno)
+                raw_ab[local_Q] = np.matmul(X_ij_slice.T, tmp)
+
+            # Cross-pair partners
+            for k, X_kj, pp_kj, n_kj in kj_data:
+                k_s = riatom_to_lmos_ext_dense[centerQ, k]
+                kj_pao_pos = riatom_to_paos_ext_dense[centerQ, pp_kj]
+                kj_mask = kj_pao_pos >= 0
+                kj_u_in_pair = np.where(kj_mask)[0]
+                kj_u_in_Q = kj_pao_pos[kj_mask]
+                if len(kj_u_in_Q) == 0:
+                    continue
+                X_kj_slice = X_kj[kj_u_in_pair]              # (|kj∩Q|, n_kj)
+                if k_s >= 0:
+                    raw_kv_kj[k][local_Q] = (qia_b[:, k_s, kj_u_in_Q]
+                                             @ X_kj_slice)
+                if len(ij_u_in_Q) > 0:
+                    nQp = len(local_Q)
+                    qab_pq_b = qab_b[:, ij_u_in_Q[:, None],
+                                     kj_u_in_Q[None, :]]      # (nQp, npp_ij, npp_kj)
+                    tmp = (qab_pq_b.reshape(nQp * len(ij_u_in_Q), -1)
+                           @ X_kj_slice).reshape(nQp, len(ij_u_in_Q), n_kj)
+                    raw_cross_kj[k][local_Q] = np.matmul(X_ij_slice.T, tmp)
+
+            for k, X_ki, pp_ki, n_ki in ki_data:
+                k_s = riatom_to_lmos_ext_dense[centerQ, k]
+                ki_pao_pos = riatom_to_paos_ext_dense[centerQ, pp_ki]
+                ki_mask = ki_pao_pos >= 0
+                ki_u_in_pair = np.where(ki_mask)[0]
+                ki_u_in_Q = ki_pao_pos[ki_mask]
+                if len(ki_u_in_Q) == 0:
+                    continue
+                X_ki_slice = X_ki[ki_u_in_pair]
+                if k_s >= 0:
+                    raw_kv_ki[k][local_Q] = (qia_b[:, k_s, ki_u_in_Q]
+                                             @ X_ki_slice)
+                if len(ij_u_in_Q) > 0:
+                    nQp = len(local_Q)
+                    qab_pq_b = qab_b[:, ij_u_in_Q[:, None],
+                                     ki_u_in_Q[None, :]]
+                    tmp = (qab_pq_b.reshape(nQp * len(ij_u_in_Q), -1)
+                           @ X_ki_slice).reshape(nQp, len(ij_u_in_Q), n_ki)
+                    raw_cross_ji[k][local_Q] = np.matmul(X_ij_slice.T, tmp)
+
+        # Apply local J^{-1/2}
         j2c_local = j2c[np.ix_(aux_idx, aux_idx)]
         eigvals, eigvecs = np.linalg.eigh(j2c_local)
         keep = eigvals > 1e-14
-        jhi = (eigvecs[:, keep] * (1.0 / np.sqrt(eigvals[keep]))) @ eigvecs[:, keep].T
+        jhi = (eigvecs[:, keep] * (1.0 / np.sqrt(eigvals[keep]))) \
+            @ eigvecs[:, keep].T
 
-        # Fitted 3-index quantities
-        q_iv = jhi @ pd['raw_iv']                    # (n_local, npno)
-        q_jv = jhi @ pd['raw_jv']
-        q_io = jhi @ raw_oo[:, i, :][:, aux_idx].T   # (n_local, nocc)
-        q_jo = jhi @ raw_oo[:, j, :][:, aux_idx].T
-        q_pair = jhi @ raw_oo[i, j, aux_idx]         # (n_local,)
+        q_iv = jhi @ raw_iv
+        q_jv = jhi @ raw_jv
+        q_io = jhi @ raw_io
+        q_jo = jhi @ raw_jo
+        q_pair = jhi @ raw_pair
+        # Use BLAS gemm via reshape (einsum 'LK,Kma->Lma' is much slower).
+        Qma = (jhi @ raw_ma.reshape(n_local, -1)).reshape(n_local, nocc, npno)
+        Qab = (jhi @ raw_ab.reshape(n_local, -1)).reshape(n_local, npno, npno)
 
-        Qma = np.zeros((n_local, nocc, npno))
-        raw_ma = pd['raw_ma']          # (nocc, n_local, npno)
-        for m in range(nocc):
-            Qma[:, m, :] = jhi @ raw_ma[m]
-        Qab = np.zeros((n_local, npno, npno))
-        raw_ab = pd['raw_ab']          # (npno, n_local, npno)
-        for a in range(npno):
-            Qab[:, a, :] = jhi @ raw_ab[a]
-
-        # 2-index intermediates
         K_iajb = q_iv.T @ q_jv
         K_mnij = q_io.T @ q_jo
         K_bar_ij = q_io.T @ q_jv
@@ -593,29 +706,24 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
         K_bar_chem = np.tensordot(q_pair, Qma, axes=(0, 0))
         J_ijab = np.tensordot(q_pair, Qab, axes=(0, 0))
 
-        # Cross-pair J/K integrals
         J_ij_kj = {}
         K_ij_kj_dict = {}
-        for k, key_kj, n_kj in pd['kj_partners']:
-            cross_fitted = np.zeros((n_local, npno, n_kj))
-            rc = pd['raw_cross_kj'][k]  # (npno, n_local, n_kj)
-            for a in range(npno):
-                cross_fitted[:, a, :] = jhi @ rc[a]
-            q_ik = jhi @ raw_oo[i, k, aux_idx]
+        for k, key_kj, _ in kj_partners:
+            cross_fitted = (jhi @ raw_cross_kj[k].reshape(n_local, -1)
+                            ).reshape(n_local, npno, raw_cross_kj[k].shape[2])
+            q_ik = q_io[:, k]
             J_ij_kj[(key, k)] = np.tensordot(q_ik, cross_fitted, axes=(0, 0))
-            q_kv_kj = jhi @ pd['raw_kv_kj'][k]
+            q_kv_kj = jhi @ raw_kv_kj[k]
             K_ij_kj_dict[(key, k)] = q_iv.T @ q_kv_kj
 
         J_ji_ki = {}
         K_ji_ki_dict = {}
-        for k, key_ki, n_ki in pd['ki_partners']:
-            cross_fitted = np.zeros((n_local, npno, n_ki))
-            rc = pd['raw_cross_ji'][k]  # (npno, n_local, n_ki)
-            for a in range(npno):
-                cross_fitted[:, a, :] = jhi @ rc[a]
-            q_jk = jhi @ raw_oo[j, k, aux_idx]
+        for k, key_ki, _ in ki_partners:
+            cross_fitted = (jhi @ raw_cross_ji[k].reshape(n_local, -1)
+                            ).reshape(n_local, npno, raw_cross_ji[k].shape[2])
+            q_jk = q_jo[:, k]
             J_ji_ki[(key, k)] = np.tensordot(q_jk, cross_fitted, axes=(0, 0))
-            q_kv_ki = jhi @ pd['raw_kv_ki'][k]
+            q_kv_ki = jhi @ raw_kv_ki[k]
             K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki
 
         cc_ints[key] = {
@@ -629,13 +737,12 @@ def compute_cc_integrals(mol, auxmol, C_lmo, pno_spaces, pair_aux_idx,
             'K_ij_kj': K_ij_kj_dict,
             'J_ji_ki': J_ji_ki,
             'K_ji_ki': K_ji_ki_dict,
-            # 3-index (stored for T1 dressing and Term A)
-            'i_Qa': q_iv.copy(),     # (n_local, npno) — Psi4 convention
-            'j_Qa': q_jv.copy(),     # (n_local, npno)
-            'i_Qk': q_io.copy(),     # (n_local, nocc)
+            'i_Qa': q_iv.copy(),
+            'j_Qa': q_jv.copy(),
+            'i_Qk': q_io.copy(),
             'j_Qk': q_jo.copy(),
-            'Qma': Qma,              # (n_local, nocc, npno)
-            'Qab': Qab,              # (n_local, npno, npno)
+            'Qma': Qma,
+            'Qab': Qab,
             'n_local': n_local,
             'aux_idx': aux_idx,
         }
