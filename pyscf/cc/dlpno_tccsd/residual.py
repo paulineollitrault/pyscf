@@ -85,7 +85,7 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
 def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                   ovL_bare, ooL_bare, S_pno_cache, with_df,
                   _term2_precomputed=None, cc_ints=None,
-                  pair_lmo_idx=None):
+                  pair_lmo_idx=None, _pool=None):
     """Build D_tilde (delta, Eq 84) for all ordered (i,k) pairs.
 
     delta_{ik}^{ac} = Terms 1-4 of Eq 84, using M/L integrals.
@@ -144,11 +144,12 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             _term2_precomputed = {ik: td['result'] for ik, td in term2_data.items()}
 
     # --- Build D_tilde for each (i,k) pair ---
-    for i_idx, k_idx in all_pairs:
+    def _process_ik(ik_tuple):
+        i_idx, k_idx = ik_tuple
         key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
         n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
         if n_ik == 0:
-            continue
+            return ik_tuple, None
 
         D_tilde_ik = np.zeros((n_ik, n_ik))
 
@@ -299,8 +300,17 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             D_temp = S_ik_il @ u_il @ S_il_lk @ L_lk @ S_lk_ik
             D_tilde_ik += 0.5 * D_temp  # Term 4: Jiang Eq 84
 
-        D_tilde_all[(i_idx, k_idx)] = D_tilde_ik
+        return ik_tuple, D_tilde_ik
 
+    if _pool is not None:
+        for ik, val in _pool.map(_process_ik, list(all_pairs)):
+            if val is not None:
+                D_tilde_all[ik] = val
+    else:
+        for ik in all_pairs:
+            _, val = _process_ik(ik)
+            if val is not None:
+                D_tilde_all[ik] = val
     return D_tilde_all
 
 
@@ -373,7 +383,7 @@ def build_mixed_domain_integrals(t2_pno_all, pno_spaces, nocc,
 def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                     ovL_pno_bare, ooL_bare, S_pno_cache, with_df,
                     _term2_precomputed=None, cc_ints=None,
-                    pair_lmo_idx=None):
+                    pair_lmo_idx=None, _pool=None):
     """Compute C_tilde (gamma intermediate, Eq 83) for all pairs.
 
     C_tilde[ki][a_ki, c_ki] = gamma_{ki}^{ac} =
@@ -431,11 +441,12 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                 aux_off += nL
         _term2_precomputed = {ki: td['result'] for ki, td in term2_data.items()}
 
-    for k, i in all_pairs:
+    def _process_ki(ki_tuple):
+        k, i = ki_tuple
         key_ki = (min(k, i), max(k, i))  # storage key
         n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
         if n_ki == 0:
-            continue
+            return ki_tuple, None
 
         C_tilde_ki = np.zeros((n_ki, n_ki))
         _dump_terms = ((k, i) == (10, 10)
@@ -593,8 +604,17 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                       f"rms={_trms:.6e} ev_top={_t0:.6e} ev_bot={_tl:.6e}",
                       flush=True)
 
-        C_tilde_all[(k, i)] = C_tilde_ki  # store with ORDERED (k,i) key
+        return ki_tuple, C_tilde_ki  # store with ORDERED (k,i) key
 
+    if _pool is not None:
+        for ki, val in _pool.map(_process_ki, list(all_pairs)):
+            if val is not None:
+                C_tilde_all[ki] = val
+    else:
+        for ki in all_pairs:
+            _, val = _process_ki(ki)
+            if val is not None:
+                C_tilde_all[ki] = val
     return C_tilde_all
 
 
@@ -605,7 +625,8 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
 
 
 def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
-                                nocc, cc_ints, S_pno_cache, pair_keys):
+                                nocc, cc_ints, S_pno_cache, pair_keys,
+                                _pool=None):
     """Per-pair, local-aux-per-pair version of compute_all_df_terms.
 
     Drop-in replacement that reads from ``cc_ints[pk]['Qab' / 'Qma']``
@@ -640,110 +661,114 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
     ladder_all = {}
 
     # ============================================================
-    # Per-pair: fvv_t1 + ladder + project T1 once per pair
+    # Per-pair: fvv_t1 + ladder. Pure function — safe to parallelize.
     # ============================================================
-    T1_all_cache = {}    # pk -> T1_all (nocc, n) projected to pk's PNO basis
-
-    def _T1_proj(pk):
-        T = T1_all_cache.get(pk)
-        if T is None:
-            n = pno_spaces[pk]['C_pno'].shape[1]
-            T = np.zeros((nocc, n))
-            for kk in range(nocc):
-                T[kk] = _project_t1_to_pair(
-                    t1_pno, kk, pk, S_pno_cache, pno_spaces)
-            T1_all_cache[pk] = T
-        return T
-
-    for pk in pair_keys:
+    def _fvv_ladder(pk):
         n = pno_spaces[pk]['C_pno'].shape[1]
         if n == 0:
-            fvv_t1_all[pk] = np.zeros((n, n))
-            ladder_all[pk] = np.zeros((n, n))
-            continue
+            return pk, np.zeros((n, n)), np.zeros((n, n))
         ci = cc_ints.get(pk)
         if ci is None:
-            fvv_t1_all[pk] = np.zeros((n, n))
-            ladder_all[pk] = np.zeros((n, n))
-            continue
+            return pk, np.zeros((n, n)), np.zeros((n, n))
 
         Qab = ci['Qab']         # (n_local, n, n)
         Qma = ci['Qma']         # (n_local, nocc, n)
-        n_local = Qab.shape[0]
         i, j = pk
-        T1_all = _T1_proj(pk)
+        T1_all = np.zeros((nocc, n))
+        for kk in range(nocc):
+            T1_all[kk] = _project_t1_to_pair(
+                t1_pno, kk, pk, S_pno_cache, pno_spaces)
 
-        # ---- fvv_t1[pk] ----
-        # Term A: 2 * Σ_L z[L] * Qab[L, a, b]
-        #   where z[L] = Σ_k Σ_a T1_all[k, a] * Qma[L, k, a]
+        # fvv_t1
         z = np.einsum('Lka,ka->L', Qma, T1_all, optimize=True)
         fvv = 2.0 * np.einsum('L,Lab->ab', z, Qab, optimize=True)
-
-        # Term B: -Σ_k,L Σ_b' Qab[L, a, b'] * T1_all[k, b'] * Qma[L, k, b]
-        # Vectorized: tmp[L, k, a] = Σ_b' Qab[L, a, b'] * T1_all[k, b']
-        # = einsum('Lab,kb->Lka', Qab, T1_all)  (one batched gemm)
-        # Then fvv -= einsum('Lka,Lkb->ab', tmp, Qma)
         tmp = np.einsum('Lab,kb->Lka', Qab, T1_all, optimize=True)
         fvv -= np.einsum('Lka,Lkb->ab', tmp, Qma, optimize=True)
-        fvv_t1_all[pk] = fvv
 
-        # ---- ladder[pk] ----
+        # ladder
         tau = t2_pno_all[pk] + np.outer(T1_all[i], T1_all[j])
-        # corr[L, a, b] = Σ_k T1_all[k, a] * Qma[L, k, b]
         corr = np.einsum('ka,Lkb->Lab', T1_all, Qma, optimize=True)
         B_tilde = Qab - corr
-        X_L = np.matmul(B_tilde, tau)              # batched (n_local, n, n)
-        # ladder[a, c] = Σ_{L, b} X_L[L, a, b] * B_tilde[L, c, b]
-        # = (X_L.transpose(1,0,2).reshape(n, -1)) @ (B_tilde.transpose(1,0,2).reshape(n, -1)).T
-        ladder_all[pk] = (X_L.transpose(1, 0, 2).reshape(n, -1) @
-                          B_tilde.transpose(1, 0, 2).reshape(n, -1).T)
+        X_L = np.matmul(B_tilde, tau)
+        ladder = (X_L.transpose(1, 0, 2).reshape(n, -1) @
+                  B_tilde.transpose(1, 0, 2).reshape(n, -1).T)
+        return pk, fvv, ladder
+
+    if _pool is not None:
+        for pk, fvv, ladder in _pool.map(_fvv_ladder, pair_keys):
+            fvv_t1_all[pk] = fvv
+            ladder_all[pk] = ladder
+    else:
+        for pk in pair_keys:
+            pk_out, fvv, ladder = _fvv_ladder(pk)
+            fvv_t1_all[pk_out] = fvv
+            ladder_all[pk_out] = ladder
 
     # ============================================================
-    # C_tilde Term 2: per (k, i) ordered pair
+    # C_tilde Term 2: per (k, i) ordered pair (parallelizable)
     # ============================================================
-    for k, i in all_ordered:
+    def _c_term2(ki_tuple):
+        k, i = ki_tuple
         key_ki = (min(k, i), max(k, i))
         n = pno_spaces[key_ki]['C_pno'].shape[1]
         if n == 0:
-            continue
+            return ki_tuple, None
         ci = cc_ints.get(key_ki)
         if ci is None:
-            continue
+            return ki_tuple, None
         t1_i = _project_t1_to_pair(t1_pno, i, key_ki, S_pno_cache, pno_spaces)
         if np.max(np.abs(t1_i)) < 1e-15:
-            continue
+            return ki_tuple, None
         Qma = ci['Qma']
         Qab = ci['Qab']
-        # z_i[L] = Σ_a t1_i[a] * Qma[L, i, a]
-        z_i = Qma[:, i, :] @ t1_i        # (n_local,)
-        # result[a, b] = Σ_L z_i[L] * Qab[L, a, b]
-        c_term2_all[(k, i)] = np.einsum('L,Lab->ab', z_i, Qab, optimize=True)
+        z_i = Qma[:, i, :] @ t1_i
+        return ki_tuple, np.einsum('L,Lab->ab', z_i, Qab, optimize=True)
+
+    ordered_list = list(all_ordered)
+    if _pool is not None:
+        for ki, val in _pool.map(_c_term2, ordered_list):
+            if val is not None:
+                c_term2_all[ki] = val
+    else:
+        for ki in ordered_list:
+            _, val = _c_term2(ki)
+            if val is not None:
+                c_term2_all[ki] = val
 
     # ============================================================
-    # D_tilde Term 2: per (i, k) ordered pair
+    # D_tilde Term 2: per (i, k) ordered pair (parallelizable)
     # ============================================================
-    for i_idx, k_idx in all_ordered:
+    def _d_term2(ik_tuple):
+        i_idx, k_idx = ik_tuple
         key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
         n = pno_spaces[key_ik]['C_pno'].shape[1]
         if n == 0:
-            continue
+            return ik_tuple, None
         ci = cc_ints.get(key_ik)
         if ci is None:
-            continue
+            return ik_tuple, None
         t1_i = _project_t1_to_pair(
             t1_pno, i_idx, key_ik, S_pno_cache, pno_spaces)
         if np.max(np.abs(t1_i)) < 1e-15:
-            continue
+            return ik_tuple, None
         Qma = ci['Qma']
         Qab = ci['Qab']
-        ovL_k = Qma[:, k_idx, :].T       # (n, n_local)
-        # z_c[L, a] = Σ_b Qab[L, a, b] * t1_i[b]  → batched matvec
-        z_c = Qab @ t1_i                  # (n_local, n)
-        # y[L] = Σ_a t1_i[a] * Qma[L, k, a]
-        y = Qma[:, k_idx, :] @ t1_i       # (n_local,)
-        result = 2.0 * (ovL_k @ z_c)      # (n, n)
+        ovL_k = Qma[:, k_idx, :].T
+        z_c = Qab @ t1_i
+        y = Qma[:, k_idx, :] @ t1_i
+        result = 2.0 * (ovL_k @ z_c)
         result -= np.einsum('L,Lab->ab', y, Qab, optimize=True)
-        d_term2_all[(i_idx, k_idx)] = result
+        return ik_tuple, result
+
+    if _pool is not None:
+        for ik, val in _pool.map(_d_term2, ordered_list):
+            if val is not None:
+                d_term2_all[ik] = val
+    else:
+        for ik in ordered_list:
+            _, val = _d_term2(ik)
+            if val is not None:
+                d_term2_all[ik] = val
 
     # Pad missing pair_keys with zeros (matching old API)
     for pk in pair_keys:

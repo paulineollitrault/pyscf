@@ -417,7 +417,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                                 pair_aux_idx, j2c, keys, nocc, s1e=None,
                                 pao_domains=None, strong_pair_keys=None,
                                 T_CUT_MKN=1e-3, T_CUT_CLMO=1e-3,
-                                screening_maps=None, sparse_arrays=None):
+                                screening_maps=None, sparse_arrays=None,
+                                _pool=None):
     """Per-pair fitted intermediates via sparse per-aux-Q sparse storage.
 
     Drop-in replacement for ``compute_cc_integrals`` that uses Psi4-style
@@ -514,27 +515,24 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     cc_ints = {}
     key_set = set(keys)
 
-    for key in keys:
+    def _process_pair(key):
+        """Build cc_ints[key] entry. Pure function — safe for thread parallel."""
         if key not in pair_aux_idx:
-            cc_ints[key] = None
-            continue
+            return key, None
         i, j = key
         pd = pno_spaces[key]
         X_pno_ij = pd.get('X_pno')
         pair_paos_ij = pd.get('pair_paos')
         if X_pno_ij is None or pair_paos_ij is None:
-            cc_ints[key] = None
-            continue
+            return key, None
         npno = X_pno_ij.shape[1]
         if npno == 0:
-            cc_ints[key] = None
-            continue
+            return key, None
 
         aux_idx = np.asarray(pair_aux_idx[key])
         n_local = len(aux_idx)
         if n_local == 0:
-            cc_ints[key] = None
-            continue
+            return key, None
 
         # Cross-pair partner enumeration (skip CAS / empty PNO partners).
         kj_partners = []
@@ -736,7 +734,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             q_kv_ki = jhi @ raw_kv_ki[k]
             K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki
 
-        cc_ints[key] = {
+        return key, {
             'K_iajb': K_iajb,
             'K_mnij': K_mnij,
             'K_bar_ij': K_bar_ij,
@@ -756,6 +754,18 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             'n_local': n_local,
             'aux_idx': aux_idx,
         }
+
+    # Dispatch: parallel via _pool if provided, else serial. Each pair's
+    # work is read-only on shared inputs (pno_spaces, pair_aux_idx, sparse
+    # arrays) and writes only to its own local arrays before returning the
+    # cc_ints entry — thread-safe.
+    if _pool is not None:
+        for k, entry in _pool.map(_process_pair, keys):
+            cc_ints[k] = entry
+    else:
+        for key in keys:
+            k, entry = _process_pair(key)
+            cc_ints[k] = entry
 
     return cc_ints
 
@@ -822,7 +832,7 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc):
 
 
 def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
-            S_pno_cache, F_lmo, eps_lmo, foo_t2, keys, nocc):
+            S_pno_cache, F_lmo, eps_lmo, foo_t2, keys, nocc, _pool=None):
     """Build dressed Fock matrices matching Psi4 t1_fock().
 
     Returns:
@@ -832,72 +842,57 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
     """
     from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
 
-    # Step 1: Fkj dressing from per-pair K_bar_chem and K_bar
-    Fkj = F_lmo.copy()
-    for key in keys:
+    # Combined per-pair work (Step 1 Fkj contribution + Step 2 Fab) so we
+    # only project T1 once per pair.
+    def _per_pair(key):
         ci = cc_ints.get(key)
         if ci is None:
-            continue
+            return key, None
         i, j = key
         npno = pno_spaces[key]['C_pno'].shape[1]
-
         T1_all = np.zeros((nocc, npno))
         for k in range(nocc):
             T1_all[k] = _project_t1_to_pair(
                 t1_pno, k, key, S_pno_cache, pno_spaces)
 
-        # Psi4 line 1546-1547:
-        # Fkj(i,j) += 2 * T_n · K_bar_chem - T_n · K_bar_ji
-        Fkj[i, j] += 2.0 * np.sum(T1_all * ci['K_bar_chem']) \
-                    - np.sum(T1_all * ci['K_bar_ji'])
+        # Step 1 Fkj contributions (returned as deltas to apply after merge).
+        d_ij = (2.0 * np.sum(T1_all * ci['K_bar_chem'])
+                - np.sum(T1_all * ci['K_bar_ji']))
+        d_ji = None
         if i != j:
-            Fkj[j, i] += 2.0 * np.sum(T1_all * ci['K_bar_chem']) \
-                        - np.sum(T1_all * ci['K_bar_ij'])
+            d_ji = (2.0 * np.sum(T1_all * ci['K_bar_chem'])
+                    - np.sum(T1_all * ci['K_bar_ij']))
 
-    # Step 2: Fab per pair from Qma, Qab
-    Fab_all = {}
-    for key in keys:
-        ci = cc_ints.get(key)
-        if ci is None:
-            continue
-        i, j = key
-        npno = pno_spaces[key]['C_pno'].shape[1]
-        n_local = ci['n_local']
+        # Step 2 Fab
         Qma = ci['Qma']
         Qab = ci['Qab']
-
-        T1_all = np.zeros((nocc, npno))
-        for k in range(nocc):
-            T1_all[k] = _project_t1_to_pair(
-                t1_pno, k, key, S_pno_cache, pno_spaces)
-
-        # Fab = diag(e_pno) + J/K dressing from Qma/Qab
         e_pno = pno_spaces[key]['e_pno']
         Fab = np.diag(e_pno)
-
-        # gamma[Q] = Σ_{m,a} T1_all[m,a] * Qma[Q,m,a]
-        gamma = Qma.reshape(Qma.shape[0], -1) @ T1_all.ravel()  # (n_local,)
-
-        # J contribution: 2 * Σ_Q gamma[Q] * Qab[Q,a,b]
+        gamma = Qma.reshape(Qma.shape[0], -1) @ T1_all.ravel()
         Fab += 2.0 * np.tensordot(gamma, Qab, axes=(0, 0))
-
-        # K contribution: -Σ_Q (Qab[Q] @ T1_all^T) @ Qma[Q]
-        # Y[Q,a,n] = Σ_b Qab[Q,a,b] * T1_all[n,b]
-        Y = Qab @ T1_all.T  # (n_local, npno, nocc)
-        # Fab[a,c] -= Σ_{Q,n} Y[Q,a,n] * Qma[Q,n,c]
+        Y = Qab @ T1_all.T
         Fab -= np.tensordot(Y, Qma, axes=((0, 2), (0, 1)))
 
-        # Psi4 ccsd.cc line 1639-1640:
-        #   Fab_[ij] = Fab_bar[ij] - T_n.T @ Fia_bar[ij]
-        # Fia_bar[k,a] = 2*gamma*Qma[k,a] - Qma@T_n.T@Qma  (lines 1602-1628)
         Fia_bar = 2.0 * np.tensordot(gamma, Qma, axes=(0, 0))
-        # Z[Q,n,k] = Σ_b T1_all[n,b] * Qma[Q,k,b]
-        Z = T1_all @ Qma.transpose(0, 2, 1)  # (n_local, nocc, nocc→k)
-        # Fia_bar[k,a] -= Σ_{Q,n} Qma[Q,n,a] * Z[Q,n,k]
+        Z = T1_all @ Qma.transpose(0, 2, 1)
         Fia_bar -= np.tensordot(Z, Qma, axes=((0, 1), (0, 1)))
-
         Fab -= T1_all.T @ Fia_bar
+        return key, (d_ij, d_ji, Fab)
 
+    Fkj = F_lmo.copy()
+    Fab_all = {}
+    if _pool is not None:
+        results = list(_pool.map(_per_pair, keys))
+    else:
+        results = [_per_pair(k) for k in keys]
+    for key, payload in results:
+        if payload is None:
+            continue
+        d_ij, d_ji, Fab = payload
+        i, j = key
+        Fkj[i, j] += d_ij
+        if d_ji is not None:
+            Fkj[j, i] += d_ji
         Fab_all[key] = Fab
 
     # Eq 94: Fkj += Σ_a Fia_bar_jj · t1_j

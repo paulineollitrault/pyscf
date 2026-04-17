@@ -305,7 +305,8 @@ def _compute_ladder(t2_ij, C_pno_ij, with_df):
     return ladder
 
 
-def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints):
+def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
+                               _pool=None):
     """Per-pair local-aux T2-dressed Fock occ-occ from cc_ints['Qma'].
 
     Equivalent to _compute_foo_dressed but skips ovL_pno_cache / with_df
@@ -314,30 +315,40 @@ def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints):
     pair's local aux. The contraction is identical in structure to the
     legacy version, just summed over local-aux instead of full naux.
     """
-    foo = np.zeros((nocc_lmo, nocc_lmo))
-    for key_mq, t2_mq_raw in t2_pno_all.items():
+    def _per_pair(key_mq):
+        t2_mq_raw = t2_pno_all.get(key_mq)
         if t2_mq_raw is None or t2_mq_raw.shape[0] == 0:
-            continue
+            return key_mq, None
         ci = cc_ints.get(key_mq)
         if ci is None:
-            continue
+            return key_mq, None
         m, q = key_mq
-        Qma = ci['Qma']                  # (n_local, nocc, n_pno)
-        ovL_m = Qma[:, m, :].T           # (n_pno, n_local)
-        # theta[m,q,a,b] = 2*t2[q,m,a,b] - t2[m,q,a,b]
+        Qma = ci['Qma']
+        ovL_m = Qma[:, m, :].T
         theta_mq = 2.0 * t2_mq_raw.T - t2_mq_raw
-        X_mq = theta_mq @ ovL_m          # (n_pno, n_local)
-        # foo[p, q] += Σ_{a, L} (Qma[:,p,:].T)[a,L] * X_mq[a,L]
-        # = Σ_p Σ_{a,L} Qma[L,p,a] * X_mq[a,L]
-        # = einsum('Lpa,aL->p') equivalently np.einsum('Lpa,aL->p', Qma, X_mq)
+        X_mq = theta_mq @ ovL_m
         contrib_q = np.einsum('Lpa,aL->p', Qma, X_mq, optimize=True)
-        foo[:, q] += contrib_q
-
+        contrib_m = None
         if m != q:
             theta_qm = 2.0 * t2_mq_raw - t2_mq_raw.T
             ovL_q = Qma[:, q, :].T
             X_qm = theta_qm @ ovL_q
             contrib_m = np.einsum('Lpa,aL->p', Qma, X_qm, optimize=True)
+        return key_mq, (contrib_q, contrib_m)
+
+    foo = np.zeros((nocc_lmo, nocc_lmo))
+    pair_list = list(t2_pno_all.keys())
+    if _pool is not None:
+        results = list(_pool.map(_per_pair, pair_list))
+    else:
+        results = [_per_pair(k) for k in pair_list]
+    for key_mq, payload in results:
+        if payload is None:
+            continue
+        m, q = key_mq
+        contrib_q, contrib_m = payload
+        foo[:, q] += contrib_q
+        if contrib_m is not None:
             foo[:, m] += contrib_m
     return foo
 
@@ -1290,7 +1301,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         mf.mol, _auxmol, C_lmo, C_pao, pno_spaces, pair_aux_idx,
         _j2c, _all_keys_cc, nocc, s1e=s1e,
         pao_domains=_pao_domains, strong_pair_keys=_all_keys_cc,
-        T_CUT_MKN=_t_mkn, T_CUT_CLMO=_t_clmo)
+        T_CUT_MKN=_t_mkn, T_CUT_CLMO=_t_clmo,
+        _pool=_pool)
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
     # Rebuild K_pno_cache from locally-fitted K_iajb
@@ -1415,13 +1427,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _time.perf_counter()
                 _t_foo = _time.perf_counter()
                 foo_total = _compute_foo_dressed_local(
-                    t2_pno_all, pno_spaces, nocc, _cc_ints)
+                    t2_pno_all, pno_spaces, nocc, _cc_ints, _pool=_pool)
                 foo_bare = foo_total
                 _t_foo_done = _time.perf_counter()
             else:
                 _t_ovl = _t_kcoul = _t_foo = _time.perf_counter()
                 foo_total = _compute_foo_dressed_local(
-                    t2_pno_all, pno_spaces, nocc, _cc_ints)
+                    t2_pno_all, pno_spaces, nocc, _cc_ints, _pool=_pool)
                 foo_bare = foo_total
                 _t_ovl_done = _t_kcoul_done = _t_foo_done = _time.perf_counter()
 
@@ -1454,7 +1466,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _fvv_t1_pre, _c_t2_pre, _d_t2_pre, _jiang_ladder_all = \
                 compute_all_df_terms_local(
                     t1_pno, fov_pno, t2_pno_all, pno_spaces, nocc,
-                    _cc_ints, S_pno_cache, keys_sorted)
+                    _cc_ints, S_pno_cache, keys_sorted, _pool=_pool)
             _tj_df = _time.perf_counter() - _tj0
 
             # C_tilde / D_tilde (Eqs 83-84, with precomputed Term 2)
@@ -1465,7 +1477,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                 _term2_precomputed=_c_t2_pre,
                 cc_ints=_cc_ints,
-                pair_lmo_idx=pair_lmo_idx)
+                pair_lmo_idx=pair_lmo_idx, _pool=_pool)
             _tj_C = _time.perf_counter() - _tj0
             _tj0 = _time.perf_counter()
             _jiang_D = build_D_tilde(
@@ -1473,7 +1485,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                 _term2_precomputed=_d_t2_pre,
                 cc_ints=_cc_ints,
-                pair_lmo_idx=pair_lmo_idx)
+                pair_lmo_idx=pair_lmo_idx, _pool=_pool)
             _tj_D = _time.perf_counter() - _tj0
 
             # Fkj / G_tilde — t1_fock (vectorized cc_ints) computes
@@ -1499,7 +1511,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
                 _cc_ints, None, t1_pno, fov_pno, pno_spaces,
                 S_pno_cache, F_lmo, eps_lmo, foo_total,
-                _all_keys_j, nocc)
+                _all_keys_j, nocc, _pool=_pool)
             _local_df_G = build_G_tilde(
                 t2_pno_all, t1_pno, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache,

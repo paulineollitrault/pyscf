@@ -173,9 +173,13 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     from pyscf import lib as _pyscf_lib
     _pyscf_lib.num_threads(ncores)
 
-    # Use caller-provided pool if available (avoids creating new thread
-    # IDs across molecules that exceed OpenBLAS MAX_THREADS), otherwise
-    # create one.
+    # Pool sizing: half of ncores for ThreadPool workers, the other half
+    # available as BLAS threads. We then use threadpool_limits to clamp
+    # BLAS to 1 thread inside parallel sections — total OS thread usage
+    # ≈ pool_size, well under OpenBLAS' per-process region cap.
+    # Setup phases (SCF, etc.) outside the parallel region keep the
+    # default BLAS thread count, so full BLAS parallelism is available
+    # there.
     from concurrent.futures import ThreadPoolExecutor
     _owns_pool = _pool is None
     if _owns_pool:
@@ -408,56 +412,88 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # ------------------------------------------------------------------
     # Stage 5: DLPNO-TCCSD
     # ------------------------------------------------------------------
+    # Limit BLAS threads to 1 during the DLPNO loops: each ThreadPool
+    # worker calls into BLAS for small matmuls; without this constraint
+    # ncores workers × default 64 BLAS threads = N×64 thread requests,
+    # severe oversubscription. With 1 BLAS thread per worker × ncores
+    # workers, total thread requests == ncores ≤ physical cores.
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        threadpool_limits = None
+
     stage5_label = 'DLPNO-CCSD' if no_cas else 'DLPNO-TCCSD'
     print(f'  Stage 5: {stage5_label}...', flush=True)
     _t_ccsd_start = _time.time()
 
     mo_coeff_cas_arg = mo_loc if no_cas else mc.mo_coeff
-    e_tccsd, t2_pno_all, t1_pno = run_lccsd(
-        mf, C_lmo, pno_spaces,
-        strong_pairs=strong_pairs,
-        cas_pairs=cas_pairs,
-        t1_cas=t1_cas, t2_cas=t2_cas,
-        occ_cas_idx=occ_cas_idx, vir_cas_idx=vir_cas_idx,
-        mo_coeff_cas=mo_coeff_cas_arg, s1e=s1e,
-        conv_tol=ccsd_conv_tol, max_cycle=ccsd_max_cycle,
-        ncores=ncores, C_pao=C_pao, verbose=verbose,
-        _pool=_shared_pool)
+
+    # Stage 5: CCSD with BLAS threads limited to 1 (workers do the parallelism).
+    _blas_ctx = (threadpool_limits(limits=1, user_api='blas')
+                 if threadpool_limits is not None and _shared_pool is not None
+                 else None)
+    if _blas_ctx is not None:
+        _blas_ctx.__enter__()
+    try:
+        e_tccsd, t2_pno_all, t1_pno = run_lccsd(
+            mf, C_lmo, pno_spaces,
+            strong_pairs=strong_pairs,
+            cas_pairs=cas_pairs,
+            t1_cas=t1_cas, t2_cas=t2_cas,
+            occ_cas_idx=occ_cas_idx, vir_cas_idx=vir_cas_idx,
+            mo_coeff_cas=mo_coeff_cas_arg, s1e=s1e,
+            conv_tol=ccsd_conv_tol, max_cycle=ccsd_max_cycle,
+            ncores=ncores, C_pao=C_pao, verbose=verbose,
+            _pool=_shared_pool)
+    finally:
+        if _blas_ctx is not None:
+            _blas_ctx.__exit__(None, None, None)
 
     _t_ccsd = _time.time() - _t_ccsd_start
     log.info('E(%s) correlation = %.15g', stage5_label, e_tccsd)
     print(f'  Stage 5 wall time: {_t_ccsd:.2f} s', flush=True)
 
     # ------------------------------------------------------------------
-    # Stage 6: External (T) correction
+    # Stage 6: External (T) correction. Same BLAS-thread limit as CCSD —
+    # without it, ncores workers × 64 BLAS threads exceeds OpenBLAS'
+    # internal memory-region cap and triggers BLAS allocation errors.
     # ------------------------------------------------------------------
     print('  Stage 6: (T) correction...', flush=True)
     _t_triples_start = _time.time()
 
     C_cas_vir_t = None if no_cas else mo_loc[:, vir_cas_idx]
 
-    if use_t1_iterations:
-        e_t = run_lccsd_t1_iterations(
-            mf, C_lmo, pno_spaces,
-            strong_pairs=strong_pairs,
-            t2_pno_all=t2_pno_all,
-            t1_pno=t1_pno,
-            occ_cas_idx=occ_cas_idx,
-            C_cas_vir=C_cas_vir_t,
-            T_CutTNO=1e-9,
-            ncores=ncores, verbose=verbose,
-            _pool=_shared_pool)
-    else:
-        e_t = run_lccsd_t_ext(
-            mf, C_lmo, pno_spaces,
-            strong_pairs=strong_pairs,
-            t2_pno_all=t2_pno_all,
-            t1_pno=t1_pno,
-            occ_cas_idx=occ_cas_idx,
-            C_cas_vir=C_cas_vir_t,
-            vir_cas_idx=vir_cas_idx,
-            ncores=ncores, verbose=verbose,
-            _pool=_shared_pool)
+    _blas_ctx_t = (threadpool_limits(limits=1, user_api='blas')
+                   if threadpool_limits is not None and _shared_pool is not None
+                   else None)
+    if _blas_ctx_t is not None:
+        _blas_ctx_t.__enter__()
+    try:
+        if use_t1_iterations:
+            e_t = run_lccsd_t1_iterations(
+                mf, C_lmo, pno_spaces,
+                strong_pairs=strong_pairs,
+                t2_pno_all=t2_pno_all,
+                t1_pno=t1_pno,
+                occ_cas_idx=occ_cas_idx,
+                C_cas_vir=C_cas_vir_t,
+                T_CutTNO=1e-9,
+                ncores=ncores, verbose=verbose,
+                _pool=_shared_pool)
+        else:
+            e_t = run_lccsd_t_ext(
+                mf, C_lmo, pno_spaces,
+                strong_pairs=strong_pairs,
+                t2_pno_all=t2_pno_all,
+                t1_pno=t1_pno,
+                occ_cas_idx=occ_cas_idx,
+                C_cas_vir=C_cas_vir_t,
+                vir_cas_idx=vir_cas_idx,
+                ncores=ncores, verbose=verbose,
+                _pool=_shared_pool)
+    finally:
+        if _blas_ctx_t is not None:
+            _blas_ctx_t.__exit__(None, None, None)
 
     _t_triples = _time.time() - _t_triples_start
     if _owns_pool and _shared_pool is not None:
