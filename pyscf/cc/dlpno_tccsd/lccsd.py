@@ -605,6 +605,9 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             continue
         r1_pno[i] = np.zeros(n_ii)
 
+    _dbg_r1 = getattr(_compute_t1_residual_psi4, '_debug_r1_dump', False)
+    _r1_iter = getattr(_compute_t1_residual_psi4, '_iter', 0)
+
     # ===========================================================
     # T1-dressing terms in Psi4's Fai_[i] (ccsd.cc lines 1631-1712)
     # ===========================================================
@@ -977,13 +980,23 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                             if T_n_l_ii.size > 0:
                                 r1_pno[i] -= scalar * T_n_l_ii
 
+    if _dbg_r1:
+        for i in range(nocc):
+            if r1_pno[i].size > 0:
+                rms = float(np.sqrt(np.mean(r1_pno[i]*r1_pno[i])))
+                mx = float(np.max(np.abs(r1_pno[i])))
+                sm = float(np.sum(r1_pno[i]))
+                print(f'  R1_OURS iter {_r1_iter} lmo({i}): rms={rms:.12e} '
+                      f'max={mx:.12e} sum={sm:.12e} np={r1_pno[i].size}',
+                      flush=True)
+
     return r1_pno
 
 
 def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                      fock_ao, eps_lmo, s1e, conv_tol, max_cycle,
                      t2_cas=None, occ_cas_idx=None, vir_cas_idx=None,
-                     mo_coeff_cas=None, diis_space=15,
+                     mo_coeff_cas=None, diis_space=5,
                      damping=0.5, diis_start_cycle=0,
                      C_pao=None, use_t1_transform=True,
                      ncores=1, _pool=None):
@@ -1404,6 +1417,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # can be filtered/labeled per iter.
             from pyscf.cc.dlpno_tccsd.residual import compute_residual_v2 as _crv2
             _crv2._iter = cycle
+            from pyscf.cc.dlpno_tccsd.residual import compute_all_df_terms_local as _cadf
+            _cadf._iter = cycle
             _crv2._debug_pterm_all = (cycle <= 2) and getattr(_run_dlpno_lccsd, '_debug_pterm_iters', False)
             # Pass strong-pair set to T1 residual so it can optionally skip
             _compute_t1_residual_psi4._iter = cycle
@@ -1469,30 +1484,53 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _cc_ints, S_pno_cache, keys_sorted, _pool=_pool)
             _tj_df = _time.perf_counter() - _tj0
 
-            # C_tilde / D_tilde (Eqs 83-84, with precomputed Term 2)
-            _tj0 = _time.perf_counter()
+            # compute_C_tilde, build_D_tilde, t1_fock are independent of
+            # each other (all consume df_terms output but not each other's
+            # results), so run them concurrently in separate driver threads.
+            # Each still uses the shared _pool for its internal per-pair
+            # parallelism; the pool schedules tasks from both drivers
+            # interleaved. This removes ~300ms/iter of sequential synchro-
+            # nization barriers.
+            from pyscf.cc.dlpno_tccsd.local_df import t1_fock
+            import threading
             compute_C_tilde._dump_iter = cycle
-            _jiang_C = compute_C_tilde(
-                t1_pno, t2_pno_all, pno_spaces, nocc,
-                ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
-                _term2_precomputed=_c_t2_pre,
-                cc_ints=_cc_ints,
-                pair_lmo_idx=pair_lmo_idx, _pool=_pool)
-            _tj_C = _time.perf_counter() - _tj0
             _tj0 = _time.perf_counter()
-            _jiang_D = build_D_tilde(
-                t1_pno, t2_pno_all, pno_spaces, nocc,
-                ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
-                _term2_precomputed=_d_t2_pre,
-                cc_ints=_cc_ints,
-                pair_lmo_idx=pair_lmo_idx, _pool=_pool)
-            _tj_D = _time.perf_counter() - _tj0
+            _cd_results = {}
 
-            # Fkj / G_tilde — t1_fock (vectorized cc_ints) computes
-            # _local_Fkj / _local_foo_t1 below; full-naux build_Fkj is gone.
+            def _run_C():
+                _cd_results['C'] = compute_C_tilde(
+                    t1_pno, t2_pno_all, pno_spaces, nocc,
+                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+                    _term2_precomputed=_c_t2_pre,
+                    cc_ints=_cc_ints,
+                    pair_lmo_idx=pair_lmo_idx, _pool=_pool)
+
+            def _run_D():
+                _cd_results['D'] = build_D_tilde(
+                    t1_pno, t2_pno_all, pno_spaces, nocc,
+                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+                    _term2_precomputed=_d_t2_pre,
+                    cc_ints=_cc_ints,
+                    pair_lmo_idx=pair_lmo_idx, _pool=_pool)
+
+            def _run_F():
+                _cd_results['F'] = t1_fock(
+                    _cc_ints, None, t1_pno, fov_pno, pno_spaces,
+                    S_pno_cache, F_lmo, eps_lmo, foo_total,
+                    _all_keys_j, nocc, _pool=_pool)
+
+            threads = [threading.Thread(target=t) for t in (_run_C, _run_D, _run_F)]
+            for t in threads: t.start()
+            for t in threads: t.join()
+            _jiang_C = _cd_results['C']
+            _jiang_D = _cd_results['D']
+            _local_Fkj, _local_df_Fab, _local_foo_t1 = _cd_results['F']
+            _tj_C = _time.perf_counter() - _tj0
+            _tj_D = 0.0
             _tj_FG = 0.0
+            _tj_Fab = 0.0
 
-            # Mixed-domain integrals for C/D bold terms
+            # Mixed-domain integrals for C/D bold terms (negligible; serial is fine)
             _tj0 = _time.perf_counter()
             _jiang_K_mixed = build_mixed_domain_integrals(
                 t2_pno_all, pno_spaces, nocc,
@@ -1500,18 +1538,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 cc_ints=_cc_ints)
             _tj_Km = _time.perf_counter() - _tj0
 
-            # per-pair B_tilde uses local DF, so no global J_oo_d needed
             _jiang_J_oo_d = None
 
-            # Fab_all — t1_fock builds _local_df_Fab (per-pair, cc_ints).
-            _tj_Fab = 0.0
-
-            # Local DF Fkj, Fab, G_tilde (computed once per iteration)
-            from pyscf.cc.dlpno_tccsd.local_df import t1_fock
-            _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
-                _cc_ints, None, t1_pno, fov_pno, pno_spaces,
-                S_pno_cache, F_lmo, eps_lmo, foo_total,
-                _all_keys_j, nocc, _pool=_pool)
             _local_df_G = build_G_tilde(
                 t2_pno_all, t1_pno, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache,
@@ -1519,7 +1547,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 cc_ints=_cc_ints)
 
             _t_jiang_done = _time.perf_counter()
-            if False:  # Set to True for detailed jiang timing
+            if getattr(_run_dlpno_lccsd, '_detail_jiang', False):
                 print(f'    [jiang] ovL_d={_tj_ovl:.3f} df={_tj_df:.3f} '
                       f'C={_tj_C:.3f} D={_tj_D:.3f} FG={_tj_FG:.3f} '
                       f'Km={_tj_Km:.3f} Fab={_tj_Fab:.3f} '
@@ -1653,9 +1681,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _pair_timings['resid'].append(
                     _time.perf_counter() - _tr0)
                 e_pno = data['e_pno']
-                # Psi4 increment form: T_new = T_old - R/D_psi4
-                # where D_psi4 = e_a + e_b - F_ii - F_jj
-                # R is the FULL Psi4 residual (zero at convergence).
+                # Psi4 increment form (ccsd.cc line 2472):
+                # T_new = T_old - R / (e_a + e_b - F_ii - F_jj)
                 D_psi4 = (e_pno[:, None] + e_pno[None, :]
                           - eps_lmo[i] - eps_lmo[j])
                 D_psi4 = np.where(np.abs(D_psi4) > 1e-12, D_psi4, 1e-12)
@@ -1670,24 +1697,25 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                             t2c_mp2 + scale * (t2c_dmrg_ref - t2c_mp2))
                     else:
                         T2_ij_new[cas_sl, cas_sl] = cb[1]
-                return key, T2_ij_new
+                return key, T2_ij_new, R_ij
 
+            r2_all = {}
             if _pool is not None:
-                for key, T2_ij_new in _pool.map(_update_pair, keys_sorted):
+                for key, T2_ij_new, R_ij in _pool.map(_update_pair, keys_sorted):
                     t2_new[key] = T2_ij_new
+                    r2_all[key] = R_ij
             else:
                 for key in keys_sorted:
-                    _, T2_ij_new = _update_pair(key)
+                    _, T2_ij_new, R_ij = _update_pair(key)
                     t2_new[key] = T2_ij_new
+                    r2_all[key] = R_ij
 
             _t_pairs_done = _time.perf_counter()
-            if False:  # Set to True for detailed pair timing
-                _sf = sum(_pair_timings['fab'])
+            if getattr(_run_dlpno_lccsd, '_detail_pairs', False):
                 _sb = sum(_pair_timings['btilde'])
                 _sr = sum(_pair_timings['resid'])
-                print(f'    [pairs] fab={_sf:.3f}s btilde={_sb:.3f}s '
-                      f'resid={_sr:.3f}s ({len(_pair_timings["fab"])} pairs)',
-                      flush=True)
+                print(f'    [pairs] btilde={_sb:.3f}s resid={_sr:.3f}s '
+                      f'({len(_pair_timings["btilde"])} pairs)', flush=True)
             _pair_timings['fab'].clear()
             _pair_timings['btilde'].clear()
             _pair_timings['resid'].clear()
@@ -1735,7 +1763,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     t1_pno_new[ii] = np.zeros(0) if ii not in t1_pno else t1_pno[ii].copy()
                     continue
                 e_pno_ii = pno_spaces[key_ii]['e_pno']
-                # Psi4 INCREMENT form (ccsd.cc line 2495):
+                # Psi4 INCREMENT form (ccsd.cc line 2456):
                 #   T_ia[a] -= R_ia[a] / (e_pno[a] - F_lmo[i,i])
                 D_i = e_pno_ii - eps_lmo[ii]
                 D_i = np.where(np.abs(D_i) > 1e-12, D_i, 1e-12)
@@ -1749,7 +1777,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                       for ii in range(nocc) if t1_pno[ii].size > 0))
                 print(f'    [T1] |t1| = {t1_norm:.6f}', flush=True)
 
-            # ---- Damping + DIIS on external amplitudes only ----
+            # ---- DIIS on external amplitudes only (Psi4-style R-based) ----
             def _mask_cas(t2_dict):
                 pieces = []
                 for k in keys_sorted:
@@ -1771,9 +1799,18 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             err_amp = amp_new - amp_old
             dT = np.max(np.abs(err_amp)) if err_amp.size > 0 else 0.0
 
-            # Global DIIS on all amplitudes simultaneously
-            if cycle >= diis_start_cycle and err_amp.size > 0:
-                amp_new = mydiis.update(amp_new, err_amp)
+            # Psi4-style DIIS: error vector is the raw residual R = (R1, R2),
+            # not ΔT = -R/D.  The ΔT form blows up on pathological near-zero
+            # orbital-energy denominators (ghost-CP basis with diffuse
+            # contamination, e.g. S22-16 ethene-ethyne a_ghost).  R-based
+            # DIIS mirrors Psi4 DLPNO-CCSD (ccsd.cc:2479-2499) which stores
+            # (T1, T2) as the DIIS vector and (R1, R2) as the error vector
+            # with DIIS_MAX_VECS=5 (Psi4 CC default).
+            r1_vec = np.concatenate([r1_pno[ii].ravel() for ii in range(nocc)])
+            r2_vec = _mask_cas(r2_all)
+            err_vec = np.concatenate([r1_vec, r2_vec])
+            if cycle >= diis_start_cycle and err_vec.size > 0:
+                amp_new = mydiis.update(amp_new, err_vec)
 
             # ---- Unpack T1 and T2; restore CAS blocks ----
             offset = 0
@@ -1841,9 +1878,12 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (amplitude).',
                       flush=True)
                 break
-            # For TCCSD, redundant PNO modes cause dT to diverge while the
-            # energy converges.  Use energy as primary convergence criterion.
-            e_conv_tol = this_tol if cas_blocks else this_tol * 1e-2
+            # Secondary energy-based convergence.  Local-orbital CCSD often
+            # has dT oscillating at ~1e-3 while the energy is already
+            # converged to μEh — the redundant PNO overlap across pairs
+            # prevents dT from reaching conv_tol even when E is stable.
+            # Fall back to |dE| < conv_tol (same order as amplitude tol).
+            e_conv_tol = this_tol
             if cycle > 5 and dE < e_conv_tol:
                 print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (energy, '
                       f'dE={dE:.2e}).',

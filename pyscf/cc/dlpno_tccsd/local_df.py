@@ -15,7 +15,7 @@ import numpy as np
 
 
 def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
-                         T_CUT_MKN=1e-3, T_CUT_CLMO=1e-3):
+                         T_CUT_MKN=1e-3, T_CUT_CLMO=1e-3, C_pao=None):
     """Build atom-localized sparsity maps matching Psi4 dlpnobase.cc.
 
     Psi4 uses TWO separate atom-locality criteria for each LMO:
@@ -60,12 +60,36 @@ def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
         lmo_to_atoms.append(np.where(has_coeff)[0])
 
     # --- lmo_to_paoatoms: atoms hosting each LMO's PAO domain ---
+    # Include:
+    #   (a) atoms that CENTER the PAO indices in pao_domains[i], AND
+    #   (b) atoms on which those PAO vectors have non-negligible AMPLITUDE
+    #       via the orthogonalization tail (C_pao[atom_AOs, pao_domains[i]]
+    #       above T_CUT_CLMO).
+    # Rationale: PAOs are (1 - P_occ) I orthogonalized in the pair domain;
+    # for CP-ghost systems the orthogonalization pushes significant
+    # amplitude onto ghost atoms.  If bfs2 excludes those atoms, the
+    # sparse integral (Q|ab) misses cancelling contributions and the
+    # T2 ladder term A blows up by ~20x.  Cf. project_s22_ladder_bug.md.
     lmo_to_paoatoms = []
     for i in range(nocc):
         if len(pao_domains[i]) == 0:
             lmo_to_paoatoms.append(np.zeros(0, dtype=int))
-        else:
-            lmo_to_paoatoms.append(np.unique(atom_ids[pao_domains[i]]))
+            continue
+        # (a) Atoms centering the PAO indices
+        indexed_atoms = set(atom_ids[pao_domains[i]].tolist())
+        # (b) Atoms with significant C_pao amplitude on those PAO columns.
+        # Skip (b) if C_pao isn't available (backward compat).
+        if C_pao is not None:
+            C_slice = C_pao[:, pao_domains[i]]                # (nao, |dom|)
+            per_ao = np.max(np.abs(C_slice), axis=1)
+            for A in range(natm):
+                if A in indexed_atoms:
+                    continue
+                mask_A = (atom_ids == A)
+                if np.any(per_ao[mask_A] > T_CUT_CLMO):
+                    indexed_atoms.add(A)
+        lmo_to_paoatoms.append(
+            np.array(sorted(indexed_atoms), dtype=int))
 
     # --- lmo_to_riatoms: aux atoms via Mulliken population ---
     lmo_to_riatoms = []
@@ -469,7 +493,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     if screening_maps is None:
         screening_maps = build_screening_maps(
             mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
-            T_CUT_MKN=T_CUT_MKN, T_CUT_CLMO=T_CUT_CLMO)
+            T_CUT_MKN=T_CUT_MKN, T_CUT_CLMO=T_CUT_CLMO, C_pao=C_pao)
     if sparse_arrays is None:
         sparse_arrays = build_sparse_df_arrays(
             mol, auxmol, C_lmo, C_pao, screening_maps)

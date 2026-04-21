@@ -282,20 +282,41 @@ def _w3_intermediate(t2_sc, ovL_sc, ooL_sc, vvL_sc, eps_occ, eps_vir,
              lambda x: x.transpose(1,2,0),    # (k,i,j) → (c,a,b)
              lambda x: x.transpose(2,1,0)]    # (k,j,i) → (c,b,a)
 
+    # Precompute K_ab[ip] = Σ_L ovL_sc[ip,a,L] * vvL_sc[b,f,L] for the 3
+    # distinct occupied-index slots. The perm loop visits each ip twice,
+    # so caching here avoids 3 redundant einsums per triple (×442 triples).
+    # tensordot is ~3-5× faster than einsum for simple 3-axis contractions
+    # since it goes straight to BLAS without the einsum path planner.
+    K_ab_cache = [None, None, None]
+    for ip in range(3):
+        # shape (n, n, n): indexed [a, f, b]
+        t = np.tensordot(ovL_sc[ip], vvL_sc, axes=([1], [2]))
+        # reorder to [a, b, f]
+        K_ab_cache[ip] = t.transpose(0, 2, 1)
+
     W = np.zeros((n, n, n))
     for pidx in range(6):
         p_map = [(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0)][pidx]
         ip, iq, ir = p_map
 
-        K_ab = np.einsum('aL,fbL->abf', ovL_sc[ip], vvL_sc)
-        base = np.einsum('abf,cf->abc', K_ab, t2_sc[ir, iq])
+        K_ab = K_ab_cache[ip]
+        # base[a,b,c] = Σ_f K_ab[a,b,f] * t2[c,f]
+        #            = (K_ab.reshape(n*n, n) @ t2.T).reshape(n,n,n)
+        t2_rq = t2_sc[ir, iq]
+        base = (K_ab.reshape(n * n, n) @ t2_rq.T).reshape(n, n, n)
 
         if ooL_sc_full is not None and t2_sc_full is not None:
-            A_al = np.einsum('aL,mL->am', ovL_sc[ip], ooL_sc_full[iq])
-            base -= np.einsum('am,mbc->abc', A_al, t2_sc_full[:, ir])
+            # A_al = ovL_sc[ip] @ ooL_sc_full[iq].T  (shape: n × m)
+            A_al = ovL_sc[ip] @ ooL_sc_full[iq].T
+            # base[a,b,c] -= Σ_m A_al[a,m] * t2[m,b,c]
+            t2_mbc = t2_sc_full[:, ir]
+            m = t2_mbc.shape[0]
+            base -= (A_al @ t2_mbc.reshape(m, n * n)).reshape(n, n, n)
         else:
-            A_al = np.einsum('aL,mL->am', ovL_sc[ip], ooL_sc[iq])
-            base -= np.einsum('am,mbc->abc', A_al, t2_sc[:, ir])
+            A_al = ovL_sc[ip] @ ooL_sc[iq].T
+            t2_mbc = t2_sc[:, ir]
+            m = t2_mbc.shape[0]
+            base -= (A_al @ t2_mbc.reshape(m, n * n)).reshape(n, n, n)
 
         W += trans[pidx](base)
 
@@ -305,12 +326,12 @@ def _w3_intermediate(t2_sc, ovL_sc, ooL_sc, vvL_sc, eps_occ, eps_vir,
     # --- V = W + T1 disconnected (Psi4 lines 930-962) ---
     V = W.copy()
     if t1_sc is not None and fvo_sc is not None:
-        K_jk = np.einsum('bL,cL->bc', ovL_sc[1], ovL_sc[2])
-        K_ik = np.einsum('aL,cL->ac', ovL_sc[0], ovL_sc[2])
-        K_ij = np.einsum('aL,bL->ab', ovL_sc[0], ovL_sc[1])
-        V += (np.einsum('a,bc->abc', t1_sc[0], K_jk)
-              + np.einsum('b,ac->abc', t1_sc[1], K_ik)
-              + np.einsum('c,ab->abc', t1_sc[2], K_ij))
+        K_jk = ovL_sc[1] @ ovL_sc[2].T
+        K_ik = ovL_sc[0] @ ovL_sc[2].T
+        K_ij = ovL_sc[0] @ ovL_sc[1].T
+        V += (t1_sc[0][:, None, None] * K_jk[None, :, :]
+              + t1_sc[1][None, :, None] * K_ik[:, None, :]
+              + t1_sc[2][None, None, :] * K_ij[:, :, None])
 
     # --- Energy: Eq 53 antisymmetrizer on virtual indices ---
     et = (8 * np.sum(V * T)

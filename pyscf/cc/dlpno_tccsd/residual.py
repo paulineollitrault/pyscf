@@ -16,6 +16,36 @@ from pyscf.cc.dlpno_tccsd.local_df import (
 )
 
 
+def _chunked_map(pool, fn, items, chunks_per_worker=4):
+    """Dispatch many small tasks to a ThreadPoolExecutor in chunks.
+
+    ThreadPoolExecutor.map has ~5-50 us of dispatch overhead per task,
+    which dominates when tasks are <1 ms. Chunking into N_workers*4 groups
+    collapses overhead into ~N_workers dispatches while keeping load
+    balancing healthy (4 chunks per worker).
+
+    Yields results in submission order, matching pool.map semantics.
+    """
+    if pool is None:
+        for it in items:
+            yield fn(it)
+        return
+    items = list(items)
+    n = len(items)
+    if n == 0:
+        return
+    workers = getattr(pool, '_max_workers', 1)
+    chunk_size = max(1, (n + workers * chunks_per_worker - 1)
+                        // (workers * chunks_per_worker))
+
+    def _process_chunk(chunk):
+        return [fn(x) for x in chunk]
+
+    chunks = [items[i:i + chunk_size] for i in range(0, n, chunk_size)]
+    for chunk_result in pool.map(_process_chunk, chunks):
+        yield from chunk_result
+
+
 # =========================================================================
 # T1-dressed intermediates: G_tilde, D_tilde, Fab, Fkj, Fia_bar (Eqs 82-86)
 # =========================================================================
@@ -692,20 +722,23 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         X_L = np.matmul(B_tilde, tau)
         ladder = (X_L.transpose(1, 0, 2).reshape(n, -1) @
                   B_tilde.transpose(1, 0, 2).reshape(n, -1).T)
+        # Debug: print for diagonal (0,0), off-diag (0,5), diagonal (5,5)
+        _it = getattr(compute_all_df_terms_local, '_iter', 0)
+        if _it <= 2 and pk in [(0, 0), (0, 5), (5, 5)]:
+            print(f'  LADDER_DBG iter {_it} '
+                  f'pair{pk}: |T1_all|={np.linalg.norm(T1_all):.3e} '
+                  f'|T2|={np.linalg.norm(t2_pno_all[pk]):.3e} '
+                  f'|tau|={np.linalg.norm(tau):.3e} '
+                  f'|corr|={np.linalg.norm(corr):.3e} '
+                  f'|B_tilde|={np.linalg.norm(B_tilde):.3e} '
+                  f'|Qab|={np.linalg.norm(Qab):.3e} '
+                  f'|Qma|={np.linalg.norm(Qma):.3e} '
+                  f'|ladder|={np.linalg.norm(ladder):.3e}',
+                  flush=True)
         return pk, fvv, ladder
 
-    if _pool is not None:
-        for pk, fvv, ladder in _pool.map(_fvv_ladder, pair_keys):
-            fvv_t1_all[pk] = fvv
-            ladder_all[pk] = ladder
-    else:
-        for pk in pair_keys:
-            pk_out, fvv, ladder = _fvv_ladder(pk)
-            fvv_t1_all[pk_out] = fvv
-            ladder_all[pk_out] = ladder
-
     # ============================================================
-    # C_tilde Term 2: per (k, i) ordered pair (parallelizable)
+    # C_tilde Term 2: per (k, i) ordered pair
     # ============================================================
     def _c_term2(ki_tuple):
         k, i = ki_tuple
@@ -724,19 +757,8 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         z_i = Qma[:, i, :] @ t1_i
         return ki_tuple, np.einsum('L,Lab->ab', z_i, Qab, optimize=True)
 
-    ordered_list = list(all_ordered)
-    if _pool is not None:
-        for ki, val in _pool.map(_c_term2, ordered_list):
-            if val is not None:
-                c_term2_all[ki] = val
-    else:
-        for ki in ordered_list:
-            _, val = _c_term2(ki)
-            if val is not None:
-                c_term2_all[ki] = val
-
     # ============================================================
-    # D_tilde Term 2: per (i, k) ordered pair (parallelizable)
+    # D_tilde Term 2: per (i, k) ordered pair
     # ============================================================
     def _d_term2(ik_tuple):
         i_idx, k_idx = ik_tuple
@@ -760,13 +782,34 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         result -= np.einsum('L,Lab->ab', y, Qab, optimize=True)
         return ik_tuple, result
 
-    if _pool is not None:
-        for ik, val in _pool.map(_d_term2, ordered_list):
+    # Unified dispatch: one _pool.map (chunked) covering all three
+    # task kinds. Removes 2 synchronization barriers per CCSD iteration
+    # and amortizes pool dispatch overhead across chunks.
+    ordered_list = list(all_ordered)
+    work = ([('fvv_ladder', pk) for pk in pair_keys]
+            + [('c_term2', ki) for ki in ordered_list]
+            + [('d_term2', ik) for ik in ordered_list])
+
+    def _dispatch(item):
+        kind, key = item
+        if kind == 'fvv_ladder':
+            return kind, _fvv_ladder(key)
+        elif kind == 'c_term2':
+            return kind, _c_term2(key)
+        else:  # d_term2
+            return kind, _d_term2(key)
+
+    for kind, payload in _chunked_map(_pool, _dispatch, work):
+        if kind == 'fvv_ladder':
+            pk, fvv, ladder = payload
+            fvv_t1_all[pk] = fvv
+            ladder_all[pk] = ladder
+        elif kind == 'c_term2':
+            ki, val = payload
             if val is not None:
-                d_term2_all[ik] = val
-    else:
-        for ik in ordered_list:
-            _, val = _d_term2(ik)
+                c_term2_all[ki] = val
+        else:  # d_term2
+            ik, val = payload
             if val is not None:
                 d_term2_all[ik] = val
 
