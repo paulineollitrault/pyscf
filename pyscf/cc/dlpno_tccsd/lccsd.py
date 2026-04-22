@@ -999,7 +999,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                      mo_coeff_cas=None, diis_space=5,
                      damping=0.5, diis_start_cycle=0,
                      C_pao=None, use_t1_transform=True,
-                     ncores=1, _pool=None):
+                     ncores=1, negligible_pairs=None, _pool=None):
     """DLPNO-CCSD with pair-local residual and per-pair PNO virtual spaces.
 
     Each pair (i,j) updates ONLY its own T2_ij in its own PNO basis.
@@ -1251,20 +1251,33 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             if key_w not in _all_keys_init and pno_spaces[key_w]['C_pno'].shape[1] > 0:
                 _all_keys_init.append(key_w)
 
-        # Pair LMO domain: m is in pair (i,j)'s domain if pairs (i,m)
-        # AND (j,m) both exist in pno_spaces.  This matches Psi4's
-        # lmopair_to_lmos_ (dlpnobase.cc line 774-782).
-        pair_lmo_idx = {}  # pair_key -> np.array of LMO indices in domain
-        _all_pair_keys_set = set(_all_keys_init)
+        # Pair LMO domain: m is in pair (i,j)'s domain iff pairs (i,m) AND
+        # (j,m) are BOTH non-negligible (strong or weak).  This matches
+        # Psi4's lmopair_to_lmos_ (dlpnobase.cc line 798-818) where
+        # i_j_to_ij_[i][m] == -1 for discarded (negligible) pairs.
+        # Using only the strong+weak set (t2_pno_all keys) — NOT the
+        # full pno_spaces — is what makes this domain actually local:
+        # for water chains, including negligible pairs leaves every pair
+        # with domain = full nocc.
+        pair_lmo_idx = {}
+        _negligible_set = set(
+            (min(p), max(p)) for p in (negligible_pairs or []))
+        _non_negligible_set = {k for k in t2_pno_all.keys()
+                                if k not in _negligible_set}
         for key in _all_keys_init:
             i, j = key
             domain_lmos = []
             for m in range(nocc):
                 key_im = (min(i, m), max(i, m))
                 key_jm = (min(j, m), max(j, m))
-                if key_im in _all_pair_keys_set and key_jm in _all_pair_keys_set:
+                if (key_im in _non_negligible_set
+                        and key_jm in _non_negligible_set):
                     domain_lmos.append(m)
             pair_lmo_idx[key] = np.array(domain_lmos)
+        _plens = np.array([len(v) for v in pair_lmo_idx.values()])
+        print(f"  Pair LMO domains: mean={_plens.mean():.1f}  "
+              f"max={_plens.max()} (of nocc={nocc})",
+              flush=True)
 
         for key in _all_keys_init:
             i, j = key
@@ -1315,6 +1328,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         _j2c, _all_keys_cc, nocc, s1e=s1e,
         pao_domains=_pao_domains, strong_pair_keys=_all_keys_cc,
         T_CUT_MKN=_t_mkn, T_CUT_CLMO=_t_clmo,
+        pair_lmo_idx=pair_lmo_idx,
         _pool=_pool)
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
@@ -1325,36 +1339,33 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             K_pno_cache[key] = ci['K_iajb']
 
 
-    # Pre-compute PNO overlap matrices S_pno_cache[(key_ij, key_kl)]
-    # for ALL pair combinations (strong + weak) with PNOs.  Weak-pair
-    # overlaps are needed by Eq 88 (A term, T1 residual) which sums over
-    # all k including weak (k,i) pairs — without them we silently drop
-    # weak-pair A contributions on LMOs 0/2 (~3% low on str 010).
+    # Pre-compute PNO overlap matrices S_pno_cache[(key_ij, key_kl)].
     #
-    # Psi4-style PAO-domain build: S_pno[ij, kl] = X_pno[ij]^T
-    #     @ S_pao[pair_paos[ij]][:, pair_paos[kl]] @ X_pno[kl]
-    # — bypasses materializing C_pno in AO basis. Falls back to C_pno for
-    # CAS pairs (X_pno=None there since the basis spills past the pair
-    # PAO domain via C_cas_vir).
+    # Restrict upfront build to O(N^2) entries where key_kl has BOTH
+    # LMOs in pair (i,j)'s local domain (pair_lmo_idx[ij]), matching
+    # Psi4's S_PNO which is indexed by lmopair_to_lmos_[ij] pairs.
+    # Any residual / compute_C_tilde / build_D_tilde site that asks for
+    # an unrestricted (key_a, key_b) overlap will go through the
+    # ``compute_S_pno`` helper with IDENTICAL numerics — no drift.
+    # This drops setup from O(N^4) to O(N^2) memory + build time.
+    from pyscf.cc.dlpno_tccsd.local_df import compute_S_pno as _compute_S_pno
     _all_pair_keys = [k for k in pno_spaces
                       if pno_spaces[k]['C_pno'].shape[1] > 0]
+    _all_pair_set = set(_all_pair_keys)
     S_pao_full = C_pao.T @ s1e @ C_pao
     S_pno_cache = {}
     for key_ij in _all_pair_keys:
-        pd_ij = pno_spaces[key_ij]
-        X_ij = pd_ij.get('X_pno')
-        pp_ij = pd_ij.get('pair_paos')
-        for key_kl in _all_pair_keys:
-            pd_kl = pno_spaces[key_kl]
-            X_kl = pd_kl.get('X_pno')
-            pp_kl = pd_kl.get('pair_paos')
-            if X_ij is None or X_kl is None:
-                # CAS-pair fallback
-                S_pno_cache[(key_ij, key_kl)] = (
-                    pd_ij['C_pno'].T @ (s1e @ pd_kl['C_pno']))
-            else:
-                S_pno_cache[(key_ij, key_kl)] = (
-                    X_ij.T @ S_pao_full[np.ix_(pp_ij, pp_kl)] @ X_kl)
+        if pair_lmo_idx is not None and key_ij in pair_lmo_idx:
+            _dom = [int(x) for x in pair_lmo_idx[key_ij]]
+            _partner_keys = [
+                (k, l) for k in _dom for l in _dom
+                if k <= l and (k, l) in _all_pair_set
+            ]
+        else:
+            _partner_keys = _all_pair_keys
+        for key_kl in _partner_keys:
+            S_pno_cache[(key_ij, key_kl)] = _compute_S_pno(
+                key_ij, key_kl, pno_spaces, S_pao_full, s1e)
 
     # ooL_3idx (full naux occ-occ), K_coul_cache (full naux exchange) and
     # J_oo (nocc^4) are NOT built. cc_ints['i_Qk', 'j_Qk', 'J_ij_kj',
@@ -1481,7 +1492,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _fvv_t1_pre, _c_t2_pre, _d_t2_pre, _jiang_ladder_all = \
                 compute_all_df_terms_local(
                     t1_pno, fov_pno, t2_pno_all, pno_spaces, nocc,
-                    _cc_ints, S_pno_cache, keys_sorted, _pool=_pool)
+                    _cc_ints, S_pno_cache, keys_sorted, _pool=_pool,
+                    pair_lmo_idx=pair_lmo_idx)
             _tj_df = _time.perf_counter() - _tj0
 
             # compute_C_tilde, build_D_tilde, t1_fock are independent of
@@ -1503,7 +1515,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                     _term2_precomputed=_c_t2_pre,
                     cc_ints=_cc_ints,
-                    pair_lmo_idx=pair_lmo_idx, _pool=_pool)
+                    pair_lmo_idx=pair_lmo_idx, _pool=_pool,
+                    S_pao_full=S_pao_full, s1e=s1e)
 
             def _run_D():
                 _cd_results['D'] = build_D_tilde(
@@ -1511,13 +1524,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                     _term2_precomputed=_d_t2_pre,
                     cc_ints=_cc_ints,
-                    pair_lmo_idx=pair_lmo_idx, _pool=_pool)
+                    pair_lmo_idx=pair_lmo_idx, _pool=_pool,
+                    S_pao_full=S_pao_full, s1e=s1e)
 
             def _run_F():
                 _cd_results['F'] = t1_fock(
                     _cc_ints, None, t1_pno, fov_pno, pno_spaces,
                     S_pno_cache, F_lmo, eps_lmo, foo_total,
-                    _all_keys_j, nocc, _pool=_pool)
+                    _all_keys_j, nocc, _pool=_pool,
+                    pair_lmo_idx=pair_lmo_idx)
 
             threads = [threading.Thread(target=t) for t in (_run_C, _run_D, _run_F)]
             for t in threads: t.start()
@@ -1544,7 +1559,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 t2_pno_all, t1_pno, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache,
                 _local_Fkj, _local_foo_t1,
-                cc_ints=_cc_ints)
+                cc_ints=_cc_ints,
+                S_pao_full=S_pao_full, s1e=s1e)
 
             _t_jiang_done = _time.perf_counter()
             if getattr(_run_dlpno_lccsd, '_detail_jiang', False):
@@ -1565,6 +1581,46 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             }
 
             _t_pairs = _time.perf_counter()
+
+            # --- Batched B + E contributions across all strong pairs ---
+            # Replaces the per-pair `for key_kl in t2_pno_all` loops that
+            # dominate CCSD CPU time (~77% per profile).  Each strong pair
+            # has its own B_tilde (from compute_B_tilde); precompute them
+            # as a dict then call compute_B_E_batched once.
+            from pyscf.cc.dlpno_tccsd.local_df import compute_B_tilde as _cB_fn
+            from pyscf.cc.dlpno_tccsd.residual import compute_B_E_batched
+
+            def _bt_one(_key):
+                return _key, _cB_fn(_cc_ints, None, t2_pno_all, t1_pno,
+                                    pno_spaces, S_pno_cache, _key, nocc,
+                                    pair_lmo_idx=pair_lmo_idx)
+            _B_tilde_per_ij = {}
+            if _pool is not None:
+                for _k, _bt in _pool.map(_bt_one, keys_sorted):
+                    _B_tilde_per_ij[_k] = _bt
+            else:
+                for _k in keys_sorted:
+                    _, _bt = _bt_one(_k)
+                    _B_tilde_per_ij[_k] = _bt
+
+            # Parallel batched B+E across strong pairs
+            def _be_one(_key):
+                _Bt = _B_tilde_per_ij[_key]
+                _res = compute_B_E_batched(
+                    [_key], t2_pno_all, pno_spaces, S_pno_cache,
+                    _cc_ints, _Bt, pair_lmo_idx, nocc,
+                    S_pao_full=S_pao_full, s1e=s1e)
+                return _key, _res[0][_key], _res[1][_key]
+            _BE_all = {'B': {}, 'E': {}}
+            if _pool is not None:
+                for _k, _B, _E in _pool.map(_be_one, keys_sorted):
+                    _BE_all['B'][_k] = _B
+                    _BE_all['E'][_k] = _E
+            else:
+                for _k in keys_sorted:
+                    _k2, _B, _E = _be_one(_k)
+                    _BE_all['B'][_k2] = _B
+                    _BE_all['E'][_k2] = _E
 
             # Accumulator for per-pair timing (thread-safe via list append)
             _pair_timings = {'fab': [], 'resid': [], 'btilde': []}
@@ -1588,21 +1644,20 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _ladder_local = None
                 if key in _cc_ints and _cc_ints[key] is not None:
                     from pyscf.cc.dlpno_tccsd.local_df import (
-                        t1_ints, compute_B_tilde, compute_ladder)
+                        t1_ints, compute_ladder)
                     # T1-dressed K̃ (local DF)
                     _dressed = t1_ints(
                         _cc_ints, t1_pno, pno_spaces, S_pno_cache,
-                        [key], nocc)
+                        [key], nocc, pair_lmo_idx=pair_lmo_idx)
                     if key in _dressed:
                         _K_dressed_local = (_dressed[key]['i_Qa_t1'].T
                                             @ _dressed[key]['j_Qa_t1'])
-                    # B_tilde with local DF
-                    _B_tilde_local = compute_B_tilde(
-                        _cc_ints, _dressed, t2_pno_all, t1_pno,
-                        pno_spaces, S_pno_cache, key, nocc)
+                    # B_tilde reused from precomputed dict
+                    _B_tilde_local = _B_tilde_per_ij.get(key)
                     _ladder_local = compute_ladder(
                         _cc_ints, t2_pno_all, t1_pno, pno_spaces,
-                        S_pno_cache, key, nocc)
+                        S_pno_cache, key, nocc,
+                        pair_lmo_idx=pair_lmo_idx)
                     # Fab from local DF
                     if _local_df_Fab is not None and key in _local_df_Fab:
                         Fab_ij = _local_df_Fab[key]
@@ -1677,7 +1732,12 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         else jc.get('ladder_all')),
                     K_dressed_override=_K_dressed_local,
                     cc_ints=_cc_ints,
-                    pair_domain=pair_lmo_idx.get(key) if pair_lmo_idx else None)
+                    pair_domain=pair_lmo_idx.get(key) if pair_lmo_idx else None,
+                    B_term_override=(_BE_all['B'].get(key)
+                                      if _BE_all is not None else None),
+                    E_contrib_override=(_BE_all['E'].get(key)
+                                         if _BE_all is not None else None),
+                    S_pao_full=S_pao_full)
                 _pair_timings['resid'].append(
                     _time.perf_counter() - _tr0)
                 e_pno = data['e_pno']
@@ -1700,6 +1760,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 return key, T2_ij_new, R_ij
 
             r2_all = {}
+            # Enable per-term profiling in compute_residual_v2 for this cycle
+            from pyscf.cc.dlpno_tccsd.residual import compute_residual_v2 as _crv2
+            _crv2._term_times = {}
             if _pool is not None:
                 for key, T2_ij_new, R_ij in _pool.map(_update_pair, keys_sorted):
                     t2_new[key] = T2_ij_new
@@ -1709,6 +1772,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _, T2_ij_new, R_ij = _update_pair(key)
                     t2_new[key] = T2_ij_new
                     r2_all[key] = R_ij
+            _tt = _crv2._term_times
+            _crv2._term_times = None
+            if _tt:
+                _n_calls = _tt.pop('_n', 1)
+                _tot = sum(_tt.values())
+                _per = ' '.join(f'{k}={v:.2f}' for k, v in sorted(_tt.items()))
+                print(f'  [residual] n_calls={_n_calls} sum_CPU={_tot:.2f}s  {_per}', flush=True)
 
             _t_pairs_done = _time.perf_counter()
             if getattr(_run_dlpno_lccsd, '_detail_pairs', False):
@@ -1932,7 +2002,7 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
               mo_coeff_cas, s1e=None,
               conv_tol=1e-7, max_cycle=50, ncores=1,
               C_pao=None, max_outer_cycle=30, outer_conv_tol=1e-8,
-              verbose=None, _pool=None):
+              verbose=None, negligible_pairs=None, _pool=None):
     """Run pair-local CCSD over all strong pairs, injecting CAS amplitudes.
 
     For each strong pair (i,j):
@@ -1989,7 +2059,8 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
         t2_cas=t2_cas, occ_cas_idx=occ_cas_idx,
         vir_cas_idx=vir_cas_idx, mo_coeff_cas=mo_coeff_cas,
         C_pao=C_pao,
-        ncores=ncores, _pool=_pool)
+        ncores=ncores, negligible_pairs=negligible_pairs,
+        _pool=_pool)
     print(f'  E_TCCSD = {e_tccsd:.15g}', flush=True)
 
     return e_tccsd, t2_pno_all, t1_pno

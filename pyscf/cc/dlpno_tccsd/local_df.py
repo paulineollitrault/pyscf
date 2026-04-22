@@ -352,6 +352,40 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps):
     return {'qij': qij, 'qia': qia, 'qab': qab}
 
 
+def compute_S_pno(key_a, key_b, pno_spaces, S_pao_full, s1e):
+    """Compute the (n_pno_a, n_pno_b) PNO overlap matrix S_ab.
+
+    Uses the Psi4-style PAO-domain path when both pairs have X_pno /
+    pair_paos set:  S = X_a^T @ S_pao[pao_a, pao_b] @ X_b.
+    Falls back to C_pno + s1e (AO basis) only when one side has no
+    X_pno — needed for CAS pairs whose basis spills past the pair PAO
+    domain via C_cas_vir.
+
+    This is the *single authoritative* formula for all PNO overlaps so
+    the upfront S_pno_cache build and any on-demand recomputation
+    (cache miss) agree to machine precision.
+
+    Args:
+        key_a, key_b: pair keys (i, j) tuples.
+        pno_spaces: dict from make_pnos; each entry carries
+            'C_pno', optionally 'X_pno' and 'pair_paos'.
+        S_pao_full: (npao, npao) PAO overlap C_pao^T @ s1e @ C_pao.
+        s1e: (nao, nao) AO overlap.
+
+    Returns:
+        (n_pno_a, n_pno_b) overlap matrix.
+    """
+    pd_a = pno_spaces[key_a]
+    pd_b = pno_spaces[key_b]
+    X_a = pd_a.get('X_pno')
+    X_b = pd_b.get('X_pno')
+    pp_a = pd_a.get('pair_paos')
+    pp_b = pd_b.get('pair_paos')
+    if X_a is None or X_b is None or pp_a is None or pp_b is None:
+        return pd_a['C_pno'].T @ (s1e @ pd_b['C_pno'])
+    return X_a.T @ S_pao_full[np.ix_(pp_a, pp_b)] @ X_b
+
+
 def get_local_ovL(cc_ints, pair_key, lmo_idx):
     """Get locally-fitted ovL for LMO lmo_idx in pair pair_key's PNO basis.
 
@@ -371,17 +405,12 @@ def get_local_ooL_vec(cc_ints, k, l, pair_key):
     ci = cc_ints.get(pair_key)
     if ci is None:
         return None
-    i_lmo, j_lmo = pair_key  # i_lmo = min, j_lmo = max
-    # We need (Q|kl) = raw_oo[k, l, aux_idx] @ jhi
-    # From stored: i_Qk[:, m] = fitted (Q | m * i_lmo), j_Qk[:, m] = fitted (Q | m * j_lmo)
+    i_lmo, j_lmo = pair_key
     if l == i_lmo:
-        return ci['i_Qk'][:, k]  # fitted (Q | k * i_lmo) = (Q | k * l)
+        return ci['i_Qk'][:, k]
     elif l == j_lmo:
-        return ci['j_Qk'][:, k]  # fitted (Q | k * j_lmo) = (Q | k * l)
+        return ci['j_Qk'][:, k]
     else:
-        # l is neither i nor j of the pair — can't get from stored intermediates
-        # This shouldn't happen for C_tilde/D_tilde which access ooL[k,i] or ooL[i,k]
-        # where i is one of the pair's LMOs
         return None
 
 
@@ -442,6 +471,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                                 pao_domains=None, strong_pair_keys=None,
                                 T_CUT_MKN=1e-3, T_CUT_CLMO=1e-3,
                                 screening_maps=None, sparse_arrays=None,
+                                pair_lmo_idx=None,
                                 _pool=None):
     """Per-pair fitted intermediates via sparse per-aux-Q sparse storage.
 
@@ -558,10 +588,18 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         if n_local == 0:
             return key, None
 
-        # Cross-pair partner enumeration (skip CAS / empty PNO partners).
+        # Cross-pair partner enumeration, restricted to pair (i,j)'s local
+        # LMO domain when pair_lmo_idx is provided.  This drops per-pair
+        # cost from O(nocc) to O(nlmo_ij), turning cc_ints build from
+        # O(N^3) into O(N^2).
+        if pair_lmo_idx is not None and key in pair_lmo_idx:
+            _k_iter = pair_lmo_idx[key]
+        else:
+            _k_iter = range(nocc)
         kj_partners = []
         ki_partners = []
-        for k in range(nocc):
+        for k in _k_iter:
+            k = int(k)
             key_kj = (min(k, j), max(k, j))
             if key_kj in key_set and key_kj in pno_spaces:
                 Xp = pno_spaces[key_kj].get('X_pno')
@@ -573,12 +611,12 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 if Xp is not None and Xp.shape[1] > 0:
                     ki_partners.append((k, key_ki, Xp.shape[1]))
 
-        # Pre-fit accumulators
+        # Pre-fit accumulators.  raw_io/raw_jo/raw_ma's LMO axis is set
+        # to ``nocc`` below once we know which LMOs actually get
+        # populated from the centerQ stacks (the union of
+        # riatom_to_lmos_ext over all of this pair's aux centers).
         raw_iv = np.zeros((n_local, npno))
         raw_jv = np.zeros((n_local, npno))
-        raw_io = np.zeros((n_local, nocc))
-        raw_jo = np.zeros((n_local, nocc))
-        raw_ma = np.zeros((n_local, nocc, npno))
         raw_ab = np.zeros((n_local, npno, npno))
         raw_pair = np.zeros(n_local)
         raw_cross_kj = {k: np.zeros((n_local, npno, n_kj))
@@ -595,6 +633,29 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         # Group pair-aux Q's by centerQ → batched per-(pair, centerQ) ops.
         centers_of_aux = aux_atom_ids[aux_idx]
         unique_centers = np.unique(centers_of_aux)
+
+        # Pair's "extended LMO" set — union of riatom_to_lmos_ext over
+        # this pair's aux centers.  This is exactly the set of global
+        # LMO indices that get populated in raw_io/raw_jo/raw_ma, so it
+        # is the correct reduced axis: O(constant) for localized
+        # systems instead of O(nocc).  No integral information is lost
+        # because rows outside the union are zero in the original
+        # formulation too.
+        if len(unique_centers) > 0:
+            _ext_union = np.unique(np.concatenate(
+                [riatom_to_lmos_ext[c] for c in unique_centers]))
+        else:
+            _ext_union = np.zeros(0, dtype=np.int64)
+        p_lmos = _ext_union.astype(np.int64)
+        nlmo_p = len(p_lmos)
+        p_lmos_dense = np.full(nocc, -1, dtype=np.int64)
+        if nlmo_p > 0:
+            p_lmos_dense[p_lmos] = np.arange(nlmo_p)
+
+        # Now allocate the LMO-axis accumulators at the reduced size
+        raw_io = np.zeros((n_local, nlmo_p))
+        raw_jo = np.zeros((n_local, nlmo_p))
+        raw_ma = np.zeros((n_local, nlmo_p, npno))
 
         # Per-partner (k, key) pre-cache of pair_paos_kj/ki & X_pno_kj/ki —
         # so we don't do dict lookups inside the centerQ loop.
@@ -634,11 +695,28 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             i_s = riatom_to_lmos_ext_dense[centerQ, i]
             j_s = riatom_to_lmos_ext_dense[centerQ, j]
 
-            # raw_io[local_Q, ext_lmos] = qij_b[:, i_s, :]   (batched)
-            if i_s >= 0:
-                raw_io[np.ix_(local_Q, ext_lmos)] = qij_b[:, i_s, :]
-            if j_s >= 0:
-                raw_jo[np.ix_(local_Q, ext_lmos)] = qij_b[:, j_s, :]
+            # Intersect ext_lmos (LMOs with density on centerQ) with the
+            # pair's interacting-LMO domain p_lmos. Only these rows need
+            # to be populated — entries for LMOs outside p_lmos are
+            # never read downstream.
+            ext_local = p_lmos_dense[ext_lmos]
+            keep_mask = ext_local >= 0
+            if not np.any(keep_mask):
+                # Nothing to contribute from this centerQ; still need to
+                # handle the diagonal i_s/j_s and PAO pieces below.
+                ext_kept_lmos = np.zeros(0, dtype=np.int64)
+                ext_kept_pos = np.zeros(0, dtype=np.int64)
+            else:
+                ext_kept_pos = np.where(keep_mask)[0]       # rows of qij_b
+                ext_kept_lmos = ext_local[keep_mask]        # cols of raw_io
+
+            # raw_io[local_Q, p_lmos_local] = qij_b[:, i_s, kept]
+            if i_s >= 0 and ext_kept_lmos.size > 0:
+                raw_io[np.ix_(local_Q, ext_kept_lmos)] = \
+                    qij_b[:, i_s, :][:, ext_kept_pos]
+            if j_s >= 0 and ext_kept_lmos.size > 0:
+                raw_jo[np.ix_(local_Q, ext_kept_lmos)] = \
+                    qij_b[:, j_s, :][:, ext_kept_pos]
             if i_s >= 0 and j_s >= 0:
                 raw_pair[local_Q] = qij_b[:, i_s, j_s]
 
@@ -650,12 +728,15 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 if j_s >= 0:
                     raw_jv[local_Q] = qia_b_pp[:, j_s, :] @ X_ij_slice
 
-                # raw_ma: reshape+gemm gives one big BLAS call instead of nQp
-                # small ones — much better amortization.
-                nQp = len(local_Q)
-                ma_b = (qia_b_pp.reshape(nQp * len(ext_lmos), -1) @ X_ij_slice
-                        ).reshape(nQp, len(ext_lmos), npno)
-                raw_ma[np.ix_(local_Q, ext_lmos)] = ma_b
+                # raw_ma: keep only ext_lmos that are in p_lmos
+                if ext_kept_lmos.size > 0:
+                    nQp = len(local_Q)
+                    qia_b_pp_kept = qia_b_pp[:, ext_kept_pos, :]  # (nQp, n_kept, npp)
+                    ma_b_kept = (
+                        qia_b_pp_kept.reshape(nQp * ext_kept_pos.size, -1)
+                        @ X_ij_slice
+                    ).reshape(nQp, ext_kept_pos.size, npno)
+                    raw_ma[np.ix_(local_Q, ext_kept_lmos)] = ma_b_kept
 
                 # raw_ab: X^T qab_b_pp X — one big reshape+gemm for tmp,
                 # then batched gemm over Q for the second contraction.
@@ -724,15 +805,29 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
 
         q_iv = jhi @ raw_iv
         q_jv = jhi @ raw_jv
-        q_io = jhi @ raw_io
-        q_jo = jhi @ raw_jo
+        q_io_red = jhi @ raw_io                  # (n_local, nlmo_p) reduced
+        q_jo_red = jhi @ raw_jo                  # (n_local, nlmo_p) reduced
         q_pair = jhi @ raw_pair
-        # Use BLAS gemm via reshape (einsum 'LK,Kma->Lma' is much slower).
-        Qma = (jhi @ raw_ma.reshape(n_local, -1)).reshape(n_local, nocc, npno)
+        # raw_ma is reduced (n_local, nlmo_p, npno) — small jhi matmul.
+        Qma_red = (jhi @ raw_ma.reshape(n_local, -1)
+                    ).reshape(n_local, nlmo_p, npno)
         Qab = (jhi @ raw_ab.reshape(n_local, -1)).reshape(n_local, npno, npno)
 
+        # Scatter reduced fitted quantities into full-nocc shape so
+        # downstream consumers (compute_B_tilde, t1_fock Fij_bar,
+        # lccsd.py Fij_bar update, etc.) that index by global LMO
+        # continue to work unchanged. The compute savings come from
+        # the small jhi matmul above; memory footprint is the same as
+        # before (full-nocc) but zeros in rows outside p_lmos.
+        q_io = np.zeros((n_local, nocc))
+        q_jo = np.zeros((n_local, nocc))
+        Qma = np.zeros((n_local, nocc, npno))
+        q_io[:, p_lmos] = q_io_red
+        q_jo[:, p_lmos] = q_jo_red
+        Qma[:, p_lmos, :] = Qma_red
+
         K_iajb = q_iv.T @ q_jv
-        K_mnij = q_io.T @ q_jo
+        K_mnij = q_io.T @ q_jo                    # (nocc, nocc) full
         K_bar_ij = q_io.T @ q_jv
         K_bar_ji = q_jo.T @ q_iv
         K_bar_chem = np.tensordot(q_pair, Qma, axes=(0, 0))
@@ -743,7 +838,11 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         for k, key_kj, _ in kj_partners:
             cross_fitted = (jhi @ raw_cross_kj[k].reshape(n_local, -1)
                             ).reshape(n_local, npno, raw_cross_kj[k].shape[2])
-            q_ik = q_io[:, k]
+            # q_io now uses the reduced (p_lmos) axis; k is a global LMO
+            # index, kj_partners is built from pair_lmo_idx[key], so k is
+            # guaranteed to be in p_lmos — map via p_lmos_dense.
+            k_loc = int(p_lmos_dense[k])
+            q_ik = q_io[:, k_loc]
             J_ij_kj[(key, k)] = np.tensordot(q_ik, cross_fitted, axes=(0, 0))
             q_kv_kj = jhi @ raw_kv_kj[k]
             K_ij_kj_dict[(key, k)] = q_iv.T @ q_kv_kj
@@ -753,17 +852,18 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         for k, key_ki, _ in ki_partners:
             cross_fitted = (jhi @ raw_cross_ji[k].reshape(n_local, -1)
                             ).reshape(n_local, npno, raw_cross_ji[k].shape[2])
-            q_jk = q_jo[:, k]
+            k_loc = int(p_lmos_dense[k])
+            q_jk = q_jo[:, k_loc]
             J_ji_ki[(key, k)] = np.tensordot(q_jk, cross_fitted, axes=(0, 0))
             q_kv_ki = jhi @ raw_kv_ki[k]
             K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki
 
         return key, {
             'K_iajb': K_iajb,
-            'K_mnij': K_mnij,
+            'K_mnij': K_mnij,       # (nlmo_p, nlmo_p) reduced
             'K_bar_ij': K_bar_ij,
             'K_bar_ji': K_bar_ji,
-            'K_bar_chem': K_bar_chem,
+            'K_bar_chem': K_bar_chem,  # (nlmo_p, npno) reduced
             'J_ijab': J_ijab,
             'J_ij_kj': J_ij_kj,
             'K_ij_kj': K_ij_kj_dict,
@@ -771,12 +871,19 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             'K_ji_ki': K_ji_ki_dict,
             'i_Qa': q_iv.copy(),
             'j_Qa': q_jv.copy(),
-            'i_Qk': q_io.copy(),
-            'j_Qk': q_jo.copy(),
-            'Qma': Qma,
+            'i_Qk': q_io.copy(),     # (n_local, nlmo_p) reduced
+            'j_Qk': q_jo.copy(),     # (n_local, nlmo_p) reduced
+            'Qma': Qma,              # (n_local, nlmo_p, npno) reduced
             'Qab': Qab,
             'n_local': n_local,
             'aux_idx': aux_idx,
+            # LMO-axis metadata: ci['p_lmos'] is the sorted global LMO
+            # indices along the reduced "nocc" axis of i_Qk / j_Qk / Qma
+            # / K_mnij / K_bar_chem. Consumers that previously did
+            # ci['Qma'][:, pair_lmo_idx[key], :] now use ci['Qma']
+            # directly (pair_lmo_idx[key] == p_lmos by construction).
+            'p_lmos': p_lmos,
+            'p_lmos_dense': p_lmos_dense,
         }
 
     # Dispatch: parallel via _pool if provided, else serial. Each pair's
@@ -794,15 +901,16 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     return cc_ints
 
 
-def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc):
+def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
+            pair_lmo_idx=None):
     """Build T1-dressed DF intermediates, matching Psi4 t1_ints().
 
     For each pair (ij), builds:
         i_Qa_t1[Q, a] = i_Qa[Q,a] - i_Qk[Q,:] @ T1_all[:,a]
                        + Σ_b (Qab[Q,a,b] - T1_all^T @ Qma[Q,:,b]) * t1_i[b]
 
-    Returns:
-        dressed: dict pair_key -> {'i_Qa_t1': (n_local, npno), 'j_Qa_t1': ...}
+    The implicit `k` sum inside this formula is restricted to
+    pair_lmo_idx[key] (Psi4 lmopair_to_lmos_[ij]) when provided.
     """
     from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
 
@@ -813,38 +921,31 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc):
             continue
         i, j = key
         npno = pno_spaces[key]['C_pno'].shape[1]
-        n_local = ci['n_local']
 
-        # Project T1 to pair's PNO basis
-        T1_all = np.zeros((nocc, npno))
-        for k in range(nocc):
-            T1_all[k] = _project_t1_to_pair(
-                t1_pno, k, key, S_pno_cache, pno_spaces)
+        if pair_lmo_idx is not None and key in pair_lmo_idx:
+            lmo_idx = np.asarray(pair_lmo_idx[key])
+        else:
+            lmo_idx = np.arange(nocc)
 
-        Qma = ci['Qma']  # (n_local, nocc, npno)
-        Qab = ci['Qab']  # (n_local, npno, npno)
+        # Project T1 only for LMOs in pair's domain
+        T1_local = np.zeros((len(lmo_idx), npno))
+        for ki, k in enumerate(lmo_idx):
+            T1_local[ki] = _project_t1_to_pair(
+                t1_pno, int(k), key, S_pno_cache, pno_spaces)
 
-        def _dress_one(lmo_idx, Qa_key):
-            """Build i_Qa_t1 for one LMO matching Psi4 t1_ints exactly. Vectorized."""
-            i_Qa = ci[Qa_key]  # (n_local, npno)
-            i_Qk = ci[Qa_key.replace('Qa', 'Qk')]  # (n_local, nocc)
+        Qma = ci['Qma'][:, lmo_idx, :]       # (n_local, nlmo, npno)
+        Qab = ci['Qab']                       # (n_local, npno, npno)
 
-            t1_lmo = T1_all[lmo_idx]
-            # Term 1: bare
-            # Term 2: -i_Qk @ T1_all
-            # Terms 3+4 vectorized:
-            #   Σ_b Qab[Q,a,b] * t1_lmo[b] = Qab @ t1_lmo  → (n_local, npno)
-            #   Σ_b (T1_all^T @ Qma[Q,:,b]) * t1_lmo[b]
-            #     = Σ_{b,m} T1_all[m,a] * Qma[Q,m,b] * t1_lmo[b]
-            #     = Σ_m T1_all[m,a] * (Qma @ t1_lmo)[Q,m]
-            #     = (Qma @ t1_lmo) @ T1_all = (n_local, npno)
-            result = i_Qa - i_Qk @ T1_all
-            # Term 3: Σ_b Qab[Q,a,b] * t1_lmo[b]
+        def _dress_one(lmo_global, Qa_key):
+            i_Qa = ci[Qa_key]                                 # (n_local, npno)
+            i_Qk_local = ci[Qa_key.replace('Qa', 'Qk')][:, lmo_idx]  # (n_local, nlmo)
+
+            t1_lmo = _project_t1_to_pair(
+                t1_pno, int(lmo_global), key, S_pno_cache, pno_spaces)
+            result = i_Qa - i_Qk_local @ T1_local              # (n_local, npno)
             result += np.einsum('Qab,b->Qa', Qab, t1_lmo)
-            # Term 4: -Σ_{b,m} T1_all[m,a] * Qma[Q,m,b] * t1_lmo[b]
-            #       = -(Qma @ t1_lmo) @ T1_all
-            qma_t1 = np.einsum('Qmb,b->Qm', Qma, t1_lmo)  # (n_local, nocc)
-            result -= qma_t1 @ T1_all  # (n_local, npno)
+            qma_t1 = np.einsum('Qmb,b->Qm', Qma, t1_lmo)       # (n_local, nlmo_p)
+            result -= qma_t1 @ T1_local                         # (n_local, npno)
             return result
 
         dressed[key] = {
@@ -856,51 +957,64 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc):
 
 
 def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
-            S_pno_cache, F_lmo, eps_lmo, foo_t2, keys, nocc, _pool=None):
+            S_pno_cache, F_lmo, eps_lmo, foo_t2, keys, nocc, _pool=None,
+            pair_lmo_idx=None):
     """Build dressed Fock matrices matching Psi4 t1_fock().
 
     Returns:
         Fkj: (nocc, nocc) dressed occupied Fock
         Fab_all: dict pair_key -> (npno, npno) dressed virtual Fock
         foo_t1: (nocc, nocc) T1 part of foo
+
+    LMO sums inside each per-pair dressing are restricted to
+    pair_lmo_idx[key] (Psi4 lmopair_to_lmos_[ij]) when provided.
     """
     from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
 
-    # Combined per-pair work (Step 1 Fkj contribution + Step 2 Fab) so we
-    # only project T1 once per pair.
+    def _pair_domain(key):
+        if pair_lmo_idx is not None and key in pair_lmo_idx:
+            return np.asarray(pair_lmo_idx[key])
+        return np.arange(nocc)
+
+    # Combined per-pair work (Step 1 Fkj contribution + Step 2 Fab)
     def _per_pair(key):
         ci = cc_ints.get(key)
         if ci is None:
             return key, None
         i, j = key
         npno = pno_spaces[key]['C_pno'].shape[1]
-        T1_all = np.zeros((nocc, npno))
-        for k in range(nocc):
-            T1_all[k] = _project_t1_to_pair(
-                t1_pno, k, key, S_pno_cache, pno_spaces)
+        lmo_idx = _pair_domain(key)
 
-        # Step 1 Fkj contributions (returned as deltas to apply after merge).
-        d_ij = (2.0 * np.sum(T1_all * ci['K_bar_chem'])
-                - np.sum(T1_all * ci['K_bar_ji']))
+        T1_local = np.zeros((len(lmo_idx), npno))
+        for ki, k in enumerate(lmo_idx):
+            T1_local[ki] = _project_t1_to_pair(
+                t1_pno, int(k), key, S_pno_cache, pno_spaces)
+
+        # Step 1 Fkj contributions — K_bar_* are (nocc, npno); restrict rows.
+        K_bar_chem_l = ci['K_bar_chem'][lmo_idx]
+        K_bar_ji_l = ci['K_bar_ji'][lmo_idx]
+        d_ij = (2.0 * np.sum(T1_local * K_bar_chem_l)
+                - np.sum(T1_local * K_bar_ji_l))
         d_ji = None
         if i != j:
-            d_ji = (2.0 * np.sum(T1_all * ci['K_bar_chem'])
-                    - np.sum(T1_all * ci['K_bar_ij']))
+            K_bar_ij_l = ci['K_bar_ij'][lmo_idx]
+            d_ji = (2.0 * np.sum(T1_local * K_bar_chem_l)
+                    - np.sum(T1_local * K_bar_ij_l))
 
         # Step 2 Fab
-        Qma = ci['Qma']
-        Qab = ci['Qab']
+        Qma = ci['Qma'][:, lmo_idx, :]       # (n_local, nlmo, npno)
+        Qab = ci['Qab']                       # (n_local, npno, npno)
         e_pno = pno_spaces[key]['e_pno']
         Fab = np.diag(e_pno)
-        gamma = Qma.reshape(Qma.shape[0], -1) @ T1_all.ravel()
+        gamma = Qma.reshape(Qma.shape[0], -1) @ T1_local.ravel()  # (n_local,)
         Fab += 2.0 * np.tensordot(gamma, Qab, axes=(0, 0))
-        Y = Qab @ T1_all.T
+        Y = Qab @ T1_local.T                  # (n_local, npno, nlmo)
         Fab -= np.tensordot(Y, Qma, axes=((0, 2), (0, 1)))
 
-        Fia_bar = 2.0 * np.tensordot(gamma, Qma, axes=(0, 0))
-        Z = T1_all @ Qma.transpose(0, 2, 1)
-        Fia_bar -= np.tensordot(Z, Qma, axes=((0, 1), (0, 1)))
-        Fab -= T1_all.T @ Fia_bar
+        Fia_bar = 2.0 * np.tensordot(gamma, Qma, axes=(0, 0))     # (nlmo, npno)
+        Z = T1_local @ Qma.transpose(0, 2, 1)                     # (n_local, nlmo, nlmo)
+        Fia_bar -= np.tensordot(Z, Qma, axes=((0, 1), (0, 1)))    # (nlmo, npno)
+        Fab -= T1_local.T @ Fia_bar
         return key, (d_ij, d_ji, Fab)
 
     Fkj = F_lmo.copy()
@@ -919,7 +1033,7 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
             Fkj[j, i] += d_ji
         Fab_all[key] = Fab
 
-    # Eq 94: Fkj += Σ_a Fia_bar_jj · t1_j
+    # Eq 94: Fkj += Σ_a Fia_bar_jj · t1_j — use local LMO domain of (jj, jj)
     for j_idx in range(nocc):
         key_jj = (j_idx, j_idx)
         ci = cc_ints.get(key_jj)
@@ -929,18 +1043,17 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
         if t1_j is None or t1_j.size == 0:
             continue
         npno = pno_spaces[key_jj]['C_pno'].shape[1]
-        T1_all = np.zeros((nocc, npno))
-        for k in range(nocc):
-            T1_all[k] = _project_t1_to_pair(
-                t1_pno, k, key_jj, S_pno_cache, pno_spaces)
-        Qma_jj = ci['Qma']
-        gamma = Qma_jj.reshape(Qma_jj.shape[0], -1) @ T1_all.ravel()
+        lmo_idx = _pair_domain(key_jj)
+        T1_local = np.zeros((len(lmo_idx), npno))
+        for ki, k in enumerate(lmo_idx):
+            T1_local[ki] = _project_t1_to_pair(
+                t1_pno, int(k), key_jj, S_pno_cache, pno_spaces)
+        Qma_jj = ci['Qma'][:, lmo_idx, :]     # (n_local, nlmo, npno)
+        gamma = Qma_jj.reshape(Qma_jj.shape[0], -1) @ T1_local.ravel()
         Fia_bar_jj = 2.0 * np.tensordot(gamma, Qma_jj, axes=(0, 0))
-        Z_jj = T1_all @ Qma_jj.transpose(0, 2, 1)
+        Z_jj = T1_local @ Qma_jj.transpose(0, 2, 1)
         Fia_bar_jj -= np.tensordot(Z_jj, Qma_jj, axes=((0, 1), (0, 1)))
-        # Psi4 ccsd.cc line 1621: Fkj_(i,j) += Fia_bar[jj](i,:) . T_ia[j]
-        for i_idx in range(nocc):
-            Fkj[i_idx, j_idx] += np.dot(Fia_bar_jj[i_idx], t1_j)
+        Fkj[lmo_idx, j_idx] += Fia_bar_jj @ t1_j
 
     if getattr(t1_fock, '_dump_fkj', False):
         Fkj_step1 = Fkj - F_lmo  # Step 1 only (before Step 2 was added above)
@@ -978,13 +1091,15 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
 
 
 def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
-                    pno_spaces, S_pno_cache, key, nocc):
+                    pno_spaces, S_pno_cache, key, nocc,
+                    pair_lmo_idx=None):
     """Build B_tilde for pair (ij) matching Psi4's precomputed B_tilde.
 
     B_tilde[k,l] = (ki|lj)_dressed + Σ_{a,b} tau[a,b] * (ka|lb)
 
-    where (ki|lj)_dressed uses dressed ooL and
-    (ka|lb) uses bare ovL from cc_ints.
+    The k, l sums are restricted to pair_lmo_idx[key] (Psi4's
+    lmopair_to_lmos_[ij]) when provided.  Local entries are scattered into
+    a (nocc, nocc) output so downstream residual.py indexing is unchanged.
     """
     from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
 
@@ -994,41 +1109,53 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
 
     i, j = key
     npno = pno_spaces[key]['C_pno'].shape[1]
-    n_local = ci['n_local']
 
-    T1_all = np.zeros((nocc, npno))
+    if pair_lmo_idx is not None and key in pair_lmo_idx:
+        lmo_idx = np.asarray(pair_lmo_idx[key])
+    else:
+        lmo_idx = np.arange(nocc)
+    nlmo = len(lmo_idx)
+
+    Qma = ci['Qma'][:, lmo_idx, :]           # (n_local, nlmo, npno)
+    i_Qk = ci['i_Qk'][:, lmo_idx]            # (n_local, nlmo)
+    j_Qk = ci['j_Qk'][:, lmo_idx]            # (n_local, nlmo)
+
     if t1_pno is not None:
-        for k in range(nocc):
-            T1_all[k] = _project_t1_to_pair(
-                t1_pno, k, key, S_pno_cache, pno_spaces)
-    t1_i = T1_all[i]
-    t1_j = T1_all[j]
+        t1_i = _project_t1_to_pair(t1_pno, i, key, S_pno_cache, pno_spaces)
+        t1_j = _project_t1_to_pair(t1_pno, j, key, S_pno_cache, pno_spaces)
+    else:
+        t1_i = np.zeros(npno)
+        t1_j = np.zeros(npno)
 
-    # i_Qk_t1[Q, k] = i_Qk[Q,k] + Σ_a Qma[Q,k,a] * t1_i[a]
-    i_Qk_t1 = ci['i_Qk'].copy()  # (n_local, nocc)
-    i_Qk_t1 += np.einsum('Qka,a->Qk', ci['Qma'], t1_i)
+    # i_Qk_t1[Q, kl] = i_Qk[Q, kl] + Σ_a Qma[Q, kl, a] * t1_i[a]
+    i_Qk_t1 = i_Qk.copy()
+    i_Qk_t1 += np.einsum('Qka,a->Qk', Qma, t1_i)
+    j_Qk_t1 = j_Qk.copy()
+    j_Qk_t1 += np.einsum('Qka,a->Qk', Qma, t1_j)
 
-    j_Qk_t1 = ci['j_Qk'].copy()
-    j_Qk_t1 += np.einsum('Qka,a->Qk', ci['Qma'], t1_j)
+    B_local = i_Qk_t1.T @ j_Qk_t1            # (nlmo, nlmo)
 
-    # J_oo_dressed[k,l] = i_Qk_t1[Q,k] * j_Qk_t1[Q,l]
-    B_tilde = i_Qk_t1.T @ j_Qk_t1  # (nocc, nocc)
-
-    # voov: B[k,l] += Σ_{Q} Qma[Q,k,:] @ T2 @ Qma[Q,l,:].T
-    # Psi4 ccsd.cc line 1685: uses bare T_iajb, NOT tau
+    # voov dressing (bare T2 per Psi4)
     T2_ij = t2_pno_all[key]
-    Qma_arr = ci['Qma']  # (n_local, nocc, npno)
-    P = np.einsum('ab,Qka->kbQ', T2_ij, Qma_arr)  # (nocc, npno, n_local)
-    B_tilde += np.einsum('kbQ,Qlb->kl', P, Qma_arr)
+    P = np.einsum('ab,Qka->kbQ', T2_ij, Qma)     # (nlmo, npno, n_local)
+    B_local += np.einsum('kbQ,Qlb->kl', P, Qma)
 
+    # Scatter local (nlmo × nlmo) into global (nocc × nocc) output
+    B_tilde = np.zeros((nocc, nocc))
+    B_tilde[np.ix_(lmo_idx, lmo_idx)] = B_local
     return B_tilde
 
 
 def compute_ladder(cc_ints, t2_pno_all, t1_pno, pno_spaces,
-                   S_pno_cache, key, nocc):
+                   S_pno_cache, key, nocc, pair_lmo_idx=None):
     """Compute ladder term A for pair (ij) matching Psi4 Term A.
 
     A[a,b] = Σ_Q Qab_t1[Q,a,c] * T2[c,d] * Qab_t1[Q,b,d]
+
+    The `k` (LMO) sum inside Qab_t1 is restricted to the pair's local LMO
+    domain (lmopair_to_lmos_[ij] in Psi4) when pair_lmo_idx is provided.
+    This turns a per-pair cost of O(n_local · nocc · npno²) into
+    O(n_local · nlmo_ij · npno²), restoring DLPNO linear-scaling.
     """
     from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
 
@@ -1038,20 +1165,23 @@ def compute_ladder(cc_ints, t2_pno_all, t1_pno, pno_spaces,
 
     i, j = key
     npno = pno_spaces[key]['C_pno'].shape[1]
-    n_local = ci['n_local']
     Qab = ci['Qab']
-    Qma = ci['Qma']
+    Qma_full = ci['Qma']   # (n_local, nocc, npno)
 
-    T1_all = np.zeros((nocc, npno))
+    if pair_lmo_idx is not None and key in pair_lmo_idx:
+        lmo_idx = np.asarray(pair_lmo_idx[key])
+    else:
+        lmo_idx = np.arange(nocc)
+    Qma = Qma_full[:, lmo_idx, :]            # (n_local, nlmo, npno)
+
+    T1_local = np.zeros((len(lmo_idx), npno))
     if t1_pno is not None:
-        for k in range(nocc):
-            T1_all[k] = _project_t1_to_pair(
-                t1_pno, k, key, S_pno_cache, pno_spaces)
+        for ki, k in enumerate(lmo_idx):
+            T1_local[ki] = _project_t1_to_pair(
+                t1_pno, int(k), key, S_pno_cache, pno_spaces)
 
     T2_ij = t2_pno_all[key]
-    # Qab_t1[Q,a,b] = Qab[Q,a,b] - Σ_n T1[n,a] * Qma[Q,n,b]
-    # (T1_all.T @ Qma broadcasts over Q): (npno,nocc) @ (Q,nocc,npno) = (Q,npno,npno)
-    Qab_t1 = Qab - (T1_all.T @ Qma)
-    # ladder[a,b] = Σ_{Q,c,d} Qab_t1[Q,a,c] * T2[c,d] * Qab_t1[Q,b,d]
+    # Qab_t1[Q,a,b] = Qab[Q,a,b] - Σ_{k ∈ lmo_idx} T1_local[k,a] * Qma[Q,k,b]
+    Qab_t1 = Qab - (T1_local.T @ Qma)
     X = Qab_t1 @ T2_ij                        # (Q, npno, npno)
     return np.tensordot(X, Qab_t1, axes=((0, 2), (0, 2)))

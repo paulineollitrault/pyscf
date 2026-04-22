@@ -389,6 +389,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         T_CutEnergy=T_CutEnergy, T_CutTrace=T_CutTrace,
         occ_cas_idx=occ_cas_idx, C_cas_vir=C_cas_vir,
         nvir_cas=nvir_cas_loc, s1e=s1e,
+        _pool=_shared_pool,
         verbose=verbose)
 
     # ------------------------------------------------------------------
@@ -444,6 +445,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
             mo_coeff_cas=mo_coeff_cas_arg, s1e=s1e,
             conv_tol=ccsd_conv_tol, max_cycle=ccsd_max_cycle,
             ncores=ncores, C_pao=C_pao, verbose=verbose,
+            negligible_pairs=negligible_pairs,
             _pool=_shared_pool)
     finally:
         if _blas_ctx is not None:
@@ -489,6 +491,9 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
                 occ_cas_idx=occ_cas_idx,
                 C_cas_vir=C_cas_vir_t,
                 vir_cas_idx=vir_cas_idx,
+                negligible_pairs=negligible_pairs,
+                weak_pairs=weak_pairs,
+                C_pao=C_pao,
                 ncores=ncores, verbose=verbose,
                 _pool=_shared_pool)
     finally:

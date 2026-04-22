@@ -54,7 +54,8 @@ def _chunked_map(pool, fn, items, chunks_per_worker=4):
 
 def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                   ovL_bare, ooL_bare, S_pno_cache,
-                  Fkj, foo_t1, cc_ints=None):
+                  Fkj, foo_t1, cc_ints=None,
+                  S_pao_full=None, s1e=None):
     """Build G_tilde (Eq 86): double-dressed Fock oo.
 
     G_tilde[k,j] = F̃_{kj} + Σ_l u_lj × K_il (bare exchange)
@@ -66,6 +67,7 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
         foo_t1: (nocc, nocc) = T1 correction to Fock (from _compute_foo_t1)
     """
     G = Fkj.copy()
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
 
     for i_idx in range(nocc):
         for j_idx in range(nocc):
@@ -97,7 +99,7 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                 if key_il == key_lj:
                     U_lj_proj = u_lj
                 else:
-                    S_il_lj = S_pno_cache.get((key_il, key_lj))
+                    S_il_lj = _s_pno_get(key_il, key_lj)
                     if S_il_lj is None:
                         continue
                     U_lj_proj = S_il_lj @ u_lj @ S_il_lj.T  # (n_il, n_il)
@@ -112,10 +114,43 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
 
 
 
+def _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e):
+    """Return a function that retrieves S_pno[a,b] with uniform numerics.
+
+    On cache hit: returns the cached matrix.
+    On cache miss: computes via the same X_pno + S_pao_full path as the
+    build (falls back to C_pno+s1e only when X_pno unavailable, e.g.
+    CAS pairs) and POPULATES the cache so subsequent lookups hit.
+
+    This makes the upfront O(N^2) restricted build work correctly: any
+    key not pre-built is computed lazily once and cached.  After the
+    first CCSD iteration the cache contains every actually-accessed
+    entry; later iterations are pure hits.
+    """
+    from pyscf.cc.dlpno_tccsd.local_df import compute_S_pno
+
+    def _get(ka, kb, default=None):
+        if S_pno_cache is not None:
+            S = S_pno_cache.get((ka, kb))
+            if S is not None:
+                return S
+        if S_pao_full is None:
+            return default
+        S = compute_S_pno(ka, kb, pno_spaces, S_pao_full, s1e)
+        if S_pno_cache is not None:
+            # CPython dict insert is atomic under the GIL; concurrent
+            # threads may compute the same entry but the last write wins
+            # and all writes have identical contents — no data race.
+            S_pno_cache[(ka, kb)] = S
+        return S
+    return _get
+
+
 def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                   ovL_bare, ooL_bare, S_pno_cache, with_df,
                   _term2_precomputed=None, cc_ints=None,
-                  pair_lmo_idx=None, _pool=None):
+                  pair_lmo_idx=None, _pool=None,
+                  S_pao_full=None, s1e=None):
     """Build D_tilde (delta, Eq 84) for all ordered (i,k) pairs.
 
     delta_{ik}^{ac} = Terms 1-4 of Eq 84, using M/L integrals.
@@ -173,6 +208,11 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                 aux_off += nL
             _term2_precomputed = {ik: td['result'] for ik, td in term2_data.items()}
 
+    # Unified S_pno accessor (cache hit → cached value; cache miss →
+    # same X_pno + S_pao_full path as the upfront build, so restricting
+    # the cache is safe to machine precision).
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
+
     # --- Build D_tilde for each (i,k) pair ---
     def _process_ik(ik_tuple):
         i_idx, k_idx = ik_tuple
@@ -187,11 +227,18 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
         t1_i_ik = _project_t1_to_pair(
             t1_pno, i_idx, key_ik, S_pno_cache, pno_spaces)
 
-        # T1_all projected to PNO_ik
+        # Restrict LMO iteration to pair (i,k)'s local domain for Term 1.
+        if pair_lmo_idx is not None and key_ik in pair_lmo_idx:
+            _ll_idx_ik = np.asarray(pair_lmo_idx[key_ik])
+        else:
+            _ll_idx_ik = np.arange(nocc)
+
+        # Scatter T1_local into full (nocc, n_ik) — downstream Term 3 still
+        # indexes T1_all_ik[ll], but only ll ∈ domain have nonzero rows.
         T1_all_ik = np.zeros((nocc, n_ik))
-        for mm in range(nocc):
-            T1_all_ik[mm] = _project_t1_to_pair(
-                t1_pno, mm, key_ik, S_pno_cache, pno_spaces)
+        for _li, _mm in enumerate(_ll_idx_ik):
+            T1_all_ik[int(_mm)] = _project_t1_to_pair(
+                t1_pno, int(_mm), key_ik, S_pno_cache, pno_spaces)
 
         # Term 2: Psi4 lines 1791-1801 use K_tilde_chem[ki] × t1_i.
         # K_tc[b, a*n+c] = Σ_Q k_Qa[Q,b] * Qab[Q,a,c]
@@ -282,7 +329,7 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                 continue
             Lt1 = L_lk @ t1_i_lk  # (n_lk,)
             # Project to PNO_ik
-            S_ik_lk = S_pno_cache.get((key_ik, key_lk))
+            S_ik_lk = _s_pno_get(key_ik, key_lk)
             if S_ik_lk is None:
                 continue
             Lt1_ik = S_ik_lk @ Lt1  # (n_ik,)
@@ -317,7 +364,7 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             def _get_S_or_I(ka, kb, n_a):
                 if ka == kb:
                     return np.eye(n_a)
-                return S_pno_cache.get((ka, kb))
+                return _s_pno_get(ka, kb)
 
             n_ik2 = pno_spaces[key_ik]['C_pno'].shape[1]
             S_ik_il = _get_S_or_I(key_ik, key_il, n_ik2)
@@ -413,7 +460,8 @@ def build_mixed_domain_integrals(t2_pno_all, pno_spaces, nocc,
 def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                     ovL_pno_bare, ooL_bare, S_pno_cache, with_df,
                     _term2_precomputed=None, cc_ints=None,
-                    pair_lmo_idx=None, _pool=None):
+                    pair_lmo_idx=None, _pool=None,
+                    S_pao_full=None, s1e=None):
     """Compute C_tilde (gamma intermediate, Eq 83) for all pairs.
 
     C_tilde[ki][a_ki, c_ki] = gamma_{ki}^{ac} =
@@ -427,6 +475,7 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
     Returns dict: pair_key → (n_pno_ki, n_pno_ki) matrix.
     """
     C_tilde_all = {}
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
 
     # Iterate over ALL ordered (k,i) pairs, not just min/max.
     # gamma_{ki} depends on which LMO is "i" (the T1 source).
@@ -503,45 +552,48 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             C_tilde_ki += _term2_precomputed[(k, i)]
 
         # --- Term 1: -Σ_l T1_all[l,a] · (ki|lc) ---
-        # K_bar_chem[ki][l,c] = Σ_Q ooL[k,i,Q]*ovL_l_ki[c,Q] = (ki|lc)
-        T1_all_ki = np.zeros((nocc, n_ki))
-        for ll in range(nocc):
-            T1_all_ki[ll] = _project_t1_to_pair(
-                t1_pno, ll, key_ki, S_pno_cache, pno_spaces)
-        K_bar_chem = np.zeros((nocc, n_ki))
+        # Restricted to l ∈ lmopair_to_lmos_[ki] (Psi4 line 1722).
+        if pair_lmo_idx is not None and key_ki in pair_lmo_idx:
+            _ll_idx = np.asarray(pair_lmo_idx[key_ki])
+        else:
+            _ll_idx = np.arange(nocc)
+        _domain_ki = set(int(x) for x in _ll_idx)
+
+        T1_local_ki = np.zeros((len(_ll_idx), n_ki))
+        for _li, _ll in enumerate(_ll_idx):
+            T1_local_ki[_li] = _project_t1_to_pair(
+                t1_pno, int(_ll), key_ki, S_pno_cache, pno_spaces)
+
+        K_bar_chem_local = np.zeros((len(_ll_idx), n_ki))
         if key_ki in cc_ints and cc_ints[key_ki] is not None:
             from pyscf.cc.dlpno_tccsd.local_df import get_local_ovL, get_local_ooL_vec
             _ooL_ki = get_local_ooL_vec(cc_ints, k, i, key_ki)
             if _ooL_ki is not None:
-                for ll in range(nocc):
-                    _ovL_l = get_local_ovL(cc_ints, key_ki, ll)
+                for _li, _ll in enumerate(_ll_idx):
+                    _ovL_l = get_local_ovL(cc_ints, key_ki, int(_ll))
                     if _ovL_l is not None:
-                        K_bar_chem[ll] = _ovL_l @ _ooL_ki
+                        K_bar_chem_local[_li] = _ovL_l @ _ooL_ki
             else:
                 ooL_ki = ooL_bare[k, i, :]
-                for ll in range(nocc):
-                    ovL_l_ki = ovL_pno_bare.get((key_ki, ll))
+                for _li, _ll in enumerate(_ll_idx):
+                    ovL_l_ki = ovL_pno_bare.get((key_ki, int(_ll)))
                     if ovL_l_ki is not None:
-                        K_bar_chem[ll] = ovL_l_ki @ ooL_ki
+                        K_bar_chem_local[_li] = ovL_l_ki @ ooL_ki
         else:
             ooL_ki = ooL_bare[k, i, :]
-            for ll in range(nocc):
-                ovL_l_ki = ovL_pno_bare.get((key_ki, ll))
+            for _li, _ll in enumerate(_ll_idx):
+                ovL_l_ki = ovL_pno_bare.get((key_ki, int(_ll)))
                 if ovL_l_ki is not None:
-                    K_bar_chem[ll] = ovL_l_ki @ ooL_ki
-        # Psi4 line 1722 restricts the contraction over l to lmopair_to_lmos_[ki]
-        # (T_n_ij_[ki] has shape (nlmo_ki, npno_ki)).
-        _domain_ki = (set(pair_lmo_idx[key_ki].tolist())
-                      if pair_lmo_idx is not None and key_ki in pair_lmo_idx
-                      else set(range(nocc)))
-        if _domain_ki != set(range(nocc)):
-            _mask = np.zeros(nocc, dtype=bool)
-            for _l in _domain_ki:
-                _mask[_l] = True
-            T1_all_ki[~_mask] = 0.0
-            K_bar_chem[~_mask] = 0.0
-        T1_contrib = -T1_all_ki.T @ K_bar_chem
+                    K_bar_chem_local[_li] = ovL_l_ki @ ooL_ki
+
+        T1_contrib = -T1_local_ki.T @ K_bar_chem_local
         C_tilde_ki += T1_contrib  # (n_ki, n_ki)
+
+        # Scatter T1_local_ki into T1_all_ki for downstream Term 3/Term 4
+        # code that still uses full-nocc indexing (T1_all_ki[ll]).
+        T1_all_ki = np.zeros((nocc, n_ki))
+        for _li, _ll in enumerate(_ll_idx):
+            T1_all_ki[int(_ll)] = T1_local_ki[_li]
         if _dump_terms:
             ev = np.sort(np.linalg.eigvalsh(0.5*(T1_contrib+T1_contrib.T)))[::-1]
             _term_log['T1'] = (float(np.sqrt(np.mean(T1_contrib**2))), ev[0], ev[-1])
@@ -571,7 +623,7 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             # Per Eq 83: t1_i contracts with b (first index of K_kl^{bc} where
             # K_iajb[kl][a,b]=(ka|lb) has "a" at k-partner position).
             Kt1 = K_kl.T @ t1_i_kl  # (n_kl,)
-            S_ki_kl = S_pno_cache.get((key_ki, key_kl))
+            S_ki_kl = _s_pno_get(key_ki, key_kl)
             if S_ki_kl is None:
                 continue
             Kt1_ki = S_ki_kl @ Kt1  # (n_ki,)
@@ -611,8 +663,7 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             def _get_S_or_I(ka, kb, n_a):
                 if ka == kb:
                     return np.eye(n_a)
-                S = S_pno_cache.get((ka, kb))
-                return S
+                return _s_pno_get(ka, kb)
 
             n_ki2 = pno_spaces[key_ki]['C_pno'].shape[1]
             S_ki_li = _get_S_or_I(key_ki, key_li, n_ki2)
@@ -656,7 +707,7 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
 
 def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
                                 nocc, cc_ints, S_pno_cache, pair_keys,
-                                _pool=None):
+                                _pool=None, pair_lmo_idx=None):
     """Per-pair, local-aux-per-pair version of compute_all_df_terms.
 
     Drop-in replacement that reads from ``cc_ints[pk]['Qab' / 'Qma']``
@@ -701,23 +752,39 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         if ci is None:
             return pk, np.zeros((n, n)), np.zeros((n, n))
 
-        Qab = ci['Qab']         # (n_local, n, n)
-        Qma = ci['Qma']         # (n_local, nocc, n)
+        Qab = ci['Qab']                 # (n_local, n, n)
+        Qma_full = ci['Qma']            # (n_local, nocc, n)
         i, j = pk
-        T1_all = np.zeros((nocc, n))
-        for kk in range(nocc):
-            T1_all[kk] = _project_t1_to_pair(
-                t1_pno, kk, pk, S_pno_cache, pno_spaces)
+
+        # Restrict inner k-sum to pair's local LMO domain (Psi4
+        # lmopair_to_lmos_[ij]). For each k in the full nocc, the
+        # contribution is ~zero for k outside the domain; restricting
+        # collapses O(nocc·n²) tensor contractions to O(nlmo·n²).
+        if pair_lmo_idx is not None and pk in pair_lmo_idx:
+            lmo_idx = np.asarray(pair_lmo_idx[pk])
+        else:
+            lmo_idx = np.arange(nocc)
+        Qma = Qma_full[:, lmo_idx, :]   # (n_local, nlmo, n)
+
+        T1_local = np.zeros((len(lmo_idx), n))
+        for ki, kk in enumerate(lmo_idx):
+            T1_local[ki] = _project_t1_to_pair(
+                t1_pno, int(kk), pk, S_pno_cache, pno_spaces)
 
         # fvv_t1
-        z = np.einsum('Lka,ka->L', Qma, T1_all, optimize=True)
+        z = np.einsum('Lka,ka->L', Qma, T1_local, optimize=True)
         fvv = 2.0 * np.einsum('L,Lab->ab', z, Qab, optimize=True)
-        tmp = np.einsum('Lab,kb->Lka', Qab, T1_all, optimize=True)
+        tmp = np.einsum('Lab,kb->Lka', Qab, T1_local, optimize=True)
         fvv -= np.einsum('Lka,Lkb->ab', tmp, Qma, optimize=True)
 
-        # ladder
-        tau = t2_pno_all[pk] + np.outer(T1_all[i], T1_all[j])
-        corr = np.einsum('ka,Lkb->Lab', T1_all, Qma, optimize=True)
+        # ladder — t1_i and t1_j retrieved from T1_local if i/j are in domain
+        _loc = {int(k): idx for idx, k in enumerate(lmo_idx)}
+        t1_i = (T1_local[_loc[i]] if i in _loc
+                else _project_t1_to_pair(t1_pno, i, pk, S_pno_cache, pno_spaces))
+        t1_j = (T1_local[_loc[j]] if j in _loc
+                else _project_t1_to_pair(t1_pno, j, pk, S_pno_cache, pno_spaces))
+        tau = t2_pno_all[pk] + np.outer(t1_i, t1_j)
+        corr = np.einsum('ka,Lkb->Lab', T1_local, Qma, optimize=True)
         B_tilde = Qab - corr
         X_L = np.matmul(B_tilde, tau)
         ladder = (X_L.transpose(1, 0, 2).reshape(n, -1) @
@@ -726,7 +793,7 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         _it = getattr(compute_all_df_terms_local, '_iter', 0)
         if _it <= 2 and pk in [(0, 0), (0, 5), (5, 5)]:
             print(f'  LADDER_DBG iter {_it} '
-                  f'pair{pk}: |T1_all|={np.linalg.norm(T1_all):.3e} '
+                  f'pair{pk}: |T1_all|={np.linalg.norm(T1_local):.3e} '
                   f'|T2|={np.linalg.norm(t2_pno_all[pk]):.3e} '
                   f'|tau|={np.linalg.norm(tau):.3e} '
                   f'|corr|={np.linalg.norm(corr):.3e} '
@@ -825,6 +892,117 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
 
 
 # =========================================================================
+# Batched B and E terms — moved out of per-pair compute_residual_v2 so
+# that the many small S @ t2 @ S.T ops can be vectorised into batched BLAS.
+# =========================================================================
+
+
+def compute_B_E_batched(strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
+                        cc_ints, B_tilde, pair_lmo_idx, nocc, _pool=None,
+                        S_pao_full=None, s1e=None):
+    """Compute B and E-contribution dicts for all strong pairs, batched.
+
+    B_ij = Σ_{kl ∈ domain_ij²} β[k,l] · S_{kl→ij} @ t2_kl @ S_{kl→ij}.T
+           + (l≠k:) β[l,k] · S_{kl→ij} @ t2_kl.T @ S_{kl→ij}.T
+
+    E_contrib_ij = Σ_{kl ∈ domain_ij²} S_{kl→ij} @ (u_kl @ K_kl.T
+                                       + (k≠l: (2t2_kl.T - t2_kl) @ K_kl))
+                                       @ S_{kl→ij}.T
+
+    where u_kl = 2 t2_kl - t2_kl.T.  Both terms share identical projection
+    structure; batching them together halves the BLAS overhead relative
+    to two separate loops.
+
+    Returns:
+        B_all: dict key_ij → (n_ij, n_ij) B term
+        E_contrib_all: dict key_ij → (n_ij, n_ij) E subtracted contribution
+    """
+    B_all = {}
+    E_all = {}
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
+
+    def _per_ij(key_ij):
+        i, j = key_ij
+        n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
+        if n_ij == 0:
+            return key_ij, np.zeros((n_ij, n_ij)), np.zeros((n_ij, n_ij))
+
+        domain = (set(int(x) for x in pair_lmo_idx[key_ij])
+                  if pair_lmo_idx is not None and key_ij in pair_lmo_idx
+                  else set(range(nocc)))
+
+        # Collect contributors from t2_pno_all entries with both k,l in domain
+        S_list, TB_list, UK_list = [], [], []
+        for key_kl, t2_kl in t2_pno_all.items():
+            k, l = key_kl
+            if k not in domain or l not in domain:
+                continue
+            if t2_kl is None or t2_kl.shape[0] == 0:
+                continue
+            # S projects kl → ij (unified X_pno path on miss)
+            S = _s_pno_get(key_ij, key_kl)
+            if S is None:
+                continue
+
+            # --- B combined symmetric T (k=l: single term; k!=l: β·t2 + β'·t2.T) ---
+            beta_kl = B_tilde[k, l]
+            if k == l:
+                T_B = beta_kl * t2_kl
+            else:
+                T_B = beta_kl * t2_kl + B_tilde[l, k] * t2_kl.T
+
+            # --- E contribution: S @ (u_kl @ K_kl.T + ...) @ S.T ---
+            K_kl = get_local_K(cc_ints, key_kl, k, l)
+            if K_kl is None:
+                continue
+            u_kl = 2.0 * t2_kl - t2_kl.T
+            UK = u_kl @ K_kl.T
+            if k != l:
+                UK = UK + (2.0 * t2_kl.T - t2_kl) @ K_kl
+
+            S_list.append(S)
+            TB_list.append(T_B)
+            UK_list.append(UK)
+
+        if not S_list:
+            return key_ij, np.zeros((n_ij, n_ij)), np.zeros((n_ij, n_ij))
+
+        # Bucket contributions by n_kl so each bucket is a uniform-shape
+        # batched matmul. For water all pair PNO counts are similar so
+        # this gives 1-2 buckets; for mixed systems it adapts.
+        buckets = {}  # n_kl -> (list of (S, T_B, UK))
+        for S, TB, UK in zip(S_list, TB_list, UK_list):
+            n_kl = TB.shape[0]
+            buckets.setdefault(n_kl, []).append((S, TB, UK))
+
+        B_sum = np.zeros((n_ij, n_ij))
+        E_sum = np.zeros((n_ij, n_ij))
+        for n_kl, items in buckets.items():
+            N = len(items)
+            S_arr = np.stack([it[0] for it in items])    # (N, n_ij, n_kl)
+            TB_arr = np.stack([it[1] for it in items])   # (N, n_kl, n_kl)
+            UK_arr = np.stack([it[2] for it in items])   # (N, n_kl, n_kl)
+            # Batched: R[n] = S[n] @ X[n] @ S[n].T
+            S_T = S_arr.transpose(0, 2, 1)               # (N, n_kl, n_ij)
+            B_sum += np.matmul(np.matmul(S_arr, TB_arr), S_T).sum(axis=0)
+            E_sum += np.matmul(np.matmul(S_arr, UK_arr), S_T).sum(axis=0)
+
+        return key_ij, B_sum, E_sum
+
+    if _pool is not None:
+        for key, B, E in _pool.map(_per_ij, list(strong_keys)):
+            B_all[key] = B
+            E_all[key] = E
+    else:
+        for key in strong_keys:
+            key, B, E = _per_ij(key)
+            B_all[key] = B
+            E_all[key] = E
+
+    return B_all, E_all
+
+
+# =========================================================================
 # T2 residual: Psi4-compatible two-buffer formulation
 # =========================================================================
 
@@ -854,6 +1032,9 @@ def compute_residual_v2(
         K_dressed_override=None,
         cc_ints=None,
         pair_domain=None,
+        B_term_override=None,
+        E_contrib_override=None,
+        S_pao_full=None,
 ):
     """Compute T2 residual following Psi4 ccsd.cc lines 2052-2221 exactly.
 
@@ -867,11 +1048,17 @@ def compute_residual_v2(
     if n_pno == 0:
         return np.zeros((0, 0))
 
+    from pyscf.cc.dlpno_tccsd.local_df import compute_S_pno as _compute_S_pno
+    _getS_misses = [0, 0]  # [get_S, get_S2]
+
     def _get_S(key_other):
         if S_pno_cache is not None:
             S = S_pno_cache.get((key, key_other))
             if S is not None:
                 return S
+        _getS_misses[0] += 1
+        if S_pao_full is not None:
+            return _compute_S_pno(key, key_other, pno_spaces, S_pao_full, s1e)
         return C_pno_ij.T @ (s1e @ pno_spaces[key_other]['C_pno'])
 
     def _get_S2(key_a, key_b):
@@ -882,6 +1069,9 @@ def compute_residual_v2(
             S = S_pno_cache.get((key_a, key_b))
             if S is not None:
                 return S
+        _getS_misses[1] += 1
+        if S_pao_full is not None:
+            return _compute_S_pno(key_a, key_b, pno_spaces, S_pao_full, s1e)
         return pno_spaces[key_a]['C_pno'].T @ (s1e @ pno_spaces[key_b]['C_pno'])
 
     t2_ij = t2_pno_all[key]
@@ -933,26 +1123,31 @@ def compute_residual_v2(
     if _DEBUG_PTERM:
         print(f"  PTERM iter {_ITER} pair({i},{j}): A_rms={_rms(A_term):.12f} R_KA={_rms(R_sym):.12f}")
 
+    import time as _time
+    _pt = {}
+    _t0 = _time.perf_counter()
     # --- B (Eq 77/82): Woooo with dressed β ---
-    # Psi4 uses BARE T2 (T_iajb_), NOT tau. See ccsd.cc line 2137.
-    B_term = np.zeros((n_pno, n_pno))
-    for key_kl, t2_kl in t2_pno_all.items():
-        if t2_kl is None or t2_kl.shape[0] == 0:
-            continue
-        k, l = key_kl
-        if k not in _domain_set or l not in _domain_set:
-            continue
-
-        S_proj = _get_S(key_kl)
-        t2_kl_proj = S_proj @ t2_kl @ S_proj.T
-
-        beta_kl = B_tilde[k, l]
-        if k != l:
-            beta_lk = B_tilde[l, k]
-            B_term += beta_kl * t2_kl_proj + beta_lk * t2_kl_proj.T
-        else:
-            B_term += beta_kl * t2_kl_proj
+    # Use batched override if provided (compute_B_E_batched); else in-place.
+    if B_term_override is not None:
+        B_term = B_term_override
+    else:
+        B_term = np.zeros((n_pno, n_pno))
+        for key_kl, t2_kl in t2_pno_all.items():
+            if t2_kl is None or t2_kl.shape[0] == 0:
+                continue
+            k, l = key_kl
+            if k not in _domain_set or l not in _domain_set:
+                continue
+            S_proj = _get_S(key_kl)
+            t2_kl_proj = S_proj @ t2_kl @ S_proj.T
+            beta_kl = B_tilde[k, l]
+            if k != l:
+                beta_lk = B_tilde[l, k]
+                B_term += beta_kl * t2_kl_proj + beta_lk * t2_kl_proj.T
+            else:
+                B_term += beta_kl * t2_kl_proj
     R_sym += B_term
+    _pt['B'] = _time.perf_counter() - _t0; _t0 = _time.perf_counter()
     if _DEBUG_PTERM:
         print(f"  PTERM iter {_ITER} pair({i},{j}): B_rms={_rms(B_term):.12f} R_KAB={_rms(R_sym):.12f}")
 
@@ -970,27 +1165,25 @@ def compute_residual_v2(
     # Update is T -= R/D_psi4, so R = 0 at convergence (full Psi4 residual).
     E_tilde = Fab_ij.copy()
     # Psi4 E term: subtract u×K from E_tilde (Eq 85: F̃̃ = F̃ - u×K)
-    # This handles the fvv T2 dressing. C_tilde/D_tilde Term 4 handles
-    # a DIFFERENT T2 contribution (through the C/D ring terms).
-    for key_kl, t2_kl in t2_pno_all.items():
-        if t2_kl is None or t2_kl.shape[0] == 0:
-            continue
-        k, l = key_kl
-        if k not in _domain_set or l not in _domain_set:
-            continue
-        u_kl = 2.0 * t2_kl - t2_kl.T
-        # Use ONLY local DF — Psi4's K_iajb is always local DF
-        _K = get_local_K(cc_ints, key_kl, k, l)
-        if _K is None:
-            print(f"WARN: No local DF K for pair {key_kl}, skipping E contribution")
-            continue
-        K_kl = _K
-        S_kl_ij = _get_S(key_kl)
-        # (k,l) contribution
-        E_tilde -= S_kl_ij @ (u_kl @ K_kl.T) @ S_kl_ij.T
-        # (l,k) contribution for off-diagonal
-        if k != l:
-            E_tilde -= S_kl_ij @ ((2.0*t2_kl.T - t2_kl) @ K_kl) @ S_kl_ij.T
+    if E_contrib_override is not None:
+        E_tilde -= E_contrib_override
+    else:
+        for key_kl, t2_kl in t2_pno_all.items():
+            if t2_kl is None or t2_kl.shape[0] == 0:
+                continue
+            k, l = key_kl
+            if k not in _domain_set or l not in _domain_set:
+                continue
+            u_kl = 2.0 * t2_kl - t2_kl.T
+            _K = get_local_K(cc_ints, key_kl, k, l)
+            if _K is None:
+                print(f"WARN: No local DF K for pair {key_kl}, skipping E contribution")
+                continue
+            K_kl = _K
+            S_kl_ij = _get_S(key_kl)
+            E_tilde -= S_kl_ij @ (u_kl @ K_kl.T) @ S_kl_ij.T
+            if k != l:
+                E_tilde -= S_kl_ij @ ((2.0*t2_kl.T - t2_kl) @ K_kl) @ S_kl_ij.T
 
     if _DEBUG_PTERM:
         print(f"  PTERM iter {_ITER} pair({i},{j}): Etilde_rms={_rms(E_tilde):.12f}")
@@ -1003,6 +1196,7 @@ def compute_residual_v2(
     # Apply: R += t2 @ E_tilde.T + E_tilde @ t2 (Psi4 lines 2146-2147)
     E_term = t2_ij @ E_tilde.T + E_tilde @ t2_ij
     R_sym += E_term
+    _pt['E'] = _time.perf_counter() - _t0; _t0 = _time.perf_counter()
     if _DEBUG_PTERM:
         print(f"  PTERM iter {_ITER} pair({i},{j}): E_rms={_rms(E_term):.12f} R_KABE={_rms(R_sym):.12f}")
 
@@ -1079,6 +1273,7 @@ def compute_residual_v2(
         Rn_C_ji = 0.5 * C_ji + C_ji.T
         C_term = Rn_C_ij + Rn_C_ji.T
         Rn_ij += C_term
+        _pt['C'] = _time.perf_counter() - _t0; _t0 = _time.perf_counter()
         if _DEBUG_PTERM:
             # Print C_ij and C_ji separately to compare with Psi4 (which prints
             # the unsymmetrized C_ij per ordered pair).
@@ -1146,11 +1341,15 @@ def compute_residual_v2(
             print(f"  PTERM iter {_ITER} pair({i},{j}): D_ij_unsym_rms={_rms(D_ij):.12f} D_ji_unsym_rms={_rms(D_ji):.12f}")
     else:
         D_term = np.zeros((n_pno, n_pno))
+    _pt['D'] = _time.perf_counter() - _t0; _t0 = _time.perf_counter()
 
     # --- G (Eq 81): Fock oo coupling ---
+    # Psi4 restricts the k sum to lmopair_to_lmos_[ij]; doing so here
+    # makes the S_pno_cache restriction self-consistent (no lookups for
+    # k outside domain) and matches Psi4's formula.
     G_ij = np.zeros((n_pno, n_pno))
     G_ji = np.zeros((n_pno, n_pno))
-    for k in range(nocc):
+    for k in sorted(_domain_set):
         key_ik = (min(i, k), max(i, k))
         key_jk = (min(j, k), max(j, k))
         if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
@@ -1167,6 +1366,16 @@ def compute_residual_v2(
                 G_ji -= (S_ij_jk @ t2_jk @ S_ij_jk.T) * G_tilde[k, i]
     G_term = G_ij + G_ji.T
     Rn_ij += G_term
+    _pt['G'] = _time.perf_counter() - _t0
+
+    # Dump per-term timings into a module-level aggregator (optional)
+    _accum = getattr(compute_residual_v2, '_term_times', None)
+    if _accum is not None:
+        for k_, v_ in _pt.items():
+            _accum[k_] = _accum.get(k_, 0.0) + v_
+        _accum['_n'] = _accum.get('_n', 0) + 1
+        _accum['miss_S'] = _accum.get('miss_S', 0) + _getS_misses[0]
+        _accum['miss_S2'] = _accum.get('miss_S2', 0) + _getS_misses[1]
 
     if _DEBUG_PTERM:
         print(f"  PTERM iter {_ITER} pair({i},{j}): G_ij_unsym_rms={_rms(G_ij):.12f} G_ji_unsym_rms={_rms(G_ji):.12f}")

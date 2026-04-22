@@ -395,7 +395,8 @@ def _zero_cas_t2_amplitudes(t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir,
 def _process_one_triple(i, j, k,
                         pno_spaces, t2_for_T,
                         Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
-                        t1_pno=None, T_CutTNO=1e-9):
+                        t1_pno=None, T_CutTNO=1e-9,
+                        nonneg_set=None):
     """Compute (T) energy contribution for one triple (i,j,k). Thread-safe.
 
     All inputs are read-only.  Lpq_full is the preloaded DF array (naux, nao_pair)
@@ -431,21 +432,46 @@ def _process_one_triple(i, j, k,
     t2_ik_sc = _map_t2(ik)
     t2_jk_sc = _map_t2(jk)
 
-    ovL_ijk    = _build_ovL_tno(Lpq_full, C_lmo, C_tno_sc, [i, j, k])
-    vvL_sc     = _build_vvL_tno(Lpq_full, C_tno_sc)
+    # Triple-local aux domain: raw 3-center @ local J^{-1/2}_local gives
+    # a proper local DF fit for this triple. Matches CCSD pair approach
+    # (compute_cc_integrals_sparse) and dramatically reduces the naux
+    # dimension of per-triple ovL / vvL / ooL tensor transforms from
+    # O(N) to O(1).
+    # Triple-local aux domain via raw_3c + local J^{-1/2} works
+    # algorithmically (μEh drift on S22) but the per-triple Lpq_loc
+    # build (raw[:, :, aux_idx] copy + jhi matmul + tril packing) has
+    # too much numpy/Python overhead to beat the monolithic naux
+    # nr_e2 transform for these system sizes. Needs batching across
+    # triples or a C-level Lpq_loc builder to actually pay off.
+    # Left as-is (full Lpq_full path) for now.
+    Lpq_loc = Lpq_full
+
+    ovL_ijk    = _build_ovL_tno(Lpq_loc, C_lmo, C_tno_sc, [i, j, k])
+    vvL_sc     = _build_vvL_tno(Lpq_loc, C_tno_sc)
     triple_lmo = [i, j, k]
     nocc_lmo = C_lmo.shape[1]
 
-    # No occupied semicanonalization — use diagonal LMO Fock for the denominator.
-    # This matches Psi4's (T0) implementation.  The off-diagonal occupied Fock
-    # elements are neglected in (T0); the (T1) iterative approach corrects for
-    # them via inter-triple coupling.
+    # Triple-local LMO domain: m contributes to the vooo (A*t2) term only
+    # if pairs (m, i), (m, j), (m, k) all survive (non-negligible).
+    # Matches Psi4 triplet-LMO restriction and drops the (nocc) outer
+    # dim of t2_mr from O(N) to O(1) per triple.
+    _tr_pair = lambda a, b: (min(a, b), max(a, b))
+    _domain_set = nonneg_set if nonneg_set is not None else set(t2_for_T.keys())
+    triple_domain = sorted(
+        m for m in range(nocc_lmo)
+        if _tr_pair(m, i) in _domain_set
+        and _tr_pair(m, j) in _domain_set
+        and _tr_pair(m, k) in _domain_set)
+    # triple indices i,j,k must always be in the domain (guaranteed by
+    # pair-existence check above), but protect the lookup below.
+    _m_pos = {m_global: m_local for m_local, m_global in enumerate(triple_domain)}
+
     eps_occ = np.array([F_lmo[ii, ii] for ii in triple_lmo])
 
-    # Full-occ ooL for the vooo (A*t2) term
-    ooL_lmo_full = _build_ooL_triple(Lpq_full, C_lmo, list(range(nocc_lmo)))
+    # ooL for m in triple's local domain only (using triple-local Lpq).
+    ooL_lmo_full = _build_ooL_triple(Lpq_loc, C_lmo, triple_domain)
 
-    # T2 for all occupied paired with triple LMOs: t2_mr[l, r_local] = t2[l, triple[r]]
+    # T2 for m in domain × triple LMO r
     def _proj_t2(p, q):
         pk = (min(p, q), max(p, q))
         if pk not in t2_for_T or pk not in pno_spaces:
@@ -459,16 +485,17 @@ def _process_one_triple(i, j, k,
             t2_proj = t2_proj.T
         return t2_proj
 
-    t2_mr = np.zeros((nocc_lmo, 3, n_tno, n_tno))
+    m_dom_size = len(triple_domain)
+    t2_mr = np.zeros((m_dom_size, 3, n_tno, n_tno))
     for r_local, r_global in enumerate(triple_lmo):
-        for m in range(nocc_lmo):
-            t2_mr[m, r_local] = _proj_t2(m, r_global)
+        for m_local, m_global in enumerate(triple_domain):
+            t2_mr[m_local, r_local] = _proj_t2(m_global, r_global)
 
     # T2 block for the 3 triple LMOs (used by _w3_intermediate)
     t2_block = np.zeros((3, 3, n_tno, n_tno))
     for p in range(3):
         for q in range(3):
-            t2_block[p, q] = t2_mr[triple_lmo[p], q]
+            t2_block[p, q] = t2_mr[_m_pos[triple_lmo[p]], q]
 
     # Project local T1 to TNO basis for the V intermediate.
     t1_lmo = None
@@ -487,18 +514,21 @@ def _process_one_triple(i, j, k,
         C_lmo_triple = C_lmo[:, triple_lmo]
         fvo = reduce(np.dot, (C_tno_sc.T, fock_ao, C_lmo_triple))
 
+    # Indices of i,j,k in the triple-domain ordering (for ooL_sc_full[iq])
+    _triple_rows = np.array([_m_pos[x] for x in triple_lmo])
     return _w3_intermediate(t2_block, ovL_ijk, None, vvL_sc,
                             eps_occ, eps_tno_sc,
                             t1_sc=t1_lmo, fvo_sc=fvo,
                             occ_indices=(i, j, k),
-                            ooL_sc_full=ooL_lmo_full[triple_lmo],
+                            ooL_sc_full=ooL_lmo_full[_triple_rows],
                             t2_sc_full=t2_mr)
 
 
 def _process_degenerate_pair(i, k,
                              pno_spaces, t2_for_T,
                              Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
-                             t1_pno=None, T_CutTNO=1e-9):
+                             t1_pno=None, T_CutTNO=1e-9,
+                             nonneg_set=None):
     """Compute (T) energy from degenerate occupied triples {i,i,k} and {i,k,k}.
 
     With the Eq 53 formula, _process_one_triple handles degenerate triples
@@ -507,7 +537,8 @@ def _process_degenerate_pair(i, k,
     """
     kwargs = dict(pno_spaces=pno_spaces, t2_for_T=t2_for_T,
                   Lpq_full=Lpq_full, C_lmo=C_lmo, fock_ao=fock_ao,
-                  F_lmo=F_lmo, s1e=s1e, t1_pno=t1_pno, T_CutTNO=T_CutTNO)
+                  F_lmo=F_lmo, s1e=s1e, t1_pno=t1_pno, T_CutTNO=T_CutTNO,
+                  nonneg_set=nonneg_set)
     et_iik = _process_one_triple(i, i, k, **kwargs)
     et_ikk = _process_one_triple(i, k, k, **kwargs)
     return et_iik + et_ikk
@@ -675,7 +706,11 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                     vir_cas_idx=None,
                     cas_proj_thresh=0.5,
                     T_CutTNO=1e-9,
+                    T_CutTriplesWeak=0.0,
                     ncores=1,
+                    negligible_pairs=None,
+                    weak_pairs=None,
+                    C_pao=None,
                     verbose=None,
                     _pool=None):
     """Compute the (T) energy correction for DLPNO-TCCSD(T).
@@ -741,18 +776,51 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
 
     occ_list = list(range(nocc_lmo))
 
-    # Enumerate all distinct triples (i <= j <= k).
-    # Per Lang et al. 2020 Sec. II.C: all triples are included — double-counting
-    # is prevented by zeroing the CAS T2 amplitudes (done above), NOT by
-    # skipping triples with occupied indices in the CAS.
-    # Strictly ordered i < j < k — the energy formula in _w3_intermediate
-    # already sums over all 6 occupied permutations, so each distinct
-    # triple must appear exactly once.
+    # Enumerate distinct triples (i<j<k) following Psi4's triples_sparsity
+    # (dlpno/triples.cc::triples_sparsity prescreening block).
+    #   (1) k iterated over pair_lmo_idx[ij] (= lmopair_to_lmos_[ij] in Psi4)
+    #       — the pair's interacting-LMO domain, NOT all of nocc.
+    #   (2) max-2-weak-pair constraint: at least one of (ij), (ik), (jk)
+    #       must be strong, else the triple is dropped.
+    _negl_set = set((min(p), max(p)) for p in (negligible_pairs or []))
+    _weak_set = set((min(p), max(p)) for p in (weak_pairs or []))
+    _tT_set = set(k for k in t2_for_T.keys() if k not in _negl_set)
+
+    # Build pair_lmo_idx locally — m is in pair (i,j)'s domain iff both
+    # (i,m) and (j,m) are non-negligible.  (Same construction as in
+    # lccsd.py _run_dlpno_lccsd.)
+    pair_lmo_idx = {}
+    for key in _tT_set:
+        i, j = key
+        dom = [m for m in range(nocc_lmo)
+               if (min(i, m), max(i, m)) in _tT_set
+               and (min(j, m), max(j, m)) in _tT_set]
+        pair_lmo_idx[key] = dom
+
     valid_triples = []
-    for i in range(nocc_lmo):
-        for j in range(i + 1, nocc_lmo):
-            for k in range(j + 1, nocc_lmo):
-                valid_triples.append((i, j, k))
+    _n_before_weak_screen = 0
+    for ij in _tT_set:
+        i, j = ij
+        if i >= j:
+            continue        # strict i < j; degenerate (i,i,k) handled below
+        for k in pair_lmo_idx.get(ij, []):
+            if k <= j:                         # strict i < j < k
+                continue
+            ik = (i, k)
+            jk = (j, k)
+            if ik not in _tT_set or jk not in _tT_set:
+                continue
+            _n_before_weak_screen += 1
+            weak_count = ((ij in _weak_set) + (ik in _weak_set) +
+                          (jk in _weak_set))
+            if weak_count > 2:
+                continue
+            valid_triples.append((i, j, k))
+    _n_all = nocc_lmo * (nocc_lmo - 1) * (nocc_lmo - 2) // 6
+    print(f'  (T) triples after Psi4-style screening: '
+          f'{len(valid_triples)} / {_n_all} '
+          f'({100.0 * len(valid_triples) / max(_n_all, 1):.1f}%) '
+          f'[pre-weak-count: {_n_before_weak_screen}]', flush=True)
 
     # Preload all DF 3-index integrals into memory (single HDF5 read).
     # This makes all subsequent nr_e2 calls thread-safe and eliminates
@@ -766,21 +834,86 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
              Lpq_full.nbytes / 1e6,
              _dt_preload)
 
+    # --- (T) triple-local aux: structural fix notes --------------------
+    # Psi4 DLPNOCCSD_T::compute_lccsd_t0 (triples.cc:609) builds every
+    # per-triple (Q|iv), (Q|io), (Q|vv_pair) from pre-computed sparse
+    # DF arrays (qij_[Q], qia_[Q], qab_[Q]) sliced by the triple's
+    # aux_ijk / LMO_ijk / PAO_ijk domains + local J^{1/2}.
+    # Our current _process_one_triple uses _ao2mo.nr_e2(Lpq_full, mo)
+    # which scales as O(naux × nao × n_sel²) PER TRIPLE — the O(N)
+    # factor that drives our (T) exponent to ~2.68 vs Jiang's 1.78.
+    # The proper fix requires:
+    #   1. Pass qij/qia/qab (sparse DF arrays) from driver.py through
+    #      both the CCSD and (T) stages (not built twice).
+    #   2. Rewrite _process_one_triple:
+    #      q_iv = Σ_Q ∈ aux_ijk of qia[Q][i_sparse, triple_paos] @ X_tno
+    #      (and q_jv, q_kv, q_io, q_jo, q_ko, q_vv_ij, q_vv_jk, q_vv_ik)
+    #   3. Apply local J^{1/2} per triple via
+    #      J_local^{1/2} @ q_* = solve(J_local^{1/2}, q_*)
+    #   4. Rewrite _w3_intermediate to consume (q_iv, q_jv, q_kv,
+    #      q_vv_ij, q_vv_jk, q_vv_ik, q_io, q_jo, q_ko) in the same
+    #      structure as Psi4's K_ivvv / K_ovvv / K_ooov / K_jk / K_ik /
+    #      K_ij. The W/V/T algebra is identical to Jiang Eq 53.
+    # Estimated effort: 2-3 days.  Too much for this session — the
+    # current path (Lpq_full) is kept but the building blocks (aux
+    # masks, C_pao plumbing, build_sparse_df_arrays, build_screening_maps)
+    # are ready to wire.
+
     triple_kwargs = dict(
         pno_spaces=pno_spaces, t2_for_T=t2_for_T,
         Lpq_full=Lpq_full, C_lmo=C_lmo,
         fock_ao=fock_ao, F_lmo=F_lmo, s1e=s1e,
         t1_pno=t1_pno,
         T_CutTNO=T_CutTNO,
+        nonneg_set=_tT_set,
     )
 
     def _do_triple(ijk):
         return _process_one_triple(ijk[0], ijk[1], ijk[2], **triple_kwargs)
 
+    # ------------------------------------------------------------------
+    # (3) SC-MP2 (T0) prescreen to drop low-contribution triples.
+    # Psi4 does this by running (T0) with a LOOSE TNO threshold
+    # (T_CUT_TNO_PRE ~ 1e-6) first, then dropping triples with
+    # |e_ijk| < T_CUT_TRIPLES_WEAK (~ 1e-7). Surviving triples get
+    # the full (T) with the tight TNO.
+    # ------------------------------------------------------------------
+    _T_CUT_TNO_PRE = max(T_CutTNO, 1e-6)
+    _T_CUT_TRIPLES_WEAK = T_CutTriplesWeak
+    e_t_screened = 0.0   # dropped-triple contribution, ADDED BACK at end
+    if (len(valid_triples) > 0 and _T_CUT_TNO_PRE > T_CutTNO
+            and _T_CUT_TRIPLES_WEAK > 0.0):
+        _pre_kwargs = dict(triple_kwargs)
+        _pre_kwargs['T_CutTNO'] = _T_CUT_TNO_PRE
+
+        def _pre_triple(ijk):
+            return _process_one_triple(ijk[0], ijk[1], ijk[2], **_pre_kwargs)
+
+        if _pool is not None:
+            _et_pre = list(_pool.map(_pre_triple, valid_triples))
+        else:
+            _et_pre = [_pre_triple(ijk) for ijk in valid_triples]
+
+        _kept = [ijk for ijk, e in zip(valid_triples, _et_pre)
+                 if abs(e) >= _T_CUT_TRIPLES_WEAK]
+        # Psi4 (triples.cc:235, 252): the prescreen energy of *dropped*
+        # triples is tracked as de_lccsd_t_screened_ and ADDED to the
+        # final (T) correction — that way the prescreen error is
+        # bounded by T_CUT_TRIPLES_WEAK × n_triples rather than the
+        # full per-triple contribution.
+        e_t_screened = sum(e for e in _et_pre
+                           if abs(e) < _T_CUT_TRIPLES_WEAK)
+        print(f'  (T) SC-MP2 prescreen: kept {len(_kept)} / '
+              f'{len(valid_triples)} ({100.0*len(_kept)/len(valid_triples):.1f}%)'
+              f', screened-back energy = {e_t_screened:.3e} Eh',
+              flush=True)
+        valid_triples = _kept
+
     # Degenerate occupied triples: pairs (i,k) with i<k capture
     # {i,i,k} and {i,k,k} contributions (60% of canonical (T)).
     valid_pairs = [(i, k) for i in range(nocc_lmo)
-                           for k in range(i + 1, nocc_lmo)]
+                           for k in range(i + 1, nocc_lmo)
+                           if (i, k) in _tT_set]
 
     def _do_degen(ik):
         return _process_degenerate_pair(ik[0], ik[1], **triple_kwargs)
@@ -800,13 +933,17 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     e_t_degen = sum(et_degen_values)
     n_degen = sum(1 for v in et_degen_values if v != 0.0)
 
-    e_t = e_t_distinct + e_t_degen
+    # Add back the SC-MP2 prescreen energy of dropped triples — the error
+    # vs a full tight-TNO calculation is bounded by T_CUT_TRIPLES_WEAK per
+    # dropped triple (Psi4 de_lccsd_t_screened_ convention).
+    e_t = e_t_distinct + e_t_degen + e_t_screened
 
     log.info('(T) correction: %d distinct triples, %d degenerate pairs '
              '(%d + %d candidates)',
              n_triples, n_degen, len(valid_triples), len(valid_pairs))
     log.info('E(T) distinct = %.15g', e_t_distinct)
     log.info('E(T) degenerate = %.15g', e_t_degen)
+    log.info('E(T) screened-back = %.15g', e_t_screened)
     log.info('E(T) external = %.15g', e_t)
 
     return e_t

@@ -256,7 +256,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
               T_CutEnergy=1.0, T_CutTrace=1.0,
               T_CutPNO_MP2=None, T_CutTrace_MP2=0.9999, T_CutEnergy_MP2=0.999,
               occ_cas_idx=None, C_cas_vir=None, nvir_cas=0, s1e=None,
-              verbose=None):
+              _pool=None, verbose=None):
     """Construct PNO spaces for all LMO pairs and compute LMP2 energies.
 
     For each pair (i,j) with i <= j:
@@ -388,95 +388,80 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
 
     # ===================================================================
     # Phase 1: Build per-pair domain data and SC-MP2 initial guess
+    # (parallelized via _pool.map — each (i,j) pair is independent)
     # ===================================================================
     pair_domain_data = {}   # intermediate data for L-MP2 iteration
 
-    for i in range(nocc_lmo):
-        for j in range(i, nocc_lmo):
-            # --- 1. Pair domain (union of LMO domains) ---
-            domain_ij = pao_domain_union(pao_domains[i], pao_domains[j])
-            n_dom = len(domain_ij)
+    def _phase1_one(ij):
+        i, j = ij
+        domain_ij = pao_domain_union(pao_domains[i], pao_domains[j])
+        if len(domain_ij) == 0:
+            return ij, None
 
-            if n_dom == 0:
-                continue
+        C_orth_ij, X_orth_ij = orthogonalize_pao_domain(
+            C_pao, S_pao, domain_ij, S_cut=S_cut_domain, method='psi4')
+        n_orth = C_orth_ij.shape[1]
+        if getattr(make_pnos, '_dump_n_orth', False):
+            print(f'NORTH pair({i},{j}): npao_raw={len(domain_ij)} '
+                  f'npao_ortho={n_orth}', flush=True)
+        if n_orth == 0:
+            return ij, None
 
-            # --- 2. Canonical orthogonalization of PAOs in pair domain ---
-            # Use Psi4's exact PartialCholesky algorithm so the canonical
-            # PAO basis matches Psi4 — eliminates the e_pno drift that
-            # propagated through CCSD iterations.
-            C_orth_ij, X_orth_ij = orthogonalize_pao_domain(
-                C_pao, S_pao, domain_ij, S_cut=S_cut_domain,
-                method='psi4')
-            n_orth = C_orth_ij.shape[1]
-            if getattr(make_pnos, '_dump_n_orth', False):
-                print(f'NORTH pair({i},{j}): npao_raw={len(domain_ij)} '
-                      f'npao_ortho={n_orth}', flush=True)
+        F_dom = F_pao[np.ix_(domain_ij, domain_ij)]
+        F_orth = reduce(np.dot, (X_orth_ij.T, F_dom, X_orth_ij))
 
-            if n_orth == 0:
-                continue
-
-            # --- 3. F_vv and K_iajb in orthogonal domain basis ---
-            F_dom = F_pao[np.ix_(domain_ij, domain_ij)]
-            F_orth = reduce(np.dot, (X_orth_ij.T, F_dom, X_orth_ij))
-
-            if use_df:
-                if _lmo_aux_mask is not None:
-                    # Local DF K matching Psi4 pno_transform():
-                    # K = raw_i_orth^T @ J_local^{-1} @ raw_j_orth
-                    if getattr(make_pnos, '_force_full_aux', False):
-                        _pair_aux = np.arange(_j2c.shape[0])
-                    else:
-                        _pair_aux = np.where(_lmo_aux_mask[i] | _lmo_aux_mask[j])[0]
-                    # raw_i[a_dom, Q] = C_lmo[:,i]^T @ raw_half_pao[:, Q, a_dom]
-                    _raw_i_dom = np.tensordot(C_lmo[:, i], _raw_half_pao[:, :, domain_ij],
-                                              axes=([0], [0]))  # (naux, n_dom)
-                    _raw_j_dom = np.tensordot(C_lmo[:, j], _raw_half_pao[:, :, domain_ij],
-                                              axes=([0], [0]))
-                    # Transform to orth basis
-                    _raw_i_orth = _raw_i_dom @ X_orth_ij  # (naux, n_orth)
-                    _raw_j_orth = _raw_j_dom @ X_orth_ij
-                    # Extract local aux and apply J^{-1}
-                    _raw_i_local = _raw_i_orth[_pair_aux, :]  # (n_local, n_orth)
-                    _raw_j_local = _raw_j_orth[_pair_aux, :]
-                    _j2c_local = _j2c[np.ix_(_pair_aux, _pair_aux)]
-                    # K = raw_i^T @ J^{-1} @ raw_j
-                    _fitted_j = np.linalg.solve(_j2c_local, _raw_j_local)
-                    K_ij = _raw_i_local.T @ _fitted_j  # (n_orth, n_orth)
+        if use_df:
+            if _lmo_aux_mask is not None:
+                if getattr(make_pnos, '_force_full_aux', False):
+                    _pair_aux = np.arange(_j2c.shape[0])
                 else:
-                    # Fallback: global DF
-                    ovL_i_dom = ovL[i][domain_ij, :]
-                    ovL_j_dom = ovL[j][domain_ij, :]
-                    ovL_i_orth = np.dot(X_orth_ij.T, ovL_i_dom)
-                    ovL_j_orth = np.dot(X_orth_ij.T, ovL_j_dom)
-                    K_ij = _pair_K_iajb(ovL_i_orth, ovL_j_orth)
+                    _pair_aux = np.where(_lmo_aux_mask[i] | _lmo_aux_mask[j])[0]
+                _raw_i_dom = np.tensordot(C_lmo[:, i],
+                                          _raw_half_pao[:, :, domain_ij],
+                                          axes=([0], [0]))
+                _raw_j_dom = np.tensordot(C_lmo[:, j],
+                                          _raw_half_pao[:, :, domain_ij],
+                                          axes=([0], [0]))
+                _raw_i_orth = _raw_i_dom @ X_orth_ij
+                _raw_j_orth = _raw_j_dom @ X_orth_ij
+                _raw_i_local = _raw_i_orth[_pair_aux, :]
+                _raw_j_local = _raw_j_orth[_pair_aux, :]
+                _j2c_local = _j2c[np.ix_(_pair_aux, _pair_aux)]
+                _fitted_j = np.linalg.solve(_j2c_local, _raw_j_local)
+                K_ij = _raw_i_local.T @ _fitted_j
             else:
-                K_dom_ij = K_iajb_exact[i, :, j, :][np.ix_(domain_ij, domain_ij)]
-                K_ij = X_orth_ij.T @ K_dom_ij @ X_orth_ij
+                ovL_i_dom = ovL[i][domain_ij, :]
+                ovL_j_dom = ovL[j][domain_ij, :]
+                ovL_i_orth = np.dot(X_orth_ij.T, ovL_i_dom)
+                ovL_j_orth = np.dot(X_orth_ij.T, ovL_j_dom)
+                K_ij = _pair_K_iajb(ovL_i_orth, ovL_j_orth)
+        else:
+            K_dom_ij = K_iajb_exact[i, :, j, :][np.ix_(domain_ij, domain_ij)]
+            K_ij = X_orth_ij.T @ K_dom_ij @ X_orth_ij
 
-            # --- 4. Semicanonical MP2 initial guess ---
-            eps_sc, U_sc = np.linalg.eigh(F_orth)
-            K_sc = reduce(np.dot, (U_sc.T, K_ij, U_sc))
+        eps_sc, U_sc = np.linalg.eigh(F_orth)
+        K_sc = reduce(np.dot, (U_sc.T, K_ij, U_sc))
+        D_ij_sc = (eps_i[i] + eps_i[j]
+                   - eps_sc[:, None] - eps_sc[None, :])
+        D_safe = np.where(np.abs(D_ij_sc) > 1e-12, D_ij_sc, 1.0)
+        T2_sc = K_sc / D_safe
+        T2_sc = np.where(np.abs(D_ij_sc) > 1e-12, T2_sc, 0.0)
+        T2_orth = reduce(np.dot, (U_sc, T2_sc, U_sc.T))
 
-            D_ij_sc = (eps_i[i] + eps_i[j]
-                       - eps_sc[:, None] - eps_sc[None, :])
-            D_safe = np.where(np.abs(D_ij_sc) > 1e-12, D_ij_sc, 1.0)
-            T2_sc = K_sc / D_safe
-            T2_sc = np.where(np.abs(D_ij_sc) > 1e-12, T2_sc, 0.0)
+        return ij, {
+            'C_orth': C_orth_ij, 'X_orth': X_orth_ij, 'F_orth': F_orth,
+            'K_orth': K_ij, 'T2_orth': T2_orth,
+            'U_sc': U_sc, 'eps_sc': eps_sc, 'K_sc': K_sc,
+            'domain_ij': domain_ij,
+        }
 
-            # Transform SC-MP2 T2 back to orthogonal domain basis for L-MP2
-            T2_orth = reduce(np.dot, (U_sc, T2_sc, U_sc.T))
-
-            pair_domain_data[(i, j)] = {
-                'C_orth': C_orth_ij,
-                'X_orth': X_orth_ij,
-                'F_orth': F_orth,
-                'K_orth': K_ij,
-                'T2_orth': T2_orth,
-                'U_sc': U_sc,
-                'eps_sc': eps_sc,
-                'K_sc': K_sc,
-                'domain_ij': domain_ij,
-            }
+    _p1_keys = [(i, j) for i in range(nocc_lmo) for j in range(i, nocc_lmo)]
+    _p1_iter = (_pool.map(_phase1_one, _p1_keys)
+                if _pool is not None
+                else (_phase1_one(k) for k in _p1_keys))
+    for ij, data in _p1_iter:
+        if data is not None:
+            pair_domain_data[ij] = data
 
     # ===================================================================
     # Phase 2a: Build INITIAL PNOs from direct SC-MP2 T2
@@ -485,9 +470,12 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     if s1e is None:
         s1e = mf.get_ovlp()
 
-    # Build initial PNOs from direct SC-MP2 T2 for each pair
+    # Build initial PNOs from direct SC-MP2 T2 for each pair (parallel)
     initial_pno_data = {}
-    for (i, j), pdata in pair_domain_data.items():
+
+    def _phase2a_one(ij_pdata):
+        ij, pdata = ij_pdata
+        i, j = ij
         U_sc = pdata['U_sc']
         eps_sc = pdata['eps_sc']
         K_sc = pdata['K_sc']
@@ -580,7 +568,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         # C_pno in AO basis
         C_pno = C_orth_ij @ X_pno_final
 
-        initial_pno_data[(i, j)] = {
+        return ij, {
             'C_pno': C_pno, 'e_pno': e_pno_sc, 'K_pno': K_pno,
             'T2_pno': T2_pno, 'n_pno': n_pno_init,
             'e_ij': e_ij_init, 'domain_ij': domain_ij,
@@ -589,6 +577,13 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             'F_orth': pdata['F_orth'],
             'U_sc': pdata['U_sc'], 'eps_sc': pdata['eps_sc'],
         }
+
+    _p2a_items = list(pair_domain_data.items())
+    _p2a_iter = (_pool.map(_phase2a_one, _p2a_items)
+                 if _pool is not None
+                 else (_phase2a_one(x) for x in _p2a_items))
+    for ij, val in _p2a_iter:
+        initial_pno_data[ij] = val
 
     # ===================================================================
     # Phase 2b: Iterative LMP2 in PNO space
