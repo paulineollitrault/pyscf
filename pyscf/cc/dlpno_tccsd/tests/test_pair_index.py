@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from pyscf.cc.dlpno_tccsd.pair_index import (
-    PairIndex, TensorStore, FlatTensorStore,
+    PairIndex, TensorStore, FlatTensorStore, FlatPairPairStore,
     build_t1_cache, assert_consistent_with_dicts,
 )
 from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
@@ -463,3 +463,147 @@ def test_flat_tensor_store_low_level_accessors():
         slot_len = int(fts.offsets[p + 1] - fts.offsets[p])
         expected = int(np.prod(fts.shapes[p]))
         assert slot_len == expected
+
+
+# ----------------------------------------------------------------------
+# FlatPairPairStore (Phase 2d)
+# ----------------------------------------------------------------------
+def _pair_pair_fixture():
+    """Sparse (pair_a, pair_b) overlap dict on the _fixture PairIndex."""
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    # Populate overlap matrices for a few (pair_a, pair_b) combinations
+    rng = np.random.default_rng(42)
+    n_pno = {k: pno_spaces[k]["C_pno"].shape[1]
+             for k in pno_spaces}
+    initial = {
+        ((0, 0), (0, 1)): rng.standard_normal((n_pno[(0, 0)], n_pno[(0, 1)])),
+        ((0, 1), (0, 0)): rng.standard_normal((n_pno[(0, 1)], n_pno[(0, 0)])),
+        ((0, 1), (1, 2)): rng.standard_normal((n_pno[(0, 1)], n_pno[(1, 2)])),
+        ((2, 2), (1, 2)): rng.standard_normal((n_pno[(2, 2)], n_pno[(1, 2)])),
+    }
+    return pi, initial
+
+
+def test_flat_pair_pair_store_construction():
+    pi, initial = _pair_pair_fixture()
+    fpps = FlatPairPairStore(pi, initial=initial)
+    # 4 flat entries, 0 overflow
+    assert fpps.n_flat_entries == 4
+    assert fpps.n_overflow_entries == 0
+    # Buffer size equals sum of per-entry sizes
+    expected_size = sum(v.size for v in initial.values())
+    assert fpps.buffer.size == expected_size
+
+
+def test_flat_pair_pair_store_view_roundtrip():
+    pi, initial = _pair_pair_fixture()
+    fpps = FlatPairPairStore(pi, initial=initial)
+    for key, v in initial.items():
+        assert np.allclose(fpps[key], v)
+
+
+def test_flat_pair_pair_store_setitem_in_flat_tier():
+    """Assigning into an existing flat entry updates the buffer in place."""
+    pi, initial = _pair_pair_fixture()
+    fpps = FlatPairPairStore(pi, initial=initial)
+    key = ((0, 1), (0, 0))
+    new_val = np.full_like(initial[key], 7.0)
+    fpps[key] = new_val
+    # Flat tier unchanged in size; overflow stays empty.
+    assert fpps.n_flat_entries == 4
+    assert fpps.n_overflow_entries == 0
+    assert np.allclose(fpps[key], 7.0)
+
+
+def test_flat_pair_pair_store_lazy_insert_goes_to_overflow():
+    pi, initial = _pair_pair_fixture()
+    fpps = FlatPairPairStore(pi, initial=initial)
+    # Insert a key that wasn't in initial.
+    novel_key = ((0, 0), (2, 2))
+    rng = np.random.default_rng(7)
+    novel_val = rng.standard_normal(
+        (int(pi.n_pno[pi.idx_of((0, 0))]),
+         int(pi.n_pno[pi.idx_of((2, 2))])))
+    fpps[novel_key] = novel_val
+    assert fpps.n_flat_entries == 4
+    assert fpps.n_overflow_entries == 1
+    assert np.allclose(fpps[novel_key], novel_val)
+
+
+def test_flat_pair_pair_store_dict_compat():
+    pi, initial = _pair_pair_fixture()
+    fpps = FlatPairPairStore(pi, initial=initial)
+    # __contains__
+    for key in initial:
+        assert key in fpps
+    assert ((0, 0), (1, 1)) not in fpps
+    # get with default
+    assert fpps.get(((0, 0), (1, 1))) is None
+    assert fpps.get(((0, 0), (1, 1)), "missing") == "missing"
+    # keys / values / items / __iter__ / __len__
+    assert len(fpps) == 4
+    keys = list(fpps)
+    assert len(keys) == 4
+    assert len(fpps.values()) == 4
+    assert len(fpps.items()) == 4
+
+
+def test_flat_pair_pair_store_canonicalises_flipped_pair_keys():
+    pi, initial = _pair_pair_fixture()
+    fpps = FlatPairPairStore(pi, initial=initial)
+    # pair tuples stored as (i, j) with i <= j; flipping a pair within a
+    # key should resolve to the same entry.
+    flipped = ((1, 0), (0, 0))
+    canonical = ((0, 1), (0, 0))
+    assert np.array_equal(fpps[flipped], fpps[canonical])
+
+
+def test_flat_pair_pair_store_at_idx_fast_path():
+    pi, initial = _pair_pair_fixture()
+    fpps = FlatPairPairStore(pi, initial=initial)
+    for (pa, pb), v in initial.items():
+        ia = pi.idx_of(pa)
+        ib = pi.idx_of(pb)
+        got = fpps.at_idx(ia, ib)
+        assert got is not None
+        assert np.allclose(got, v)
+    # Missing slot → None
+    assert fpps.at_idx(0, 0) is None
+
+
+def test_flat_pair_pair_store_index_matrix():
+    pi, initial = _pair_pair_fixture()
+    fpps = FlatPairPairStore(pi, initial=initial)
+    idx_mat = fpps.index_matrix()
+    assert idx_mat.shape == (pi.n_pairs, pi.n_pairs)
+    assert idx_mat.dtype == np.int32
+    # Entries in initial should map to valid flat indices
+    for (pa, pb) in initial:
+        ia = pi.idx_of(pa)
+        ib = pi.idx_of(pb)
+        k = int(idx_mat[ia, ib])
+        assert 0 <= k < fpps.n_flat_entries
+    # Unseeded slots → -1
+    assert int(idx_mat[pi.idx_of((0, 0)), pi.idx_of((1, 1))]) == -1
+
+
+def test_flat_pair_pair_store_empty():
+    """Empty store — no initial, no overflow."""
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    fpps = FlatPairPairStore(pi)
+    assert len(fpps) == 0
+    assert fpps.n_flat_entries == 0
+    assert fpps.n_overflow_entries == 0
+    assert fpps.buffer.size == 0
+    assert fpps.get(((0, 0), (0, 1))) is None
+
+
+def test_flat_pair_pair_store_non_rank2_raises():
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    with pytest.raises(ValueError, match="rank-2"):
+        FlatPairPairStore(pi, initial={
+            ((0, 0), (0, 1)): np.zeros(5),  # rank 1, not rank 2
+        })

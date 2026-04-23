@@ -442,6 +442,233 @@ class FlatTensorStore:
         return store
 
 
+class FlatPairPairStore:
+    """Sparse ``(pair_a, pair_b) -> ndarray`` store with flat backing.
+
+    Handles pair-of-pair-indexed tensors like ``S_pno_cache`` where
+    ``S[(pair_a, pair_b)]`` is the PNO-overlap matrix between two
+    distinct pair PNO spaces.  Not every (pair_a, pair_b) has an entry
+    — only pairs whose PNO spaces actually overlap — hence the sparse
+    layout.
+
+    Two storage tiers:
+
+    1. **Flat tier** — ``(n_flat_entries,)`` concatenated into a single
+       ndarray ``_buffer`` with CSR-style ``_offsets`` (int64) and
+       per-entry ``_shapes`` (int32, shape ``(N, 2)``).  Entry k's view
+       is ``_buffer[_offsets[k]:_offsets[k+1]].reshape(_shapes[k])``.
+       Indexed by ``(pair_a_idx, pair_b_idx) -> k`` via ``_key_to_idx``.
+
+    2. **Overflow dict** — catches lazy insertions after construction
+       (``_s_pno_getter`` can compute new entries on demand).  Keyed by
+       ``(pair_a_idx, pair_b_idx)`` and holds the raw ndarray.
+
+    A Cython kernel consumes only the flat tier via ``buffer``,
+    ``offsets``, ``shapes``, and ``index_matrix`` (a dense
+    ``(n_pairs, n_pairs)`` int32 table giving ``k`` or ``-1``).  The
+    overflow dict is Python-only.
+    """
+
+    __slots__ = (
+        "_pi", "dtype", "_buffer", "_offsets", "_shapes",
+        "_idx_matrix", "_n_flat", "_overflow",
+    )
+
+    def __init__(self, pair_index, initial=None, dtype=np.float64):
+        """
+        Parameters
+        ----------
+        pair_index : PairIndex
+        initial : dict[(pair_a, pair_b), ndarray] | None
+            Entries seeded into the flat tier.  Missing pairs (not in
+            ``pair_index.canonical_keys``) are skipped silently.
+        dtype : numpy dtype
+        """
+        self._pi = pair_index
+        self.dtype = np.dtype(dtype)
+
+        # Resolve initial entries to (idx_a, idx_b) preserving order.
+        entries = []
+        if initial is not None:
+            for (pa, pb), arr in initial.items():
+                pa_norm = (min(pa), max(pa))
+                pb_norm = (min(pb), max(pb))
+                ia = pair_index.canonical_to_idx.get(pa_norm)
+                ib = pair_index.canonical_to_idx.get(pb_norm)
+                if ia is None or ib is None:
+                    continue
+                entries.append(((ia, ib), arr))
+
+        n = len(entries)
+        self._n_flat = n
+        self._shapes = np.zeros((n, 2), dtype=np.int32)
+        sizes = np.zeros(n, dtype=np.int64)
+        for k, ((ia, ib), arr) in enumerate(entries):
+            shape = arr.shape
+            if len(shape) != 2:
+                raise ValueError(
+                    f"FlatPairPairStore expects rank-2 entries; "
+                    f"got shape {shape} for ({ia},{ib})"
+                )
+            self._shapes[k, 0] = shape[0]
+            self._shapes[k, 1] = shape[1]
+            sizes[k] = shape[0] * shape[1]
+
+        self._offsets = np.zeros(n + 1, dtype=np.int64)
+        self._offsets[1:] = np.cumsum(sizes)
+        self._buffer = np.empty(int(self._offsets[-1]), dtype=self.dtype)
+
+        # (n_pairs, n_pairs) int32 dense lookup replaces the slow tuple
+        # dict.  ``-1`` means "not in flat tier".  Memory cost is
+        # ``4 * n_pairs**2`` bytes (~1 MB at n_pairs = 528) — cheap.
+        n_pairs = pair_index.n_pairs
+        self._idx_matrix = np.full((n_pairs, n_pairs), -1, dtype=np.int32)
+        for k, ((ia, ib), arr) in enumerate(entries):
+            start = int(self._offsets[k])
+            end = int(self._offsets[k + 1])
+            if end > start:
+                self._buffer[start:end] = arr.ravel()
+            self._idx_matrix[ia, ib] = k
+
+        self._overflow = {}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _canonical_idx(self, key):
+        """(pair_a, pair_b) tuple of pairs → (idx_a, idx_b) ints."""
+        pair_a, pair_b = key
+        pa = (min(pair_a), max(pair_a))
+        pb = (min(pair_b), max(pair_b))
+        ia = self._pi.canonical_to_idx[pa]
+        ib = self._pi.canonical_to_idx[pb]
+        return ia, ib
+
+    def _view_at(self, k):
+        start = int(self._offsets[k])
+        end = int(self._offsets[k + 1])
+        shape = (int(self._shapes[k, 0]), int(self._shapes[k, 1]))
+        if end == start:
+            return np.zeros(shape, dtype=self.dtype)
+        return self._buffer[start:end].reshape(shape)
+
+    # ------------------------------------------------------------------
+    # Integer-indexed fast path (Cython-friendly)
+    # ------------------------------------------------------------------
+    def at_idx(self, ia, ib):
+        """Return ndarray for ``(idx_a, idx_b)`` or ``None``."""
+        k = int(self._idx_matrix[ia, ib])
+        if k >= 0:
+            return self._view_at(k)
+        return self._overflow.get((ia, ib))
+
+    # ------------------------------------------------------------------
+    # Dict-compat API (for gradual migration)
+    # ------------------------------------------------------------------
+    def __getitem__(self, key):
+        ia, ib = self._canonical_idx(key)
+        v = self.at_idx(ia, ib)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __setitem__(self, key, value):
+        ia, ib = self._canonical_idx(key)
+        k = int(self._idx_matrix[ia, ib])
+        if k >= 0:
+            shape = (int(self._shapes[k, 0]), int(self._shapes[k, 1]))
+            if tuple(value.shape) == shape:
+                # In-place update into the flat buffer.
+                start = int(self._offsets[k])
+                end = int(self._offsets[k + 1])
+                if end > start:
+                    self._buffer[start:end] = np.asarray(value).ravel()
+                return
+            # Shape changed (unexpected) — fall through to overflow.
+        self._overflow[(ia, ib)] = value
+
+    def __contains__(self, key):
+        try:
+            ia, ib = self._canonical_idx(key)
+        except KeyError:
+            return False
+        return (
+            self._idx_matrix[ia, ib] >= 0
+            or (ia, ib) in self._overflow
+        )
+
+    def get(self, key, default=None):
+        try:
+            ia, ib = self._canonical_idx(key)
+        except KeyError:
+            return default
+        v = self.at_idx(ia, ib)
+        return v if v is not None else default
+
+    def keys(self):
+        ckeys = self._pi.canonical_keys
+        flat = np.argwhere(self._idx_matrix >= 0)
+        out = [(ckeys[int(ia)], ckeys[int(ib)]) for ia, ib in flat]
+        out.extend((ckeys[ia], ckeys[ib]) for (ia, ib) in self._overflow)
+        return out
+
+    def values(self):
+        flat = np.argwhere(self._idx_matrix >= 0)
+        out = [self._view_at(int(self._idx_matrix[ia, ib]))
+               for ia, ib in flat]
+        out.extend(self._overflow.values())
+        return out
+
+    def items(self):
+        return list(zip(self.keys(), self.values()))
+
+    def __iter__(self):
+        return iter(self.keys())
+
+    def __len__(self):
+        return self._n_flat + len(self._overflow)
+
+    def __repr__(self):
+        return (
+            f"FlatPairPairStore(n_flat={self._n_flat} "
+            f"n_overflow={len(self._overflow)} "
+            f"buffer={self._buffer.size} dtype={self.dtype})"
+        )
+
+    # ------------------------------------------------------------------
+    # Cython / nogil accessors
+    # ------------------------------------------------------------------
+    @property
+    def buffer(self):
+        return self._buffer
+
+    @property
+    def offsets(self):
+        return self._offsets
+
+    @property
+    def shapes(self):
+        return self._shapes
+
+    @property
+    def n_flat_entries(self):
+        return self._n_flat
+
+    @property
+    def n_overflow_entries(self):
+        return len(self._overflow)
+
+    def index_matrix(self):
+        """``(n_pairs, n_pairs)`` int32: flat index ``k`` or ``-1``.
+
+        Use this as a dense sparse table inside Cython kernels.
+        ``-1`` means the pair-of-pair is not in the flat tier (might be
+        in overflow, but Cython should not see those — the caller must
+        guarantee completeness before entering a nogil region).
+        """
+        return self._idx_matrix
+
+
 # ----------------------------------------------------------------------
 # T1 projection cache — Phase 1 of the restructure.
 #

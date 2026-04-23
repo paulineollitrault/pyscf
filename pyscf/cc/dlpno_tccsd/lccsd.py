@@ -1390,6 +1390,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                       if pno_spaces[k]['C_pno'].shape[1] > 0]
     _all_pair_set = set(_all_pair_keys)
     S_pao_full = C_pao.T @ s1e @ C_pao
+    # Build into a plain dict first — the upfront set is domain-
+    # restricted and we don't yet know every (pair_a, pair_b) the
+    # iteration will ask for.  Convert to FlatPairPairStore below;
+    # later lazy additions go into the overflow dict.
     S_pno_cache = {}
     for key_ij in _all_pair_keys:
         if pair_lmo_idx is not None and key_ij in pair_lmo_idx:
@@ -1403,6 +1407,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         for key_kl in _partner_keys:
             S_pno_cache[(key_ij, key_kl)] = _compute_S_pno(
                 key_ij, key_kl, pno_spaces, S_pao_full, s1e)
+
+    # Phase 2d: snapshot the upfront S_pno_cache into a flat
+    # pair-of-pair buffer.  Any subsequent miss inside `_s_pno_getter`
+    # lands in the overflow dict — the primary tier remains contiguous,
+    # which is what Phase 4's Cython kernels consume via
+    # ``.buffer`` / ``.offsets`` / ``.index_matrix()``.
+    from pyscf.cc.dlpno_tccsd.pair_index import FlatPairPairStore
+    S_pno_cache = FlatPairPairStore(_pair_index, initial=S_pno_cache)
+    print(f'  [S_pno_cache] {S_pno_cache!r}', flush=True)
 
     # ooL_3idx (full naux occ-occ), K_coul_cache (full naux exchange) and
     # J_oo (nocc^4) are NOT built. cc_ints['i_Qk', 'j_Qk', 'J_ij_kj',
