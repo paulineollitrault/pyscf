@@ -1543,7 +1543,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # ---- T1-dressed intermediates (precomputed once per iteration) ----
             _jiang_cache = None
             from pyscf.cc.dlpno_tccsd.residual import (
-                compute_C_tilde, build_D_tilde, build_G_tilde,
+                build_D_tilde, build_G_tilde,
                 build_mixed_domain_integrals,
             )
 
@@ -1581,26 +1581,11 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # own pass — avoids contention while keeping per-kernel
             # parallelism intact.
             from pyscf.cc.dlpno_tccsd.local_df import t1_fock
-            compute_C_tilde._dump_iter = cycle
-            _tj0 = _time.perf_counter()
-
-            _tct_old_0 = _time.perf_counter()
-            _jiang_C = compute_C_tilde(
-                t1_pno, t2_pno_all, pno_spaces, nocc,
-                ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
-                _term2_precomputed=_c_t2_pre,
-                cc_ints=_cc_ints,
-                pair_lmo_idx=pair_lmo_idx, _pool=_pool,
-                S_pao_full=S_pao_full, s1e=s1e,
-                t1_cache=_t1_cache)
-            _tct_old = _time.perf_counter() - _tct_old_0
-
-            # Prototype: batched compute_C_tilde (Terms 3+4 vectorized).
-            # Runs side-by-side for validation + timing; no pool, 32-thread BLAS.
             from pyscf.cc.dlpno_tccsd.residual import compute_C_tilde_batched
             compute_C_tilde_batched._dump_timing = (cycle == 5)
-            _tct_new_0 = _time.perf_counter()
-            _jiang_C_new = compute_C_tilde_batched(
+            _tj0 = _time.perf_counter()
+
+            _jiang_C = compute_C_tilde_batched(
                 t1_pno, t2_pno_all, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                 _term2_precomputed=_c_t2_pre,
@@ -1608,24 +1593,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 pair_lmo_idx=pair_lmo_idx, _pool=_pool,
                 S_pao_full=S_pao_full, s1e=s1e,
                 blas_threads=32)
-            _tct_new = _time.perf_counter() - _tct_new_0
-            _max_diff = 0.0
-            _missing = 0
-            _extra = 0
-            for _k in _jiang_C:
-                if _k in _jiang_C_new:
-                    _d = float(np.max(np.abs(_jiang_C[_k] - _jiang_C_new[_k])))
-                    if _d > _max_diff:
-                        _max_diff = _d
-                else:
-                    _missing += 1
-            for _k in _jiang_C_new:
-                if _k not in _jiang_C:
-                    _extra += 1
-            print(f'  [c_tilde_proto] iter={cycle} '
-                  f'old={_tct_old*1e3:.0f}ms new={_tct_new*1e3:.0f}ms '
-                  f'max_diff={_max_diff:.2e} '
-                  f'missing={_missing} extra={_extra}', flush=True)
             _jiang_D = build_D_tilde(
                 t1_pno, t2_pno_all, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,

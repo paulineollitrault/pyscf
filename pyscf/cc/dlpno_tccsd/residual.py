@@ -1071,12 +1071,12 @@ def compute_C_tilde_batched(
         _cache_attr[plan_key] = plan
 
     # ------------------------------------------------------------------
-    # Migrate Phase 1 results into flat per-n_ki buffers; Numba kernels
-    # will accumulate Terms 3 + 4 on top.  All scatter-add happens inside
-    # Numba (race-free via two-stage: parallel compute → serial add).
+    # Migrate Phase 1 results into flat per-n_ki buffers; nogil Cython
+    # kernels accumulate Terms 3 + 4 on top.  Two-stage structure:
+    # parallel prange compute → sequential scatter-add (race-free).
     # ------------------------------------------------------------------
-    from pyscf.cc.dlpno_tccsd._c_tilde_numba import (
-        t3_kernel as _t3_numba, t4_kernel as _t4_numba,
+    from pyscf.cc.dlpno_tccsd._c_tilde_cy import (
+        t3_kernel as _t3_kern, t4_kernel as _t4_kern,
     )
 
     _t_alloc = _time_dbg.perf_counter()
@@ -1090,10 +1090,10 @@ def compute_C_tilde_batched(
         flat_out[n_ki] = buf
     _pt['flat_alloc'] = _time_dbg.perf_counter() - _t_alloc
 
-    _pt['t3_gather'] = 0.0; _pt['t3_numba'] = 0.0
-    _pt['t4_gather'] = 0.0; _pt['t4_numba'] = 0.0
+    _pt['t3_gather'] = 0.0; _pt['t3_kern'] = 0.0
+    _pt['t4_gather'] = 0.0; _pt['t4_kern'] = 0.0
 
-    # ----- Term 3 via Numba kernel -----
+    # ----- Term 3 via Cython kernel -----
     for bucket in plan['t3']:
         _tg = _time_dbg.perf_counter()
         t1i = np.ascontiguousarray(
@@ -1103,11 +1103,11 @@ def compute_C_tilde_batched(
         _pt['t3_gather'] += _time_dbg.perf_counter() - _tg
 
         _tn = _time_dbg.perf_counter()
-        _t3_numba(bucket['K'], bucket['S'], t1i, T1l,
-                  bucket['item_idx'], flat_out[bucket['n_ki']])
-        _pt['t3_numba'] += _time_dbg.perf_counter() - _tn
+        _t3_kern(bucket['K'], bucket['S'], t1i, T1l,
+                 bucket['item_idx'], flat_out[bucket['n_ki']])
+        _pt['t3_kern'] += _time_dbg.perf_counter() - _tn
 
-    # ----- Term 4 via Numba kernel -----
+    # ----- Term 4 via Cython kernel -----
     for bucket in plan['t4']:
         _tg = _time_dbg.perf_counter()
         t2_arr = np.ascontiguousarray(np.array([
@@ -1117,10 +1117,10 @@ def compute_C_tilde_batched(
         _pt['t4_gather'] += _time_dbg.perf_counter() - _tg
 
         _tn = _time_dbg.perf_counter()
-        _t4_numba(bucket['S_ki_li'], t2_arr, bucket['S_li_kl'],
-                  bucket['K'], bucket['S_kl_ki'],
-                  bucket['item_idx'], flat_out[bucket['n_ki']])
-        _pt['t4_numba'] += _time_dbg.perf_counter() - _tn
+        _t4_kern(bucket['S_ki_li'], t2_arr, bucket['S_li_kl'],
+                 bucket['K'], bucket['S_kl_ki'],
+                 bucket['item_idx'], flat_out[bucket['n_ki']])
+        _pt['t4_kern'] += _time_dbg.perf_counter() - _tn
 
     # Unpack flat_out back into C_tilde_all dict.
     _t_unpack = _time_dbg.perf_counter()
