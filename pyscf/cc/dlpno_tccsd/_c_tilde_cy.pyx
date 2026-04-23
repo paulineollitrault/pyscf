@@ -94,7 +94,8 @@ def t4_kernel(double[:, :, ::1] S_ki_li,
               double[:, :, ::1] K,
               double[:, :, ::1] S_kl_ki,
               long[::1] idx,
-              double[:, :, ::1] out):
+              double[:, :, ::1] out,
+              double scale=-0.5):
     """Accumulate Term 4 contributions into ``out``.
 
     For each triple n:
@@ -102,9 +103,10 @@ def t4_kernel(double[:, :, ::1] S_ki_li,
         tmp2 = tmp1       @ S_li_kl[n]     (n_ki, n_kl)
         tmp3 = tmp2       @ K[n]           (n_ki, n_kl)
         C    = tmp3       @ S_kl_ki[n]     (n_ki, n_ki)
-        out[idx[n]] += -0.5 * C
+        out[idx[n]] += scale * C
 
-    Matches ``_c_tilde_numba.t4_kernel`` bit-for-bit up to FP reordering.
+    ``scale`` defaults to -0.5 (C_tilde convention); D_tilde Term 4 uses
+    ``scale=+0.5`` with ``K = L_lk`` and ``t2 = u_il``.
     """
     cdef Py_ssize_t N = S_ki_li.shape[0]
     cdef Py_ssize_t n_ki = S_ki_li.shape[1]
@@ -145,13 +147,13 @@ def t4_kernel(double[:, :, ::1] S_ki_li,
                     for c in range(n_kl):
                         s = s + wks_tmp2[n, a, c] * K[n, c, b]
                     wks_tmp3[n, a, b] = s
-            # contrib = -0.5 * tmp3 @ S_kl_ki[n]
+            # contrib = scale * tmp3 @ S_kl_ki[n]
             for a in range(n_ki):
                 for b in range(n_ki):
                     s = 0.0
                     for c in range(n_kl):
                         s = s + wks_tmp3[n, a, c] * S_kl_ki[n, c, b]
-                    contrib[n, a, b] = -0.5 * s
+                    contrib[n, a, b] = scale * s
 
     for n in range(N):
         target = idx[n]

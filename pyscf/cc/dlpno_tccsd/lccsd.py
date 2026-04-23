@@ -1543,8 +1543,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # ---- T1-dressed intermediates (precomputed once per iteration) ----
             _jiang_cache = None
             from pyscf.cc.dlpno_tccsd.residual import (
-                build_D_tilde, build_G_tilde,
-                build_mixed_domain_integrals,
+                build_G_tilde, build_mixed_domain_integrals,
             )
 
             _t_jiang = _time.perf_counter()
@@ -1593,7 +1592,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 pair_lmo_idx=pair_lmo_idx, _pool=_pool,
                 S_pao_full=S_pao_full, s1e=s1e,
                 blas_threads=32)
-            _jiang_D = build_D_tilde(
+            from pyscf.cc.dlpno_tccsd.residual import build_D_tilde_batched
+            _jiang_D = build_D_tilde_batched(
                 t1_pno, t2_pno_all, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                 _term2_precomputed=_d_t2_pre,

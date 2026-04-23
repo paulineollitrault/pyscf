@@ -405,6 +405,369 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
     return D_tilde_all
 
 
+def _build_d_tilde_t34_plan(
+        all_pairs, pno_spaces, pair_lmo_idx, t2_pno_all,
+        S_pno_cache, cc_ints, _s_pno_get, nocc):
+    """Build the one-time plan for D_tilde Terms 3 and 4.
+
+    Structurally identical to ``_build_c_tilde_t34_plan``: same (i, k, l)
+    triple space, same bucket-by-shape grouping, same scatter-index
+    machinery.  The only differences versus C_tilde:
+
+      - T3 stacks ``L_lk.T`` (where ``L_lk = 2*K_lk - K_lk.T``) in the
+        ``K`` slot so the shared kernel's ``K[n].T @ t1i[n]`` evaluates
+        to ``L_lk @ t1_i_lk`` (the contraction D_tilde actually wants).
+      - T4 stacks ``L_lk`` directly in the ``K`` slot and records the
+        (key_il, transpose-flag) pair in ``u_sources`` so the per-cycle
+        gather can materialise ``u_il = 2*t2_il_d - t2_il_d.T`` cheaply
+        from the current ``t2_pno_all`` snapshot.
+    """
+    from pyscf.cc.dlpno_tccsd.local_df import get_local_K
+
+    t3_items = []  # (i, k, l, M, S_ik_lk, key_lk, key_ik, n_ik, n_lk)
+    t4_items = []  # (i, k, S_ik_il, S_il_lk, L, S_lk_ik, key_il, transpose, n_ik, n_lk, n_il)
+
+    for (i, k) in all_pairs:
+        key_ik = (min(i, k), max(i, k))
+        n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
+        if n_ik == 0:
+            continue
+        if pair_lmo_idx is not None and key_ik in pair_lmo_idx:
+            _ll_idx = pair_lmo_idx[key_ik]
+        else:
+            _ll_idx = np.arange(nocc)
+
+        for ll_raw in _ll_idx:
+            ll = int(ll_raw)
+            key_lk = (min(ll, k), max(ll, k))
+
+            # Term 3: need K_lk (not K_kl) — MO-ordered get_local_K(ll, k).
+            if key_lk in pno_spaces:
+                n_lk = pno_spaces[key_lk]['C_pno'].shape[1]
+                if n_lk > 0:
+                    K_lk = get_local_K(cc_ints, key_lk, ll, k)
+                    if K_lk is not None:
+                        S_ik_lk = (np.eye(n_ik) if key_ik == key_lk
+                                   else _s_pno_get(key_ik, key_lk))
+                        if S_ik_lk is not None:
+                            L_lk = 2.0 * K_lk - K_lk.T
+                            M_stacked = np.ascontiguousarray(L_lk.T)
+                            t3_items.append((i, k, ll, M_stacked, S_ik_lk,
+                                             key_lk, key_ik, n_ik, n_lk))
+
+            # Term 4: u_il contraction through L_lk with four S-projections.
+            key_il = (min(i, ll), max(i, ll))
+            if key_il not in t2_pno_all:
+                continue
+            if key_lk not in pno_spaces:
+                continue
+            n_il = pno_spaces[key_il]['C_pno'].shape[1]
+            n_lk = pno_spaces[key_lk]['C_pno'].shape[1]
+            if n_il == 0 or n_lk == 0:
+                continue
+            K_lk = get_local_K(cc_ints, key_lk, ll, k)
+            if K_lk is None:
+                continue
+            L_lk = np.ascontiguousarray(2.0 * K_lk - K_lk.T)
+            transpose = (i > ll)  # opposite of C_tilde's (ll > i) rule
+            S_ik_il = (np.eye(n_ik) if key_ik == key_il
+                       else _s_pno_get(key_ik, key_il))
+            S_il_lk = (np.eye(n_il) if key_il == key_lk
+                       else _s_pno_get(key_il, key_lk))
+            S_lk_ik = (np.eye(n_lk) if key_lk == key_ik
+                       else _s_pno_get(key_lk, key_ik))
+            if S_ik_il is None or S_il_lk is None or S_lk_ik is None:
+                continue
+            t4_items.append((i, k, S_ik_il, S_il_lk, L_lk, S_lk_ik,
+                             key_il, transpose, n_ik, n_lk, n_il))
+
+    # --- Global (i, k) → flat slot map (one slot per n_ik output bucket) ---
+    pairs_by_n_ik = {}
+    pair_to_slot = {}
+    for (i, k) in all_pairs:
+        key_ik = (min(i, k), max(i, k))
+        n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
+        if n_ik == 0:
+            continue
+        if n_ik not in pairs_by_n_ik:
+            pairs_by_n_ik[n_ik] = []
+        slot = len(pairs_by_n_ik[n_ik])
+        pairs_by_n_ik[n_ik].append((i, k))
+        pair_to_slot[(i, k)] = slot
+
+    # --- Bucket T3 by (n_ik, n_lk); stack L.T (in K slot), S, index arrays ---
+    t3_by_shape = {}
+    for it in t3_items:
+        t3_by_shape.setdefault((it[7], it[8]), []).append(it)
+    t3_buckets = []
+    for (n_ik, n_lk), items in t3_by_shape.items():
+        N = len(items)
+        K = np.empty((N, n_lk, n_lk))
+        S = np.empty((N, n_ik, n_lk))
+        t1i_keys = []
+        T1l_keys = []
+        item_idx = np.empty(N, dtype=np.intp)
+        for n, it in enumerate(items):
+            i_, k_, ll = it[0], it[1], it[2]
+            K[n] = it[3]
+            S[n] = it[4]
+            key_lk, key_ik = it[5], it[6]
+            t1i_keys.append((key_lk, i_))
+            T1l_keys.append((key_ik, ll))
+            item_idx[n] = pair_to_slot[(i_, k_)]
+        t3_buckets.append({
+            'K': K, 'S': S,
+            't1i_keys': t1i_keys, 'T1l_keys': T1l_keys,
+            'n_ki': n_ik, 'n_kl': n_lk,
+            'item_idx': item_idx,
+        })
+
+    # --- Bucket T4 by (n_ik, n_lk, n_il); stack L and u-source descriptors ---
+    t4_by_shape = {}
+    for it in t4_items:
+        t4_by_shape.setdefault((it[8], it[9], it[10]), []).append(it)
+    t4_buckets = []
+    for (n_ik, n_lk, n_il), items in t4_by_shape.items():
+        N = len(items)
+        S_ik_il = np.empty((N, n_ik, n_il))
+        S_il_lk = np.empty((N, n_il, n_lk))
+        K = np.empty((N, n_lk, n_lk))
+        S_lk_ik = np.empty((N, n_lk, n_ik))
+        u_sources = []
+        item_idx = np.empty(N, dtype=np.intp)
+        for n, it in enumerate(items):
+            i_, k_ = it[0], it[1]
+            S_ik_il[n] = it[2]
+            S_il_lk[n] = it[3]
+            K[n] = it[4]
+            S_lk_ik[n] = it[5]
+            u_sources.append((it[6], bool(it[7])))
+            item_idx[n] = pair_to_slot[(i_, k_)]
+        t4_buckets.append({
+            'S_ki_li': S_ik_il, 'S_li_kl': S_il_lk,
+            'K': K, 'S_kl_ki': S_lk_ik,
+            'u_sources': u_sources,
+            'n_ki': n_ik, 'n_kl': n_lk, 'n_li': n_il,
+            'item_idx': item_idx,
+        })
+
+    return {
+        't3': t3_buckets, 't4': t4_buckets,
+        'pairs_by_n_ki': pairs_by_n_ik,
+        'pair_to_slot': pair_to_slot,
+    }
+
+
+def build_D_tilde_batched(
+        t1_pno, t2_pno_all, pno_spaces, nocc,
+        ovL_bare, ooL_bare, S_pno_cache, with_df,
+        _term2_precomputed=None, cc_ints=None,
+        pair_lmo_idx=None, _pool=None,
+        S_pao_full=None, s1e=None,
+        t1_cache=None):
+    """Drop-in replacement for ``build_D_tilde`` with Terms 3+4 batched.
+
+    Phase 1 runs Terms 1 and 2 per-pair via the reference ``_process_ik``
+    (unchanged code path — split out below as ``_process_ik_t12``).
+    Phase 2 then runs Terms 3 and 4 on top via the shared Cython kernels
+    (``t3_kernel``, ``t4_kernel(scale=+0.5)``) using a plan-cache keyed
+    on ``t2_pno_all.keys()`` — the same pattern as
+    ``compute_C_tilde_batched``.  Output matches the reference to
+    machine precision.
+    """
+    from pyscf.cc.dlpno_tccsd.local_df import (
+        get_local_K, get_local_ovL, get_local_ooL_vec,
+    )
+    from pyscf.ao2mo import _ao2mo
+
+    D_tilde_all = {}
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
+
+    # --- T1 cache (reuse if caller provided one) ---
+    if t1_cache is None:
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            PairIndex, build_t1_cache,
+        )
+        _pi = PairIndex(
+            pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+        t1_cache = build_t1_cache(
+            t1_pno, _pi, S_pno_cache, pno_spaces)
+
+    all_pairs = set()
+    for key in t2_pno_all:
+        a, b = key
+        all_pairs.add((a, b))
+        all_pairs.add((b, a))
+
+    # --- Term 2 fallback via batched DF (only when cc_ints doesn't cover) ---
+    if _term2_precomputed is None:
+        term2_data = {}
+        for i_idx, k_idx in all_pairs:
+            key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
+            n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
+            if n_ik == 0:
+                continue
+            t1_i_ik = t1_cache[key_ik][i_idx]
+            if np.max(np.abs(t1_i_ik)) < 1e-15:
+                continue
+            ovL_k_ik = ovL_bare.get((key_ik, k_idx))
+            if ovL_k_ik is None:
+                continue
+            term2_data[(i_idx, k_idx)] = {
+                'key_ik': key_ik, 'n_ik': n_ik,
+                'C_pno': np.asfortranarray(pno_spaces[key_ik]['C_pno']),
+                't1_i': t1_i_ik, 'ovL_k': ovL_k_ik,
+                'result': np.zeros((n_ik, n_ik)),
+            }
+        if term2_data:
+            aux_off = 0
+            for Lpq in with_df.loop():
+                nL = Lpq.shape[0]
+                for (i_idx, k_idx), td in term2_data.items():
+                    n_ik = td['n_ik']
+                    buf = _ao2mo.nr_e2(Lpq, td['C_pno'],
+                                       (0, n_ik, 0, n_ik), aosym='s2')
+                    B_L = buf.reshape(nL, n_ik, n_ik)
+                    ovL_k_batch = td['ovL_k'][:, aux_off:aux_off+nL]
+                    z_c = np.einsum('b,Lbc->Lc', td['t1_i'], B_L)
+                    y = td['t1_i'] @ ovL_k_batch
+                    td['result'] += 2.0 * ovL_k_batch @ z_c
+                    td['result'] -= np.tensordot(y, B_L, axes=(0, 0))
+                aux_off += nL
+            _term2_precomputed = {
+                ik: td['result'] for ik, td in term2_data.items()}
+
+    # --- Phase 1: per-(i,k) loop covering Terms 1 and 2 only ---
+    def _process_ik_t12(ik_tuple):
+        i_idx, k_idx = ik_tuple
+        key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
+        n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
+        if n_ik == 0:
+            return ik_tuple, None
+
+        D_tilde_ik = np.zeros((n_ik, n_ik))
+        t1_i_ik = t1_cache[key_ik][i_idx]
+        T1_all_ik = t1_cache[key_ik]
+
+        # Term 2 — mirror of build_D_tilde's per-triple Term 2 branches
+        key_ki = key_ik
+        if key_ki in cc_ints and cc_ints[key_ki] is not None:
+            ci_ki = cc_ints[key_ki]
+            if key_ki[0] == k_idx:
+                k_Qa = ci_ki['i_Qa']
+            else:
+                k_Qa = ci_ki['j_Qa']
+            Qab_ki = ci_ki['Qab']
+            z_Qa = np.tensordot(Qab_ki, t1_i_ik, axes=(2, 0))
+            D_tilde_ik += 2.0 * z_Qa.T @ k_Qa
+            w = k_Qa @ t1_i_ik
+            D_tilde_ik -= np.tensordot(w, Qab_ki, axes=(0, 0)).T
+        elif _term2_precomputed and (i_idx, k_idx) in _term2_precomputed:
+            D_tilde_ik += _term2_precomputed[(i_idx, k_idx)]
+
+        # Term 1 — per-LMO DF contractions, restricted to pair_lmo_idx
+        _domain_ik_t1 = (set(pair_lmo_idx[key_ik].tolist())
+                         if pair_lmo_idx is not None and key_ik in pair_lmo_idx
+                         else set(range(nocc)))
+        _use_local_d1 = (key_ik in cc_ints and cc_ints[key_ik] is not None)
+        for ll in range(nocc):
+            if ll not in _domain_ik_t1:
+                continue
+            if _use_local_d1:
+                _ovL_k = get_local_ovL(cc_ints, key_ik, k_idx)
+                _ovL_l = get_local_ovL(cc_ints, key_ik, ll)
+                _ooL_il = get_local_ooL_vec(cc_ints, i_idx, ll, key_ik)
+                _ooL_ik = get_local_ooL_vec(cc_ints, i_idx, k_idx, key_ik)
+                if (_ovL_k is not None and _ovL_l is not None
+                        and _ooL_il is not None and _ooL_ik is not None):
+                    ilkc = _ovL_k @ _ooL_il
+                    iklc = _ovL_l @ _ooL_ik
+                else:
+                    continue
+            else:
+                ooL_il = ooL_bare[i_idx, ll, :]
+                ooL_ik = ooL_bare[i_idx, k_idx, :]
+                ovL_k_ik_entry = ovL_bare.get((key_ik, k_idx))
+                ovL_l_ik_entry = ovL_bare.get((key_ik, ll))
+                if ovL_k_ik_entry is None or ovL_l_ik_entry is None:
+                    continue
+                ilkc = ovL_k_ik_entry @ ooL_il
+                iklc = ovL_l_ik_entry @ ooL_ik
+            M_lc = 2.0 * ilkc - iklc
+            D_tilde_ik -= np.outer(T1_all_ik[ll], M_lc)
+
+        return ik_tuple, D_tilde_ik
+
+    if _pool is not None:
+        for ik, val in _pool.map(_process_ik_t12, list(all_pairs)):
+            if val is not None:
+                D_tilde_all[ik] = val
+    else:
+        for ik in all_pairs:
+            _, val = _process_ik_t12(ik)
+            if val is not None:
+                D_tilde_all[ik] = val
+
+    # --- Phase 2: Terms 3 + 4 via plan-cached Cython kernels ---
+    plan_key = tuple(sorted(t2_pno_all.keys()))
+    _cache_attr = getattr(build_D_tilde_batched, '_plan_cache', None)
+    if _cache_attr is None:
+        _cache_attr = {}
+        build_D_tilde_batched._plan_cache = _cache_attr
+    plan = _cache_attr.get(plan_key)
+    if plan is None:
+        plan = _build_d_tilde_t34_plan(
+            all_pairs, pno_spaces, pair_lmo_idx, t2_pno_all,
+            S_pno_cache, cc_ints, _s_pno_get, nocc)
+        _cache_attr[plan_key] = plan
+
+    from pyscf.cc.dlpno_tccsd._c_tilde_cy import (
+        t3_kernel as _t3_kern, t4_kernel as _t4_kern,
+    )
+
+    # Per-n_ik flat buffers carrying Phase 1 (Terms 1 + 2) results; the
+    # Cython kernels accumulate Terms 3 + 4 on top, then we unpack back
+    # into D_tilde_all.
+    flat_out = {}
+    for n_ik, pairs in plan['pairs_by_n_ki'].items():
+        buf = np.zeros((len(pairs), n_ik, n_ik))
+        for slot, pair in enumerate(pairs):
+            v = D_tilde_all.get(pair)
+            if v is not None:
+                buf[slot] = v
+        flat_out[n_ik] = buf
+
+    # Term 3 — same kernel as C_tilde; D_tilde's sign and L-vs-K swap
+    # are absorbed into the plan's stacked K = L.T.
+    for bucket in plan['t3']:
+        t1i = np.ascontiguousarray(
+            np.array([t1_cache[key][l] for (key, l) in bucket['t1i_keys']]))
+        T1l = np.ascontiguousarray(
+            np.array([t1_cache[key][l] for (key, l) in bucket['T1l_keys']]))
+        _t3_kern(bucket['K'], bucket['S'], t1i, T1l,
+                 bucket['item_idx'], flat_out[bucket['n_ki']])
+
+    # Term 4 — stack u_il each cycle; kernel scale=+0.5 (D_tilde sign).
+    for bucket in plan['t4']:
+        u_arr = np.empty((len(bucket['u_sources']),
+                          bucket['n_li'], bucket['n_li']))
+        for n, (key_il, transpose) in enumerate(bucket['u_sources']):
+            t2_d = (t2_pno_all[key_il].T if transpose
+                    else t2_pno_all[key_il])
+            u_arr[n] = 2.0 * t2_d - t2_d.T
+        _t4_kern(bucket['S_ki_li'], u_arr, bucket['S_li_kl'],
+                 bucket['K'], bucket['S_kl_ki'],
+                 bucket['item_idx'], flat_out[bucket['n_ki']],
+                 0.5)
+
+    for n_ik, pairs in plan['pairs_by_n_ki'].items():
+        buf = flat_out[n_ik]
+        for slot, pair in enumerate(pairs):
+            D_tilde_all[pair] = buf[slot]
+
+    return D_tilde_all
+
+
 def build_mixed_domain_integrals(t2_pno_all, pno_spaces, nocc,
                                  ovL_bare, ooL_bare, S_pno_cache,
                                  cc_ints=None):
