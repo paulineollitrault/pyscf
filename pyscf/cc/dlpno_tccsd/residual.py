@@ -2016,6 +2016,473 @@ def compute_B_E_batched_v2(
 
 
 # =========================================================================
+# C and D dressed contractions: plan-cached + Cython kernels (Phase 5e).
+#
+# These are the two biggest remaining CPU bins inside compute_residual_v2
+# (C ~11s CPU/iter, D ~16s CPU/iter at water8).  The per-(ij, k, side)
+# items are structurally uniform once bucketed by shape, so the gather/
+# scatter plan is cycle-invariant and can be cached; only ct/dt and t2
+# values change per cycle.
+# =========================================================================
+
+
+def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
+                   cc_ints, K_ij_kj_all, K_coul_cache,
+                   _s_pno_get, nocc):
+    """Plan for compute_CD_terms_batched.
+
+    Enumerates every (key_ij, k, side) item that the reference C/D
+    blocks of compute_residual_v2 iterate over (residual.py lines
+    2200-2334), groups them by shape, and pre-stacks all constant
+    tensors (S projections, J_bold for C, 2*K-J for D).
+
+    Returns a dict with two buckets lists — ``c_buckets`` and
+    ``d_buckets`` — each bucketed by shape; plus the output slot map
+    ``pair_to_slot`` and ``pairs_by_n_pno``.  Missing entries (absent
+    ct, absent bold integrals) are zero-filled so the Cython kernels
+    stay branch-free.
+    """
+    # --- Output slot map (one slot per strong pair, grouped by n_pno) ---
+    pairs_by_n_pno = {}
+    pair_to_slot = {}
+    for key_ij in strong_keys:
+        n_pno = pno_spaces[key_ij]['C_pno'].shape[1]
+        if n_pno == 0:
+            continue
+        pairs_by_n_pno.setdefault(n_pno, []).append(key_ij)
+        pair_to_slot[key_ij] = len(pairs_by_n_pno[n_pno]) - 1
+
+    # --- Enumerate items, bucketed by shape ---
+    c_items_by_shape = {}   # (n_pno, n_ct, n_other) -> list
+    d_items_by_shape = {}   # (n_pno, n_A,  n_B)     -> list
+
+    for key_ij in strong_keys:
+        i, j = key_ij
+        n_pno = pno_spaces[key_ij]['C_pno'].shape[1]
+        if n_pno == 0:
+            continue
+        domain = (sorted(int(x) for x in pair_lmo_idx[key_ij])
+                  if pair_lmo_idx is not None and key_ij in pair_lmo_idx
+                  else list(range(nocc)))
+        ci_ij = cc_ints.get(key_ij)
+        J_ij_kj_local = ci_ij.get('J_ij_kj', {}) if ci_ij is not None else {}
+        J_ji_ki = ci_ij.get('J_ji_ki', {}) if ci_ij is not None else {}
+        K_ji_ki = ci_ij.get('K_ji_ki', {}) if ci_ij is not None else {}
+
+        for k in domain:
+            key_ik = (min(i, k), max(i, k))
+            key_kj = (min(k, j), max(k, j))
+            key_jk = (min(j, k), max(j, k))
+            key_ki = (min(k, i), max(k, i))
+
+            # ========= C_ij side: t2(key_kj), ct=(k, i) =========
+            if key_kj in t2_pno_all and t2_pno_all[key_kj] is not None \
+                    and t2_pno_all[key_kj].shape[0] > 0:
+                n_other = t2_pno_all[key_kj].shape[0]
+                n_ct = pno_spaces[key_ik]['C_pno'].shape[1]
+                if n_ct > 0:
+                    S_big = _s_pno_get(key_ij, key_ik)     # (n_pno, n_ct)
+                    S_mid = _s_pno_get(key_ik, key_kj)     # (n_ct, n_other)
+                    S_outer = _s_pno_get(key_ij, key_kj)   # (n_pno, n_other)
+                    if (S_big is not None and S_mid is not None
+                            and S_outer is not None):
+                        # J_ij_kj: local cc_ints preferred; K_coul_cache
+                        # fallback for entries missing locally (matches
+                        # _update_pair's augment logic at lccsd.py:1730).
+                        J_b = J_ij_kj_local.get((key_ij, k))
+                        if J_b is None and K_coul_cache is not None:
+                            J_b = K_coul_cache.get(
+                                (key_ij, key_kj, i, k))
+                        J_bold = (np.ascontiguousarray(J_b)
+                                  if J_b is not None
+                                  else np.zeros((n_pno, n_other)))
+                        ct_key = (k, i)
+                        c_items_by_shape.setdefault(
+                            (n_pno, n_ct, n_other), []).append({
+                                'side': 'ij',
+                                'key_ij': key_ij,
+                                'S_big': np.ascontiguousarray(S_big),
+                                'S_mid': np.ascontiguousarray(S_mid),
+                                'S_outer': np.ascontiguousarray(S_outer),
+                                'J_bold': J_bold,
+                                'ct_key': ct_key,
+                                't2_key': key_kj,
+                                't2_transpose': (k > j),
+                            })
+
+            # ========= C_ji side: t2(key_ki), ct_j=(k, j) =========
+            if key_ki in t2_pno_all and t2_pno_all[key_ki] is not None \
+                    and t2_pno_all[key_ki].shape[0] > 0:
+                n_other = t2_pno_all[key_ki].shape[0]
+                n_ct = pno_spaces[key_jk]['C_pno'].shape[1]
+                if n_ct > 0:
+                    S_big = _s_pno_get(key_ij, key_jk)
+                    S_mid = _s_pno_get(key_jk, key_ki)
+                    S_outer = _s_pno_get(key_ij, key_ki)
+                    if (S_big is not None and S_mid is not None
+                            and S_outer is not None):
+                        # J_bold: local J_ji_ki preferred; fall back to
+                        # K_coul_cache (global DF) when local absent.
+                        J_b = J_ji_ki.get((key_ij, k)) if J_ji_ki else None
+                        if J_b is None and K_coul_cache is not None:
+                            J_b = K_coul_cache.get((key_ij, key_ki, j, k))
+                        J_bold = (np.ascontiguousarray(J_b)
+                                  if J_b is not None
+                                  else np.zeros((n_pno, n_other)))
+                        ct_key = (k, j)
+                        c_items_by_shape.setdefault(
+                            (n_pno, n_ct, n_other), []).append({
+                                'side': 'ji',
+                                'key_ij': key_ij,
+                                'S_big': np.ascontiguousarray(S_big),
+                                'S_mid': np.ascontiguousarray(S_mid),
+                                'S_outer': np.ascontiguousarray(S_outer),
+                                'J_bold': J_bold,
+                                'ct_key': ct_key,
+                                't2_key': key_ki,
+                                't2_transpose': (k > i),
+                            })
+
+            # ========= D_ij side: t2(key_jk), dt=(i, k) =========
+            if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None \
+                    and t2_pno_all[key_jk].shape[0] > 0:
+                n_A = t2_pno_all[key_jk].shape[0]
+                n_B = pno_spaces[key_ik]['C_pno'].shape[1]
+                if n_A > 0:
+                    S_a = _s_pno_get(key_ij, key_jk)   # (n_pno, n_A)
+                    S_b = (_s_pno_get(key_jk, key_ik)  # (n_A, n_B)
+                           if n_B > 0 else None)
+                    S_c = (_s_pno_get(key_ij, key_ik)  # (n_pno, n_B)
+                           if n_B > 0 else None)
+                    if S_a is not None:
+                        # Part A requires S_b, S_c, and non-null n_B.
+                        has_A = (n_B > 0 and S_b is not None
+                                 and S_c is not None)
+                        if not has_A:
+                            n_B = 1   # placeholder dimension; Part A
+                                      # is zero-filled
+                        K_b = (K_ij_kj_all.get((key_ij, k))
+                               if K_ij_kj_all is not None else None)
+                        # D uses J_ij_kj from local cc_ints (reference
+                        # residual.py:2800 — no K_coul_cache fallback
+                        # for the D bold term).
+                        J_b = J_ij_kj_local.get((key_ij, k))
+                        if K_b is not None and J_b is not None:
+                            KJ = np.ascontiguousarray(2.0 * K_b - J_b)
+                        else:
+                            KJ = np.zeros((n_pno, n_A))
+                        d_items_by_shape.setdefault(
+                            (n_pno, n_A, n_B), []).append({
+                                'side': 'ij',
+                                'key_ij': key_ij,
+                                'S_a': np.ascontiguousarray(S_a),
+                                'S_b': (np.ascontiguousarray(S_b) if has_A
+                                        else np.zeros((n_A, n_B))),
+                                'S_c': (np.ascontiguousarray(S_c) if has_A
+                                        else np.zeros((n_pno, n_B))),
+                                'KJ': KJ,
+                                'dt_key': ((i, k) if has_A else None),
+                                'dt_dim': n_B if has_A else n_B,
+                                't2_key': key_jk,
+                                't2_transpose': (j > k),
+                            })
+
+            # ========= D_ji side: t2(key_ik), dt_j=(j, k) =========
+            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None \
+                    and t2_pno_all[key_ik].shape[0] > 0:
+                n_A = t2_pno_all[key_ik].shape[0]
+                n_B = pno_spaces[key_jk]['C_pno'].shape[1]
+                if n_A > 0:
+                    S_a = _s_pno_get(key_ij, key_ik)
+                    S_b = (_s_pno_get(key_ik, key_jk)
+                           if n_B > 0 else None)
+                    S_c = (_s_pno_get(key_ij, key_jk)
+                           if n_B > 0 else None)
+                    if S_a is not None:
+                        has_A = (n_B > 0 and S_b is not None
+                                 and S_c is not None)
+                        if not has_A:
+                            n_B = 1
+                        K_b = K_ji_ki.get((key_ij, k)) if K_ji_ki else None
+                        J_b = J_ji_ki.get((key_ij, k)) if J_ji_ki else None
+                        if K_b is not None and J_b is not None:
+                            KJ = np.ascontiguousarray(2.0 * K_b - J_b)
+                        else:
+                            KJ = np.zeros((n_pno, n_A))
+                        d_items_by_shape.setdefault(
+                            (n_pno, n_A, n_B), []).append({
+                                'side': 'ji',
+                                'key_ij': key_ij,
+                                'S_a': np.ascontiguousarray(S_a),
+                                'S_b': (np.ascontiguousarray(S_b) if has_A
+                                        else np.zeros((n_A, n_B))),
+                                'S_c': (np.ascontiguousarray(S_c) if has_A
+                                        else np.zeros((n_pno, n_B))),
+                                'KJ': KJ,
+                                'dt_key': ((j, k) if has_A else None),
+                                'dt_dim': n_B if has_A else n_B,
+                                't2_key': key_ik,
+                                't2_transpose': (i > k),
+                            })
+
+    # --- Stack each bucket's constants into contiguous 3D arrays ---
+    def _pack_c(items, n_pno, n_ct, n_other):
+        N = len(items)
+        S_big = np.empty((N, n_pno, n_ct))
+        S_mid = np.empty((N, n_ct, n_other))
+        S_outer = np.empty((N, n_pno, n_other))
+        J_bold = np.empty((N, n_pno, n_other))
+        ct_keys = [None] * N
+        t2_keys = [None] * N
+        t2_trans = np.empty(N, dtype=np.uint8)
+        item_idx_ij = np.empty(N, dtype=np.intp)   # flat slot for C_ij
+        item_idx_ji = np.empty(N, dtype=np.intp)   # flat slot for C_ji
+        side_flag = np.empty(N, dtype=np.uint8)    # 0=ij, 1=ji
+        for n, it in enumerate(items):
+            S_big[n] = it['S_big']
+            S_mid[n] = it['S_mid']
+            S_outer[n] = it['S_outer']
+            J_bold[n] = it['J_bold']
+            ct_keys[n] = it['ct_key']
+            t2_keys[n] = it['t2_key']
+            t2_trans[n] = 1 if it['t2_transpose'] else 0
+            slot = pair_to_slot[it['key_ij']]
+            if it['side'] == 'ij':
+                item_idx_ij[n] = slot
+                item_idx_ji[n] = -1
+                side_flag[n] = 0
+            else:
+                item_idx_ij[n] = -1
+                item_idx_ji[n] = slot
+                side_flag[n] = 1
+        return {
+            'n_pno': n_pno, 'n_ct': n_ct, 'n_other': n_other,
+            'S_big': S_big, 'S_mid': S_mid, 'S_outer': S_outer,
+            'J_bold': J_bold,
+            'ct_keys': ct_keys, 't2_keys': t2_keys, 't2_trans': t2_trans,
+            'item_idx_ij': item_idx_ij, 'item_idx_ji': item_idx_ji,
+            'side_flag': side_flag,
+        }
+
+    def _pack_d(items, n_pno, n_A, n_B):
+        N = len(items)
+        S_a = np.empty((N, n_pno, n_A))
+        S_b = np.empty((N, n_A, n_B))
+        S_c = np.empty((N, n_pno, n_B))
+        KJ = np.empty((N, n_pno, n_A))
+        dt_keys = [None] * N
+        t2_keys = [None] * N
+        t2_trans = np.empty(N, dtype=np.uint8)
+        item_idx_ij = np.empty(N, dtype=np.intp)
+        item_idx_ji = np.empty(N, dtype=np.intp)
+        side_flag = np.empty(N, dtype=np.uint8)
+        for n, it in enumerate(items):
+            S_a[n] = it['S_a']
+            S_b[n] = it['S_b']
+            S_c[n] = it['S_c']
+            KJ[n] = it['KJ']
+            dt_keys[n] = it['dt_key']
+            t2_keys[n] = it['t2_key']
+            t2_trans[n] = 1 if it['t2_transpose'] else 0
+            slot = pair_to_slot[it['key_ij']]
+            if it['side'] == 'ij':
+                item_idx_ij[n] = slot
+                item_idx_ji[n] = -1
+                side_flag[n] = 0
+            else:
+                item_idx_ij[n] = -1
+                item_idx_ji[n] = slot
+                side_flag[n] = 1
+        return {
+            'n_pno': n_pno, 'n_A': n_A, 'n_B': n_B,
+            'S_a': S_a, 'S_b': S_b, 'S_c': S_c, 'KJ': KJ,
+            'dt_keys': dt_keys, 't2_keys': t2_keys, 't2_trans': t2_trans,
+            'item_idx_ij': item_idx_ij, 'item_idx_ji': item_idx_ji,
+            'side_flag': side_flag,
+        }
+
+    c_buckets = [_pack_c(items, *shape)
+                 for shape, items in c_items_by_shape.items()]
+    d_buckets = [_pack_d(items, *shape)
+                 for shape, items in d_items_by_shape.items()]
+
+    return {
+        'c_buckets': c_buckets, 'd_buckets': d_buckets,
+        'pairs_by_n_pno': pairs_by_n_pno,
+        'pair_to_slot': pair_to_slot,
+    }
+
+
+def compute_CD_terms_batched(
+        strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
+        cc_ints, C_tilde_cache, D_tilde_cache,
+        K_ij_kj_all, K_coul_cache,
+        pair_lmo_idx, nocc,
+        S_pao_full=None, s1e=None, omp_threads=None):
+    """Plan-cached batched build of the compute_residual_v2 C and D terms.
+
+    For each strong pair key_ij, returns two (n_pno, n_pno) tiles —
+    ``C_term[key_ij]`` and ``D_term[key_ij]`` — that a caller can hand
+    to ``compute_residual_v2`` via ``C_term_override`` and
+    ``D_term_override``, bypassing the per-pair Python k-loop.
+
+    The C-term symmetrization is:
+        C_term = 0.5*C_ij + C_ij.T + 0.5*C_ji.T + C_ji
+    The D-term combination is:
+        D_term = D_ij + D_ji.T
+    """
+    from pyscf.cc.dlpno_tccsd._cd_cy import c_kernel, d_kernel
+
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
+
+    # Plan structure is cycle-invariant once t2_pno_all's keys are fixed.
+    plan_key = (tuple(sorted(strong_keys)),
+                tuple(sorted(t2_pno_all.keys())))
+    _cache_attr = getattr(compute_CD_terms_batched, '_plan_cache', None)
+    if _cache_attr is None:
+        _cache_attr = {}
+        compute_CD_terms_batched._plan_cache = _cache_attr
+    plan = _cache_attr.get(plan_key)
+    if plan is None:
+        plan = _build_cd_plan(
+            strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
+            cc_ints, K_ij_kj_all, K_coul_cache,
+            _s_pno_get, nocc)
+        _cache_attr[plan_key] = plan
+
+    # Flat output buffers per n_pno — one for each of C_ij, C_ji, D_ij, D_ji.
+    flat_C_ij = {}
+    flat_C_ji = {}
+    flat_D_ij = {}
+    flat_D_ji = {}
+    for n_pno, pairs in plan['pairs_by_n_pno'].items():
+        shp = (len(pairs), n_pno, n_pno)
+        flat_C_ij[n_pno] = np.zeros(shp)
+        flat_C_ji[n_pno] = np.zeros(shp)
+        flat_D_ij[n_pno] = np.zeros(shp)
+        flat_D_ji[n_pno] = np.zeros(shp)
+
+    with _omp_threads_ctx(omp_threads):
+        # --- C kernel, one call per (n_pno, n_ct, n_other) bucket ---
+        for bucket in plan['c_buckets']:
+            n_pno = bucket['n_pno']
+            n_ct = bucket['n_ct']
+            n_other = bucket['n_other']
+            N = len(bucket['ct_keys'])
+            # Gather ct (per-cycle): zero-fill when absent.
+            ct_arr = np.zeros((N, n_ct, n_ct))
+            for n, ck in enumerate(bucket['ct_keys']):
+                ct_val = C_tilde_cache.get(ck) if C_tilde_cache else None
+                if ct_val is not None and ct_val.shape[0] == n_ct:
+                    ct_arr[n] = ct_val
+            # Gather t2 (per-cycle).
+            t2_arr = np.empty((N, n_other, n_other))
+            for n in range(N):
+                t2 = t2_pno_all[bucket['t2_keys'][n]]
+                t2_arr[n] = t2.T if bucket['t2_trans'][n] else t2
+
+            # Run C kernel for ij-side items on flat_C_ij, then ji-side
+            # items on flat_C_ji.  Splitting keeps the scatter targets
+            # correct without adding branches inside the kernel.
+            side = bucket['side_flag']
+            ij_mask = side == 0
+            ji_mask = side == 1
+            if ij_mask.any():
+                sel = np.where(ij_mask)[0]
+                c_kernel(
+                    np.ascontiguousarray(bucket['S_big'][sel]),
+                    np.ascontiguousarray(ct_arr[sel]),
+                    np.ascontiguousarray(bucket['S_mid'][sel]),
+                    np.ascontiguousarray(bucket['J_bold'][sel]),
+                    np.ascontiguousarray(t2_arr[sel]),
+                    np.ascontiguousarray(bucket['S_outer'][sel]),
+                    np.ascontiguousarray(bucket['item_idx_ij'][sel]),
+                    flat_C_ij[n_pno])
+            if ji_mask.any():
+                sel = np.where(ji_mask)[0]
+                c_kernel(
+                    np.ascontiguousarray(bucket['S_big'][sel]),
+                    np.ascontiguousarray(ct_arr[sel]),
+                    np.ascontiguousarray(bucket['S_mid'][sel]),
+                    np.ascontiguousarray(bucket['J_bold'][sel]),
+                    np.ascontiguousarray(t2_arr[sel]),
+                    np.ascontiguousarray(bucket['S_outer'][sel]),
+                    np.ascontiguousarray(bucket['item_idx_ji'][sel]),
+                    flat_C_ji[n_pno])
+
+        # --- D kernel, one call per (n_pno, n_A, n_B) bucket ---
+        for bucket in plan['d_buckets']:
+            n_pno = bucket['n_pno']
+            n_A = bucket['n_A']
+            n_B = bucket['n_B']
+            N = len(bucket['dt_keys'])
+            # Gather t2 and build u = 2 t2 - t2.T.
+            u_arr = np.empty((N, n_A, n_A))
+            for n in range(N):
+                t2 = t2_pno_all[bucket['t2_keys'][n]]
+                t2_d = t2.T if bucket['t2_trans'][n] else t2
+                u_arr[n] = 2.0 * t2_d - t2_d.T
+            # Gather dt (per-cycle); zero-fill when absent.
+            dt_arr = np.zeros((N, n_B, n_B))
+            for n, dk in enumerate(bucket['dt_keys']):
+                if dk is None or D_tilde_cache is None:
+                    continue
+                dt_val = D_tilde_cache.get(dk)
+                if dt_val is not None and dt_val.shape[0] == n_B:
+                    dt_arr[n] = dt_val
+
+            side = bucket['side_flag']
+            ij_mask = side == 0
+            ji_mask = side == 1
+            if ij_mask.any():
+                sel = np.where(ij_mask)[0]
+                d_kernel(
+                    np.ascontiguousarray(bucket['S_a'][sel]),
+                    np.ascontiguousarray(u_arr[sel]),
+                    np.ascontiguousarray(bucket['S_b'][sel]),
+                    np.ascontiguousarray(bucket['S_c'][sel]),
+                    np.ascontiguousarray(dt_arr[sel]),
+                    np.ascontiguousarray(bucket['KJ'][sel]),
+                    np.ascontiguousarray(bucket['item_idx_ij'][sel]),
+                    flat_D_ij[n_pno],
+                    0.5)
+            if ji_mask.any():
+                sel = np.where(ji_mask)[0]
+                d_kernel(
+                    np.ascontiguousarray(bucket['S_a'][sel]),
+                    np.ascontiguousarray(u_arr[sel]),
+                    np.ascontiguousarray(bucket['S_b'][sel]),
+                    np.ascontiguousarray(bucket['S_c'][sel]),
+                    np.ascontiguousarray(dt_arr[sel]),
+                    np.ascontiguousarray(bucket['KJ'][sel]),
+                    np.ascontiguousarray(bucket['item_idx_ji'][sel]),
+                    flat_D_ji[n_pno],
+                    0.5)
+
+    # --- Assemble final C_term and D_term dicts, keyed by strong pair ---
+    C_term = {}
+    D_term = {}
+    for n_pno, pairs in plan['pairs_by_n_pno'].items():
+        Cij = flat_C_ij[n_pno]
+        Cji = flat_C_ji[n_pno]
+        Dij = flat_D_ij[n_pno]
+        Dji = flat_D_ji[n_pno]
+        for slot, key_ij in enumerate(pairs):
+            C_term[key_ij] = (0.5 * Cij[slot] + Cij[slot].T
+                              + 0.5 * Cji[slot].T + Cji[slot])
+            D_term[key_ij] = Dij[slot] + Dji[slot].T
+
+    # Keys with n_pno == 0 need zero tiles (for downstream lookup).
+    for key_ij in strong_keys:
+        if key_ij not in C_term:
+            n_pno = pno_spaces[key_ij]['C_pno'].shape[1]
+            C_term[key_ij] = np.zeros((n_pno, n_pno))
+            D_term[key_ij] = np.zeros((n_pno, n_pno))
+
+    return C_term, D_term
+
+
+# =========================================================================
 # T2 residual: Psi4-compatible two-buffer formulation
 # =========================================================================
 
@@ -2047,6 +2514,8 @@ def compute_residual_v2(
         pair_domain=None,
         B_term_override=None,
         E_contrib_override=None,
+        C_term_override=None,
+        D_term_override=None,
         S_pao_full=None,
         t1_cache=None,
 ):
@@ -2226,7 +2695,10 @@ def compute_residual_v2(
     Rn_ij = np.zeros((n_pno, n_pno))
 
     # --- C (Eq 78) ---
-    if C_tilde_cache is not None:
+    if C_term_override is not None:
+        Rn_ij += C_term_override
+        _pt['C'] = _time.perf_counter() - _t0; _t0 = _time.perf_counter()
+    elif C_tilde_cache is not None:
         C_ij = np.zeros((n_pno, n_pno))
         C_ji = np.zeros((n_pno, n_pno))
         for k in sorted(_domain_set):
@@ -2301,7 +2773,10 @@ def compute_residual_v2(
         C_term = np.zeros((n_pno, n_pno))
 
     # --- D (Eq 79): antisymmetric ring with delta ---
-    if D_tilde_cache is not None:
+    if D_term_override is not None:
+        Rn_ij += D_term_override
+        D_term = D_term_override
+    elif D_tilde_cache is not None:
         D_ij = np.zeros((n_pno, n_pno))
         D_ji = np.zeros((n_pno, n_pno))
         for k in sorted(_domain_set):

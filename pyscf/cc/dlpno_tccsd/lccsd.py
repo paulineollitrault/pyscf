@@ -1684,6 +1684,20 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _BE_all = {'B': _B_dict, 'E': _E_dict}
             _t_be = _time.perf_counter() - _t_be0
 
+            # Batched C and D contractions (Phase 5e).  Precomputes the
+            # per-pair C_term and D_term tiles once, across all (ij, k)
+            # items at once, bypassing the per-pair k-loop inside
+            # compute_residual_v2.
+            from pyscf.cc.dlpno_tccsd.residual import compute_CD_terms_batched
+            _t_cd0 = _time.perf_counter()
+            _C_term_all, _D_term_all = compute_CD_terms_batched(
+                keys_sorted, t2_pno_all, pno_spaces, S_pno_cache,
+                _cc_ints, _jiang_C, _jiang_D,
+                _jiang_K_mixed, K_coul_cache,
+                pair_lmo_idx, nocc,
+                S_pao_full=S_pao_full, s1e=s1e, omp_threads=ncores)
+            _t_cd = _time.perf_counter() - _t_cd0
+
             # Accumulator for per-pair timing (thread-safe via list append)
             _pair_timings = {'fab': [], 'resid': [], 'btilde': []}
 
@@ -1799,6 +1813,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                       if _BE_all is not None else None),
                     E_contrib_override=(_BE_all['E'].get(key)
                                          if _BE_all is not None else None),
+                    C_term_override=_C_term_all.get(key),
+                    D_term_override=_D_term_all.get(key),
                     S_pao_full=S_pao_full,
                     t1_cache=_t1_cache)
                 _pair_timings['resid'].append(
