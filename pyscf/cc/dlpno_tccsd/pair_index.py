@@ -266,6 +266,182 @@ class TensorStore:
         )
 
 
+class FlatTensorStore:
+    """Pair-indexed tensor store backed by a single flat ndarray.
+
+    Storage layout (CSR-like):
+
+      - ``_buffer``  : 1D ndarray, total size ``sum_p prod(shape[p])``
+      - ``_offsets`` : int64[n_pairs + 1] slicing the buffer per pair
+      - ``_shapes``  : int32[n_pairs, max_ndim] per-pair shapes
+                       (trailing zeros indicate unused dims; ``_ndim``
+                       stores the canonical rank so dim=0 and unused
+                       are distinguishable)
+      - ``_ndim``    : int, common rank of all pair tensors
+
+    Key differences vs ``TensorStore``:
+
+      - Zero-copy ``at(p)`` returns an ``ndarray`` *view* into
+        ``_buffer`` with the correct shape — no per-pair allocation.
+      - A single contiguous buffer + offset table is what Cython-nogil
+        kernels need: the kernel can take ``_buffer`` as a typed
+        memoryview, ``_offsets`` / ``_shapes`` as int arrays, and
+        navigate without Python.
+      - ``__setitem__`` copies the incoming array into the pair's
+        reserved slot (shape must match the allocated slot).
+
+    Shapes may be ragged across pairs (e.g. ``n_pno[p]`` varies), but
+    within a pair the tensor is contiguous in C order.  All pairs must
+    have the same rank (enforced at construction).
+    """
+
+    __slots__ = ("_pi", "_buffer", "_offsets", "_shapes", "_ndim", "dtype")
+
+    def __init__(self, pair_index, shape_fn, dtype=np.float64):
+        self._pi = pair_index
+        self.dtype = np.dtype(dtype)
+        n_pairs = pair_index.n_pairs
+
+        # First pass: determine per-pair shapes + common rank + sizes.
+        shape_tuples = [tuple(shape_fn(p)) for p in range(n_pairs)]
+        if n_pairs == 0:
+            self._ndim = 0
+            self._shapes = np.zeros((0, 0), dtype=np.int32)
+            self._offsets = np.zeros(1, dtype=np.int64)
+            self._buffer = np.zeros(0, dtype=self.dtype)
+            return
+
+        ranks = {len(s) for s in shape_tuples}
+        if len(ranks) != 1:
+            raise ValueError(
+                f"FlatTensorStore requires uniform rank across pairs; "
+                f"got {ranks}"
+            )
+        self._ndim = next(iter(ranks))
+
+        self._shapes = np.zeros((n_pairs, self._ndim), dtype=np.int32)
+        sizes = np.zeros(n_pairs, dtype=np.int64)
+        for p, shape in enumerate(shape_tuples):
+            for d, n in enumerate(shape):
+                self._shapes[p, d] = n
+            sizes[p] = int(np.prod(shape)) if shape else 1
+
+        self._offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+        self._offsets[1:] = np.cumsum(sizes)
+        self._buffer = np.zeros(int(self._offsets[-1]), dtype=self.dtype)
+
+    # ------------------------------------------------------------------
+    # Zero-copy access
+    # ------------------------------------------------------------------
+    def at(self, pair_idx):
+        """Return a view of pair ``pair_idx``'s tensor (zero-copy)."""
+        if isinstance(pair_idx, tuple):
+            pair_idx = self._pi.canonical_to_idx[
+                (min(pair_idx), max(pair_idx))]
+        start = int(self._offsets[pair_idx])
+        end = int(self._offsets[pair_idx + 1])
+        shape = tuple(int(n) for n in self._shapes[pair_idx])
+        # A zero-size slot (e.g. when a shape contains a 0) still needs to
+        # return an ndarray of the right declared shape.
+        if end == start:
+            return np.zeros(shape, dtype=self.dtype)
+        return self._buffer[start:end].reshape(shape)
+
+    def set_at(self, pair_idx, value):
+        view = self.at(pair_idx)
+        if view.size == 0:
+            return
+        view[:] = value
+
+    # ------------------------------------------------------------------
+    # dict-compatible API (mirror of TensorStore)
+    # ------------------------------------------------------------------
+    def __getitem__(self, key):
+        return self.at(key)
+
+    def __setitem__(self, key, value):
+        self.set_at(key, value)
+
+    def __contains__(self, key):
+        if isinstance(key, tuple):
+            canonical = (min(key), max(key))
+            return canonical in self._pi.canonical_to_idx
+        return 0 <= key < self._pi.n_pairs
+
+    def get(self, key, default=None):
+        if isinstance(key, tuple):
+            canonical = (min(key), max(key))
+            idx = self._pi.canonical_to_idx.get(canonical)
+            if idx is None:
+                return default
+            return self.at(idx)
+        if 0 <= key < self._pi.n_pairs:
+            return self.at(key)
+        return default
+
+    def keys(self):
+        return list(self._pi.canonical_keys)
+
+    def values(self):
+        return [self.at(p) for p in range(self._pi.n_pairs)]
+
+    def items(self):
+        return [(self._pi.canonical_keys[p], self.at(p))
+                for p in range(self._pi.n_pairs)]
+
+    def __iter__(self):
+        return iter(self._pi.canonical_keys)
+
+    def __len__(self):
+        return self._pi.n_pairs
+
+    def __repr__(self):
+        return (
+            f"FlatTensorStore(n_pairs={self._pi.n_pairs} "
+            f"buffer={self._buffer.size} ndim={self._ndim} "
+            f"dtype={self.dtype})"
+        )
+
+    # ------------------------------------------------------------------
+    # Low-level accessors for Cython / nogil consumers.
+    # The kernel takes these three arrays as typed memoryviews.
+    # ------------------------------------------------------------------
+    @property
+    def buffer(self):
+        """Flat backing buffer.  Cython: ``double[::1] buf``."""
+        return self._buffer
+
+    @property
+    def offsets(self):
+        """CSR-style offsets (int64).  Cython: ``long[::1] off``."""
+        return self._offsets
+
+    @property
+    def shapes(self):
+        """Per-pair shape matrix (int32, shape ``(n_pairs, ndim)``)."""
+        return self._shapes
+
+    @classmethod
+    def from_dict(cls, pair_index, source_dict, shape_fn=None,
+                  dtype=np.float64):
+        """Build a FlatTensorStore seeded from a pair-keyed dict.
+
+        ``shape_fn`` defaults to ``source_dict[key].shape`` for each pair.
+        Missing entries get zero-filled.
+        """
+        if shape_fn is None:
+            def shape_fn(p):
+                key = pair_index.canonical_keys[p]
+                arr = source_dict.get(key)
+                return tuple(arr.shape) if arr is not None else (0,)
+        store = cls(pair_index, shape_fn, dtype=dtype)
+        for key, arr in source_dict.items():
+            canonical = (min(key), max(key))
+            if canonical in pair_index.canonical_to_idx:
+                store[key] = arr
+        return store
+
+
 # ----------------------------------------------------------------------
 # T1 projection cache — Phase 1 of the restructure.
 #
@@ -281,7 +457,7 @@ def build_t1_cache(
     pair_index: PairIndex,
     S_pno_cache: dict,
     pno_spaces: dict,
-) -> TensorStore:
+) -> "FlatTensorStore":
     """Pre-project t1 into every pair's PNO basis, one row per LMO.
 
     Semantics match ``_project_t1_to_pair``:
@@ -293,12 +469,16 @@ def build_t1_cache(
 
     Returns
     -------
-    TensorStore
-        Indexed by canonical pair key.  Slot ``p`` holds a contiguous
-        ``(nocc, n_pno[p])`` float64 array.
+    FlatTensorStore
+        Indexed by canonical pair key.  Each slot is a ``(nocc, n_pno[p])``
+        view into a single flat float64 buffer.  The same ``store[key][k]``
+        indexing pattern works as with the legacy ``TensorStore``, but
+        all per-pair rows share one contiguous allocation — exactly the
+        layout Phase 4's Cython kernels can take as typed memoryviews
+        without Python dispatch.
     """
     nocc = pair_index.nocc
-    cache = TensorStore(
+    cache = FlatTensorStore(
         pair_index,
         shape_fn=lambda p: (nocc, int(pair_index.n_pno[p])),
     )
@@ -306,7 +486,7 @@ def build_t1_cache(
         n_pno_p = int(pair_index.n_pno[p])
         if n_pno_p == 0:
             continue
-        out = cache.at(p)  # (nocc, n_pno_p), zero-initialised
+        out = cache.at(p)  # (nocc, n_pno_p) view into flat buffer (zeros).
         for k in range(nocc):
             t1_k = t1_pno.get(k)
             if t1_k is None or t1_k.size == 0:

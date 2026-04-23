@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 
 from pyscf.cc.dlpno_tccsd.pair_index import (
-    PairIndex, TensorStore, build_t1_cache, assert_consistent_with_dicts,
+    PairIndex, TensorStore, FlatTensorStore,
+    build_t1_cache, assert_consistent_with_dicts,
 )
 from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
 
@@ -316,3 +317,149 @@ def test_build_t1_cache_missing_overlap_returns_zeros():
     # Other rows unaffected
     lazy_k0 = _project_t1_to_pair(t1_pno, 0, pair, S_pno_cache_bad, pno_spaces)
     assert np.allclose(cache[pair][0], lazy_k0)
+
+
+# ----------------------------------------------------------------------
+# FlatTensorStore (Phase 2a)
+# ----------------------------------------------------------------------
+def test_flat_tensor_store_construction():
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    # Default square shape (n_pno, n_pno)
+    fts = FlatTensorStore(
+        pi, shape_fn=lambda p: (int(pi.n_pno[p]), int(pi.n_pno[p])),
+    )
+    # Buffer size matches sum of per-pair sizes
+    expected_size = sum(int(n) ** 2 for n in pi.n_pno)
+    assert fts.buffer.size == expected_size
+    assert fts.offsets[0] == 0
+    assert fts.offsets[-1] == expected_size
+    assert fts._ndim == 2
+
+
+def test_flat_tensor_store_at_returns_view():
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    fts = FlatTensorStore(
+        pi, shape_fn=lambda p: (int(pi.n_pno[p]), int(pi.n_pno[p])),
+    )
+    # Write through a view, verify buffer content changes.
+    view = fts.at(pi.idx_of((0, 1)))
+    assert view.shape == (4, 4)
+    view[0, 0] = 42.0
+    # Buffer should show it
+    start = int(fts.offsets[pi.idx_of((0, 1))])
+    assert fts.buffer[start] == 42.0
+    # Read back via another at() call → same memory
+    assert fts.at(pi.idx_of((0, 1)))[0, 0] == 42.0
+
+
+def test_flat_tensor_store_setitem_copies():
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    fts = FlatTensorStore(
+        pi, shape_fn=lambda p: (int(pi.n_pno[p]), int(pi.n_pno[p])),
+    )
+    src = np.arange(16.0).reshape(4, 4)
+    fts[(0, 1)] = src
+    assert np.array_equal(fts[(0, 1)], src)
+    # Mutating src does NOT affect the flat buffer
+    src[0, 0] = -99.0
+    assert fts[(0, 1)][0, 0] == 0.0
+
+
+def test_flat_tensor_store_dict_compat():
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    fts = FlatTensorStore(
+        pi, shape_fn=lambda p: (int(pi.n_pno[p]), int(pi.n_pno[p])),
+    )
+    # keys/values/items/iter/len/contains
+    assert len(fts) == 6
+    assert (0, 1) in fts
+    assert (2, 0) in fts  # canonicalised
+    assert (9, 9) not in fts
+    assert fts.get((9, 9)) is None
+    assert fts.get((9, 9), "missing") == "missing"
+    for k in fts:
+        assert fts[k].shape == (int(pi.n_pno[pi.idx_of(k)]),) * 2
+    assert len(fts.keys()) == 6
+    assert len(fts.values()) == 6
+    assert len(fts.items()) == 6
+
+
+def test_flat_tensor_store_ragged_shapes():
+    """Per-pair tensor shapes can vary across pairs as long as rank matches."""
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    # Shape (domain_size, n_pno) — different per pair
+    fts = FlatTensorStore(
+        pi,
+        shape_fn=lambda p: (int(pi.domain_size[p]), int(pi.n_pno[p])),
+    )
+    for p, k in enumerate(pi.canonical_keys):
+        assert fts[k].shape == (int(pi.domain_size[p]), int(pi.n_pno[p]))
+
+
+def test_flat_tensor_store_uniform_rank_enforced():
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    # Mix rank-1 and rank-2 shapes — should raise.
+    def shape_fn(p):
+        if p == 0:
+            return (5,)  # rank 1
+        return (3, 3)    # rank 2
+    with pytest.raises(ValueError, match="uniform rank"):
+        FlatTensorStore(pi, shape_fn=shape_fn)
+
+
+def test_flat_tensor_store_empty_pair():
+    """Zero-size pair slot returns a zero-shaped ndarray view."""
+    pno_spaces = {
+        (0, 0): {"C_pno": np.zeros((10, 3))},
+        (0, 1): {"C_pno": np.zeros((10, 0))},  # empty
+    }
+    pair_lmo_idx = {(0, 0): np.array([0]), (0, 1): np.array([0, 1])}
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=2)
+    fts = FlatTensorStore(
+        pi, shape_fn=lambda p: (int(pi.n_pno[p]), int(pi.n_pno[p])),
+    )
+    assert fts[(0, 1)].shape == (0, 0)
+    assert fts[(0, 0)].shape == (3, 3)
+
+
+def test_flat_tensor_store_from_dict():
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    src = {
+        (0, 0): np.full((3, 3), 1.0),
+        (1, 2): np.full((3, 3), 7.0),
+    }
+    fts = FlatTensorStore.from_dict(
+        pi, src,
+        shape_fn=lambda p: (int(pi.n_pno[p]), int(pi.n_pno[p])),
+    )
+    assert np.allclose(fts[(0, 0)], 1.0)
+    assert np.allclose(fts[(2, 1)], 7.0)  # canonicalised
+    # Unseeded slots are zeros (pre-allocated)
+    assert np.all(fts[(0, 1)] == 0.0)
+
+
+def test_flat_tensor_store_low_level_accessors():
+    pno_spaces, pair_lmo_idx = _fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc=3)
+    fts = FlatTensorStore(
+        pi, shape_fn=lambda p: (int(pi.n_pno[p]), int(pi.n_pno[p])),
+    )
+    # buffer, offsets, shapes exposed and dtype-correct
+    assert fts.buffer.dtype == np.float64
+    assert fts.offsets.dtype == np.int64
+    assert fts.offsets.shape == (pi.n_pairs + 1,)
+    assert fts.shapes.shape == (pi.n_pairs, 2)
+    # Offsets strictly non-decreasing
+    assert np.all(np.diff(fts.offsets) >= 0)
+    # Shape sum across dims × per-pair size = slot length
+    for p in range(pi.n_pairs):
+        slot_len = int(fts.offsets[p + 1] - fts.offsets[p])
+        expected = int(np.prod(fts.shapes[p]))
+        assert slot_len == expected
