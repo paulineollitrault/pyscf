@@ -49,7 +49,7 @@ class TestPNOConstruction(unittest.TestCase):
         C_lmo = mf.mo_coeff[:, :nocc].copy()
 
         s1e = mf.get_ovlp()
-        C_pao, pao_domains, S_pao, F_pao = make_paos(
+        C_pao, pao_domains, S_pao, F_pao, _ = make_paos(
             mf, C_lmo, T_CutDO=0.0, s1e=s1e)  # T_CutDO=0: include all AOs
 
         pno_spaces, strong_pairs, weak_pairs, e_lmp2_total = make_pnos(
@@ -113,7 +113,7 @@ class TestPNOConstruction(unittest.TestCase):
         nocc = self.nocc
         C_lmo = mf.mo_coeff[:, :nocc].copy()
         s1e = mf.get_ovlp()
-        C_pao, pao_domains, S_pao, F_pao = make_paos(
+        C_pao, pao_domains, S_pao, F_pao, _ = make_paos(
             mf, C_lmo, T_CutDO=0.0, s1e=s1e)
 
         pno_spaces, strong_pairs, weak_pairs, _ = make_pnos(

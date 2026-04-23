@@ -144,6 +144,8 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
             of the AO indices belonging to the domain of LMO i.
         S_pao (np.ndarray): Shape (nao, nao). PAO overlap matrix.
         F_pao (np.ndarray): Shape (nao, nao). Fock matrix in PAO basis.
+        doi_iu (np.ndarray or None): Shape (nocc_lmo, nao). DOI matrix used
+            for domain assignment (DOI-based branches only); None otherwise.
     """
     if hasattr(mf_or_mc, 'nelecas'):
         mol = mf_or_mc.mol
@@ -193,6 +195,11 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
     pao_domains = []
     ao_labels = mol.ao_labels(fmt=False)
     atom_ids = np.array([lbl[0] for lbl in ao_labels])
+
+    # DOI_{i,mu} matrix in (nocc, nao) form; only populated by DOI-based
+    # branches (grid, pao). Returned so the (T) stage can rebuild per-LMO
+    # PAO domains with a tighter T_CUT_DO_TRIPLES threshold.
+    doi_iu = None
 
     if doi_method == 'mulliken' and T_CutMKN > 0:
         # ORCA-compatible atom-based Mulliken domain assignment.
@@ -279,8 +286,9 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
 
         ao_labels_df = mol.ao_labels(fmt=False)
         atom_ids_df = np.array([lbl[0] for lbl in ao_labels_df])
+        doi_iu = np.sqrt(np.sum(ovL_lmo_pao ** 2, axis=2))  # (nocc, nao)
         for i in range(nocc_lmo):
-            doi = np.sqrt(np.sum(ovL_lmo_pao[i] ** 2, axis=1))  # (nao,)
+            doi = doi_iu[i]  # (nao,)
             pao_inds = np.where(doi > T_CutDO)[0]
             if len(pao_inds) == 0:
                 pao_inds = np.array([np.argmax(doi)])
@@ -328,7 +336,7 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
     log.info('PAO construction: nao=%d  avg domain size=%.1f',
              nao, np.mean([len(d) for d in pao_domains]))
 
-    return C_pao, pao_domains, S_pao, F_pao
+    return C_pao, pao_domains, S_pao, F_pao, doi_iu
 
 
 def split_localize_orbitals(mf, ncas, nelec_cas, method='pipek-mezey',

@@ -69,42 +69,50 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
     G = Fkj.copy()
     _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
 
-    for i_idx in range(nocc):
+    # Pre-compute u_lj = 2*t2_lj - t2_lj.T for every (l, j) with non-empty t2.
+    # Only depends on (l, j); the original triple loop recomputed it across
+    # the i axis (nocc× redundant).
+    u_lj_cache = {}
+    for l_idx in range(nocc):
         for j_idx in range(nocc):
-            for l_idx in range(nocc):
-                key_il = (min(i_idx, l_idx), max(i_idx, l_idx))
-                key_lj = (min(l_idx, j_idx), max(l_idx, j_idx))
+            key_lj = (min(l_idx, j_idx), max(l_idx, j_idx))
+            if key_lj not in t2_pno_all:
+                continue
+            t2_lj = t2_pno_all.get(key_lj)
+            if t2_lj is None or t2_lj.shape[0] == 0:
+                continue
+            t2_lj_d = t2_lj.T if l_idx > j_idx else t2_lj
+            u_lj_cache[(l_idx, j_idx)] = (key_lj, 2.0 * t2_lj_d - t2_lj_d.T)
 
-                if key_il not in t2_pno_all or key_lj not in t2_pno_all:
-                    continue
-                t2_il = t2_pno_all.get(key_il)
-                t2_lj = t2_pno_all.get(key_lj)
-                if t2_il is None or t2_lj is None:
-                    continue
-                if t2_il.shape[0] == 0 or t2_lj.shape[0] == 0:
-                    continue
+    # Swap loop order to (i, l, j) so K_il / t2_il setup happens once per
+    # (i, l) instead of once per (i, l, j).
+    for i_idx in range(nocc):
+        for l_idx in range(nocc):
+            key_il = (min(i_idx, l_idx), max(i_idx, l_idx))
+            if key_il not in t2_pno_all:
+                continue
+            t2_il = t2_pno_all.get(key_il)
+            if t2_il is None or t2_il.shape[0] == 0:
+                continue
+            K_il = get_local_K(cc_ints, key_il, i_idx, l_idx)
+            if K_il is None:
+                continue
 
-                # u_lj = 2*t2_lj - t2_lj.T (antisymmetrized)
-                t2_lj_d = t2_lj.T if l_idx > j_idx else t2_lj
-                u_lj = 2.0 * t2_lj_d - t2_lj_d.T
-
-                # K_il = (ia|lb) = ovL_i_il @ ovL_l_il.T (bare exchange)
-                K_il = get_local_K(cc_ints, key_il, i_idx, l_idx)
-                if K_il is None:
+            for j_idx in range(nocc):
+                u_entry = u_lj_cache.get((l_idx, j_idx))
+                if u_entry is None:
                     continue
+                key_lj, u_lj = u_entry
 
-                # Project u_lj to PNO_il: S(il,lj) @ u_lj @ S(lj,il)
-                # When key_il == key_lj (always when i==j and l shares the
-                # diagonal), the projection is identity (same PNO basis).
                 if key_il == key_lj:
                     U_lj_proj = u_lj
                 else:
                     S_il_lj = _s_pno_get(key_il, key_lj)
                     if S_il_lj is None:
                         continue
-                    U_lj_proj = S_il_lj @ u_lj @ S_il_lj.T  # (n_il, n_il)
+                    U_lj_proj = S_il_lj @ u_lj @ S_il_lj.T
 
-                # G[i,j] += K_il · U_lj.T = trace(K @ U.T) = Σ_{a,b} K[a,b]*U[b,a]
+                # G[i,j] += K_il · U_lj.T = trace(K @ U.T)
                 G[i_idx, j_idx] += np.sum(K_il * U_lj_proj.T)
 
     return G
@@ -699,6 +707,418 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
     return C_tilde_all
 
 
+# =========================================================================
+# Prototype: compute_C_tilde_batched (plan-cached)
+# =========================================================================
+# Architecture test for "no per-pair Python loops; batched matmul with
+# BLAS threading."  Terms 1 and 2 run per-pair (same code path as the
+# reference).  Terms 3 and 4 — the per-l inner Python loops inside the
+# reference — are replaced with a gather/bucket/batched-matmul/scatter
+# pipeline across ALL (k, i, l) triples, with BLAS threading enabled for
+# the matmul phase via threadpool_limits.
+#
+# The "plan" (bucket shape grouping, pre-stacked constant tensors K/S,
+# scatter indices) is built once per run and cached on the function
+# object.  Per-cycle work is only: gather T1/T2 values (which change),
+# batched matmul, scatter.
+# =========================================================================
+
+
+def _build_c_tilde_t34_plan(
+        all_pairs, pno_spaces, pair_lmo_idx, t2_pno_all,
+        S_pno_cache, cc_ints, _s_pno_get, nocc):
+    """Build the one-time plan for Terms 3 and 4.
+
+    Returns dict with keys ``'t3'`` and ``'t4'``, each a list of per-shape
+    bucket dicts carrying pre-stacked constant tensors (K, S) and the
+    index arrays for T1/T2 gather + output scatter.  Per-cycle execution
+    only needs to gather T1/T2 values and run batched matmuls; no Python
+    loop over triples.
+    """
+    from pyscf.cc.dlpno_tccsd.local_df import get_local_K
+
+    # --- Collect all valid (k, i, l) triples for Terms 3 and 4 ---
+    t3_items = []  # (k, i, l, K_kl, S_ki_kl, key_kl, key_ki, n_ki, n_kl)
+    t4_items = []  # (k, i, S_ki_li, S_li_kl, K_kl, S_kl_ki, key_li, transpose, n_ki, n_kl, n_li)
+
+    for (k, i) in all_pairs:
+        key_ki = (min(k, i), max(k, i))
+        n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+        if n_ki == 0:
+            continue
+        if pair_lmo_idx is not None and key_ki in pair_lmo_idx:
+            _ll_idx = pair_lmo_idx[key_ki]
+        else:
+            _ll_idx = np.arange(nocc)
+
+        for ll_raw in _ll_idx:
+            ll = int(ll_raw)
+            key_kl = (min(k, ll), max(k, ll))
+
+            # Term 3 gather
+            if key_kl in pno_spaces:
+                n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
+                if n_kl > 0:
+                    K_kl = get_local_K(cc_ints, key_kl, k, ll)
+                    if K_kl is not None:
+                        S_ki_kl = _s_pno_get(key_ki, key_kl)
+                        if S_ki_kl is not None:
+                            t3_items.append((k, i, ll, K_kl, S_ki_kl,
+                                             key_kl, key_ki, n_ki, n_kl))
+
+            # Term 4 gather
+            key_li = (min(ll, i), max(ll, i))
+            if key_li not in t2_pno_all:
+                continue
+            if key_kl not in pno_spaces:
+                continue
+            n_li = pno_spaces[key_li]['C_pno'].shape[1]
+            n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
+            if n_li == 0 or n_kl == 0:
+                continue
+            K_kl = get_local_K(cc_ints, key_kl, k, ll)
+            if K_kl is None:
+                continue
+            transpose = (ll > i)
+            S_ki_li = (np.eye(n_ki) if key_ki == key_li
+                       else _s_pno_get(key_ki, key_li))
+            S_li_kl = (np.eye(n_li) if key_li == key_kl
+                       else _s_pno_get(key_li, key_kl))
+            S_kl_ki = (np.eye(n_kl) if key_kl == key_ki
+                       else _s_pno_get(key_kl, key_ki))
+            if S_ki_li is None or S_li_kl is None or S_kl_ki is None:
+                continue
+            t4_items.append((k, i, S_ki_li, S_li_kl, K_kl, S_kl_ki,
+                             key_li, transpose, n_ki, n_kl, n_li))
+
+    # --- Global pair→(n_ki, flat_slot) map: covers Phase 1 + Phase 2 outputs ---
+    # Every (k, i) with n_ki > 0 gets a slot in flat_out[n_ki].  Phase 1
+    # results are copied into flat_out before Numba kernels accumulate
+    # Terms 3 + 4 on top; at function exit flat_out is unpacked into
+    # C_tilde_all dict.
+    pairs_by_n_ki = {}
+    pair_to_slot = {}
+    for (k, i) in all_pairs:
+        key_ki = (min(k, i), max(k, i))
+        n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+        if n_ki == 0:
+            continue
+        if n_ki not in pairs_by_n_ki:
+            pairs_by_n_ki[n_ki] = []
+        slot = len(pairs_by_n_ki[n_ki])
+        pairs_by_n_ki[n_ki].append((k, i))
+        pair_to_slot[(k, i)] = slot
+
+    # --- Bucket Term 3 by (n_ki, n_kl); pre-stack K, S, gather index arrays ---
+    t3_by_shape = {}
+    for it in t3_items:
+        t3_by_shape.setdefault((it[7], it[8]), []).append(it)
+
+    t3_buckets = []
+    for (n_ki, n_kl), items in t3_by_shape.items():
+        N = len(items)
+        K = np.empty((N, n_kl, n_kl))
+        S = np.empty((N, n_ki, n_kl))
+        t1i_keys = []      # list of (key_kl, i)  → T1_cache lookup for t1_i in PNO_kl
+        T1l_keys = []      # list of (key_ki, l)  → T1_cache lookup for t1_l in PNO_ki
+        # item_idx points into flat_out[n_ki] directly (GLOBAL slot),
+        # so the Numba kernel can scatter without per-bucket unpacking.
+        item_idx = np.empty(N, dtype=np.intp)
+        for n, it in enumerate(items):
+            k, i, ll = it[0], it[1], it[2]
+            K[n] = it[3]
+            S[n] = it[4]
+            key_kl, key_ki = it[5], it[6]
+            t1i_keys.append((key_kl, i))
+            T1l_keys.append((key_ki, ll))
+            item_idx[n] = pair_to_slot[(k, i)]
+        t3_buckets.append({
+            'K': K, 'S': S,
+            't1i_keys': t1i_keys, 'T1l_keys': T1l_keys,
+            'n_ki': n_ki, 'n_kl': n_kl,
+            'item_idx': item_idx,
+        })
+
+    # --- Bucket Term 4 by (n_ki, n_kl, n_li); pre-stack 4 S matrices + K ---
+    t4_by_shape = {}
+    for it in t4_items:
+        t4_by_shape.setdefault((it[8], it[9], it[10]), []).append(it)
+
+    t4_buckets = []
+    for (n_ki, n_kl, n_li), items in t4_by_shape.items():
+        N = len(items)
+        S_ki_li = np.empty((N, n_ki, n_li))
+        S_li_kl = np.empty((N, n_li, n_kl))
+        K = np.empty((N, n_kl, n_kl))
+        S_kl_ki = np.empty((N, n_kl, n_ki))
+        t2_sources = []    # list of (key_li, transpose)
+        item_idx = np.empty(N, dtype=np.intp)
+        for n, it in enumerate(items):
+            k, i = it[0], it[1]
+            S_ki_li[n] = it[2]
+            S_li_kl[n] = it[3]
+            K[n] = it[4]
+            S_kl_ki[n] = it[5]
+            t2_sources.append((it[6], bool(it[7])))
+            item_idx[n] = pair_to_slot[(k, i)]
+        t4_buckets.append({
+            'S_ki_li': S_ki_li, 'S_li_kl': S_li_kl,
+            'K': K, 'S_kl_ki': S_kl_ki,
+            't2_sources': t2_sources,
+            'n_ki': n_ki, 'n_kl': n_kl, 'n_li': n_li,
+            'item_idx': item_idx,
+        })
+
+    return {
+        't3': t3_buckets, 't4': t4_buckets,
+        'pairs_by_n_ki': pairs_by_n_ki,
+        'pair_to_slot': pair_to_slot,
+    }
+
+
+def compute_C_tilde_batched(
+        t1_pno, t2_pno_all, pno_spaces, nocc,
+        ovL_pno_bare, ooL_bare, S_pno_cache, with_df,
+        _term2_precomputed=None, cc_ints=None,
+        pair_lmo_idx=None, _pool=None,
+        S_pao_full=None, s1e=None,
+        blas_threads=32):
+    """Drop-in replacement for compute_C_tilde with Terms 3+4 batched.
+
+    Signature matches compute_C_tilde exactly plus one kwarg
+    ``blas_threads`` controlling the threadpool_limits scope used during
+    the batched phase (set to None to keep the caller's BLAS thread
+    count).  Output dict format and values match the reference to
+    machine precision.
+    """
+    import time as _time_dbg
+    _dbg = getattr(compute_C_tilde_batched, '_dump_timing', False)
+    _pt = {}
+    _t0 = _time_dbg.perf_counter()
+
+    from pyscf.cc.dlpno_tccsd.local_df import (
+        get_local_K, get_local_ovL, get_local_ooL_vec,
+    )
+
+    C_tilde_all = {}
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
+
+    # All ordered (k, i) pairs gamma_{ki} is defined over.
+    all_pairs = set()
+    canonical_keys = set()
+    for key in t2_pno_all:
+        a, b = key
+        all_pairs.add((a, b))
+        all_pairs.add((b, a))
+        canonical_keys.add(key)
+
+    # ------------------------------------------------------------------
+    # T1 projection cache: T1_cache[(canonical_pair, l)] = (n_pno,)
+    # Built once up front; every phase reads from it.
+    # ------------------------------------------------------------------
+    T1_cache = {}
+    for pk in canonical_keys:
+        if pno_spaces[pk]['C_pno'].shape[1] == 0:
+            continue
+        for l in range(nocc):
+            T1_cache[(pk, l)] = _project_t1_to_pair(
+                t1_pno, l, pk, S_pno_cache, pno_spaces)
+    _pt['T1_cache'] = _time_dbg.perf_counter() - _t0; _t0 = _time_dbg.perf_counter()
+
+    # ------------------------------------------------------------------
+    # Term 2 DF-pass fallback (only when cc_ints doesn't cover a pair).
+    # This is the same code as the reference's fallback branch.
+    # ------------------------------------------------------------------
+    if _term2_precomputed is None:
+        term2_data = {}
+        for k, i in all_pairs:
+            key_ki = (min(k, i), max(k, i))
+            n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+            if n_ki == 0:
+                continue
+            t1_i_ki = T1_cache.get((key_ki, i))
+            if t1_i_ki is None or np.max(np.abs(t1_i_ki)) < 1e-15:
+                continue
+            ovL_i_ki = ovL_pno_bare.get((key_ki, i))
+            if ovL_i_ki is None:
+                continue
+            term2_data[(k, i)] = {
+                'key_ki': key_ki, 'n_ki': n_ki,
+                'C_pno': np.asfortranarray(pno_spaces[key_ki]['C_pno']),
+                't1_i': t1_i_ki, 'ovL_i': ovL_i_ki,
+                'result': np.zeros((n_ki, n_ki)),
+            }
+        if term2_data:
+            aux_off = 0
+            for Lpq in with_df.loop():
+                nL = Lpq.shape[0]
+                for (k, i), td in term2_data.items():
+                    n_ki = td['n_ki']
+                    buf = _ao2mo.nr_e2(Lpq, td['C_pno'],
+                                       (0, n_ki, 0, n_ki), aosym='s2')
+                    B_L = buf.reshape(nL, n_ki, n_ki)
+                    z_i = td['t1_i'] @ td['ovL_i'][:, aux_off:aux_off+nL]
+                    td['result'] += np.tensordot(z_i, B_L, axes=(0, 0))
+                aux_off += nL
+        _term2_precomputed = {ki: td['result'] for ki, td in term2_data.items()}
+
+    # ------------------------------------------------------------------
+    # Phase 1: Terms 1 + 2 per-pair (same shape as reference; pool if given)
+    # ------------------------------------------------------------------
+    def _process_ki_terms12(ki_tuple):
+        k, i = ki_tuple
+        key_ki = (min(k, i), max(k, i))
+        n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+        if n_ki == 0:
+            return ki_tuple, None
+
+        C_tilde_ki = np.zeros((n_ki, n_ki))
+
+        # --- Term 2 ---
+        if key_ki in cc_ints and cc_ints[key_ki] is not None:
+            ci_ki = cc_ints[key_ki]
+            k_Qa = ci_ki['i_Qa'] if key_ki[0] == k else ci_ki['j_Qa']
+            Qab_ki = ci_ki['Qab']
+            t1_i_ki = T1_cache.get((key_ki, i), np.zeros(n_ki))
+            z = k_Qa @ t1_i_ki
+            C_tilde_ki += np.tensordot(z, Qab_ki, axes=(0, 0))
+        elif (k, i) in _term2_precomputed:
+            C_tilde_ki += _term2_precomputed[(k, i)]
+
+        # --- Term 1: -Σ_l T1_all[l,a] · (ki|lc) ---
+        if pair_lmo_idx is not None and key_ki in pair_lmo_idx:
+            _ll_idx = np.asarray(pair_lmo_idx[key_ki])
+        else:
+            _ll_idx = np.arange(nocc)
+
+        T1_local_ki = np.zeros((len(_ll_idx), n_ki))
+        for _li, _ll in enumerate(_ll_idx):
+            T1_local_ki[_li] = T1_cache.get(
+                (key_ki, int(_ll)), np.zeros(n_ki))
+
+        K_bar_chem_local = np.zeros((len(_ll_idx), n_ki))
+        if key_ki in cc_ints and cc_ints[key_ki] is not None:
+            _ooL_ki = get_local_ooL_vec(cc_ints, k, i, key_ki)
+            if _ooL_ki is not None:
+                for _li, _ll in enumerate(_ll_idx):
+                    _ovL_l = get_local_ovL(cc_ints, key_ki, int(_ll))
+                    if _ovL_l is not None:
+                        K_bar_chem_local[_li] = _ovL_l @ _ooL_ki
+            else:
+                ooL_ki = ooL_bare[k, i, :]
+                for _li, _ll in enumerate(_ll_idx):
+                    ovL_l_ki = ovL_pno_bare.get((key_ki, int(_ll)))
+                    if ovL_l_ki is not None:
+                        K_bar_chem_local[_li] = ovL_l_ki @ ooL_ki
+        else:
+            ooL_ki = ooL_bare[k, i, :]
+            for _li, _ll in enumerate(_ll_idx):
+                ovL_l_ki = ovL_pno_bare.get((key_ki, int(_ll)))
+                if ovL_l_ki is not None:
+                    K_bar_chem_local[_li] = ovL_l_ki @ ooL_ki
+
+        C_tilde_ki += -T1_local_ki.T @ K_bar_chem_local
+        return ki_tuple, C_tilde_ki
+
+    if _pool is not None:
+        for ki, val in _pool.map(_process_ki_terms12, list(all_pairs)):
+            if val is not None:
+                C_tilde_all[ki] = val
+    else:
+        for ki in all_pairs:
+            _, val = _process_ki_terms12(ki)
+            if val is not None:
+                C_tilde_all[ki] = val
+    _pt['phase1_t12'] = _time_dbg.perf_counter() - _t0; _t0 = _time_dbg.perf_counter()
+
+    # ------------------------------------------------------------------
+    # Phase 2: Terms 3 + 4 via plan cache.
+    #
+    # Plan depends only on the pair structure (pno_spaces, pair_lmo_idx,
+    # S_pno_cache contents, cc_ints integrals) — all fixed after Stage 3.
+    # Built once per CCSD run and reused every cycle; per-cycle cost is
+    # just T1/T2 gather + batched matmul + scatter.
+    # ------------------------------------------------------------------
+    plan_key = tuple(sorted(t2_pno_all.keys()))
+    _cache_attr = getattr(compute_C_tilde_batched, '_plan_cache', None)
+    if _cache_attr is None:
+        _cache_attr = {}
+        compute_C_tilde_batched._plan_cache = _cache_attr
+    plan = _cache_attr.get(plan_key)
+    if plan is None:
+        plan = _build_c_tilde_t34_plan(
+            all_pairs, pno_spaces, pair_lmo_idx, t2_pno_all,
+            S_pno_cache, cc_ints, _s_pno_get, nocc)
+        _cache_attr[plan_key] = plan
+
+    # ------------------------------------------------------------------
+    # Migrate Phase 1 results into flat per-n_ki buffers; Numba kernels
+    # will accumulate Terms 3 + 4 on top.  All scatter-add happens inside
+    # Numba (race-free via two-stage: parallel compute → serial add).
+    # ------------------------------------------------------------------
+    from pyscf.cc.dlpno_tccsd._c_tilde_numba import (
+        t3_kernel as _t3_numba, t4_kernel as _t4_numba,
+    )
+
+    _t_alloc = _time_dbg.perf_counter()
+    flat_out = {}
+    for n_ki, pairs in plan['pairs_by_n_ki'].items():
+        buf = np.zeros((len(pairs), n_ki, n_ki))
+        for slot, pair in enumerate(pairs):
+            v = C_tilde_all.get(pair)
+            if v is not None:
+                buf[slot] = v
+        flat_out[n_ki] = buf
+    _pt['flat_alloc'] = _time_dbg.perf_counter() - _t_alloc
+
+    _pt['t3_gather'] = 0.0; _pt['t3_numba'] = 0.0
+    _pt['t4_gather'] = 0.0; _pt['t4_numba'] = 0.0
+
+    # ----- Term 3 via Numba kernel -----
+    for bucket in plan['t3']:
+        _tg = _time_dbg.perf_counter()
+        t1i = np.ascontiguousarray(
+            np.array([T1_cache[key] for key in bucket['t1i_keys']]))
+        T1l = np.ascontiguousarray(
+            np.array([T1_cache[key] for key in bucket['T1l_keys']]))
+        _pt['t3_gather'] += _time_dbg.perf_counter() - _tg
+
+        _tn = _time_dbg.perf_counter()
+        _t3_numba(bucket['K'], bucket['S'], t1i, T1l,
+                  bucket['item_idx'], flat_out[bucket['n_ki']])
+        _pt['t3_numba'] += _time_dbg.perf_counter() - _tn
+
+    # ----- Term 4 via Numba kernel -----
+    for bucket in plan['t4']:
+        _tg = _time_dbg.perf_counter()
+        t2_arr = np.ascontiguousarray(np.array([
+            (t2_pno_all[k_].T if tr else t2_pno_all[k_])
+            for (k_, tr) in bucket['t2_sources']
+        ]))
+        _pt['t4_gather'] += _time_dbg.perf_counter() - _tg
+
+        _tn = _time_dbg.perf_counter()
+        _t4_numba(bucket['S_ki_li'], t2_arr, bucket['S_li_kl'],
+                  bucket['K'], bucket['S_kl_ki'],
+                  bucket['item_idx'], flat_out[bucket['n_ki']])
+        _pt['t4_numba'] += _time_dbg.perf_counter() - _tn
+
+    # Unpack flat_out back into C_tilde_all dict.
+    _t_unpack = _time_dbg.perf_counter()
+    for n_ki, pairs in plan['pairs_by_n_ki'].items():
+        buf = flat_out[n_ki]
+        for slot, pair in enumerate(pairs):
+            C_tilde_all[pair] = buf[slot]
+    _pt['unpack'] = _time_dbg.perf_counter() - _t_unpack
+
+    if _dbg:
+        _per = ' '.join(f'{k}={v*1e3:.0f}ms' for k, v in _pt.items())
+        _tot = sum(_pt.values())
+        print(f'  [c_tilde_batched_timing] tot={_tot*1e3:.0f}ms '
+              f'{_per}', flush=True)
+
+    return C_tilde_all
+
 
 # ---------------------------------------------------------------------------
 # T1-dressed Fock intermediates (Eqs 94-101, 85-86)
@@ -898,7 +1318,7 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
 
 
 def compute_B_E_batched(strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
-                        cc_ints, B_tilde, pair_lmo_idx, nocc, _pool=None,
+                        cc_ints, B_tilde_per_ij, pair_lmo_idx, nocc, _pool=None,
                         S_pao_full=None, s1e=None):
     """Compute B and E-contribution dicts for all strong pairs, batched.
 
@@ -912,6 +1332,9 @@ def compute_B_E_batched(strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
     where u_kl = 2 t2_kl - t2_kl.T.  Both terms share identical projection
     structure; batching them together halves the BLAS overhead relative
     to two separate loops.
+
+    ``B_tilde_per_ij`` is a dict keyed by strong pair: each entry is the
+    pair's (nocc, nocc) B_tilde matrix.
 
     Returns:
         B_all: dict key_ij → (n_ij, n_ij) B term
@@ -927,65 +1350,78 @@ def compute_B_E_batched(strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
         if n_ij == 0:
             return key_ij, np.zeros((n_ij, n_ij)), np.zeros((n_ij, n_ij))
 
+        B_tilde = B_tilde_per_ij[key_ij]
         domain = (set(int(x) for x in pair_lmo_idx[key_ij])
                   if pair_lmo_idx is not None and key_ij in pair_lmo_idx
                   else set(range(nocc)))
 
-        # Collect contributors from t2_pno_all entries with both k,l in domain
-        S_list, TB_list, UK_list = [], [], []
+        # --- Gather phase: collect pointers only (no per-kl math). ---
+        # Bucket by n_kl so each bucket is a uniform-shape batched contraction.
+        # Each entry carries (S, t2, K, beta_kl, beta_lk, same) where same = (k==l).
+        buckets = {}  # n_kl -> list of (S, t2, K, beta_kl, beta_lk, same)
         for key_kl, t2_kl in t2_pno_all.items():
+            if t2_kl is None or t2_kl.shape[0] == 0:
+                continue
             k, l = key_kl
             if k not in domain or l not in domain:
                 continue
-            if t2_kl is None or t2_kl.shape[0] == 0:
-                continue
-            # S projects kl → ij (unified X_pno path on miss)
             S = _s_pno_get(key_ij, key_kl)
             if S is None:
                 continue
-
-            # --- B combined symmetric T (k=l: single term; k!=l: β·t2 + β'·t2.T) ---
-            beta_kl = B_tilde[k, l]
-            if k == l:
-                T_B = beta_kl * t2_kl
-            else:
-                T_B = beta_kl * t2_kl + B_tilde[l, k] * t2_kl.T
-
-            # --- E contribution: S @ (u_kl @ K_kl.T + ...) @ S.T ---
             K_kl = get_local_K(cc_ints, key_kl, k, l)
             if K_kl is None:
                 continue
-            u_kl = 2.0 * t2_kl - t2_kl.T
-            UK = u_kl @ K_kl.T
-            if k != l:
-                UK = UK + (2.0 * t2_kl.T - t2_kl) @ K_kl
+            same = (k == l)
+            beta_kl = B_tilde[k, l]
+            beta_lk = 0.0 if same else B_tilde[l, k]
+            n_kl = t2_kl.shape[0]
+            buckets.setdefault(n_kl, []).append(
+                (S, t2_kl, K_kl, beta_kl, beta_lk, same))
 
-            S_list.append(S)
-            TB_list.append(T_B)
-            UK_list.append(UK)
-
-        if not S_list:
+        if not buckets:
             return key_ij, np.zeros((n_ij, n_ij)), np.zeros((n_ij, n_ij))
 
-        # Bucket contributions by n_kl so each bucket is a uniform-shape
-        # batched matmul. For water all pair PNO counts are similar so
-        # this gives 1-2 buckets; for mixed systems it adapts.
-        buckets = {}  # n_kl -> (list of (S, T_B, UK))
-        for S, TB, UK in zip(S_list, TB_list, UK_list):
-            n_kl = TB.shape[0]
-            buckets.setdefault(n_kl, []).append((S, TB, UK))
-
+        # --- Batched phase: stack, then do per-bucket batched operations. ---
+        # This replaces ~n_kept per-element numpy calls (which dominated at
+        # small PNO size via BLAS-dispatch overhead) with O(1) big BLAS calls.
         B_sum = np.zeros((n_ij, n_ij))
         E_sum = np.zeros((n_ij, n_ij))
         for n_kl, items in buckets.items():
             N = len(items)
-            S_arr = np.stack([it[0] for it in items])    # (N, n_ij, n_kl)
-            TB_arr = np.stack([it[1] for it in items])   # (N, n_kl, n_kl)
-            UK_arr = np.stack([it[2] for it in items])   # (N, n_kl, n_kl)
-            # Batched: R[n] = S[n] @ X[n] @ S[n].T
-            S_T = S_arr.transpose(0, 2, 1)               # (N, n_kl, n_ij)
-            B_sum += np.matmul(np.matmul(S_arr, TB_arr), S_T).sum(axis=0)
-            E_sum += np.matmul(np.matmul(S_arr, UK_arr), S_T).sum(axis=0)
+            S_arr = np.empty((N, n_ij, n_kl))
+            T_arr = np.empty((N, n_kl, n_kl))
+            K_arr = np.empty((N, n_kl, n_kl))
+            b_kl_arr = np.empty(N)
+            b_lk_arr = np.empty(N)
+            same_arr = np.zeros(N, dtype=bool)
+            for n, (S, t2, K, bkl, blk, same) in enumerate(items):
+                S_arr[n] = S
+                T_arr[n] = t2
+                K_arr[n] = K
+                b_kl_arr[n] = bkl
+                b_lk_arr[n] = blk
+                same_arr[n] = same
+
+            T_T = T_arr.transpose(0, 2, 1)
+
+            # TB[n] = β_kl·t2_n (for k==l)  OR  β_kl·t2_n + β_lk·t2_n.T (k!=l)
+            TB = b_kl_arr[:, None, None] * T_arr
+            if (~same_arr).any():
+                TB = TB + b_lk_arr[:, None, None] * T_T
+
+            # UK[n] = u·K.T (for k==l)  OR  u·K.T + (2 t2.T - t2)·K (k!=l)
+            u = 2.0 * T_arr - T_T                        # (N, n_kl, n_kl)
+            UK = np.matmul(u, K_arr.transpose(0, 2, 1))  # (N, n_kl, n_kl)
+            if (~same_arr).any():
+                v = 2.0 * T_T - T_arr
+                vk = np.matmul(v, K_arr)
+                vk[same_arr] = 0.0
+                UK = UK + vk
+
+            # B_sum += Σ_n S_n @ TB_n @ S_n.T  (batched)
+            S_T = S_arr.transpose(0, 2, 1)
+            B_sum += np.matmul(np.matmul(S_arr, TB), S_T).sum(axis=0)
+            E_sum += np.matmul(np.matmul(S_arr, UK), S_T).sum(axis=0)
 
         return key_ij, B_sum, E_sum
 

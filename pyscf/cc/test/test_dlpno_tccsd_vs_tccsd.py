@@ -53,7 +53,7 @@ class TestDLPNOTCCSDvsCanonical(unittest.TestCase):
         C_lmo = mf.mo_coeff[:, :nocc].copy()
         s1e = mf.get_ovlp()
 
-        C_pao, pao_domains, S_pao, F_pao = make_paos(
+        C_pao, pao_domains, S_pao, F_pao, _ = make_paos(
             mf, C_lmo, T_CutDO=0.0, s1e=s1e)
 
         pno_spaces, strong_pairs, weak_pairs, e_lmp2 = make_pnos(
@@ -85,7 +85,7 @@ class TestDLPNOTCCSDvsCanonical(unittest.TestCase):
         nocc = np.count_nonzero(mf.mo_occ > 1e-10)
         C_lmo = mf.mo_coeff[:, :nocc].copy()
 
-        C_pao, pao_domains, S_pao, F_pao = make_paos(
+        C_pao, pao_domains, S_pao, F_pao, _ = make_paos(
             mc, C_lmo, T_CutDO=0.0, s1e=s1e)
 
         pno_spaces, strong_raw, weak_raw, e_lmp2 = make_pnos(
@@ -123,7 +123,7 @@ class TestDLPNOTCCSDvsCanonical(unittest.TestCase):
         nocc = np.count_nonzero(mf.mo_occ > 1e-10)
         C_lmo = mf.mo_coeff[:, :nocc].copy()
 
-        C_pao, pao_domains, S_pao, F_pao = make_paos(
+        C_pao, pao_domains, S_pao, F_pao, _ = make_paos(
             mc, C_lmo, T_CutDO=0.0, s1e=s1e)
 
         pno_spaces, strong_raw, weak_raw, e_lmp2 = make_pnos(
@@ -161,7 +161,7 @@ class TestDLPNOTCCSDvsCanonical(unittest.TestCase):
         C_lmo = mf.mo_coeff[:, :nocc].copy()
         s1e = mf.get_ovlp()
 
-        C_pao, pao_domains, S_pao, F_pao = make_paos(
+        C_pao, pao_domains, S_pao, F_pao, _ = make_paos(
             mf, C_lmo, T_CutDO=0.0, s1e=s1e)
 
         _, _, _, e_lmp2 = make_pnos(

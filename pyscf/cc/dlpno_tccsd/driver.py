@@ -71,7 +71,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
                       T_CutPairs=1e-4,
                       T_CutPairs_MP2=1e-6,
                       T_CutDO=0.02,
-                      S_cut_domain=1e-6,
+                      S_cut_domain=1e-8,
                       T_CutEnergy=0.97,
                       T_CutTrace=1.0,
                       cas_pno_proj_thresh=0.99,
@@ -363,7 +363,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # Use grid-based DOI to match Psi4 (Jiang Eq 58 PAO-based DOI gives
     # much larger domains and is not compatible with Psi4's truncation).
     _with_df = getattr(mf, 'with_df', None)
-    C_pao, pao_domains, S_pao, F_pao = make_paos(
+    C_pao, pao_domains, S_pao, F_pao, doi_iu = make_paos(
         mf_or_mc, C_lmo, T_CutDO=T_CutDO, s1e=s1e, with_df=_with_df,
         doi_method='grid')
 
@@ -494,6 +494,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
                 negligible_pairs=negligible_pairs,
                 weak_pairs=weak_pairs,
                 C_pao=C_pao,
+                doi_iu=doi_iu,
                 ncores=ncores, verbose=verbose,
                 _pool=_shared_pool)
     finally:

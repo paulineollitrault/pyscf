@@ -733,16 +733,11 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
 
         # ---- Stage 4: -sum_k T_n[ii][k,a] * Fij_bar[k,i] ----
         # (ccsd.cc line 1709)
-        # INCREMENT form: include ALL k (including k=i).
-        for k in range(nocc):
-            f_dressed = Fij_bar[k, i]
-            if abs(f_dressed) < 1e-15:
-                continue
-            t1_k_in_ii = _project_t1_to_pair(
-                t1_pno, k, key_ii, S_pno_cache, pno_spaces)
-            if t1_k_in_ii.size == 0:
-                continue
-            r1_pno[i] -= f_dressed * t1_k_in_ii
+        # INCREMENT form: include ALL k (including k=i).  T_n_ii was already
+        # built above (nocc, n_ii) with row k = t1_k in PNO_ii basis;
+        # rows outside the cache are zero and contribute nothing, so this
+        # is one matvec instead of nocc _project_t1_to_pair calls.
+        r1_pno[i] -= Fij_bar[:, i] @ T_n_ii
 
     # Helper: get integral (k a_ki | c d) from cc_ints
     def _get_ki_data(k, i_lmo):
@@ -762,6 +757,30 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     # ===========================================================
     # A and C terms: loop over ordered pairs (i, k) for each i
     # ===========================================================
+    # Pre-compute LT1[(i, m)] = (key_im, L_im @ t1_m_in_im) once per (i, m).
+    # Inside the k-loop below the original code recomputed this for each
+    # of the nocc values of k; since LT1 depends only on (i, m) we can
+    # hoist it. The k-dependent part (S_ki_im projection) stays inside.
+    _LT1_cache = {}
+    for m in range(nocc):
+        t1_m = t1_pno.get(m)
+        if t1_m is None or t1_m.size == 0:
+            continue
+        if np.max(np.abs(t1_m)) < 1e-15:
+            continue
+        for i_out in range(nocc):
+            key_im = (min(i_out, m), max(i_out, m))
+            ci_im = cc_ints.get(key_im)
+            if ci_im is None:
+                continue
+            if pno_spaces[key_im]['C_pno'].shape[1] == 0:
+                continue
+            K_im = ci_im['K_iajb']
+            L_im = 2.0 * K_im - K_im.T
+            t1_m_in_im = _project_t1_to_pair(
+                t1_pno, m, key_im, S_pno_cache, pno_spaces)
+            _LT1_cache[(i_out, m)] = (key_im, L_im @ t1_m_in_im)
+
     for i in range(nocc):
         key_ii = (i, i)
         if key_ii not in pno_spaces or pno_spaces[key_ii]['C_pno'].shape[1] == 0:
@@ -833,27 +852,10 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             # This dressing is evaluated in PNO_ki basis.
             fkc_dress = np.zeros_like(fov_k_in_ki)
             for m in range(nocc):
-                t1_m = t1_pno.get(m)
-                if t1_m is None or t1_m.size == 0:
+                entry = _LT1_cache.get((i, m))
+                if entry is None:
                     continue
-                if np.max(np.abs(t1_m)) < 1e-15:
-                    continue
-                key_im = (min(i, m), max(i, m))
-                key_mm = (m, m)
-                ci_im = cc_ints.get(key_im)
-                if ci_im is None:
-                    continue
-                n_im = pno_spaces[key_im]['C_pno'].shape[1]
-                if n_im == 0:
-                    continue
-                # L[im] = 2*K[im] - K[im].T  where K[im] = K_iajb of pair (i,m)
-                K_im = ci_im['K_iajb']
-                L_im = 2.0 * K_im - K_im.T  # (n_im, n_im)
-                # S(im, mm) @ T1[m] → project T1[m] to PNO_im
-                t1_m_in_im = _project_t1_to_pair(
-                    t1_pno, m, key_im, S_pno_cache, pno_spaces)
-                # L[im] @ t1_m_in_im → (n_im,)
-                LT1 = L_im @ t1_m_in_im
+                key_im, LT1 = entry
                 # S(ki, im) @ LT1 → project from PNO_im to PNO_ki
                 if key_ki == key_im:
                     fkc_dress += LT1
@@ -1496,50 +1498,70 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     pair_lmo_idx=pair_lmo_idx)
             _tj_df = _time.perf_counter() - _tj0
 
-            # compute_C_tilde, build_D_tilde, t1_fock are independent of
-            # each other (all consume df_terms output but not each other's
-            # results), so run them concurrently in separate driver threads.
-            # Each still uses the shared _pool for its internal per-pair
-            # parallelism; the pool schedules tasks from both drivers
-            # interleaved. This removes ~300ms/iter of sequential synchro-
-            # nization barriers.
+            # compute_C_tilde, build_D_tilde, t1_fock each dispatch their
+            # own ~400 tasks via _pool.map. Running them in 3 driver
+            # threads concurrently contends for the shared 32-worker pool
+            # (task-queue lock, cache lines on shared caches). Running
+            # them sequentially — each grabbing the full pool for its
+            # own pass — avoids contention while keeping per-kernel
+            # parallelism intact.
             from pyscf.cc.dlpno_tccsd.local_df import t1_fock
-            import threading
             compute_C_tilde._dump_iter = cycle
             _tj0 = _time.perf_counter()
-            _cd_results = {}
 
-            def _run_C():
-                _cd_results['C'] = compute_C_tilde(
-                    t1_pno, t2_pno_all, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
-                    _term2_precomputed=_c_t2_pre,
-                    cc_ints=_cc_ints,
-                    pair_lmo_idx=pair_lmo_idx, _pool=_pool,
-                    S_pao_full=S_pao_full, s1e=s1e)
+            _tct_old_0 = _time.perf_counter()
+            _jiang_C = compute_C_tilde(
+                t1_pno, t2_pno_all, pno_spaces, nocc,
+                ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+                _term2_precomputed=_c_t2_pre,
+                cc_ints=_cc_ints,
+                pair_lmo_idx=pair_lmo_idx, _pool=_pool,
+                S_pao_full=S_pao_full, s1e=s1e)
+            _tct_old = _time.perf_counter() - _tct_old_0
 
-            def _run_D():
-                _cd_results['D'] = build_D_tilde(
-                    t1_pno, t2_pno_all, pno_spaces, nocc,
-                    ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
-                    _term2_precomputed=_d_t2_pre,
-                    cc_ints=_cc_ints,
-                    pair_lmo_idx=pair_lmo_idx, _pool=_pool,
-                    S_pao_full=S_pao_full, s1e=s1e)
-
-            def _run_F():
-                _cd_results['F'] = t1_fock(
-                    _cc_ints, None, t1_pno, fov_pno, pno_spaces,
-                    S_pno_cache, F_lmo, eps_lmo, foo_total,
-                    _all_keys_j, nocc, _pool=_pool,
-                    pair_lmo_idx=pair_lmo_idx)
-
-            threads = [threading.Thread(target=t) for t in (_run_C, _run_D, _run_F)]
-            for t in threads: t.start()
-            for t in threads: t.join()
-            _jiang_C = _cd_results['C']
-            _jiang_D = _cd_results['D']
-            _local_Fkj, _local_df_Fab, _local_foo_t1 = _cd_results['F']
+            # Prototype: batched compute_C_tilde (Terms 3+4 vectorized).
+            # Runs side-by-side for validation + timing; no pool, 32-thread BLAS.
+            from pyscf.cc.dlpno_tccsd.residual import compute_C_tilde_batched
+            compute_C_tilde_batched._dump_timing = (cycle == 5)
+            _tct_new_0 = _time.perf_counter()
+            _jiang_C_new = compute_C_tilde_batched(
+                t1_pno, t2_pno_all, pno_spaces, nocc,
+                ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+                _term2_precomputed=_c_t2_pre,
+                cc_ints=_cc_ints,
+                pair_lmo_idx=pair_lmo_idx, _pool=_pool,
+                S_pao_full=S_pao_full, s1e=s1e,
+                blas_threads=32)
+            _tct_new = _time.perf_counter() - _tct_new_0
+            _max_diff = 0.0
+            _missing = 0
+            _extra = 0
+            for _k in _jiang_C:
+                if _k in _jiang_C_new:
+                    _d = float(np.max(np.abs(_jiang_C[_k] - _jiang_C_new[_k])))
+                    if _d > _max_diff:
+                        _max_diff = _d
+                else:
+                    _missing += 1
+            for _k in _jiang_C_new:
+                if _k not in _jiang_C:
+                    _extra += 1
+            print(f'  [c_tilde_proto] iter={cycle} '
+                  f'old={_tct_old*1e3:.0f}ms new={_tct_new*1e3:.0f}ms '
+                  f'max_diff={_max_diff:.2e} '
+                  f'missing={_missing} extra={_extra}', flush=True)
+            _jiang_D = build_D_tilde(
+                t1_pno, t2_pno_all, pno_spaces, nocc,
+                ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+                _term2_precomputed=_d_t2_pre,
+                cc_ints=_cc_ints,
+                pair_lmo_idx=pair_lmo_idx, _pool=_pool,
+                S_pao_full=S_pao_full, s1e=s1e)
+            _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
+                _cc_ints, None, t1_pno, fov_pno, pno_spaces,
+                S_pno_cache, F_lmo, eps_lmo, foo_total,
+                _all_keys_j, nocc, _pool=_pool,
+                pair_lmo_idx=pair_lmo_idx)
             _tj_C = _time.perf_counter() - _tj0
             _tj_D = 0.0
             _tj_FG = 0.0
@@ -1603,24 +1625,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _, _bt = _bt_one(_k)
                     _B_tilde_per_ij[_k] = _bt
 
-            # Parallel batched B+E across strong pairs
-            def _be_one(_key):
-                _Bt = _B_tilde_per_ij[_key]
-                _res = compute_B_E_batched(
-                    [_key], t2_pno_all, pno_spaces, S_pno_cache,
-                    _cc_ints, _Bt, pair_lmo_idx, nocc,
-                    S_pao_full=S_pao_full, s1e=s1e)
-                return _key, _res[0][_key], _res[1][_key]
-            _BE_all = {'B': {}, 'E': {}}
-            if _pool is not None:
-                for _k, _B, _E in _pool.map(_be_one, keys_sorted):
-                    _BE_all['B'][_k] = _B
-                    _BE_all['E'][_k] = _E
-            else:
-                for _k in keys_sorted:
-                    _k2, _B, _E = _be_one(_k)
-                    _BE_all['B'][_k2] = _B
-                    _BE_all['E'][_k2] = _E
+            # Batched B+E across all strong pairs — one pool dispatch.
+            # The function iterates keys internally via _pool.map.
+            _B_dict, _E_dict = compute_B_E_batched(
+                keys_sorted, t2_pno_all, pno_spaces, S_pno_cache,
+                _cc_ints, _B_tilde_per_ij, pair_lmo_idx, nocc,
+                _pool=_pool, S_pao_full=S_pao_full, s1e=s1e)
+            _BE_all = {'B': _B_dict, 'E': _E_dict}
 
             # Accumulator for per-pair timing (thread-safe via list append)
             _pair_timings = {'fab': [], 'resid': [], 'btilde': []}

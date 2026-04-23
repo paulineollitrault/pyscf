@@ -137,6 +137,129 @@ def _triple_pno_union(pno_spaces, i, j, k, s1e, t2_for_T=None,
     return C_tno, n_tno
 
 
+def _triple_pno_union_psi4(pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
+                            t2_for_T=None, T_CutTNO=1e-9, S_cut_domain=1e-8,
+                            pao_domains_triple=None):
+    """Psi4-style TNO construction in orthogonalized triple-PAO basis.
+
+    Mirrors Psi4 DLPNOCCSD_T::tno_transform (triples.cc:431):
+    (1) triple_paos = union of pair_paos for (ij), (jk), (ik) in PAO
+        index space (no orthogonalization yet).
+    (2) Canonical orthogonalization of S_pao[triple_paos, triple_paos]
+        → X_pao_ijk (npao_ijk, npao_can_ijk).
+    (3) Project each pair's density D_ij = Tt_ij @ T_ij.T + Tt_ij.T @ T_ij
+        into the triple's orthogonal-PAO basis.
+    (4) D_ijk = (D_ij + D_jk + D_ik) / 3; diagonalize → TNOs.
+    (5) Truncate at T_CutTNO, canonicalize in F basis → X_tno_canonical.
+    (6) X_tno_ijk = X_pao_ijk @ X_tno_canonical
+        shape (npao_ijk, n_tno) — maps triple's RAW PAO domain to
+        canonical TNO. This is what Psi4 stores as X_tno_[ijk] and what
+        compute_lccsd_t0 uses to slice sparse qia[Q]/qij[Q]/qab[Q].
+
+    Returns:
+        C_tno_sc   : (nao, n_tno) TNO in AO basis (S-orthonormal)
+        n_tno      : int
+        X_tno_ijk  : (npao_ijk, n_tno) triple-PAO → canonical-TNO
+        triple_paos: (npao_ijk,) int PAO indices (sorted)
+        eps_tno_sc : (n_tno,) TNO orbital energies
+    """
+    ij = (min(i, j), max(i, j))
+    ik = (min(i, k), max(i, k))
+    jk = (min(j, k), max(j, k))
+    nao = C_pao.shape[0]
+
+    if not all(key in pno_spaces for key in (ij, ik, jk)):
+        return None, 0, None, None, None
+
+    # (1) triple_paos: union of per-LMO PAO domains [i, j, k]
+    # Psi4 lmotriplet_to_paos_[ijk] = union of lmo_to_paos[i, j, k] rebuilt
+    # at the triples stage with T_CUT_DO_TRIPLES (triples.cc:316-329).
+    # Fallback: union of pair_paos for (ij, jk, ik) — the CCSD-stage domain.
+    if pao_domains_triple is not None:
+        pao_set = set()
+        for lmo in (i, j, k):
+            pao_set.update(int(x) for x in np.asarray(pao_domains_triple[lmo]).tolist())
+    else:
+        pao_set = set()
+        for key in (ij, jk, ik):
+            pp = pno_spaces[key].get('pair_paos')
+            if pp is not None:
+                pao_set.update(int(x) for x in np.asarray(pp).tolist())
+    if not pao_set:
+        return np.zeros((nao, 0)), 0, None, None, None
+    triple_paos = np.array(sorted(pao_set), dtype=np.int64)
+
+    # (2) Canonical orthogonalization of triple's PAO domain
+    from pyscf.cc.dlpno_tccsd.local_orbs import orthogonalize_pao_domain
+    C_orth_ijk, X_pao_ijk = orthogonalize_pao_domain(
+        C_pao, S_pao_full, triple_paos,
+        S_cut=S_cut_domain, method='psi4')
+    npao_can_ijk = X_pao_ijk.shape[1]
+    if npao_can_ijk == 0:
+        return np.zeros((nao, 0)), 0, None, None, None
+
+    # F_pao in orthogonalized triple basis
+    F_dom = F_pao_full[np.ix_(triple_paos, triple_paos)]
+    F_orth_ijk = X_pao_ijk.T @ F_dom @ X_pao_ijk
+
+    # (3) Pair-PNO to triple-orth-PAO projections (S-weighted)
+    # S_proj[key] has shape (n_pno_pair, npao_can_ijk):
+    #   S_proj = X_pno[pair].T @ S_pao[pair_paos, triple_paos] @ X_pao_ijk
+    S_projs = {}
+    for key in (ij, jk, ik):
+        pp_pair = np.asarray(pno_spaces[key]['pair_paos'])
+        X_pno_pair = pno_spaces[key].get('X_pno')
+        if X_pno_pair is None or X_pno_pair.shape[1] == 0:
+            S_projs[key] = None
+            continue
+        S_pair_triple = S_pao_full[np.ix_(pp_pair, triple_paos)]
+        S_projs[key] = X_pno_pair.T @ S_pair_triple @ X_pao_ijk
+
+    # (4) Sum projected pair densities
+    D_ijk = np.zeros((npao_can_ijk, npao_can_ijk))
+    for key, ii_lmo, jj_lmo in [(ij, i, j), (jk, j, k), (ik, i, k)]:
+        S = S_projs[key]
+        if S is None:
+            continue
+        if t2_for_T is not None and key in t2_for_T:
+            T2_p = t2_for_T[key]
+        elif pno_spaces[key].get('T2_pno') is not None:
+            T2_p = pno_spaces[key]['T2_pno']
+        else:
+            continue
+        Tt_p = 2.0 * T2_p - T2_p.T
+        D_pair = Tt_p @ T2_p.T + Tt_p.T @ T2_p
+        if ii_lmo == jj_lmo:
+            D_pair *= 0.5
+        D_ijk += S.T @ D_pair @ S
+    D_ijk /= 3.0
+
+    # (5) Diagonalize, sort, truncate
+    tno_occ, tno_vecs = np.linalg.eigh(D_ijk)
+    order = np.argsort(tno_occ)[::-1]
+    tno_occ = tno_occ[order]
+    tno_vecs = tno_vecs[:, order]
+    keep = np.abs(tno_occ) >= T_CutTNO
+    n_tno = int(np.sum(keep))
+    if n_tno == 0:
+        n_tno = 1
+        keep[0] = True
+    X_tno_initial = tno_vecs[:, keep]
+
+    # (6) Canonicalize in F basis
+    F_in_tno = X_tno_initial.T @ F_orth_ijk @ X_tno_initial
+    eps_tno_sc, tno_canon = np.linalg.eigh(F_in_tno)
+    X_tno_canonical = X_tno_initial @ tno_canon
+
+    # (7) X_tno_ijk maps triple's raw PAO domain → canonical TNO
+    X_tno_ijk = X_pao_ijk @ X_tno_canonical              # (npao_ijk, n_tno)
+
+    # TNO in AO basis (S-orthonormal by construction)
+    C_tno_sc = C_pao[:, triple_paos] @ X_tno_ijk         # (nao, n_tno)
+
+    return C_tno_sc, n_tno, X_tno_ijk, triple_paos, eps_tno_sc
+
+
 def _preload_df_integrals(with_df):
     """Preload all DF 3-index integrals into memory.
 
@@ -224,7 +347,8 @@ def _build_ooL_triple(Lpq_full, C_lmo, lmo_indices):
 def _w3_intermediate(t2_sc, ovL_sc, ooL_sc, vvL_sc, eps_occ, eps_vir,
                      t1_sc=None, fvo_sc=None, sum_all_occ=False,
                      occ_indices=None,
-                     ooL_sc_full=None, t2_sc_full=None):
+                     ooL_sc_full=None, t2_sc_full=None,
+                     K_ooov=None):
     """Compute (T) energy for one triple i<=j<=k using Eq 53 (Jiang 2024).
 
     Uses the base W (single occupied assignment, no P_L permutation) with the
@@ -294,31 +418,54 @@ def _w3_intermediate(t2_sc, ovL_sc, ooL_sc, vvL_sc, eps_occ, eps_vir,
         # reorder to [a, b, f]
         K_ab_cache[ip] = t.transpose(0, 2, 1)
 
+    # Permutation index tables — shared by K_ovvv phase and K_ooov phase.
+    p_table = [(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0)]
+    _ip_arr = np.array([p[0] for p in p_table])   # (6,) ovL-slot of each perm
+    _iq_arr = np.array([p[1] for p in p_table])   # (6,) oo-slot
+    _ir_arr = np.array([p[2] for p in p_table])   # (6,) t2-slot
+
+    # --- Phase 1: K_ovvv contribution (Psi4 triples.cc:827-830) ---
+    # Per perm (A, B, C): base += K_Avvv[a, b, f] * t2_{CB}[c, f]
     W = np.zeros((n, n, n))
     for pidx in range(6):
-        p_map = [(0,1,2),(0,2,1),(1,0,2),(1,2,0),(2,0,1),(2,1,0)][pidx]
-        ip, iq, ir = p_map
-
+        ip, iq, ir = p_table[pidx]
         K_ab = K_ab_cache[ip]
-        # base[a,b,c] = Σ_f K_ab[a,b,f] * t2[c,f]
-        #            = (K_ab.reshape(n*n, n) @ t2.T).reshape(n,n,n)
         t2_rq = t2_sc[ir, iq]
         base = (K_ab.reshape(n * n, n) @ t2_rq.T).reshape(n, n, n)
-
-        if ooL_sc_full is not None and t2_sc_full is not None:
-            # A_al = ovL_sc[ip] @ ooL_sc_full[iq].T  (shape: n × m)
-            A_al = ovL_sc[ip] @ ooL_sc_full[iq].T
-            # base[a,b,c] -= Σ_m A_al[a,m] * t2[m,b,c]
-            t2_mbc = t2_sc_full[:, ir]
-            m = t2_mbc.shape[0]
-            base -= (A_al @ t2_mbc.reshape(m, n * n)).reshape(n, n, n)
-        else:
-            A_al = ovL_sc[ip] @ ooL_sc[iq].T
-            t2_mbc = t2_sc[:, ir]
-            m = t2_mbc.shape[0]
-            base -= (A_al @ t2_mbc.reshape(m, n * n)).reshape(n, n, n)
-
         W += trans[pidx](base)
+
+    # --- Phase 2: K_ooov subtraction (Psi4 triples.cc:832-848) ---
+    # Psi4 streams m one at a time: per perm (A, B, C), per m, build
+    # T_Am[a,b] from pair (A, m) and subtract T_Am[a,b] × K_{Bo Cv}[m, c].
+    # We vectorize the m-sum (and batch across the 6 perms) into one
+    # matmul: sub[p, a, b, c] = Σ_m K_ooov[ip,iq,a,m] · t2[m, ir, b, c].
+    if K_ooov is not None and t2_sc_full is not None:
+        K_batch = K_ooov[_ip_arr, _iq_arr]                         # (6, n, m_dom)
+        t2_batch = t2_sc_full[:, _ir_arr].transpose(1, 0, 2, 3)    # (6, m_dom, n, n)
+        m_dom = K_batch.shape[2]
+        sub = np.matmul(
+            K_batch, t2_batch.reshape(6, m_dom, n * n)
+        ).reshape(6, n, n, n)
+        # Apply per-perm virtual-index transpose (inverts P_L) and subtract.
+        W -= sub[0]
+        W -= sub[1].transpose(0, 2, 1)
+        W -= sub[2].transpose(1, 0, 2)
+        W -= sub[3].transpose(2, 0, 1)
+        W -= sub[4].transpose(1, 2, 0)
+        W -= sub[5].transpose(2, 1, 0)
+    else:
+        # Fallback for legacy callers (no pre-built K_ooov, or in-block-only).
+        for pidx in range(6):
+            ip, iq, ir = p_table[pidx]
+            if ooL_sc_full is not None and t2_sc_full is not None:
+                A_al = ovL_sc[ip] @ ooL_sc_full[iq].T
+                t2_mbc = t2_sc_full[:, ir]
+            else:
+                A_al = ovL_sc[ip] @ ooL_sc[iq].T
+                t2_mbc = t2_sc[:, ir]
+            m = t2_mbc.shape[0]
+            W -= trans[pidx](
+                (A_al @ t2_mbc.reshape(m, n * n)).reshape(n, n, n))
 
     # --- T = -W/D ---
     T = -W / D
@@ -392,11 +539,160 @@ def _zero_cas_t2_amplitudes(t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir,
     return t2_zeroed
 
 
+def _build_triple_local_DF(i, j, k, X_tno_ijk, triple_paos, triple_domain,
+                            sparse_df, screening, j2c_full,
+                            lmo_aux_mask):
+    """Psi4-style per-triple DF integrals on a local aux domain.
+
+    Mirrors Psi4 DLPNOCCSD_T::compute_lccsd_t0 (triples.cc:667+). Aux Q's
+    are grouped by atom center; each center's Q-stack is contracted in
+    one batched matmul, amortizing BLAS-3 across the n_aux_at_A Q's of
+    each atom (same pattern as compute_cc_integrals for CCSD pairs).
+
+      q_iv[q, a_tno] = Σ_{u ∈ paos_ext[Q] ∩ triple_paos}
+                          qia[Q][i_sparse, u_in_Q]
+                          * X_tno_ijk[u_in_triple_paos, a_tno]
+
+      q_vv[q, a, b]  = Σ_{u, v ∈ paos_ext[Q] ∩ triple_paos}
+                          X_tno_ijk[u_tp, a]
+                          * qab[Q][u_in_Q, v_in_Q]
+                          * X_tno_ijk[v_tp, b]
+
+      q_io[q, m]     = qij[Q][i_sparse, m_sparse]
+
+    After the per-center loop, apply local J^{-1/2}.
+
+    Args:
+        X_tno_ijk: (npao_ijk, n_tno) — triple's raw-PAO → canonical-TNO
+            transform (from _triple_pno_union_psi4).
+        triple_paos: (npao_ijk,) global PAO indices in the triple.
+        triple_domain: list of global LMO indices (sorted) for ooL rows.
+
+    Returns:
+        ovL_sc  (3, n_tno, naux_ijk), vvL_sc (n_tno, n_tno, naux_ijk),
+        ooL_sc  (3, n_domain, naux_ijk), all fitted with local J^{-1/2}.
+    """
+    qij_atom = sparse_df.get('qij_atom')
+    qia_atom = sparse_df.get('qia_atom')
+    qab_atom = sparse_df.get('qab_atom')
+    aux_pos_in_atom = sparse_df.get('aux_pos_in_atom')
+    aux_atom_ids = sparse_df.get('aux_atom_ids')
+    riatom_to_lmos_ext_dense = screening['riatom_to_lmos_ext_dense']
+    riatom_to_paos_ext_dense = screening['riatom_to_paos_ext_dense']
+
+    aux_mask = lmo_aux_mask[i] | lmo_aux_mask[j] | lmo_aux_mask[k]
+    aux_idx = np.where(aux_mask)[0]
+    naux_ijk = aux_idx.size
+    n_tno = X_tno_ijk.shape[1]
+    n_domain = len(triple_domain)
+
+    if naux_ijk == 0 or n_tno == 0:
+        return (np.zeros((3, n_tno, 0)),
+                np.zeros((n_tno, n_tno, 0)),
+                np.zeros((3, n_domain, 0)))
+
+    dom_arr = np.asarray(triple_domain, dtype=np.int64)
+    ijk_global = np.array([i, j, k], dtype=np.int64)
+
+    # Raw (pre-metric) tensors
+    ovL_raw = np.zeros((3, n_tno, naux_ijk))
+    vvL_raw = np.zeros((n_tno, n_tno, naux_ijk))
+    ooL_raw = np.zeros((3, n_domain, naux_ijk))
+
+    # Group by center: aux Q's of the same atom share paos_ext/lmos_ext,
+    # so we can do one batched BLAS-3 operation per center.
+    centers_of_aux = aux_atom_ids[aux_idx]
+    unique_centers = np.unique(centers_of_aux)
+
+    for centerQ in unique_centers:
+        centerQ = int(centerQ)
+        mask_c = centers_of_aux == centerQ
+        local_Q = np.where(mask_c)[0]              # (nQ_c,) positions in naux_ijk
+        global_Q = aux_idx[local_Q]                # global aux indices
+        atom_pos = aux_pos_in_atom[global_Q]       # positions within centerQ's stack
+        nQ_c = local_Q.size
+
+        # Occupied-index sparse positions (same for all Q's in this center)
+        i_s = int(riatom_to_lmos_ext_dense[centerQ, i])
+        j_s = int(riatom_to_lmos_ext_dense[centerQ, j])
+        k_s = int(riatom_to_lmos_ext_dense[centerQ, k])
+        occ_sp = (i_s, j_s, k_s)
+
+        # ------------- ooL (qij path, PAO-free) -------------
+        # Slice LMO axes FIRST (nl_c is O(1)), then Q: avoids copying the
+        # (nQ_A, nl_c, nl_c) full stack when atom_pos is a subset.
+        if qij_atom[centerQ] is not None:
+            m_sparse_arr = riatom_to_lmos_ext_dense[centerQ, dom_arr]  # (n_dom,)
+            m_valid_mask = m_sparse_arr >= 0
+            dom_local = np.where(m_valid_mask)[0]       # positions in triple_domain
+            m_sparse_kept = m_sparse_arr[m_valid_mask]  # positions in centerQ's lmo stack
+            if dom_local.size > 0:
+                qij_A = qij_atom[centerQ]               # (nQ_A, nl, nl) — shared
+                for idx in range(3):
+                    occ = occ_sp[idx]
+                    if occ >= 0:
+                        # qij_A[:, occ, m_sparse_kept] — (nQ_A, n_valid), then pick atom_pos
+                        vals_full = qij_A[:, occ, m_sparse_kept]  # (nQ_A, n_valid)
+                        ooL_raw[idx][np.ix_(dom_local, local_Q)] = vals_full[atom_pos].T
+
+        # ------------- ovL & vvL (PAO paths) -------------
+        if qia_atom[centerQ] is None and qab_atom[centerQ] is None:
+            continue
+        # Triple PAO → centerQ's pao stack position (-1 if outside)
+        tp_pos_in_Q = riatom_to_paos_ext_dense[centerQ, triple_paos]  # (npao_ijk,)
+        valid_tp = np.where(tp_pos_in_Q >= 0)[0]        # positions in triple_paos
+        valid_u_Q = tp_pos_in_Q[valid_tp]               # positions in centerQ's pao stack
+        nu = valid_tp.size
+        if nu == 0:
+            continue
+        X_Q = X_tno_ijk[valid_tp]                       # (nu, n_tno) — shared by all Q
+
+        # ovL: slice PAO axis FIRST on the full (nQ_A, nl, np_A) stack so
+        # the (copy-triggering) atom_pos slice sees only (nQ_A, nl, nu)
+        # — scales like nu, not np_A.
+        if qia_atom[centerQ] is not None:
+            qia_A = qia_atom[centerQ]                           # (nQ_A, nl, np_A)
+            qia_A_u = qia_A[:, :, valid_u_Q]                    # (nQ_A, nl, nu)
+            qia_stack_cut = qia_A_u[atom_pos]                   # (nQ_c, nl, nu)
+            for idx in range(3):
+                occ = occ_sp[idx]
+                if occ >= 0:
+                    block = qia_stack_cut[:, occ, :] @ X_Q      # (nQ_c, n_tno)
+                    ovL_raw[idx][:, local_Q] = block.T          # (n_tno, nQ_c)
+
+        # vvL: same trick — PAO-PAO slice first (nu² << np_A²), then Q-slice.
+        if qab_atom[centerQ] is not None:
+            qab_A = qab_atom[centerQ]                           # (nQ_A, np_A, np_A)
+            qab_A_uu = qab_A[:, valid_u_Q[:, None],
+                             valid_u_Q[None, :]]                # (nQ_A, nu, nu)
+            qab_stack_cut = qab_A_uu[atom_pos]                  # (nQ_c, nu, nu)
+            tmp = qab_stack_cut @ X_Q                           # (nQ_c, nu, n_tno)
+            vvL_c = np.matmul(X_Q.T, tmp)                       # (nQ_c, n_tno, n_tno)
+            vvL_raw[:, :, local_Q] = vvL_c.transpose(1, 2, 0)
+
+    # Local J^{-1/2}
+    j_loc = j2c_full[np.ix_(aux_idx, aux_idx)]
+    evals, evecs = np.linalg.eigh(j_loc)
+    keep_e = evals > 1e-14
+    jhi = (evecs[:, keep_e] * (1.0 / np.sqrt(evals[keep_e]))
+           ) @ evecs[:, keep_e].T
+
+    ovL_sc = ovL_raw @ jhi
+    vvL_sc = vvL_raw @ jhi
+    ooL_sc = ooL_raw @ jhi
+
+    return ovL_sc, vvL_sc, ooL_sc
+
+
 def _process_one_triple(i, j, k,
                         pno_spaces, t2_for_T,
                         Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
                         t1_pno=None, T_CutTNO=1e-9,
-                        nonneg_set=None):
+                        nonneg_set=None,
+                        sparse_df=None, screening=None,
+                        j2c_full=None, lmo_aux_mask=None, C_pao=None,
+                        S_pao_full=None, F_pao_full=None,
+                        pao_domains_triple=None):
     """Compute (T) energy contribution for one triple (i,j,k). Thread-safe.
 
     All inputs are read-only.  Lpq_full is the preloaded DF array (naux, nao_pair)
@@ -413,48 +709,44 @@ def _process_one_triple(i, j, k,
     if (ij not in t2_for_T or ik not in t2_for_T or jk not in t2_for_T):
         return 0.0
 
-    C_tno, n_tno = _triple_pno_union(pno_spaces, i, j, k, s1e,
-                                      t2_for_T=t2_for_T,
-                                      T_CutTNO=T_CutTNO)
-    if n_tno == 0:
-        return 0.0
-
-    F_tno_full = reduce(np.dot, (C_tno.T, fock_ao, C_tno))
-    eps_tno_sc, V_sc = np.linalg.eigh(F_tno_full)
-    C_tno_sc = np.dot(C_tno, V_sc)
-
-    def _map_t2(pk):
-        C_p = pno_spaces[pk]['C_pno']
-        U = reduce(np.dot, (C_p.T, s1e, C_tno_sc))
-        return reduce(np.dot, (U.T, t2_for_T[pk], U))
-
-    t2_ij_sc = _map_t2(ij)
-    t2_ik_sc = _map_t2(ik)
-    t2_jk_sc = _map_t2(jk)
+    # Psi4-style TNO build in orthogonalized triple-PAO basis when the
+    # sparse-DF data is available — gives us X_tno_ijk and triple_paos
+    # needed by _build_triple_local_DF. Falls back to the legacy
+    # AO-basis construction otherwise.
+    _use_psi4_tno = (sparse_df is not None and screening is not None
+                     and j2c_full is not None and lmo_aux_mask is not None
+                     and C_pao is not None
+                     and S_pao_full is not None and F_pao_full is not None)
+    if _use_psi4_tno:
+        C_tno_sc, n_tno, X_tno_ijk, triple_paos, eps_tno_sc = \
+            _triple_pno_union_psi4(
+                pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
+                t2_for_T=t2_for_T, T_CutTNO=T_CutTNO,
+                pao_domains_triple=pao_domains_triple)
+        if n_tno == 0:
+            return 0.0
+    else:
+        C_tno, n_tno = _triple_pno_union(pno_spaces, i, j, k, s1e,
+                                          t2_for_T=t2_for_T,
+                                          T_CutTNO=T_CutTNO)
+        if n_tno == 0:
+            return 0.0
+        F_tno_full = reduce(np.dot, (C_tno.T, fock_ao, C_tno))
+        eps_tno_sc, V_sc = np.linalg.eigh(F_tno_full)
+        C_tno_sc = np.dot(C_tno, V_sc)
+        X_tno_ijk = None
+        triple_paos = None
 
     # Triple-local aux domain: raw 3-center @ local J^{-1/2}_local gives
     # a proper local DF fit for this triple. Matches CCSD pair approach
     # (compute_cc_integrals_sparse) and dramatically reduces the naux
     # dimension of per-triple ovL / vvL / ooL tensor transforms from
     # O(N) to O(1).
-    # Triple-local aux domain via raw_3c + local J^{-1/2} works
-    # algorithmically (μEh drift on S22) but the per-triple Lpq_loc
-    # build (raw[:, :, aux_idx] copy + jhi matmul + tril packing) has
-    # too much numpy/Python overhead to beat the monolithic naux
-    # nr_e2 transform for these system sizes. Needs batching across
-    # triples or a C-level Lpq_loc builder to actually pay off.
-    # Left as-is (full Lpq_full path) for now.
-    Lpq_loc = Lpq_full
-
-    ovL_ijk    = _build_ovL_tno(Lpq_loc, C_lmo, C_tno_sc, [i, j, k])
-    vvL_sc     = _build_vvL_tno(Lpq_loc, C_tno_sc)
     triple_lmo = [i, j, k]
     nocc_lmo = C_lmo.shape[1]
 
     # Triple-local LMO domain: m contributes to the vooo (A*t2) term only
     # if pairs (m, i), (m, j), (m, k) all survive (non-negligible).
-    # Matches Psi4 triplet-LMO restriction and drops the (nocc) outer
-    # dim of t2_mr from O(N) to O(1) per triple.
     _tr_pair = lambda a, b: (min(a, b), max(a, b))
     _domain_set = nonneg_set if nonneg_set is not None else set(t2_for_T.keys())
     triple_domain = sorted(
@@ -462,25 +754,70 @@ def _process_one_triple(i, j, k,
         if _tr_pair(m, i) in _domain_set
         and _tr_pair(m, j) in _domain_set
         and _tr_pair(m, k) in _domain_set)
-    # triple indices i,j,k must always be in the domain (guaranteed by
-    # pair-existence check above), but protect the lookup below.
     _m_pos = {m_global: m_local for m_local, m_global in enumerate(triple_domain)}
 
     eps_occ = np.array([F_lmo[ii, ii] for ii in triple_lmo])
 
-    # ooL for m in triple's local domain only (using triple-local Lpq).
-    ooL_lmo_full = _build_ooL_triple(Lpq_loc, C_lmo, triple_domain)
+    # DF integrals: Psi4-style triple-local aux path when available.
+    if _use_psi4_tno and X_tno_ijk is not None:
+        ovL_ijk, vvL_sc, ooL_lmo_full = _build_triple_local_DF(
+            i, j, k, X_tno_ijk, triple_paos, triple_domain,
+            sparse_df, screening, j2c_full, lmo_aux_mask)
+        _sparse_path_prebuilt_rows = True
+    else:
+        ovL_ijk = _build_ovL_tno(Lpq_full, C_lmo, C_tno_sc, [i, j, k])
+        vvL_sc = _build_vvL_tno(Lpq_full, C_tno_sc)
+        ooL_lmo_full = _build_ooL_triple(Lpq_full, C_lmo, triple_domain)
+        _sparse_path_prebuilt_rows = False
 
-    # T2 for m in domain × triple LMO r
+    # --- Pair PNO → triple TNO overlap matrix U[pk] in PAO basis ---
+    # Psi4-style (O(1) per pair): U = X_pno[pk].T @ S_pao[pair_paos, triple_paos]
+    #                                  @ X_tno_ijk.
+    # Precompute W = S_pao[:, triple_paos] @ X_tno_ijk once per triple
+    # (shape: (nao_pao, n_tno)) so each pair lookup reduces to one int-slice
+    # + one matmul (avoids O(nao²) s1e matmul AND np.ix_ fancy indexing).
+    # Fallback (AO-basis C_pno path): O(nao²) per pair via s1e.
+    _pao_basis = (_use_psi4_tno and X_tno_ijk is not None
+                  and S_pao_full is not None and triple_paos is not None)
+    if _pao_basis:
+        _W_pao_tno = S_pao_full[:, triple_paos] @ X_tno_ijk  # (nao_pao, n_tno)
+    else:
+        _W_pao_tno = None
+    _U_cache = {}
+
+    def _U_for(pk):
+        if pk in _U_cache:
+            return _U_cache[pk]
+        if pk not in pno_spaces:
+            _U_cache[pk] = None
+            return None
+        if _pao_basis:
+            X_pno = pno_spaces[pk].get('X_pno')
+            pp = pno_spaces[pk].get('pair_paos')
+            if X_pno is None or pp is None or X_pno.shape[1] == 0:
+                _U_cache[pk] = None
+                return None
+            # W_pk = W_pao_tno[pair_paos, :], shape (n_pao_pk, n_tno)
+            # U    = X_pno.T @ W_pk, shape (n_pno_pk, n_tno)
+            U = X_pno.T @ _W_pao_tno[pp]
+        else:
+            C_p = pno_spaces[pk]['C_pno']
+            if C_p.shape[1] == 0:
+                _U_cache[pk] = None
+                return None
+            U = reduce(np.dot, (C_p.T, s1e, C_tno_sc))
+        _U_cache[pk] = U
+        return U
+
+    # T2 projection: pair-PNO → triple-TNO.
     def _proj_t2(p, q):
         pk = (min(p, q), max(p, q))
-        if pk not in t2_for_T or pk not in pno_spaces:
+        if pk not in t2_for_T:
             return np.zeros((n_tno, n_tno))
-        C_p = pno_spaces[pk]['C_pno']
-        if C_p.shape[1] == 0:
+        U = _U_for(pk)
+        if U is None:
             return np.zeros((n_tno, n_tno))
-        U = reduce(np.dot, (C_p.T, s1e, C_tno_sc))
-        t2_proj = reduce(np.dot, (U.T, t2_for_T[pk], U))
+        t2_proj = U.T @ t2_for_T[pk] @ U
         if p > q:
             t2_proj = t2_proj.T
         return t2_proj
@@ -505,30 +842,56 @@ def _process_one_triple(i, j, k,
         for idx_local, r_global in enumerate(triple_lmo):
             key_rr = (r_global, r_global)
             if key_rr in pno_spaces and t1_pno.get(r_global) is not None:
-                C_pno_rr = pno_spaces[key_rr]['C_pno']
-                if C_pno_rr.shape[1] > 0 and t1_pno[r_global].size > 0:
-                    U_rr = reduce(np.dot, (C_pno_rr.T, s1e, C_tno_sc))
+                if t1_pno[r_global].size == 0:
+                    continue
+                U_rr = _U_for(key_rr)
+                if U_rr is not None:
                     t1_lmo_tno[idx_local] = U_rr.T @ t1_pno[r_global]
         t1_lmo = t1_lmo_tno
 
         C_lmo_triple = C_lmo[:, triple_lmo]
         fvo = reduce(np.dot, (C_tno_sc.T, fock_ao, C_lmo_triple))
 
-    # Indices of i,j,k in the triple-domain ordering (for ooL_sc_full[iq])
-    _triple_rows = np.array([_m_pos[x] for x in triple_lmo])
+    # ooL_sc_full shape (3, n_domain, naux).  In the sparse path it is
+    # already indexed by (i,j,k) rows; in the full-naux path we still
+    # need to pick out the rows corresponding to i,j,k.
+    if _sparse_path_prebuilt_rows:
+        _ooL_for_w3 = ooL_lmo_full
+    else:
+        _triple_rows = np.array([_m_pos[x] for x in triple_lmo])
+        _ooL_for_w3 = ooL_lmo_full[_triple_rows]
+
+    # Pre-build the 6 K_ooov permutation matrices once per triple (Psi4
+    # triples.cc:775-809). Each K_ooov[p, q] = Σ_Q ovL_ijk[p, :, Q] *
+    # ooL[q, :, Q], shape (n_tno, n_domain). One batched matmul is
+    # cheaper than recomputing the same thing inside the 6-perm loop of
+    # _w3_intermediate, and it's the prerequisite for the per-m vooo
+    # restructure (step 2).
+    naux_ijk = ovL_ijk.shape[2]
+    ov_flat = ovL_ijk.reshape(3 * n_tno, naux_ijk)
+    oo_flat = _ooL_for_w3.reshape(3 * m_dom_size, naux_ijk)
+    K_ooov = (ov_flat @ oo_flat.T).reshape(
+        3, n_tno, 3, m_dom_size).transpose(0, 2, 1, 3)
+
     return _w3_intermediate(t2_block, ovL_ijk, None, vvL_sc,
                             eps_occ, eps_tno_sc,
                             t1_sc=t1_lmo, fvo_sc=fvo,
                             occ_indices=(i, j, k),
-                            ooL_sc_full=ooL_lmo_full[_triple_rows],
-                            t2_sc_full=t2_mr)
+                            ooL_sc_full=_ooL_for_w3,
+                            t2_sc_full=t2_mr,
+                            K_ooov=K_ooov)
 
 
 def _process_degenerate_pair(i, k,
                              pno_spaces, t2_for_T,
                              Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
                              t1_pno=None, T_CutTNO=1e-9,
-                             nonneg_set=None):
+                             nonneg_set=None,
+                             sparse_df=None, screening=None,
+                             j2c_full=None, lmo_aux_mask=None,
+                             C_pao=None,
+                             S_pao_full=None, F_pao_full=None,
+                             pao_domains_triple=None):
     """Compute (T) energy from degenerate occupied triples {i,i,k} and {i,k,k}.
 
     With the Eq 53 formula, _process_one_triple handles degenerate triples
@@ -538,7 +901,12 @@ def _process_degenerate_pair(i, k,
     kwargs = dict(pno_spaces=pno_spaces, t2_for_T=t2_for_T,
                   Lpq_full=Lpq_full, C_lmo=C_lmo, fock_ao=fock_ao,
                   F_lmo=F_lmo, s1e=s1e, t1_pno=t1_pno, T_CutTNO=T_CutTNO,
-                  nonneg_set=nonneg_set)
+                  nonneg_set=nonneg_set,
+                  sparse_df=sparse_df, screening=screening,
+                  j2c_full=j2c_full, lmo_aux_mask=lmo_aux_mask,
+                  C_pao=C_pao,
+                  S_pao_full=S_pao_full, F_pao_full=F_pao_full,
+                  pao_domains_triple=pao_domains_triple)
     et_iik = _process_one_triple(i, i, k, **kwargs)
     et_ikk = _process_one_triple(i, k, k, **kwargs)
     return et_iik + et_ikk
@@ -706,11 +1074,12 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                     vir_cas_idx=None,
                     cas_proj_thresh=0.5,
                     T_CutTNO=1e-9,
-                    T_CutTriplesWeak=0.0,
+                    T_CutTriplesWeak=1e-7,
                     ncores=1,
                     negligible_pairs=None,
                     weak_pairs=None,
                     C_pao=None,
+                    doi_iu=None,
                     verbose=None,
                     _pool=None):
     """Compute the (T) energy correction for DLPNO-TCCSD(T).
@@ -834,30 +1203,193 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
              Lpq_full.nbytes / 1e6,
              _dt_preload)
 
-    # --- (T) triple-local aux: structural fix notes --------------------
-    # Psi4 DLPNOCCSD_T::compute_lccsd_t0 (triples.cc:609) builds every
-    # per-triple (Q|iv), (Q|io), (Q|vv_pair) from pre-computed sparse
-    # DF arrays (qij_[Q], qia_[Q], qab_[Q]) sliced by the triple's
-    # aux_ijk / LMO_ijk / PAO_ijk domains + local J^{1/2}.
-    # Our current _process_one_triple uses _ao2mo.nr_e2(Lpq_full, mo)
-    # which scales as O(naux × nao × n_sel²) PER TRIPLE — the O(N)
-    # factor that drives our (T) exponent to ~2.68 vs Jiang's 1.78.
-    # The proper fix requires:
-    #   1. Pass qij/qia/qab (sparse DF arrays) from driver.py through
-    #      both the CCSD and (T) stages (not built twice).
-    #   2. Rewrite _process_one_triple:
-    #      q_iv = Σ_Q ∈ aux_ijk of qia[Q][i_sparse, triple_paos] @ X_tno
-    #      (and q_jv, q_kv, q_io, q_jo, q_ko, q_vv_ij, q_vv_jk, q_vv_ik)
-    #   3. Apply local J^{1/2} per triple via
-    #      J_local^{1/2} @ q_* = solve(J_local^{1/2}, q_*)
-    #   4. Rewrite _w3_intermediate to consume (q_iv, q_jv, q_kv,
-    #      q_vv_ij, q_vv_jk, q_vv_ik, q_io, q_jo, q_ko) in the same
-    #      structure as Psi4's K_ivvv / K_ovvv / K_ooov / K_jk / K_ik /
-    #      K_ij. The W/V/T algebra is identical to Jiang Eq 53.
-    # Estimated effort: 2-3 days.  Too much for this session — the
-    # current path (Lpq_full) is kept but the building blocks (aux
-    # masks, C_pao plumbing, build_sparse_df_arrays, build_screening_maps)
-    # are ready to wire.
+    # --- Build sparse-DF infrastructure for triple-local aux path ---
+    # Mirrors Psi4 DLPNOCCSD_T::compute_lccsd_t0: per-triple integrals
+    # are constructed by slicing pre-computed sparse arrays qij[Q],
+    # qia[Q], qab[Q] by the triple's aux_ijk/LMO_ijk/PAO_ijk domains,
+    # then applying a local J^{-1/2}.  _process_one_triple will use
+    # this path when all of {sparse_df, screening, j2c_full,
+    # lmo_aux_mask, C_pao} are available.
+    from pyscf.cc.dlpno_tccsd.local_df import (
+        build_screening_maps as _build_screen,
+        build_sparse_df_arrays as _build_sparse,
+    )
+    # Psi4/Jiang defaults for the TRIPLES stage (distinct from CCSD T_CUT_MKN=1e-3):
+    #   T_CUT_MKN_TRIPLES = 1e-2   (read_options.cc line 2573)
+    #   T_CUT_DO_TRIPLES  = 1e-2   (read_options.cc line 2575; applied to PAO domains)
+    # The triples-stage thresholds are 10× LOOSER than CCSD to keep per-triple
+    # aux/PAO domains small while not hurting (T) accuracy.
+    # Psi4 (T) thresholds — separate defaults for tight pass and (T0) prescreen.
+    # read_options.cc L2565-2575. The PRE thresholds are deliberately looser so
+    # the prescreen pass runs on a SMALLER sparse-DF infrastructure (cheap (T0)),
+    # while the tight pass on surviving triples uses the full-accuracy thresholds.
+    _T_CUT_MKN_TRIPLES     = 1e-2
+    _T_CUT_DO_TRIPLES      = 1e-2
+    _T_CUT_MKN_TRIPLES_PRE = 1e-1    # 10× looser than tight
+    _T_CUT_DO_TRIPLES_PRE  = 2e-2    # 2× looser than tight
+    _T_CUT_CLMO = 1e-3
+    _auxmol = mf.with_df.auxmol if hasattr(mf.with_df, 'auxmol') else None
+    _j2c_full = None
+    if _auxmol is not None and C_pao is not None:
+        _natm = mf.mol.natm
+        _ao_labels = mf.mol.ao_labels(fmt=False)
+        _atom_ids = np.array([lbl[0] for lbl in _ao_labels])
+        _aux_atom_ids = np.array(
+            [lbl[0] for lbl in _auxmol.ao_labels(fmt=False)])
+        _atom_to_ao = [np.where(_atom_ids == a)[0] for a in range(_natm)]
+
+        def _build_triples_infrastructure(T_CUT_MKN, T_CUT_DO, label):
+            """Build lmo_aux_mask, pao_domains, screening, and sparse_df stacks
+            at the given thresholds. Mirrors Psi4 triples_sparsity(prescreening).
+            """
+            # --- lmo_aux_mask: per-LMO Mulliken-weighted aux-atom mask ---
+            mask_rows = []
+            for ii in range(nocc_lmo):
+                c_i = C_lmo[:, ii]
+                P_i = s1e * c_i[:, None] * c_i[None, :]
+                p_diag = np.diag(P_i)
+                sum_diag = p_diag[:, None] + p_diag[None, :]
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    w_u = np.where(sum_diag > 1e-15,
+                                   p_diag[:, None] / sum_diag, 0.0)
+                    w_v = np.where(sum_diag > 1e-15,
+                                   p_diag[None, :] / sum_diag, 0.0)
+                contrib_u = P_i * w_u
+                contrib_v = P_i * w_v
+                mkn_pop = np.zeros(_natm)
+                for _a in range(_natm):
+                    mask_a = (_atom_ids == _a)
+                    mkn_pop[_a] = (np.sum(contrib_u[mask_a, :])
+                                   + np.sum(contrib_v[:, mask_a]))
+                mask_rows.append(
+                    np.isin(_aux_atom_ids,
+                            np.where(np.abs(mkn_pop) > T_CUT_MKN)[0]))
+            lmo_aux_mask = np.array(mask_rows)
+
+            # --- pao_domains: DOI > T_CUT_DO, atom-complete (triples.cc:316-329) ---
+            pao_domains = []
+            if doi_iu is not None:
+                for ii in range(nocc_lmo):
+                    doi = doi_iu[ii]
+                    pao_inds = np.where(doi > T_CUT_DO)[0]
+                    if pao_inds.size == 0:
+                        pao_inds = np.array([int(np.argmax(doi))])
+                    atoms_in = np.unique(_atom_ids[pao_inds])
+                    domain_i = np.concatenate([_atom_to_ao[a] for a in atoms_in])
+                    pao_domains.append(np.sort(domain_i))
+            else:
+                for ii in range(nocc_lmo):
+                    key_ii = (ii, ii)
+                    if (key_ii in pno_spaces
+                            and pno_spaces[key_ii].get('pair_paos') is not None):
+                        pao_domains.append(
+                            np.asarray(pno_spaces[key_ii]['pair_paos']))
+                    else:
+                        pao_domains.append(np.zeros(0, dtype=int))
+
+            _dom_sizes = [len(d) for d in pao_domains]
+            log.info('(T) [%s] T_CUT_MKN=%.1e T_CUT_DO=%.1e: '
+                     'avg PAOs/LMO=%.1f (min=%d, max=%d)', label,
+                     T_CUT_MKN, T_CUT_DO,
+                     float(np.mean(_dom_sizes)),
+                     int(min(_dom_sizes)), int(max(_dom_sizes)))
+
+            # --- screening + sparse_df + per-atom stacks ---
+            strong_pair_keys = list(t2_for_T.keys())
+            screening = _build_screen(
+                mf.mol, _auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
+                T_CUT_MKN=T_CUT_MKN, T_CUT_CLMO=_T_CUT_CLMO, C_pao=C_pao)
+            sparse_df = _build_sparse(mf.mol, _auxmol, C_lmo, C_pao, screening)
+            aux_atom_ids_arr = screening['aux_atom_ids']
+            naux_total = len(sparse_df['qij'])
+            aux_at_atom_list = [np.where(aux_atom_ids_arr == A)[0]
+                                for A in range(_natm)]
+            qij_stack = [None] * _natm
+            qia_stack = [None] * _natm
+            qab_stack = [None] * _natm
+            ri_lmos_ext = screening['riatom_to_lmos_ext']
+            ri_paos_ext = screening['riatom_to_paos_ext']
+            for A in range(_natm):
+                Qs_A = aux_at_atom_list[A]
+                if len(Qs_A) == 0:
+                    continue
+                nl_A = len(ri_lmos_ext[A])
+                np_A = len(ri_paos_ext[A])
+                if nl_A > 0:
+                    qij_stack[A] = np.stack(
+                        [sparse_df['qij'][Q] for Q in Qs_A])
+                if nl_A > 0 and np_A > 0:
+                    qia_stack[A] = np.stack(
+                        [sparse_df['qia'][Q] for Q in Qs_A])
+                if np_A > 0:
+                    qab_stack[A] = np.stack(
+                        [sparse_df['qab'][Q] for Q in Qs_A])
+            aux_pos_in_atom = -np.ones(naux_total, dtype=np.int64)
+            for A in range(_natm):
+                for pos, Q in enumerate(aux_at_atom_list[A]):
+                    aux_pos_in_atom[Q] = pos
+            sparse_df['qij_atom'] = qij_stack
+            sparse_df['qia_atom'] = qia_stack
+            sparse_df['qab_atom'] = qab_stack
+            sparse_df['aux_at_atom'] = aux_at_atom_list
+            sparse_df['aux_pos_in_atom'] = aux_pos_in_atom
+            sparse_df['aux_atom_ids'] = aux_atom_ids_arr
+            return lmo_aux_mask, pao_domains, screening, sparse_df
+
+        # Tight infrastructure (used for the final (T) pass on surviving triples).
+        _lmo_aux_mask, _pao_domains, _screening, _sparse_df = \
+            _build_triples_infrastructure(
+                _T_CUT_MKN_TRIPLES, _T_CUT_DO_TRIPLES, 'tight')
+        _j2c_full = _auxmol.intor('int2c2e')
+        _S_pao_full = C_pao.T @ s1e @ C_pao
+        _F_pao_full = C_pao.T @ fock_ao @ C_pao
+
+        # Prescreen infrastructure (used by the loose (T0) pass).
+        if T_CutTriplesWeak > 0.0:
+            _lmo_aux_mask_pre, _pao_domains_pre, _screening_pre, _sparse_df_pre = \
+                _build_triples_infrastructure(
+                    _T_CUT_MKN_TRIPLES_PRE, _T_CUT_DO_TRIPLES_PRE, 'prescreen')
+        else:
+            _lmo_aux_mask_pre = _lmo_aux_mask
+            _pao_domains_pre = _pao_domains
+            _screening_pre = _screening
+            _sparse_df_pre = _sparse_df
+    else:
+        _lmo_aux_mask = None
+        _sparse_df = None
+        _screening = None
+        _pao_domains = None
+        _lmo_aux_mask_pre = None
+        _sparse_df_pre = None
+        _screening_pre = None
+        _pao_domains_pre = None
+        _S_pao_full = None
+        _F_pao_full = None
+
+    # Diagnostic: per-triple screening tightness. naux_ijk / naux_full and
+    # len(triple_domain) / nocc tell us whether aux-Q and occupied domains
+    # are O(1) per triple (good scaling) or growing with system size (bad).
+    if valid_triples:
+        _naux_tot = _lmo_aux_mask.shape[1] if _lmo_aux_mask is not None else 0
+        _ss_aux, _ss_dom = [], []
+        for _i, _j, _k in valid_triples:
+            if _lmo_aux_mask is not None:
+                _ss_aux.append(int((_lmo_aux_mask[_i] | _lmo_aux_mask[_j]
+                                   | _lmo_aux_mask[_k]).sum()))
+            _dom = [m for m in range(nocc_lmo)
+                    if (min(m, _i), max(m, _i)) in _tT_set
+                    and (min(m, _j), max(m, _j)) in _tT_set
+                    and (min(m, _k), max(m, _k)) in _tT_set]
+            _ss_dom.append(len(_dom))
+        if _ss_aux:
+            print(f'  (T) naux_ijk: avg={np.mean(_ss_aux):.1f}/{_naux_tot} '
+                  f'({100.0*np.mean(_ss_aux)/max(_naux_tot,1):.1f}%)  '
+                  f'min={min(_ss_aux)}  max={max(_ss_aux)}',
+                  flush=True)
+        print(f'  (T) triple_domain: avg={np.mean(_ss_dom):.1f}/{nocc_lmo} '
+              f'({100.0*np.mean(_ss_dom)/max(nocc_lmo,1):.1f}%)  '
+              f'min={min(_ss_dom)}  max={max(_ss_dom)}',
+              flush=True)
 
     triple_kwargs = dict(
         pno_spaces=pno_spaces, t2_for_T=t2_for_T,
@@ -866,6 +1398,11 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
         t1_pno=t1_pno,
         T_CutTNO=T_CutTNO,
         nonneg_set=_tT_set,
+        sparse_df=_sparse_df, screening=_screening,
+        j2c_full=_j2c_full, lmo_aux_mask=_lmo_aux_mask,
+        C_pao=C_pao,
+        S_pao_full=_S_pao_full, F_pao_full=_F_pao_full,
+        pao_domains_triple=_pao_domains,
     )
 
     def _do_triple(ijk):
@@ -873,18 +1410,27 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
 
     # ------------------------------------------------------------------
     # (3) SC-MP2 (T0) prescreen to drop low-contribution triples.
-    # Psi4 does this by running (T0) with a LOOSE TNO threshold
-    # (T_CUT_TNO_PRE ~ 1e-6) first, then dropping triples with
-    # |e_ijk| < T_CUT_TRIPLES_WEAK (~ 1e-7). Surviving triples get
-    # the full (T) with the tight TNO.
+    # Psi4 (triples.cc:1296-1326) runs the prescreen on a SEPARATE sparse-DF
+    # infrastructure built with LOOSER thresholds (T_CUT_MKN_TRIPLES_PRE,
+    # T_CUT_DO_TRIPLES_PRE, T_CUT_TNO_PRE). Surviving triples are then
+    # rerun at the tight thresholds. This makes the (T0) pass genuinely
+    # cheap while preserving accuracy on the triples that matter.
     # ------------------------------------------------------------------
-    _T_CUT_TNO_PRE = max(T_CutTNO, 1e-6)
+    _T_CUT_TNO_PRE = max(T_CutTNO, 1e-7)   # Psi4 read_options.cc:2565
     _T_CUT_TRIPLES_WEAK = T_CutTriplesWeak
     e_t_screened = 0.0   # dropped-triple contribution, ADDED BACK at end
     if (len(valid_triples) > 0 and _T_CUT_TNO_PRE > T_CutTNO
             and _T_CUT_TRIPLES_WEAK > 0.0):
+        # Build kwargs for the prescreen pass: LOOSE thresholds on every
+        # axis — PAO domain, aux-Q mask, sparse-DF stacks, screening maps,
+        # and TNO cutoff. Everything else (triple-paos union, F/S matrices,
+        # t2 amplitudes) is shared with the tight pass.
         _pre_kwargs = dict(triple_kwargs)
         _pre_kwargs['T_CutTNO'] = _T_CUT_TNO_PRE
+        _pre_kwargs['sparse_df'] = _sparse_df_pre
+        _pre_kwargs['screening'] = _screening_pre
+        _pre_kwargs['lmo_aux_mask'] = _lmo_aux_mask_pre
+        _pre_kwargs['pao_domains_triple'] = _pao_domains_pre
 
         def _pre_triple(ijk):
             return _process_one_triple(ijk[0], ijk[1], ijk[2], **_pre_kwargs)
