@@ -1351,6 +1351,30 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         if ci is not None:
             K_pno_cache[key] = ci['K_iajb']
 
+    # ------------------------------------------------------------------
+    # Phase 2c of the restructure: build the canonical PairIndex once
+    # per CCSD run (previously rebuilt every cycle — wasteful and
+    # scoped too narrowly) and flatten the two per-pair (n_pno, n_pno)
+    # amplitude / integral dicts onto contiguous FlatTensorStore
+    # buffers.  Every downstream site still uses dict-style access, but
+    # the backing memory layout now matches what Phase 4's Cython
+    # kernels expect.
+    # ------------------------------------------------------------------
+    from pyscf.cc.dlpno_tccsd.pair_index import (
+        PairIndex, FlatTensorStore, assert_consistent_with_dicts,
+    )
+    _pair_index = PairIndex(
+        list(t2_pno_all.keys()), pno_spaces, pair_lmo_idx, nocc)
+    assert_consistent_with_dicts(
+        _pair_index, pno_spaces, pair_lmo_idx)
+    print(f'  [pair_index] {_pair_index!r}', flush=True)
+
+    _pair_t2_shape = lambda p: (int(_pair_index.n_pno[p]),
+                                int(_pair_index.n_pno[p]))
+    t2_pno_all = FlatTensorStore.from_dict(
+        _pair_index, t2_pno_all, shape_fn=_pair_t2_shape)
+    K_pno_cache = FlatTensorStore.from_dict(
+        _pair_index, K_pno_cache, shape_fn=_pair_t2_shape)
 
     # Pre-compute PNO overlap matrices S_pno_cache[(key_ij, key_kl)].
     #
@@ -1434,26 +1458,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         e_prev = 0.0
         import time as _time
 
-        # Phase 0 of DLPNO-restructure: build the canonical pair index.
-        # Read-only for now; later phases will migrate pair-keyed dicts
-        # (t2_pno_all, S_pno_cache, cc_ints, ovL_pno_cache, ...) onto
-        # TensorStore instances backed by this index.  See pair_index.py.
-        #
-        # NB: keys_sorted only captures strong pairs (frozen before the
-        # weak-pair extension of t2_pno_all above L1172). Downstream
-        # CCSD functions iterate t2_pno_all directly, so the PairIndex
-        # must cover the union of strong + weak pairs — hence we use
-        # list(t2_pno_all.keys()) here.
-        from pyscf.cc.dlpno_tccsd.pair_index import (
-            PairIndex, assert_consistent_with_dicts, build_t1_cache,
-        )
-        _pair_index = PairIndex(
-            list(t2_pno_all.keys()),
-            pno_spaces, pair_lmo_idx, nocc)
-        assert_consistent_with_dicts(
-            _pair_index, pno_spaces, pair_lmo_idx)
-        if boot_step == 0:
-            print(f'  [pair_index] {_pair_index!r}', flush=True)
+        # Phase 2c: _pair_index and flat t2_pno_all / K_pno_cache are
+        # already built above (outside the bootstrap loop) — just use
+        # them here.  build_t1_cache is pulled in per-cycle.
+        from pyscf.cc.dlpno_tccsd.pair_index import build_t1_cache
 
         for cycle in range(this_max):
             # Phase 1: pre-project t1 into every pair's PNO basis once
