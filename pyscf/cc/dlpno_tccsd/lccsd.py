@@ -1591,7 +1591,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 cc_ints=_cc_ints,
                 pair_lmo_idx=pair_lmo_idx, _pool=_pool,
                 S_pao_full=S_pao_full, s1e=s1e,
-                blas_threads=32)
+                blas_threads=32, omp_threads=ncores)
             from pyscf.cc.dlpno_tccsd.residual import build_D_tilde_batched
             _jiang_D = build_D_tilde_batched(
                 t1_pno, t2_pno_all, pno_spaces, nocc,
@@ -1600,7 +1600,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 cc_ints=_cc_ints,
                 pair_lmo_idx=pair_lmo_idx, _pool=_pool,
                 S_pao_full=S_pao_full, s1e=s1e,
-                t1_cache=_t1_cache)
+                t1_cache=_t1_cache, omp_threads=ncores)
             _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
                 _cc_ints, None, t1_pno, fov_pno, pno_spaces,
                 S_pno_cache, F_lmo, eps_lmo, foo_total,
@@ -1679,7 +1679,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _B_dict, _E_dict = compute_B_E_batched_v2(
                 keys_sorted, t2_pno_all, pno_spaces, S_pno_cache,
                 _cc_ints, _B_tilde_per_ij, pair_lmo_idx, nocc,
-                _pool=_pool, S_pao_full=S_pao_full, s1e=s1e)
+                _pool=_pool, S_pao_full=S_pao_full, s1e=s1e,
+                omp_threads=ncores)
             _BE_all = {'B': _B_dict, 'E': _E_dict}
             _t_be = _time.perf_counter() - _t_be0
 

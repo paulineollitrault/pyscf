@@ -6,6 +6,7 @@ dressing via explicit intermediates (B_tilde, C_tilde, D_tilde, G_tilde,
 Fab, Fkj). All integrals are BARE (computed from undressed C_lmo); T1
 enters exclusively through the dressed intermediates built here.
 """
+import contextlib
 import numpy as np
 from pyscf.ao2mo import _ao2mo
 from pyscf.cc.dlpno_tccsd.lccsd import (
@@ -14,6 +15,27 @@ from pyscf.cc.dlpno_tccsd.lccsd import (
 from pyscf.cc.dlpno_tccsd.local_df import (
     get_local_K, get_local_ovL, get_local_ooL_vec,
 )
+
+
+def _omp_threads_ctx(n_threads):
+    """Context manager that boosts OpenMP to ``n_threads`` for its scope.
+
+    The CCSD driver imports numpy / pyscf under ``OMP_NUM_THREADS=1`` so
+    that Python-pool workers each hold a single BLAS/OMP thread.  Our
+    nogil-prange Cython kernels run from the main thread (outside the
+    pool) and want every core; scoping ``user_api='openmp'`` lifts the
+    cap for the kernel call only, leaving pool workers unaffected.
+
+    ``n_threads=None`` or threadpoolctl-missing returns a no-op CM so
+    callers don't need ``if``-ladders.
+    """
+    if n_threads is None:
+        return contextlib.nullcontext()
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        return contextlib.nullcontext()
+    return threadpool_limits(limits=int(n_threads), user_api='openmp')
 
 
 def _chunked_map(pool, fn, items, chunks_per_worker=4):
@@ -564,7 +586,7 @@ def build_D_tilde_batched(
         _term2_precomputed=None, cc_ints=None,
         pair_lmo_idx=None, _pool=None,
         S_pao_full=None, s1e=None,
-        t1_cache=None):
+        t1_cache=None, omp_threads=None):
     """Drop-in replacement for ``build_D_tilde`` with Terms 3+4 batched.
 
     Phase 1 runs Terms 1 and 2 per-pair via the reference ``_process_ik``
@@ -737,28 +759,29 @@ def build_D_tilde_batched(
                 buf[slot] = v
         flat_out[n_ik] = buf
 
-    # Term 3 — same kernel as C_tilde; D_tilde's sign and L-vs-K swap
-    # are absorbed into the plan's stacked K = L.T.
-    for bucket in plan['t3']:
-        t1i = np.ascontiguousarray(
-            np.array([t1_cache[key][l] for (key, l) in bucket['t1i_keys']]))
-        T1l = np.ascontiguousarray(
-            np.array([t1_cache[key][l] for (key, l) in bucket['T1l_keys']]))
-        _t3_kern(bucket['K'], bucket['S'], t1i, T1l,
-                 bucket['item_idx'], flat_out[bucket['n_ki']])
+    with _omp_threads_ctx(omp_threads):
+        # Term 3 — same kernel as C_tilde; D_tilde's sign and L-vs-K swap
+        # are absorbed into the plan's stacked K = L.T.
+        for bucket in plan['t3']:
+            t1i = np.ascontiguousarray(
+                np.array([t1_cache[key][l] for (key, l) in bucket['t1i_keys']]))
+            T1l = np.ascontiguousarray(
+                np.array([t1_cache[key][l] for (key, l) in bucket['T1l_keys']]))
+            _t3_kern(bucket['K'], bucket['S'], t1i, T1l,
+                     bucket['item_idx'], flat_out[bucket['n_ki']])
 
-    # Term 4 — stack u_il each cycle; kernel scale=+0.5 (D_tilde sign).
-    for bucket in plan['t4']:
-        u_arr = np.empty((len(bucket['u_sources']),
-                          bucket['n_li'], bucket['n_li']))
-        for n, (key_il, transpose) in enumerate(bucket['u_sources']):
-            t2_d = (t2_pno_all[key_il].T if transpose
-                    else t2_pno_all[key_il])
-            u_arr[n] = 2.0 * t2_d - t2_d.T
-        _t4_kern(bucket['S_ki_li'], u_arr, bucket['S_li_kl'],
-                 bucket['K'], bucket['S_kl_ki'],
-                 bucket['item_idx'], flat_out[bucket['n_ki']],
-                 0.5)
+        # Term 4 — stack u_il each cycle; kernel scale=+0.5 (D_tilde sign).
+        for bucket in plan['t4']:
+            u_arr = np.empty((len(bucket['u_sources']),
+                              bucket['n_li'], bucket['n_li']))
+            for n, (key_il, transpose) in enumerate(bucket['u_sources']):
+                t2_d = (t2_pno_all[key_il].T if transpose
+                        else t2_pno_all[key_il])
+                u_arr[n] = 2.0 * t2_d - t2_d.T
+            _t4_kern(bucket['S_ki_li'], u_arr, bucket['S_li_kl'],
+                     bucket['K'], bucket['S_kl_ki'],
+                     bucket['item_idx'], flat_out[bucket['n_ki']],
+                     0.5)
 
     for n_ik, pairs in plan['pairs_by_n_ki'].items():
         buf = flat_out[n_ik]
@@ -1264,7 +1287,7 @@ def compute_C_tilde_batched(
         _term2_precomputed=None, cc_ints=None,
         pair_lmo_idx=None, _pool=None,
         S_pao_full=None, s1e=None,
-        blas_threads=32):
+        blas_threads=32, omp_threads=None):
     """Drop-in replacement for compute_C_tilde with Terms 3+4 batched.
 
     Signature matches compute_C_tilde exactly plus one kwarg
@@ -1456,34 +1479,35 @@ def compute_C_tilde_batched(
     _pt['t3_gather'] = 0.0; _pt['t3_kern'] = 0.0
     _pt['t4_gather'] = 0.0; _pt['t4_kern'] = 0.0
 
-    # ----- Term 3 via Cython kernel -----
-    for bucket in plan['t3']:
-        _tg = _time_dbg.perf_counter()
-        t1i = np.ascontiguousarray(
-            np.array([T1_cache[key] for key in bucket['t1i_keys']]))
-        T1l = np.ascontiguousarray(
-            np.array([T1_cache[key] for key in bucket['T1l_keys']]))
-        _pt['t3_gather'] += _time_dbg.perf_counter() - _tg
+    with _omp_threads_ctx(omp_threads):
+        # ----- Term 3 via Cython kernel -----
+        for bucket in plan['t3']:
+            _tg = _time_dbg.perf_counter()
+            t1i = np.ascontiguousarray(
+                np.array([T1_cache[key] for key in bucket['t1i_keys']]))
+            T1l = np.ascontiguousarray(
+                np.array([T1_cache[key] for key in bucket['T1l_keys']]))
+            _pt['t3_gather'] += _time_dbg.perf_counter() - _tg
 
-        _tn = _time_dbg.perf_counter()
-        _t3_kern(bucket['K'], bucket['S'], t1i, T1l,
-                 bucket['item_idx'], flat_out[bucket['n_ki']])
-        _pt['t3_kern'] += _time_dbg.perf_counter() - _tn
+            _tn = _time_dbg.perf_counter()
+            _t3_kern(bucket['K'], bucket['S'], t1i, T1l,
+                     bucket['item_idx'], flat_out[bucket['n_ki']])
+            _pt['t3_kern'] += _time_dbg.perf_counter() - _tn
 
-    # ----- Term 4 via Cython kernel -----
-    for bucket in plan['t4']:
-        _tg = _time_dbg.perf_counter()
-        t2_arr = np.ascontiguousarray(np.array([
-            (t2_pno_all[k_].T if tr else t2_pno_all[k_])
-            for (k_, tr) in bucket['t2_sources']
-        ]))
-        _pt['t4_gather'] += _time_dbg.perf_counter() - _tg
+        # ----- Term 4 via Cython kernel -----
+        for bucket in plan['t4']:
+            _tg = _time_dbg.perf_counter()
+            t2_arr = np.ascontiguousarray(np.array([
+                (t2_pno_all[k_].T if tr else t2_pno_all[k_])
+                for (k_, tr) in bucket['t2_sources']
+            ]))
+            _pt['t4_gather'] += _time_dbg.perf_counter() - _tg
 
-        _tn = _time_dbg.perf_counter()
-        _t4_kern(bucket['S_ki_li'], t2_arr, bucket['S_li_kl'],
-                 bucket['K'], bucket['S_kl_ki'],
-                 bucket['item_idx'], flat_out[bucket['n_ki']])
-        _pt['t4_kern'] += _time_dbg.perf_counter() - _tn
+            _tn = _time_dbg.perf_counter()
+            _t4_kern(bucket['S_ki_li'], t2_arr, bucket['S_li_kl'],
+                     bucket['K'], bucket['S_kl_ki'],
+                     bucket['item_idx'], flat_out[bucket['n_ki']])
+            _pt['t4_kern'] += _time_dbg.perf_counter() - _tn
 
     # Unpack flat_out back into C_tilde_all dict.
     _t_unpack = _time_dbg.perf_counter()
@@ -1907,7 +1931,7 @@ def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
 def compute_B_E_batched_v2(
         strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
         cc_ints, B_tilde_per_ij, pair_lmo_idx, nocc, _pool=None,
-        S_pao_full=None, s1e=None):
+        S_pao_full=None, s1e=None, omp_threads=None):
     """Plan-cached + Cython-kernel rewrite of ``compute_B_E_batched``.
 
     Same signature, same output semantics (B_all, E_all dicts keyed by
@@ -1948,23 +1972,27 @@ def compute_B_E_batched_v2(
         flat_E[n_ij] = np.zeros((len(pairs), n_ij, n_ij))
 
     # Per-cycle gather + kernel dispatch, one bucket at a time.
-    for bucket in plan['buckets']:
-        n_ij = bucket['n_ij']
-        n_kl = bucket['n_kl']
-        N = len(bucket['kl_keys'])
-        T_arr = np.empty((N, n_kl, n_kl))
-        beta_kl_arr = np.empty(N)
-        beta_lk_arr = np.empty(N)
-        for n in range(N):
-            T_arr[n] = t2_pno_all[bucket['kl_keys'][n]]
-            key_ij, k, l = bucket['beta_coords'][n]
-            B_tilde = B_tilde_per_ij[key_ij]
-            beta_kl_arr[n] = B_tilde[k, l]
-            beta_lk_arr[n] = 0.0 if k == l else B_tilde[l, k]
-        be_kernel(bucket['S'], T_arr, bucket['K'],
-                  beta_kl_arr, beta_lk_arr, bucket['same'],
-                  bucket['item_idx'],
-                  flat_B[n_ij], flat_E[n_ij])
+    # Scope OpenMP to ``omp_threads`` so the nogil prange inside be_kernel
+    # actually runs in parallel (the CCSD driver caps OMP=1 at import time
+    # so that Python-pool workers stay on 1 BLAS thread each).
+    with _omp_threads_ctx(omp_threads):
+        for bucket in plan['buckets']:
+            n_ij = bucket['n_ij']
+            n_kl = bucket['n_kl']
+            N = len(bucket['kl_keys'])
+            T_arr = np.empty((N, n_kl, n_kl))
+            beta_kl_arr = np.empty(N)
+            beta_lk_arr = np.empty(N)
+            for n in range(N):
+                T_arr[n] = t2_pno_all[bucket['kl_keys'][n]]
+                key_ij, k, l = bucket['beta_coords'][n]
+                B_tilde = B_tilde_per_ij[key_ij]
+                beta_kl_arr[n] = B_tilde[k, l]
+                beta_lk_arr[n] = 0.0 if k == l else B_tilde[l, k]
+            be_kernel(bucket['S'], T_arr, bucket['K'],
+                      beta_kl_arr, beta_lk_arr, bucket['same'],
+                      bucket['item_idx'],
+                      flat_B[n_ij], flat_E[n_ij])
 
     # Unpack flat outputs into dicts keyed by strong pair.
     B_all = {}
