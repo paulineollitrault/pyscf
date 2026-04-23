@@ -1422,6 +1422,21 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
 
         e_prev = 0.0
         import time as _time
+
+        # Phase 0 of DLPNO-restructure: build the canonical pair index.
+        # Read-only for now; later phases will migrate pair-keyed dicts
+        # (t2_pno_all, S_pno_cache, cc_ints, ovL_pno_cache, ...) onto
+        # TensorStore instances backed by this index.  See pair_index.py.
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            PairIndex, assert_consistent_with_dicts,
+        )
+        _pair_index = PairIndex(
+            keys_sorted, pno_spaces, pair_lmo_idx, nocc)
+        assert_consistent_with_dicts(
+            _pair_index, pno_spaces, pair_lmo_idx)
+        if boot_step == 0:
+            print(f'  [pair_index] {_pair_index!r}', flush=True)
+
         for cycle in range(this_max):
             _t_cycle_start = _time.perf_counter()
             t2_new = {}
