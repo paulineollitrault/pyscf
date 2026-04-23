@@ -140,6 +140,202 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
     return G
 
 
+# =========================================================================
+# G-term (Eq 81 Fock-oo coupling in T2 residual) — batched across pairs
+# =========================================================================
+
+def _build_g_term_plan(strong_keys, pno_spaces, pair_lmo_idx,
+                      t2_pno_all, S_pno_cache, nocc):
+    """One-time plan for compute_G_term_batched.
+
+    Enumerates every (ij, k) item — ij ∈ strong_keys, k ∈ ij's LMO
+    domain, both (i,k) and (j,k) partner pairs existing in t2_pno_all.
+    Buckets items by ``(n_ij, n_ik)`` so each bucket is a uniform
+    batched matmul.
+
+    Plan is iteration-independent: t2 values change each cycle, but S,
+    bucket assignments, and scatter indices are static.  Built once per
+    CCSD run, reused every cycle.
+    """
+    # Output slots: one per strong ij, grouped by n_ij.
+    pairs_by_n_ij = {}
+    pair_to_slot = {}
+    for key_ij in strong_keys:
+        n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
+        if n_ij == 0:
+            continue
+        pairs_by_n_ij.setdefault(n_ij, []).append(key_ij)
+        pair_to_slot[key_ij] = len(pairs_by_n_ij[n_ij]) - 1
+
+    # Collect items per side.  Each item: (key_ij, key_pk, k, side,
+    # scalar_other_lmo, transpose_flag, n_ij, n_pk, S, pair_slot).
+    # side = 0 -> ik direction (G_ij), side = 1 -> jk direction (G_ji).
+    items_ik_by_shape = {}
+    items_jk_by_shape = {}
+
+    for key_ij in strong_keys:
+        i, j = key_ij
+        n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
+        if n_ij == 0:
+            continue
+        domain = (set(int(x) for x in pair_lmo_idx[key_ij])
+                  if pair_lmo_idx is not None and key_ij in pair_lmo_idx
+                  else set(range(nocc)))
+        slot = pair_to_slot[key_ij]
+        for k in domain:
+            # IK direction: contributes to G_ij
+            key_ik = (min(i, k), max(i, k))
+            if key_ik in t2_pno_all:
+                t2_ik = t2_pno_all[key_ik]
+                n_ik = t2_ik.shape[0]
+                if n_ik > 0:
+                    S_ij_ik = S_pno_cache.get((key_ij, key_ik))
+                    if S_ij_ik is not None:
+                        items_ik_by_shape.setdefault(
+                            (n_ij, n_ik), []).append((
+                                key_ik, key_ij, i > k, j, slot, S_ij_ik))
+            # JK direction: contributes to G_ji
+            key_jk = (min(j, k), max(j, k))
+            if key_jk in t2_pno_all:
+                t2_jk = t2_pno_all[key_jk]
+                n_jk = t2_jk.shape[0]
+                if n_jk > 0:
+                    S_ij_jk = S_pno_cache.get((key_ij, key_jk))
+                    if S_ij_jk is not None:
+                        items_jk_by_shape.setdefault(
+                            (n_ij, n_jk), []).append((
+                                key_jk, key_ij, j > k, i, slot, S_ij_jk))
+
+    def _stack_buckets(items_by_shape, side):
+        buckets = []
+        for (n_ij, n_ik), items in items_by_shape.items():
+            N = len(items)
+            t2_keys = [it[0] for it in items]
+            t2_transp = np.array([it[2] for it in items], dtype=np.bool_)
+            scalar_lmo = np.array([it[3] for it in items], dtype=np.intp)
+            item_idx = np.array([it[4] for it in items], dtype=np.intp)
+            S_arr = np.empty((N, n_ij, n_ik))
+            for n, it in enumerate(items):
+                S_arr[n] = it[5]
+            # Pre-compute which ks matter for gathering G_tilde rows.
+            # The actual G_tilde index for item n is (k, other_lmo).
+            # Store k per item too (extracted from key_ik).
+            k_idx = np.empty(N, dtype=np.intp)
+            for n, it in enumerate(items):
+                key_pk = it[0]  # (min(i,k), max(i,k)) or (min(j,k), max(j,k))
+                key_ij = it[1]
+                i_or_j = key_ij[0] if side == 0 else key_ij[1]
+                k_idx[n] = key_pk[1] if key_pk[0] == i_or_j else key_pk[0]
+            buckets.append({
+                'n_ij': n_ij, 'n_ik': n_ik,
+                'S_arr': S_arr,
+                't2_keys': t2_keys,
+                't2_transp': t2_transp,
+                'scalar_lmo': scalar_lmo,   # j for ik-side, i for jk-side
+                'k_idx': k_idx,
+                'item_idx': item_idx,
+            })
+        return buckets
+
+    ik_buckets = _stack_buckets(items_ik_by_shape, side=0)
+    jk_buckets = _stack_buckets(items_jk_by_shape, side=1)
+    return {
+        'ik_buckets': ik_buckets,
+        'jk_buckets': jk_buckets,
+        'pairs_by_n_ij': pairs_by_n_ij,
+        'pair_to_slot': pair_to_slot,
+    }
+
+
+def compute_G_term_batched(strong_keys, t2_pno_all, pno_spaces,
+                          S_pno_cache, G_tilde, pair_lmo_idx, nocc,
+                          S_pao_full=None, s1e=None, _pool=None):
+    """Batched per-pair G_term (T2 residual Eq 81 Fock-oo coupling).
+
+    Replaces the per-k inner loop inside compute_residual_v2 with one
+    batched matmul per (n_ij, n_ik) shape bucket across all strong
+    pairs.  Plan is built once per CCSD run (structure only depends on
+    pair domains + PNO shapes) and cached as a function attribute.
+
+    With a ``_pool``, buckets are processed in parallel (each task does
+    one bucket's batched matmul with 1-thread BLAS — matches the rest of
+    the CCSD driver's threading strategy).  Without a pool, serial.
+
+    Returns: dict {key_ij: G_term (n_ij, n_ij) np.ndarray}
+    """
+    plan_key = tuple(sorted(t2_pno_all.keys()))
+    _cache = getattr(compute_G_term_batched, '_plan_cache', None)
+    if _cache is None:
+        _cache = {}
+        compute_G_term_batched._plan_cache = _cache
+    plan = _cache.get(plan_key)
+    if plan is None:
+        plan = _build_g_term_plan(
+            strong_keys, pno_spaces, pair_lmo_idx,
+            t2_pno_all, S_pno_cache, nocc)
+        _cache[plan_key] = plan
+
+    # Flat output: one (n_pairs_in_n_ij, n_ij, n_ij) buffer per n_ij.
+    flat_G_ij = {}
+    flat_G_ji = {}
+    for n_ij, pairs in plan['pairs_by_n_ij'].items():
+        shp = (len(pairs), n_ij, n_ij)
+        flat_G_ij[n_ij] = np.zeros(shp)
+        flat_G_ji[n_ij] = np.zeros(shp)
+
+    def _bucket_result(bucket):
+        """Compute one bucket's batched contraction, returning the
+        scaled (N, n_ij, n_ij) result ready for scatter-add."""
+        n_ij = bucket['n_ij']
+        n_ik = bucket['n_ik']
+        S_arr = bucket['S_arr']                # (N, n_ij, n_ik)
+        t2_keys = bucket['t2_keys']
+        t2_transp = bucket['t2_transp']
+        scalar_lmo = bucket['scalar_lmo']
+        k_idx = bucket['k_idx']
+        N = len(t2_keys)
+
+        t2_arr = np.empty((N, n_ik, n_ik))
+        for n in range(N):
+            v = t2_pno_all[t2_keys[n]]
+            t2_arr[n] = v.T if t2_transp[n] else v
+
+        scalars = G_tilde[k_idx, scalar_lmo]
+
+        tmp = np.matmul(S_arr, t2_arr)                 # (N, n_ij, n_ik)
+        out_batch = np.matmul(tmp, S_arr.swapaxes(1, 2))
+        out_batch *= scalars[:, None, None]
+        return out_batch
+
+    def _process_buckets(buckets, flat_out):
+        # Parallel per-bucket compute (pool workers release the GIL
+        # inside numpy matmul), serial scatter-add (np.add.at isn't
+        # thread-safe across different output buffers anyway).
+        if _pool is not None and len(buckets) > 1:
+            results = list(_pool.map(_bucket_result, buckets))
+        else:
+            results = [_bucket_result(b) for b in buckets]
+        for bucket, out_batch in zip(buckets, results):
+            buf = flat_out[bucket['n_ij']]
+            np.add.at(buf, bucket['item_idx'], -out_batch)
+
+    _process_buckets(plan['ik_buckets'], flat_G_ij)
+    _process_buckets(plan['jk_buckets'], flat_G_ji)
+
+    # Unpack back into dict {key_ij: G_term}.  G_term = G_ij + G_ji.T
+    G_term_all = {}
+    for n_ij, pairs in plan['pairs_by_n_ij'].items():
+        G_ij_buf = flat_G_ij[n_ij]
+        G_ji_buf = flat_G_ji[n_ij]
+        for slot, key_ij in enumerate(pairs):
+            G_term_all[key_ij] = (
+                G_ij_buf[slot] + G_ji_buf[slot].T)
+    # Pairs with zero n_ij or no items: return an empty array.
+    for key_ij in strong_keys:
+        if key_ij not in G_term_all:
+            n_ij_ = pno_spaces[key_ij]['C_pno'].shape[1]
+            G_term_all[key_ij] = np.zeros((n_ij_, n_ij_))
+    return G_term_all
 
 
 
@@ -2516,6 +2712,7 @@ def compute_residual_v2(
         E_contrib_override=None,
         C_term_override=None,
         D_term_override=None,
+        G_term_override=None,
         S_pao_full=None,
         t1_cache=None,
 ):
@@ -2849,24 +3046,27 @@ def compute_residual_v2(
     # Psi4 restricts the k sum to lmopair_to_lmos_[ij]; doing so here
     # makes the S_pno_cache restriction self-consistent (no lookups for
     # k outside domain) and matches Psi4's formula.
-    G_ij = np.zeros((n_pno, n_pno))
-    G_ji = np.zeros((n_pno, n_pno))
-    for k in sorted(_domain_set):
-        key_ik = (min(i, k), max(i, k))
-        key_jk = (min(j, k), max(j, k))
-        if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
-            t2_ik_raw = t2_pno_all[key_ik]
-            if t2_ik_raw.shape[0] > 0:
-                t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
-                S_ij_ik = _get_S(key_ik)
-                G_ij -= (S_ij_ik @ t2_ik @ S_ij_ik.T) * G_tilde[k, j]
-        if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
-            t2_jk_raw = t2_pno_all[key_jk]
-            if t2_jk_raw.shape[0] > 0:
-                t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
-                S_ij_jk = _get_S(key_jk)
-                G_ji -= (S_ij_jk @ t2_jk @ S_ij_jk.T) * G_tilde[k, i]
-    G_term = G_ij + G_ji.T
+    if G_term_override is not None:
+        G_term = G_term_override
+    else:
+        G_ij = np.zeros((n_pno, n_pno))
+        G_ji = np.zeros((n_pno, n_pno))
+        for k in sorted(_domain_set):
+            key_ik = (min(i, k), max(i, k))
+            key_jk = (min(j, k), max(j, k))
+            if key_ik in t2_pno_all and t2_pno_all[key_ik] is not None:
+                t2_ik_raw = t2_pno_all[key_ik]
+                if t2_ik_raw.shape[0] > 0:
+                    t2_ik = t2_ik_raw.T if i > k else t2_ik_raw
+                    S_ij_ik = _get_S(key_ik)
+                    G_ij -= (S_ij_ik @ t2_ik @ S_ij_ik.T) * G_tilde[k, j]
+            if key_jk in t2_pno_all and t2_pno_all[key_jk] is not None:
+                t2_jk_raw = t2_pno_all[key_jk]
+                if t2_jk_raw.shape[0] > 0:
+                    t2_jk = t2_jk_raw.T if j > k else t2_jk_raw
+                    S_ij_jk = _get_S(key_jk)
+                    G_ji -= (S_ij_jk @ t2_jk @ S_ij_jk.T) * G_tilde[k, i]
+        G_term = G_ij + G_ji.T
     Rn_ij += G_term
     _pt['G'] = _time.perf_counter() - _t0
 

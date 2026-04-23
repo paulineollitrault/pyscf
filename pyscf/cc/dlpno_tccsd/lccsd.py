@@ -1713,6 +1713,24 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 S_pao_full=S_pao_full, s1e=s1e, omp_threads=ncores)
             _t_cd = _time.perf_counter() - _t_cd0
 
+            # Batched G_term: moved out of per-pair residual (profile
+            # showed the per-k inner loop in compute_residual_v2 was
+            # 9s CPU/iter at water10, ~82% of residual CPU).  Building
+            # a single plan bucketed by (n_ij, n_ik) across all strong
+            # pairs turns ~30 small matmuls per pair per iter into a
+            # handful of large batched matmuls.  Plan is cached across
+            # iterations (static structure).
+            from pyscf.cc.dlpno_tccsd.residual import compute_G_term_batched
+            _t_g0 = _time.perf_counter()
+            _G_term_all = compute_G_term_batched(
+                keys_sorted, t2_pno_all, pno_spaces, S_pno_cache,
+                (_local_df_G if _local_df_G is not None
+                 else jc['G_tilde']),
+                pair_lmo_idx, nocc,
+                S_pao_full=S_pao_full, s1e=s1e,
+                _pool=_pool)
+            _t_g = _time.perf_counter() - _t_g0
+
             # Accumulator for per-pair timing (thread-safe via list append)
             _pair_timings = {'fab': [], 'resid': [], 'btilde': []}
 
@@ -1830,6 +1848,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                          if _BE_all is not None else None),
                     C_term_override=_C_term_all.get(key),
                     D_term_override=_D_term_all.get(key),
+                    G_term_override=_G_term_all.get(key),
                     S_pao_full=S_pao_full,
                     t1_cache=_t1_cache)
                 _pair_timings['resid'].append(
