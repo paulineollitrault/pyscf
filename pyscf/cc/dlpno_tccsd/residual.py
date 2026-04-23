@@ -2424,7 +2424,11 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
                             })
 
     # --- Stack each bucket's constants into contiguous 3D arrays ---
-    def _pack_c(items, n_pno, n_ct, n_other):
+    # Bucket key is (shape, side) so that at runtime every bucket is
+    # homogeneous and we can hand it straight to the Cython kernel
+    # without the old mask + ascontiguousarray(sel) split pass.  Items
+    # are partitioned by ``it['side']`` (0 = ij, 1 = ji) before packing.
+    def _pack_c(items, n_pno, n_ct, n_other, side):
         N = len(items)
         S_big = np.empty((N, n_pno, n_ct))
         S_mid = np.empty((N, n_ct, n_other))
@@ -2433,9 +2437,7 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         ct_keys = [None] * N
         t2_keys = [None] * N
         t2_trans = np.empty(N, dtype=np.uint8)
-        item_idx_ij = np.empty(N, dtype=np.intp)   # flat slot for C_ij
-        item_idx_ji = np.empty(N, dtype=np.intp)   # flat slot for C_ji
-        side_flag = np.empty(N, dtype=np.uint8)    # 0=ij, 1=ji
+        item_idx = np.empty(N, dtype=np.intp)
         for n, it in enumerate(items):
             S_big[n] = it['S_big']
             S_mid[n] = it['S_mid']
@@ -2444,25 +2446,17 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
             ct_keys[n] = it['ct_key']
             t2_keys[n] = it['t2_key']
             t2_trans[n] = 1 if it['t2_transpose'] else 0
-            slot = pair_to_slot[it['key_ij']]
-            if it['side'] == 'ij':
-                item_idx_ij[n] = slot
-                item_idx_ji[n] = -1
-                side_flag[n] = 0
-            else:
-                item_idx_ij[n] = -1
-                item_idx_ji[n] = slot
-                side_flag[n] = 1
+            item_idx[n] = pair_to_slot[it['key_ij']]
         return {
             'n_pno': n_pno, 'n_ct': n_ct, 'n_other': n_other,
+            'side': side,
             'S_big': S_big, 'S_mid': S_mid, 'S_outer': S_outer,
             'J_bold': J_bold,
             'ct_keys': ct_keys, 't2_keys': t2_keys, 't2_trans': t2_trans,
-            'item_idx_ij': item_idx_ij, 'item_idx_ji': item_idx_ji,
-            'side_flag': side_flag,
+            'item_idx': item_idx,
         }
 
-    def _pack_d(items, n_pno, n_A, n_B):
+    def _pack_d(items, n_pno, n_A, n_B, side):
         N = len(items)
         S_a = np.empty((N, n_pno, n_A))
         S_b = np.empty((N, n_A, n_B))
@@ -2471,9 +2465,7 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         dt_keys = [None] * N
         t2_keys = [None] * N
         t2_trans = np.empty(N, dtype=np.uint8)
-        item_idx_ij = np.empty(N, dtype=np.intp)
-        item_idx_ji = np.empty(N, dtype=np.intp)
-        side_flag = np.empty(N, dtype=np.uint8)
+        item_idx = np.empty(N, dtype=np.intp)
         for n, it in enumerate(items):
             S_a[n] = it['S_a']
             S_b[n] = it['S_b']
@@ -2482,27 +2474,35 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
             dt_keys[n] = it['dt_key']
             t2_keys[n] = it['t2_key']
             t2_trans[n] = 1 if it['t2_transpose'] else 0
-            slot = pair_to_slot[it['key_ij']]
-            if it['side'] == 'ij':
-                item_idx_ij[n] = slot
-                item_idx_ji[n] = -1
-                side_flag[n] = 0
-            else:
-                item_idx_ij[n] = -1
-                item_idx_ji[n] = slot
-                side_flag[n] = 1
+            item_idx[n] = pair_to_slot[it['key_ij']]
         return {
             'n_pno': n_pno, 'n_A': n_A, 'n_B': n_B,
+            'side': side,
             'S_a': S_a, 'S_b': S_b, 'S_c': S_c, 'KJ': KJ,
             'dt_keys': dt_keys, 't2_keys': t2_keys, 't2_trans': t2_trans,
-            'item_idx_ij': item_idx_ij, 'item_idx_ji': item_idx_ji,
-            'side_flag': side_flag,
+            'item_idx': item_idx,
         }
 
-    c_buckets = [_pack_c(items, *shape)
-                 for shape, items in c_items_by_shape.items()]
-    d_buckets = [_pack_d(items, *shape)
-                 for shape, items in d_items_by_shape.items()]
+    def _split_by_side(items):
+        ij = [it for it in items if it['side'] == 'ij']
+        ji = [it for it in items if it['side'] == 'ji']
+        return ij, ji
+
+    c_buckets = []
+    for shape, items in c_items_by_shape.items():
+        ij_items, ji_items = _split_by_side(items)
+        if ij_items:
+            c_buckets.append(_pack_c(ij_items, *shape, side=0))
+        if ji_items:
+            c_buckets.append(_pack_c(ji_items, *shape, side=1))
+
+    d_buckets = []
+    for shape, items in d_items_by_shape.items():
+        ij_items, ji_items = _split_by_side(items)
+        if ij_items:
+            d_buckets.append(_pack_d(ij_items, *shape, side=0))
+        if ji_items:
+            d_buckets.append(_pack_d(ji_items, *shape, side=1))
 
     return {
         'c_buckets': c_buckets, 'd_buckets': d_buckets,
@@ -2561,66 +2561,40 @@ def compute_CD_terms_batched(
         flat_D_ji[n_pno] = np.zeros(shp)
 
     with _omp_threads_ctx(omp_threads):
-        # --- C kernel, one call per (n_pno, n_ct, n_other) bucket ---
+        # --- C kernel, one call per (n_pno, n_ct, n_other, side) bucket ---
+        # Buckets are pre-split by side in _build_cd_plan; no per-cycle
+        # masking or np.ascontiguousarray(sel) copy required.
         for bucket in plan['c_buckets']:
             n_pno = bucket['n_pno']
             n_ct = bucket['n_ct']
             n_other = bucket['n_other']
             N = len(bucket['ct_keys'])
-            # Gather ct (per-cycle): zero-fill when absent.
             ct_arr = np.zeros((N, n_ct, n_ct))
             for n, ck in enumerate(bucket['ct_keys']):
                 ct_val = C_tilde_cache.get(ck) if C_tilde_cache else None
                 if ct_val is not None and ct_val.shape[0] == n_ct:
                     ct_arr[n] = ct_val
-            # Gather t2 (per-cycle).
             t2_arr = np.empty((N, n_other, n_other))
             for n in range(N):
                 t2 = t2_pno_all[bucket['t2_keys'][n]]
                 t2_arr[n] = t2.T if bucket['t2_trans'][n] else t2
+            out_flat = flat_C_ij[n_pno] if bucket['side'] == 0 else flat_C_ji[n_pno]
+            c_kernel(
+                bucket['S_big'], ct_arr, bucket['S_mid'],
+                bucket['J_bold'], t2_arr, bucket['S_outer'],
+                bucket['item_idx'], out_flat)
 
-            # Run C kernel for ij-side items on flat_C_ij, then ji-side
-            # items on flat_C_ji.  Splitting keeps the scatter targets
-            # correct without adding branches inside the kernel.
-            side = bucket['side_flag']
-            ij_mask = side == 0
-            ji_mask = side == 1
-            if ij_mask.any():
-                sel = np.where(ij_mask)[0]
-                c_kernel(
-                    np.ascontiguousarray(bucket['S_big'][sel]),
-                    np.ascontiguousarray(ct_arr[sel]),
-                    np.ascontiguousarray(bucket['S_mid'][sel]),
-                    np.ascontiguousarray(bucket['J_bold'][sel]),
-                    np.ascontiguousarray(t2_arr[sel]),
-                    np.ascontiguousarray(bucket['S_outer'][sel]),
-                    np.ascontiguousarray(bucket['item_idx_ij'][sel]),
-                    flat_C_ij[n_pno])
-            if ji_mask.any():
-                sel = np.where(ji_mask)[0]
-                c_kernel(
-                    np.ascontiguousarray(bucket['S_big'][sel]),
-                    np.ascontiguousarray(ct_arr[sel]),
-                    np.ascontiguousarray(bucket['S_mid'][sel]),
-                    np.ascontiguousarray(bucket['J_bold'][sel]),
-                    np.ascontiguousarray(t2_arr[sel]),
-                    np.ascontiguousarray(bucket['S_outer'][sel]),
-                    np.ascontiguousarray(bucket['item_idx_ji'][sel]),
-                    flat_C_ji[n_pno])
-
-        # --- D kernel, one call per (n_pno, n_A, n_B) bucket ---
+        # --- D kernel, one call per (n_pno, n_A, n_B, side) bucket ---
         for bucket in plan['d_buckets']:
             n_pno = bucket['n_pno']
             n_A = bucket['n_A']
             n_B = bucket['n_B']
             N = len(bucket['dt_keys'])
-            # Gather t2 and build u = 2 t2 - t2.T.
             u_arr = np.empty((N, n_A, n_A))
             for n in range(N):
                 t2 = t2_pno_all[bucket['t2_keys'][n]]
                 t2_d = t2.T if bucket['t2_trans'][n] else t2
                 u_arr[n] = 2.0 * t2_d - t2_d.T
-            # Gather dt (per-cycle); zero-fill when absent.
             dt_arr = np.zeros((N, n_B, n_B))
             for n, dk in enumerate(bucket['dt_keys']):
                 if dk is None or D_tilde_cache is None:
@@ -2628,34 +2602,12 @@ def compute_CD_terms_batched(
                 dt_val = D_tilde_cache.get(dk)
                 if dt_val is not None and dt_val.shape[0] == n_B:
                     dt_arr[n] = dt_val
-
-            side = bucket['side_flag']
-            ij_mask = side == 0
-            ji_mask = side == 1
-            if ij_mask.any():
-                sel = np.where(ij_mask)[0]
-                d_kernel(
-                    np.ascontiguousarray(bucket['S_a'][sel]),
-                    np.ascontiguousarray(u_arr[sel]),
-                    np.ascontiguousarray(bucket['S_b'][sel]),
-                    np.ascontiguousarray(bucket['S_c'][sel]),
-                    np.ascontiguousarray(dt_arr[sel]),
-                    np.ascontiguousarray(bucket['KJ'][sel]),
-                    np.ascontiguousarray(bucket['item_idx_ij'][sel]),
-                    flat_D_ij[n_pno],
-                    0.5)
-            if ji_mask.any():
-                sel = np.where(ji_mask)[0]
-                d_kernel(
-                    np.ascontiguousarray(bucket['S_a'][sel]),
-                    np.ascontiguousarray(u_arr[sel]),
-                    np.ascontiguousarray(bucket['S_b'][sel]),
-                    np.ascontiguousarray(bucket['S_c'][sel]),
-                    np.ascontiguousarray(dt_arr[sel]),
-                    np.ascontiguousarray(bucket['KJ'][sel]),
-                    np.ascontiguousarray(bucket['item_idx_ji'][sel]),
-                    flat_D_ji[n_pno],
-                    0.5)
+            out_flat = flat_D_ij[n_pno] if bucket['side'] == 0 else flat_D_ji[n_pno]
+            d_kernel(
+                bucket['S_a'], u_arr, bucket['S_b'],
+                bucket['S_c'], dt_arr, bucket['KJ'],
+                bucket['item_idx'], out_flat,
+                0.5)
 
     # --- Assemble final C_term and D_term dicts, keyed by strong pair ---
     C_term = {}
