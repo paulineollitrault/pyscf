@@ -731,6 +731,104 @@ def build_t1_cache(
 
 
 # ----------------------------------------------------------------------
+# cc_ints flattening — Phase 2e of the restructure.
+# ----------------------------------------------------------------------
+# Per-pair DF / exchange integrals start life as nested dicts of
+# ndarrays (see ``local_df.compute_cc_integrals_sparse``).  Phase 2e
+# replaces each tensor field's per-pair ndarray with a view into one
+# shared ``FlatTensorStore`` backing buffer.  The dict structure of
+# ``cc_ints`` is preserved so existing Python callers work unchanged,
+# but the underlying memory is now contiguous across pairs — which is
+# what Phase 4's Cython kernels need.
+#
+# Only the 12 fields with uniform rank across pairs are flattened:
+#
+#   Rank 3: Qab (n_local, n_pno, n_pno), Qma (n_local, nocc, n_pno)
+#   Rank 2: i_Qa, j_Qa (n_local, n_pno);  i_Qk, j_Qk (n_local, nocc);
+#           K_iajb, J_ijab (n_pno, n_pno); K_mnij (nocc, nocc);
+#           K_bar_chem, K_bar_ij, K_bar_ji (nocc, n_pno).
+#
+# Left untouched (kept as normal dict entries):
+#
+#   - Scalars / small metadata: n_local, aux_idx, p_lmos, p_lmos_dense.
+#   - Nested dicts with composite (pair, k) keys: J_ij_kj, K_ij_kj,
+#     J_ji_ki, K_ji_ki.  Flattening them requires per-(pair, k)
+#     indexing; deferred — they're small and accessed in few sites.
+# ----------------------------------------------------------------------
+_CC_INTS_FLAT_FIELDS_3D = ("Qab", "Qma")
+_CC_INTS_FLAT_FIELDS_2D = (
+    "i_Qa", "j_Qa", "i_Qk", "j_Qk",
+    "K_iajb", "K_mnij", "K_bar_ij", "K_bar_ji", "K_bar_chem", "J_ijab",
+)
+
+
+def flatten_cc_ints_fields(cc_ints, pair_index):
+    """Replace per-pair tensor fields in ``cc_ints`` with flat-buffer views.
+
+    For each of the 12 tensor fields listed above, build one
+    ``FlatTensorStore`` holding that field's data for every pair in a
+    single contiguous buffer.  Each ``cc_ints[pair][field]`` is then
+    overwritten with ``store.at(pair_idx)`` — a view into the shared
+    buffer — so the original per-pair ndarray can be garbage-collected.
+
+    The ``cc_ints`` dict is mutated in place.  Nested dicts, scalars,
+    and metadata fields are left untouched.
+
+    Parameters
+    ----------
+    cc_ints : dict
+        ``{pair_key: per_pair_dict | None}`` as produced by
+        ``compute_cc_integrals_sparse``.
+    pair_index : PairIndex
+
+    Returns
+    -------
+    dict[field_name, FlatTensorStore]
+        For each flattened field, the shared flat store exposing
+        ``.buffer`` / ``.offsets`` / ``.shapes`` for Cython consumers.
+    """
+    # Precompute the set of pair keys whose entry is present and non-None,
+    # indexed by canonical pair_idx.  Missing / None pairs get
+    # zero-shaped slots in the flat buffer.
+    flat_stores = {}
+
+    for rank, field_list in (
+        (3, _CC_INTS_FLAT_FIELDS_3D),
+        (2, _CC_INTS_FLAT_FIELDS_2D),
+    ):
+        zero_shape = (0,) * rank
+        for field in field_list:
+            def shape_fn(p, field=field, zero_shape=zero_shape):
+                key = pair_index.canonical_keys[p]
+                entry = cc_ints.get(key)
+                if entry is None:
+                    return zero_shape
+                arr = entry.get(field)
+                if arr is None:
+                    return zero_shape
+                return tuple(arr.shape)
+
+            store = FlatTensorStore(pair_index, shape_fn=shape_fn)
+
+            # Seed the buffer + replace each entry's ndarray with a view.
+            # Processed pair-by-pair so the old ndarray's refcount drops
+            # to zero as soon as we overwrite the dict slot, keeping the
+            # memory peak at ~ total_size_of_field + one pair's data.
+            for p, key in enumerate(pair_index.canonical_keys):
+                entry = cc_ints.get(key)
+                if entry is None:
+                    continue
+                arr = entry.get(field)
+                if arr is None:
+                    continue
+                store[key] = arr             # copy into flat buffer
+                entry[field] = store.at(p)   # replace with view
+            flat_stores[field] = store
+
+    return flat_stores
+
+
+# ----------------------------------------------------------------------
 # Consistency checker used by the lccsd.py assertion in Phase 0.  Keeps
 # assertion wiring concise and off the hot path.
 # ----------------------------------------------------------------------

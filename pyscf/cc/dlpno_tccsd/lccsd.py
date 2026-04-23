@@ -1345,23 +1345,18 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         _pool=_pool)
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
-    # Rebuild K_pno_cache from locally-fitted K_iajb
-    for key in list(K_pno_cache.keys()):
-        ci = _cc_ints.get(key)
-        if ci is not None:
-            K_pno_cache[key] = ci['K_iajb']
 
     # ------------------------------------------------------------------
-    # Phase 2c of the restructure: build the canonical PairIndex once
-    # per CCSD run (previously rebuilt every cycle — wasteful and
-    # scoped too narrowly) and flatten the two per-pair (n_pno, n_pno)
-    # amplitude / integral dicts onto contiguous FlatTensorStore
-    # buffers.  Every downstream site still uses dict-style access, but
-    # the backing memory layout now matches what Phase 4's Cython
-    # kernels expect.
+    # Phase 2c + 2e of the restructure — now happens in one block right
+    # after cc_ints is available.  The canonical PairIndex is built once
+    # per CCSD run and the per-pair amplitude / integral dicts are
+    # flattened onto contiguous FlatTensorStore buffers.  Every
+    # downstream site still uses dict-style access, but the backing
+    # memory layout now matches what Phase 4's Cython kernels expect.
     # ------------------------------------------------------------------
     from pyscf.cc.dlpno_tccsd.pair_index import (
         PairIndex, FlatTensorStore, assert_consistent_with_dicts,
+        flatten_cc_ints_fields,
     )
     _pair_index = PairIndex(
         list(t2_pno_all.keys()), pno_spaces, pair_lmo_idx, nocc)
@@ -1369,6 +1364,26 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         _pair_index, pno_spaces, pair_lmo_idx)
     print(f'  [pair_index] {_pair_index!r}', flush=True)
 
+    # Phase 2e: flatten the 12 tensor fields of cc_ints onto shared
+    # per-field FlatTensorStore buffers.  The dict keeps its structure;
+    # each field's per-pair ndarray becomes a view into a contiguous
+    # buffer.  The `_cc_ints_flat` handle is kept around for Phase 4's
+    # Cython kernels (``.buffer`` / ``.offsets`` / ``.shapes``).
+    _t_flat = _time_cc.perf_counter()
+    _cc_ints_flat = flatten_cc_ints_fields(_cc_ints, _pair_index)
+    print(f'  [cc_ints_flat] {len(_cc_ints_flat)} fields flattened, '
+          f'{_time_cc.perf_counter() - _t_flat:.2f}s '
+          f'total_buffer={sum(s.buffer.size for s in _cc_ints_flat.values())*8/2**20:.1f} MB',
+          flush=True)
+
+    # Rebuild K_pno_cache from locally-fitted K_iajb (now a view
+    # into the flattened Qab/K_iajb field store).
+    for key in list(K_pno_cache.keys()):
+        ci = _cc_ints.get(key)
+        if ci is not None:
+            K_pno_cache[key] = ci['K_iajb']
+
+    # Phase 2c: flatten the (n_pno, n_pno) amplitude / K_pno dicts.
     _pair_t2_shape = lambda p: (int(_pair_index.n_pno[p]),
                                 int(_pair_index.n_pno[p]))
     t2_pno_all = FlatTensorStore.from_dict(
