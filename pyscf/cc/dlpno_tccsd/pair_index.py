@@ -295,7 +295,8 @@ class FlatTensorStore:
     have the same rank (enforced at construction).
     """
 
-    __slots__ = ("_pi", "_buffer", "_offsets", "_shapes", "_ndim", "dtype")
+    __slots__ = ("_pi", "_buffer", "_offsets", "_shapes", "_ndim", "dtype",
+                 "_views", "_canon_to_idx")
 
     def __init__(self, pair_index, shape_fn, dtype=np.float64):
         self._pi = pair_index
@@ -309,6 +310,8 @@ class FlatTensorStore:
             self._shapes = np.zeros((0, 0), dtype=np.int32)
             self._offsets = np.zeros(1, dtype=np.int64)
             self._buffer = np.zeros(0, dtype=self.dtype)
+            self._views = []
+            self._canon_to_idx = pair_index.canonical_to_idx
             return
 
         ranks = {len(s) for s in shape_tuples}
@@ -330,22 +333,48 @@ class FlatTensorStore:
         self._offsets[1:] = np.cumsum(sizes)
         self._buffer = np.zeros(int(self._offsets[-1]), dtype=self.dtype)
 
+        # Pre-build per-pair views.  The buffer is allocated once and
+        # never resized; mutations go through ``set_at`` (view[:] = ...)
+        # so these views always reflect current buffer contents.  This
+        # collapses ``at()`` from 2–3µs of Python overhead (tuple parse
+        # + int casts + shape tuple build + reshape) down to a list
+        # index.  Zero-sized slots get a fresh zeros() on each call —
+        # rare in practice.
+        self._views = []
+        for p, shape in enumerate(shape_tuples):
+            start = int(self._offsets[p])
+            end = int(self._offsets[p + 1])
+            if end == start:
+                self._views.append(None)   # sentinel — fallback in at()
+            else:
+                self._views.append(
+                    self._buffer[start:end].reshape(shape)
+                )
+        # Local reference to the (tuple → int) dict avoids attribute
+        # chase on every tuple lookup.
+        self._canon_to_idx = pair_index.canonical_to_idx
+
     # ------------------------------------------------------------------
     # Zero-copy access
     # ------------------------------------------------------------------
     def at(self, pair_idx):
-        """Return a view of pair ``pair_idx``'s tensor (zero-copy)."""
+        """Return a view of pair ``pair_idx``'s tensor (zero-copy).
+
+        Hot path: pre-built views are cached in ``self._views``.  Tuple
+        keys incur one dict lookup on top of that.  A zero-sized slot
+        (None sentinel) falls through to a fresh np.zeros — the declared
+        shape comes from ``self._shapes`` in that cold path.
+        """
         if isinstance(pair_idx, tuple):
-            pair_idx = self._pi.canonical_to_idx[
-                (min(pair_idx), max(pair_idx))]
-        start = int(self._offsets[pair_idx])
-        end = int(self._offsets[pair_idx + 1])
+            if pair_idx[0] <= pair_idx[1]:
+                pair_idx = self._canon_to_idx[pair_idx]
+            else:
+                pair_idx = self._canon_to_idx[(pair_idx[1], pair_idx[0])]
+        v = self._views[pair_idx]
+        if v is not None:
+            return v
         shape = tuple(int(n) for n in self._shapes[pair_idx])
-        # A zero-size slot (e.g. when a shape contains a 0) still needs to
-        # return an ndarray of the right declared shape.
-        if end == start:
-            return np.zeros(shape, dtype=self.dtype)
-        return self._buffer[start:end].reshape(shape)
+        return np.zeros(shape, dtype=self.dtype)
 
     def set_at(self, pair_idx, value):
         view = self.at(pair_idx)
@@ -472,6 +501,7 @@ class FlatPairPairStore:
     __slots__ = (
         "_pi", "dtype", "_buffer", "_offsets", "_shapes",
         "_idx_matrix", "_n_flat", "_overflow",
+        "_views", "_canon_to_idx",
     )
 
     def __init__(self, pair_index, initial=None, dtype=np.float64):
@@ -532,34 +562,58 @@ class FlatPairPairStore:
 
         self._overflow = {}
 
+        # Pre-build views for every flat entry (buffer is stable; writes
+        # go through view[:] = ... in __setitem__).  Cold path for zero-
+        # sized entries returns a fresh zeros().
+        self._views = []
+        for k in range(n):
+            start = int(self._offsets[k])
+            end = int(self._offsets[k + 1])
+            shape = (int(self._shapes[k, 0]), int(self._shapes[k, 1]))
+            if end == start:
+                self._views.append(None)
+            else:
+                self._views.append(
+                    self._buffer[start:end].reshape(shape)
+                )
+        # Local ref avoids the attribute chase on every lookup.
+        self._canon_to_idx = pair_index.canonical_to_idx
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _canonical_idx(self, key):
         """(pair_a, pair_b) tuple of pairs → (idx_a, idx_b) ints."""
         pair_a, pair_b = key
-        pa = (min(pair_a), max(pair_a))
-        pb = (min(pair_b), max(pair_b))
-        ia = self._pi.canonical_to_idx[pa]
-        ib = self._pi.canonical_to_idx[pb]
+        if pair_a[0] <= pair_a[1]:
+            ia = self._canon_to_idx[pair_a]
+        else:
+            ia = self._canon_to_idx[(pair_a[1], pair_a[0])]
+        if pair_b[0] <= pair_b[1]:
+            ib = self._canon_to_idx[pair_b]
+        else:
+            ib = self._canon_to_idx[(pair_b[1], pair_b[0])]
         return ia, ib
 
     def _view_at(self, k):
-        start = int(self._offsets[k])
-        end = int(self._offsets[k + 1])
+        v = self._views[k]
+        if v is not None:
+            return v
         shape = (int(self._shapes[k, 0]), int(self._shapes[k, 1]))
-        if end == start:
-            return np.zeros(shape, dtype=self.dtype)
-        return self._buffer[start:end].reshape(shape)
+        return np.zeros(shape, dtype=self.dtype)
 
     # ------------------------------------------------------------------
     # Integer-indexed fast path (Cython-friendly)
     # ------------------------------------------------------------------
     def at_idx(self, ia, ib):
         """Return ndarray for ``(idx_a, idx_b)`` or ``None``."""
-        k = int(self._idx_matrix[ia, ib])
+        k = self._idx_matrix[ia, ib]
         if k >= 0:
-            return self._view_at(k)
+            v = self._views[k]
+            if v is not None:
+                return v
+            shape = (int(self._shapes[k, 0]), int(self._shapes[k, 1]))
+            return np.zeros(shape, dtype=self.dtype)
         return self._overflow.get((ia, ib))
 
     # ------------------------------------------------------------------

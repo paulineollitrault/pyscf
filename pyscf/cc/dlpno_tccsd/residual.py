@@ -2541,8 +2541,12 @@ def compute_residual_v2(
                 return S
         _getS_misses[0] += 1
         if S_pao_full is not None:
-            return _compute_S_pno(key, key_other, pno_spaces, S_pao_full, s1e)
-        return C_pno_ij.T @ (s1e @ pno_spaces[key_other]['C_pno'])
+            S = _compute_S_pno(key, key_other, pno_spaces, S_pao_full, s1e)
+        else:
+            S = C_pno_ij.T @ (s1e @ pno_spaces[key_other]['C_pno'])
+        if S_pno_cache is not None:
+            S_pno_cache[(key, key_other)] = S
+        return S
 
     def _get_S2(key_a, key_b):
         """Get S overlap between any two pair keys, with identity fallback."""
@@ -2554,8 +2558,12 @@ def compute_residual_v2(
                 return S
         _getS_misses[1] += 1
         if S_pao_full is not None:
-            return _compute_S_pno(key_a, key_b, pno_spaces, S_pao_full, s1e)
-        return pno_spaces[key_a]['C_pno'].T @ (s1e @ pno_spaces[key_b]['C_pno'])
+            S = _compute_S_pno(key_a, key_b, pno_spaces, S_pao_full, s1e)
+        else:
+            S = pno_spaces[key_a]['C_pno'].T @ (s1e @ pno_spaces[key_b]['C_pno'])
+        if S_pno_cache is not None:
+            S_pno_cache[(key_a, key_b)] = S
+        return S
 
     t2_ij = t2_pno_all[key]
 

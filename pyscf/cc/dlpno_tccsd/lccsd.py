@@ -1409,8 +1409,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # restricted and we don't yet know every (pair_a, pair_b) the
     # iteration will ask for.  Convert to FlatPairPairStore below;
     # later lazy additions go into the overflow dict.
-    S_pno_cache = {}
-    for key_ij in _all_pair_keys:
+    #
+    # Parallel across `key_ij`: each task computes all its partner
+    # overlaps independently (no cross-task writes).  Releases the GIL
+    # via numpy @ / np.ix_, so ThreadPool scales near-linearly with
+    # `_pool` size when OMP_NUM_THREADS=1.  Without the pool, falls
+    # back to the serial path.
+    def _build_one_key(key_ij):
         if pair_lmo_idx is not None and key_ij in pair_lmo_idx:
             _dom = [int(x) for x in pair_lmo_idx[key_ij]]
             _partner_keys = [
@@ -1419,9 +1424,19 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             ]
         else:
             _partner_keys = _all_pair_keys
+        out = {}
         for key_kl in _partner_keys:
-            S_pno_cache[(key_ij, key_kl)] = _compute_S_pno(
+            out[(key_ij, key_kl)] = _compute_S_pno(
                 key_ij, key_kl, pno_spaces, S_pao_full, s1e)
+        return out
+
+    S_pno_cache = {}
+    if _pool is not None:
+        for sub in _pool.map(_build_one_key, _all_pair_keys):
+            S_pno_cache.update(sub)
+    else:
+        for key_ij in _all_pair_keys:
+            S_pno_cache.update(_build_one_key(key_ij))
 
     # Phase 2d: snapshot the upfront S_pno_cache into a flat
     # pair-of-pair buffer.  Any subsequent miss inside `_s_pno_getter`
