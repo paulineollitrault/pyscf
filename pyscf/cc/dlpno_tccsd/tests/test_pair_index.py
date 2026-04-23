@@ -10,8 +10,9 @@ import numpy as np
 import pytest
 
 from pyscf.cc.dlpno_tccsd.pair_index import (
-    PairIndex, TensorStore, assert_consistent_with_dicts,
+    PairIndex, TensorStore, build_t1_cache, assert_consistent_with_dicts,
 )
+from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
 
 
 # ----------------------------------------------------------------------
@@ -218,3 +219,100 @@ def test_consistency_checker_catches_domain_mismatch():
     bad[(0, 1)] = np.array([0, 1])  # was [0, 1, 2]
     with pytest.raises(AssertionError, match="domain_lmos mismatch"):
         assert_consistent_with_dicts(pi, pno_spaces, bad)
+
+
+# ----------------------------------------------------------------------
+# build_t1_cache — must reproduce _project_t1_to_pair exactly.
+# ----------------------------------------------------------------------
+def _t1_cache_fixture(seed=0):
+    """Fixture with realistic t1_pno and S_pno_cache populated."""
+    rng = np.random.default_rng(seed)
+    pno_spaces = {
+        (0, 0): {"C_pno": np.zeros((10, 3))},
+        (0, 1): {"C_pno": np.zeros((10, 4))},
+        (1, 1): {"C_pno": np.zeros((10, 2))},
+        (0, 2): {"C_pno": np.zeros((10, 5))},
+        (1, 2): {"C_pno": np.zeros((10, 3))},
+        (2, 2): {"C_pno": np.zeros((10, 4))},
+    }
+    pair_lmo_idx = {k: np.arange(3) for k in pno_spaces}
+    nocc = 3
+
+    # t1_pno keyed by LMO i; shape (n_pno[i,i],)
+    t1_pno = {i: rng.standard_normal(pno_spaces[(i, i)]["C_pno"].shape[1])
+              for i in range(nocc)}
+
+    # S_pno_cache[(pair_a, pair_b)] = overlap (n_pno_a, n_pno_b).
+    # Populate all (pair, (k,k)) needed for projections.
+    S_pno_cache = {}
+    for pair, space in pno_spaces.items():
+        n_pair = space["C_pno"].shape[1]
+        for k in range(nocc):
+            key_kk = (k, k)
+            if pair == key_kk:
+                continue  # diagonal projection is identity-ish
+            n_k = pno_spaces[key_kk]["C_pno"].shape[1]
+            S_pno_cache[(pair, key_kk)] = rng.standard_normal((n_pair, n_k))
+
+    return pno_spaces, pair_lmo_idx, t1_pno, S_pno_cache, nocc
+
+
+def test_build_t1_cache_matches_lazy_projection():
+    pno_spaces, pair_lmo_idx, t1_pno, S_pno_cache, nocc = _t1_cache_fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+    cache = build_t1_cache(t1_pno, pi, S_pno_cache, pno_spaces)
+
+    # For every pair and every LMO, cached row must equal lazy projection.
+    for pair in pno_spaces:
+        n_pno = pno_spaces[pair]["C_pno"].shape[1]
+        if n_pno == 0:
+            continue
+        for k in range(nocc):
+            expected = _project_t1_to_pair(
+                t1_pno, k, pair, S_pno_cache, pno_spaces)
+            got = cache[pair][k]
+            assert np.allclose(got, expected, atol=1e-15), (
+                f"pair={pair} k={k}: "
+                f"cache={got} lazy={expected}"
+            )
+
+
+def test_build_t1_cache_diagonal_no_copy_loop():
+    """Row k of pair (k, k) should equal t1_pno[k] exactly (not a copy)."""
+    pno_spaces, pair_lmo_idx, t1_pno, S_pno_cache, nocc = _t1_cache_fixture()
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+    cache = build_t1_cache(t1_pno, pi, S_pno_cache, pno_spaces)
+    for k in range(nocc):
+        key_kk = (k, k)
+        row = cache[key_kk][k]
+        assert np.array_equal(row, t1_pno[k])
+
+
+def test_build_t1_cache_missing_t1_returns_zeros():
+    """t1_pno[k] absent → row is zero."""
+    pno_spaces, pair_lmo_idx, t1_pno, S_pno_cache, nocc = _t1_cache_fixture()
+    # Drop LMO 1
+    t1_pno = {0: t1_pno[0], 2: t1_pno[2]}
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+    cache = build_t1_cache(t1_pno, pi, S_pno_cache, pno_spaces)
+    for pair in pno_spaces:
+        if pno_spaces[pair]["C_pno"].shape[1] == 0:
+            continue
+        assert np.all(cache[pair][1] == 0.0), (
+            f"pair={pair} LMO 1 should be zero (t1 absent)"
+        )
+
+
+def test_build_t1_cache_missing_overlap_returns_zeros():
+    """S_pno_cache entry absent → row is zero (fallback path)."""
+    pno_spaces, pair_lmo_idx, t1_pno, S_pno_cache, nocc = _t1_cache_fixture()
+    pair = (0, 1)
+    key_kk = (2, 2)
+    S_pno_cache_bad = dict(S_pno_cache)
+    del S_pno_cache_bad[(pair, key_kk)]
+    pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+    cache = build_t1_cache(t1_pno, pi, S_pno_cache_bad, pno_spaces)
+    assert np.all(cache[pair][2] == 0.0)
+    # Other rows unaffected
+    lazy_k0 = _project_t1_to_pair(t1_pno, 0, pair, S_pno_cache_bad, pno_spaces)
+    assert np.allclose(cache[pair][0], lazy_k0)

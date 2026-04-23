@@ -158,7 +158,8 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                   ovL_bare, ooL_bare, S_pno_cache, with_df,
                   _term2_precomputed=None, cc_ints=None,
                   pair_lmo_idx=None, _pool=None,
-                  S_pao_full=None, s1e=None):
+                  S_pao_full=None, s1e=None,
+                  t1_cache=None):
     """Build D_tilde (delta, Eq 84) for all ordered (i,k) pairs.
 
     delta_{ik}^{ac} = Terms 1-4 of Eq 84, using M/L integrals.
@@ -169,6 +170,16 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
     from pyscf.ao2mo import _ao2mo
 
     D_tilde_all = {}
+
+    # Phase 1: cache t1 projections once (or reuse one passed from driver).
+    if t1_cache is None:
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            PairIndex, build_t1_cache,
+        )
+        _pi = PairIndex(
+            pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+        t1_cache = build_t1_cache(
+            t1_pno, _pi, S_pno_cache, pno_spaces)
 
     # Iterate over all ordered (i,k) pairs
     all_pairs = set()
@@ -186,8 +197,7 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
             if n_ik == 0:
                 continue
-            t1_i_ik = _project_t1_to_pair(
-                t1_pno, i_idx, key_ik, S_pno_cache, pno_spaces)
+            t1_i_ik = t1_cache[key_ik][i_idx]
             if np.max(np.abs(t1_i_ik)) < 1e-15:
                 continue
             ovL_k_ik = ovL_bare.get((key_ik, k_idx))
@@ -232,8 +242,7 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
         D_tilde_ik = np.zeros((n_ik, n_ik))
 
         # T1_i projected to PNO_ik
-        t1_i_ik = _project_t1_to_pair(
-            t1_pno, i_idx, key_ik, S_pno_cache, pno_spaces)
+        t1_i_ik = t1_cache[key_ik][i_idx]
 
         # Restrict LMO iteration to pair (i,k)'s local domain for Term 1.
         if pair_lmo_idx is not None and key_ik in pair_lmo_idx:
@@ -241,12 +250,10 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
         else:
             _ll_idx_ik = np.arange(nocc)
 
-        # Scatter T1_local into full (nocc, n_ik) — downstream Term 3 still
-        # indexes T1_all_ik[ll], but only ll ∈ domain have nonzero rows.
-        T1_all_ik = np.zeros((nocc, n_ik))
-        for _li, _mm in enumerate(_ll_idx_ik):
-            T1_all_ik[int(_mm)] = _project_t1_to_pair(
-                t1_pno, int(_mm), key_ik, S_pno_cache, pno_spaces)
+        # Phase 1: T1_all_ik = full (nocc, n_pno_ik) T1 projection table.
+        # Cached copy already has zero rows for LMOs outside the domain, so
+        # downstream Term 3 indexing T1_all_ik[ll] just works.
+        T1_all_ik = t1_cache[key_ik]
 
         # Term 2: Psi4 lines 1791-1801 use K_tilde_chem[ki] × t1_i.
         # K_tc[b, a*n+c] = Σ_Q k_Qa[Q,b] * Qab[Q,a,c]
@@ -331,8 +338,7 @@ def build_D_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                 continue
             L_lk = 2.0 * K_lk - K_lk.T
 
-            t1_i_lk = _project_t1_to_pair(
-                t1_pno, i_idx, key_lk, S_pno_cache, pno_spaces)
+            t1_i_lk = t1_cache[key_lk][i_idx]
             if np.max(np.abs(t1_i_lk)) < 1e-15:
                 continue
             Lt1 = L_lk @ t1_i_lk  # (n_lk,)
@@ -469,7 +475,8 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                     ovL_pno_bare, ooL_bare, S_pno_cache, with_df,
                     _term2_precomputed=None, cc_ints=None,
                     pair_lmo_idx=None, _pool=None,
-                    S_pao_full=None, s1e=None):
+                    S_pao_full=None, s1e=None,
+                    t1_cache=None):
     """Compute C_tilde (gamma intermediate, Eq 83) for all pairs.
 
     C_tilde[ki][a_ki, c_ki] = gamma_{ki}^{ac} =
@@ -484,6 +491,18 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
     """
     C_tilde_all = {}
     _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
+
+    # Phase 1: t1 projections are cached once per CCSD cycle.  If caller
+    # passed ``t1_cache``, use it; otherwise build a local one (back-compat
+    # for callers that predate the cache-based migration).
+    if t1_cache is None:
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            PairIndex, build_t1_cache,
+        )
+        _pi = PairIndex(
+            pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+        t1_cache = build_t1_cache(
+            t1_pno, _pi, S_pno_cache, pno_spaces)
 
     # Iterate over ALL ordered (k,i) pairs, not just min/max.
     # gamma_{ki} depends on which LMO is "i" (the T1 source).
@@ -502,7 +521,7 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
             if n_ki == 0:
                 continue
-            t1_i_ki = _project_t1_to_pair(t1_pno, i, key_ki, S_pno_cache, pno_spaces)
+            t1_i_ki = t1_cache[key_ki][i]
             if np.max(np.abs(t1_i_ki)) < 1e-15:
                 continue
             ovL_i_ki = ovL_pno_bare.get((key_ki, i))
@@ -549,7 +568,7 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             else:
                 k_Qa = ci_ki['j_Qa']
             Qab_ki = ci_ki['Qab']
-            t1_i_ki = _project_t1_to_pair(t1_pno, i, key_ki, S_pno_cache, pno_spaces)
+            t1_i_ki = t1_cache[key_ki][i]
             z = k_Qa @ t1_i_ki
             T2_contrib = np.tensordot(z, Qab_ki, axes=(0, 0))
             C_tilde_ki += T2_contrib
@@ -567,10 +586,10 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
             _ll_idx = np.arange(nocc)
         _domain_ki = set(int(x) for x in _ll_idx)
 
-        T1_local_ki = np.zeros((len(_ll_idx), n_ki))
-        for _li, _ll in enumerate(_ll_idx):
-            T1_local_ki[_li] = _project_t1_to_pair(
-                t1_pno, int(_ll), key_ki, S_pno_cache, pno_spaces)
+        # Phase 1: fancy-index into cached (nocc, n_pno) matrix replaces
+        # the per-l projection loop.
+        T1_local_ki = np.ascontiguousarray(
+            t1_cache[key_ki][np.asarray(_ll_idx, dtype=np.intp)])
 
         K_bar_chem_local = np.zeros((len(_ll_idx), n_ki))
         if key_ki in cc_ints and cc_ints[key_ki] is not None:
@@ -624,7 +643,7 @@ def compute_C_tilde(t1_pno, t2_pno_all, pno_spaces, nocc,
                 continue
 
             # T1_i projected to PNO_kl
-            t1_i_kl = _project_t1_to_pair(t1_pno, i, key_kl, S_pno_cache, pno_spaces)
+            t1_i_kl = t1_cache[key_kl][i]
             if np.max(np.abs(t1_i_kl)) < 1e-15:
                 continue
 
@@ -1127,7 +1146,8 @@ def compute_C_tilde_batched(
 
 def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
                                 nocc, cc_ints, S_pno_cache, pair_keys,
-                                _pool=None, pair_lmo_idx=None):
+                                _pool=None, pair_lmo_idx=None,
+                                t1_cache=None):
     """Per-pair, local-aux-per-pair version of compute_all_df_terms.
 
     Drop-in replacement that reads from ``cc_ints[pk]['Qab' / 'Qma']``
@@ -1149,6 +1169,16 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         S_pno_cache: dict (key1, key2) -> (n1, n2) overlap
         pair_keys: list of pair keys for which fvv_t1 and ladder are returned.
     """
+    # Phase 1: cache t1 projections once (or reuse one from driver).
+    if t1_cache is None:
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            PairIndex, build_t1_cache,
+        )
+        _pi = PairIndex(
+            pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+        t1_cache = build_t1_cache(
+            t1_pno, _pi, S_pno_cache, pno_spaces)
+
     # All ordered (k, i) pairs that appear in t2 (both directions).
     all_ordered = set()
     for key in t2_pno_all:
@@ -1186,10 +1216,9 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
             lmo_idx = np.arange(nocc)
         Qma = Qma_full[:, lmo_idx, :]   # (n_local, nlmo, n)
 
-        T1_local = np.zeros((len(lmo_idx), n))
-        for ki, kk in enumerate(lmo_idx):
-            T1_local[ki] = _project_t1_to_pair(
-                t1_pno, int(kk), pk, S_pno_cache, pno_spaces)
+        # Phase 1: fancy-index into cached (nocc, n_pno) projection matrix.
+        T1_local = np.ascontiguousarray(
+            t1_cache[pk][np.asarray(lmo_idx, dtype=np.intp)])
 
         # fvv_t1
         z = np.einsum('Lka,ka->L', Qma, T1_local, optimize=True)
@@ -1197,12 +1226,10 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         tmp = np.einsum('Lab,kb->Lka', Qab, T1_local, optimize=True)
         fvv -= np.einsum('Lka,Lkb->ab', tmp, Qma, optimize=True)
 
-        # ladder — t1_i and t1_j retrieved from T1_local if i/j are in domain
-        _loc = {int(k): idx for idx, k in enumerate(lmo_idx)}
-        t1_i = (T1_local[_loc[i]] if i in _loc
-                else _project_t1_to_pair(t1_pno, i, pk, S_pno_cache, pno_spaces))
-        t1_j = (T1_local[_loc[j]] if j in _loc
-                else _project_t1_to_pair(t1_pno, j, pk, S_pno_cache, pno_spaces))
+        # ladder — t1_i and t1_j: cache has zero rows for out-of-domain
+        # LMOs, so indexing the cached matrix covers both paths in one line.
+        t1_i = t1_cache[pk][i]
+        t1_j = t1_cache[pk][j]
         tau = t2_pno_all[pk] + np.outer(t1_i, t1_j)
         corr = np.einsum('ka,Lkb->Lab', T1_local, Qma, optimize=True)
         B_tilde = Qab - corr
@@ -1236,7 +1263,7 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         ci = cc_ints.get(key_ki)
         if ci is None:
             return ki_tuple, None
-        t1_i = _project_t1_to_pair(t1_pno, i, key_ki, S_pno_cache, pno_spaces)
+        t1_i = t1_cache[key_ki][i]
         if np.max(np.abs(t1_i)) < 1e-15:
             return ki_tuple, None
         Qma = ci['Qma']
@@ -1256,8 +1283,7 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         ci = cc_ints.get(key_ik)
         if ci is None:
             return ik_tuple, None
-        t1_i = _project_t1_to_pair(
-            t1_pno, i_idx, key_ik, S_pno_cache, pno_spaces)
+        t1_i = t1_cache[key_ik][i_idx]
         if np.max(np.abs(t1_i)) < 1e-15:
             return ik_tuple, None
         Qma = ci['Qma']
@@ -1471,6 +1497,7 @@ def compute_residual_v2(
         B_term_override=None,
         E_contrib_override=None,
         S_pao_full=None,
+        t1_cache=None,
 ):
     """Compute T2 residual following Psi4 ccsd.cc lines 2052-2221 exactly.
 
@@ -1542,11 +1569,16 @@ def compute_residual_v2(
 
     # --- A (Eq 76): dressed ladder ---
     # B̃_{ab} = B_{ab} - Σ_k T1_all[k,a]*ovL_k[b,Q] (Eq 93)
-    T1_all_ij = np.zeros((nocc, n_pno))
-    if t1_pno is not None:
+    # Phase 1: use pre-built T1 cache; fall back to lazy build otherwise.
+    if t1_cache is not None:
+        T1_all_ij = t1_cache[key]
+    elif t1_pno is not None:
+        T1_all_ij = np.zeros((nocc, n_pno))
         for kk in range(nocc):
             T1_all_ij[kk] = _project_t1_to_pair(
                 t1_pno, kk, key, S_pno_cache, pno_spaces)
+    else:
+        T1_all_ij = np.zeros((nocc, n_pno))
 
     t1_i_pno = T1_all_ij[i] if t1_pno else np.zeros(n_pno)
     t1_j_pno = T1_all_ij[j] if t1_pno else np.zeros(n_pno)

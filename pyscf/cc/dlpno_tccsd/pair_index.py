@@ -267,6 +267,63 @@ class TensorStore:
 
 
 # ----------------------------------------------------------------------
+# T1 projection cache — Phase 1 of the restructure.
+#
+# Matches Psi4's `T_n_ij_[ij]` pattern: every CCSD cycle, project t1_k
+# into every pair's PNO basis once, so downstream kernels can index
+# into a pre-built matrix instead of each site calling
+# `_project_t1_to_pair` lazily (~1.5 M calls/run at water8 in the old
+# path).  Stored as a TensorStore keyed by canonical pair with entries
+# of shape ``(nocc, n_pno[pair])``.
+# ----------------------------------------------------------------------
+def build_t1_cache(
+    t1_pno: dict,
+    pair_index: PairIndex,
+    S_pno_cache: dict,
+    pno_spaces: dict,
+) -> TensorStore:
+    """Pre-project t1 into every pair's PNO basis, one row per LMO.
+
+    Semantics match ``_project_t1_to_pair``:
+      - If ``t1_pno[k]`` is absent / empty → row is zero.
+      - If ``pair == (k, k)`` → row is ``t1_pno[k]`` (no projection).
+      - Else if ``S_pno_cache[(pair, (k,k))]`` is present → row is
+        ``S @ t1_pno[k]``.
+      - Else (S missing) → row is zero (fallback).
+
+    Returns
+    -------
+    TensorStore
+        Indexed by canonical pair key.  Slot ``p`` holds a contiguous
+        ``(nocc, n_pno[p])`` float64 array.
+    """
+    nocc = pair_index.nocc
+    cache = TensorStore(
+        pair_index,
+        shape_fn=lambda p: (nocc, int(pair_index.n_pno[p])),
+    )
+    for p, pair_key in enumerate(pair_index.canonical_keys):
+        n_pno_p = int(pair_index.n_pno[p])
+        if n_pno_p == 0:
+            continue
+        out = cache.at(p)  # (nocc, n_pno_p), zero-initialised
+        for k in range(nocc):
+            t1_k = t1_pno.get(k)
+            if t1_k is None or t1_k.size == 0:
+                continue  # already zeros
+            key_kk = (k, k)
+            if pair_key == key_kk:
+                out[k] = t1_k
+                continue
+            S = S_pno_cache.get((pair_key, key_kk))
+            if S is not None:
+                out[k] = S @ t1_k
+            # else: leave row as zeros — matches _project_t1_to_pair's
+            # final ``return np.zeros(...)`` fallback.
+    return cache
+
+
+# ----------------------------------------------------------------------
 # Consistency checker used by the lccsd.py assertion in Phase 0.  Keeps
 # assertion wiring concise and off the hot path.
 # ----------------------------------------------------------------------

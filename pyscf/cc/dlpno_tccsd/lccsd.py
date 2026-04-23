@@ -537,7 +537,8 @@ def _project_t1_to_pair(t1_pno, i, key_kl, S_pno_cache, pno_spaces):
 def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                                fov_pno, F_lmo, eps_lmo,
                                nocc, S_pno_cache, cc_ints,
-                               ovL_pno_cache=None, pair_lmo_idx=None):
+                               ovL_pno_cache=None, pair_lmo_idx=None,
+                               t1_cache=None):
     """T1 residual EXACTLY matching Psi4's structure (DePrince Eqs 19-22).
 
     R[i, a_ii] = Fai[i,a_ii] + A[i,a] + C[i,a] - B[i,a] - A2[i,a]
@@ -572,20 +573,31 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     if cc_ints is None:
         raise ValueError("cc_ints required for Psi4-style T1 residual")
 
+    # Phase 1: use pre-built t1 cache (or build one locally for back-compat).
+    if t1_cache is None:
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            PairIndex, build_t1_cache,
+        )
+        _pi = PairIndex(
+            pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+        t1_cache = build_t1_cache(
+            t1_pno, _pi, S_pno_cache, pno_spaces)
+
     # Pre-compute Tt for all canonical pairs (in their canonical PNO basis)
     Tt_canon = {}
     for key, t2 in t2_pno_all.items():
         if t2 is not None and t2.shape[0] > 0:
             Tt_canon[key] = 2.0 * t2 - t2.T
 
-    # T_n[(key, k)] = t1_k projected to pair key's PNO basis
+    # T_n[(key, k)] = t1_k projected to pair key's PNO basis.
+    # Phase 1: fill directly from the cached (nocc, n_pno) matrix.
     T_n = {}
     for key in t2_pno_all:
         if pno_spaces[key]['C_pno'].shape[1] == 0:
             continue
+        cached_matrix = t1_cache[key]
         for k in range(nocc):
-            T_n[(key, k)] = _project_t1_to_pair(
-                t1_pno, k, key, S_pno_cache, pno_spaces)
+            T_n[(key, k)] = cached_matrix[k]
 
     # Initialize R1 from Fai_[i].  At iter 0 with T1=0, Fai_bar = 0 and
     # all dressing terms vanish, so R1 starts from just A + B.
@@ -777,8 +789,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                 continue
             K_im = ci_im['K_iajb']
             L_im = 2.0 * K_im - K_im.T
-            t1_m_in_im = _project_t1_to_pair(
-                t1_pno, m, key_im, S_pno_cache, pno_spaces)
+            t1_m_in_im = t1_cache[key_im][m]
             _LT1_cache[(i_out, m)] = (key_im, L_im @ t1_m_in_im)
 
     for i in range(nocc):
@@ -1427,17 +1438,30 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         # Read-only for now; later phases will migrate pair-keyed dicts
         # (t2_pno_all, S_pno_cache, cc_ints, ovL_pno_cache, ...) onto
         # TensorStore instances backed by this index.  See pair_index.py.
+        #
+        # NB: keys_sorted only captures strong pairs (frozen before the
+        # weak-pair extension of t2_pno_all above L1172). Downstream
+        # CCSD functions iterate t2_pno_all directly, so the PairIndex
+        # must cover the union of strong + weak pairs — hence we use
+        # list(t2_pno_all.keys()) here.
         from pyscf.cc.dlpno_tccsd.pair_index import (
-            PairIndex, assert_consistent_with_dicts,
+            PairIndex, assert_consistent_with_dicts, build_t1_cache,
         )
         _pair_index = PairIndex(
-            keys_sorted, pno_spaces, pair_lmo_idx, nocc)
+            list(t2_pno_all.keys()),
+            pno_spaces, pair_lmo_idx, nocc)
         assert_consistent_with_dicts(
             _pair_index, pno_spaces, pair_lmo_idx)
         if boot_step == 0:
             print(f'  [pair_index] {_pair_index!r}', flush=True)
 
         for cycle in range(this_max):
+            # Phase 1: pre-project t1 into every pair's PNO basis once
+            # per cycle, replacing ~1.5 M lazy _project_t1_to_pair calls.
+            # ``_t1_cache[key]`` is a (nocc, n_pno[key]) matrix;
+            # ``_t1_cache[key][k]`` is the t1_k projection into pair key.
+            _t1_cache = build_t1_cache(
+                t1_pno, _pair_index, S_pno_cache, pno_spaces)
             _t_cycle_start = _time.perf_counter()
             t2_new = {}
             t1_pno_old = {i: t1_pno[i].copy() for i in range(nocc)}
@@ -1510,7 +1534,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 compute_all_df_terms_local(
                     t1_pno, fov_pno, t2_pno_all, pno_spaces, nocc,
                     _cc_ints, S_pno_cache, keys_sorted, _pool=_pool,
-                    pair_lmo_idx=pair_lmo_idx)
+                    pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache)
             _tj_df = _time.perf_counter() - _tj0
 
             # compute_C_tilde, build_D_tilde, t1_fock each dispatch their
@@ -1531,7 +1555,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _term2_precomputed=_c_t2_pre,
                 cc_ints=_cc_ints,
                 pair_lmo_idx=pair_lmo_idx, _pool=_pool,
-                S_pao_full=S_pao_full, s1e=s1e)
+                S_pao_full=S_pao_full, s1e=s1e,
+                t1_cache=_t1_cache)
             _tct_old = _time.perf_counter() - _tct_old_0
 
             # Prototype: batched compute_C_tilde (Terms 3+4 vectorized).
@@ -1571,12 +1596,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _term2_precomputed=_d_t2_pre,
                 cc_ints=_cc_ints,
                 pair_lmo_idx=pair_lmo_idx, _pool=_pool,
-                S_pao_full=S_pao_full, s1e=s1e)
+                S_pao_full=S_pao_full, s1e=s1e,
+                t1_cache=_t1_cache)
             _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
                 _cc_ints, None, t1_pno, fov_pno, pno_spaces,
                 S_pno_cache, F_lmo, eps_lmo, foo_total,
                 _all_keys_j, nocc, _pool=_pool,
-                pair_lmo_idx=pair_lmo_idx)
+                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache)
             _tj_C = _time.perf_counter() - _tj0
             _tj_D = 0.0
             _tj_FG = 0.0
@@ -1630,7 +1656,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             def _bt_one(_key):
                 return _key, _cB_fn(_cc_ints, None, t2_pno_all, t1_pno,
                                     pno_spaces, S_pno_cache, _key, nocc,
-                                    pair_lmo_idx=pair_lmo_idx)
+                                    pair_lmo_idx=pair_lmo_idx,
+                                    t1_cache=_t1_cache)
             _B_tilde_per_ij = {}
             if _pool is not None:
                 for _k, _bt in _pool.map(_bt_one, keys_sorted):
@@ -1674,7 +1701,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     # T1-dressed K̃ (local DF)
                     _dressed = t1_ints(
                         _cc_ints, t1_pno, pno_spaces, S_pno_cache,
-                        [key], nocc, pair_lmo_idx=pair_lmo_idx)
+                        [key], nocc, pair_lmo_idx=pair_lmo_idx,
+                        t1_cache=_t1_cache)
                     if key in _dressed:
                         _K_dressed_local = (_dressed[key]['i_Qa_t1'].T
                                             @ _dressed[key]['j_Qa_t1'])
@@ -1683,7 +1711,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _ladder_local = compute_ladder(
                         _cc_ints, t2_pno_all, t1_pno, pno_spaces,
                         S_pno_cache, key, nocc,
-                        pair_lmo_idx=pair_lmo_idx)
+                        pair_lmo_idx=pair_lmo_idx,
+                        t1_cache=_t1_cache)
                     # Fab from local DF
                     if _local_df_Fab is not None and key in _local_df_Fab:
                         Fab_ij = _local_df_Fab[key]
@@ -1703,10 +1732,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _B_tilde_local = None
                 if _B_tilde_local is None:
                     Fab_ij = jc['Fab_all'][key]
-                    t1_i = _project_t1_to_pair(
-                        t1_pno, i, key, S_pno_cache, pno_spaces)
-                    t1_j = _project_t1_to_pair(
-                        t1_pno, j, key, S_pno_cache, pno_spaces)
+                    t1_i = _t1_cache[key][i]
+                    t1_j = _t1_cache[key][j]
                     tau = t2_pno_all[key] + np.outer(t1_i, t1_j)
                     B_tilde_oo = jc['J_oo_d'][:, i, :, j].copy()
                     _naux_ij = ovL_pno_cache.get((key, 0))
@@ -1763,7 +1790,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                       if _BE_all is not None else None),
                     E_contrib_override=(_BE_all['E'].get(key)
                                          if _BE_all is not None else None),
-                    S_pao_full=S_pao_full)
+                    S_pao_full=S_pao_full,
+                    t1_cache=_t1_cache)
                 _pair_timings['resid'].append(
                     _time.perf_counter() - _tr0)
                 e_pno = data['e_pno']
@@ -1851,7 +1879,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             r1_pno = _compute_t1_residual_psi4(
                 t1_pno, t2_pno_all, pno_spaces, _t1_fov, F_lmo, eps_lmo, nocc,
                 S_pno_cache, _cc_ints, ovL_pno_cache=_t1_ovL,
-                pair_lmo_idx=pair_lmo_idx)
+                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache)
             t1_pno_new = {}
             for ii in range(nocc):
                 key_ii = (ii, ii)
@@ -1947,11 +1975,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     K_p = pno_spaces.get(pk, {}).get('K_pno')
                 if T2_p.shape[0] == 0 or K_p is None:
                     continue
-                # tau = t2 + t1_i ⊗ t1_j in PNO basis (local T1 projection)
-                t1i_pno = _project_t1_to_pair(
-                    t1_pno, pk[0], pk, S_pno_cache, pno_spaces)
-                t1j_pno = _project_t1_to_pair(
-                    t1_pno, pk[1], pk, S_pno_cache, pno_spaces)
+                # tau = t2 + t1_i ⊗ t1_j in PNO basis (Phase 1: cached).
+                t1i_pno = _t1_cache[pk][pk[0]]
+                t1j_pno = _t1_cache[pk][pk[1]]
                 tau_p = T2_p + np.outer(t1i_pno, t1j_pno)
                 Tt_p = 2.0 * tau_p - tau_p.T
                 e_p = np.einsum('ab,ab->', K_p, Tt_p)
