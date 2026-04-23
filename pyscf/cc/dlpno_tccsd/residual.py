@@ -1827,6 +1827,166 @@ def compute_B_E_batched(strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
     return B_all, E_all
 
 
+def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
+                   cc_ints, _s_pno_get, nocc):
+    """One-time plan for compute_B_E_batched_v2.
+
+    Enumerates every (ij, kl) item — ij ∈ strong_keys, kl with k,l in
+    ij's LMO domain and t2_kl present — and pre-stacks the cycle-
+    invariant constants (S, K, same-flag) into per-(n_ij, n_kl) buckets.
+    Each item also carries the flat output slot for its ij and the keys
+    needed to gather T / β_kl / β_lk per cycle.
+    """
+    from pyscf.cc.dlpno_tccsd.local_df import get_local_K
+
+    # Output slots: one per strong ij, grouped by n_ij.
+    pairs_by_n_ij = {}
+    pair_to_slot = {}
+    for key_ij in strong_keys:
+        n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
+        if n_ij == 0:
+            continue
+        pairs_by_n_ij.setdefault(n_ij, []).append(key_ij)
+        pair_to_slot[key_ij] = len(pairs_by_n_ij[n_ij]) - 1
+
+    # Per-item gather: (key_ij, key_kl, k, l, same, n_ij, n_kl, S, K).
+    items_by_shape = {}
+    for key_ij in strong_keys:
+        n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
+        if n_ij == 0:
+            continue
+        domain = (set(int(x) for x in pair_lmo_idx[key_ij])
+                  if pair_lmo_idx is not None and key_ij in pair_lmo_idx
+                  else set(range(nocc)))
+        for key_kl, t2_kl in t2_pno_all.items():
+            if t2_kl is None or t2_kl.shape[0] == 0:
+                continue
+            k, l = key_kl
+            if k not in domain or l not in domain:
+                continue
+            S = _s_pno_get(key_ij, key_kl)
+            if S is None:
+                continue
+            K_kl = get_local_K(cc_ints, key_kl, k, l)
+            if K_kl is None:
+                continue
+            n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
+            items_by_shape.setdefault((n_ij, n_kl), []).append(
+                (key_ij, key_kl, k, l, k == l, S, K_kl))
+
+    buckets = []
+    for (n_ij, n_kl), items in items_by_shape.items():
+        N = len(items)
+        S_arr = np.empty((N, n_ij, n_kl))
+        K_arr = np.empty((N, n_kl, n_kl))
+        same_arr = np.empty(N, dtype=np.uint8)
+        item_idx = np.empty(N, dtype=np.intp)
+        kl_keys = []       # per-item key_kl for T lookup
+        beta_coords = []   # per-item (key_ij, k, l) for β lookup
+        for n, (key_ij, key_kl, k, l, same, S, K_kl) in enumerate(items):
+            S_arr[n] = S
+            K_arr[n] = K_kl
+            same_arr[n] = 1 if same else 0
+            item_idx[n] = pair_to_slot[key_ij]
+            kl_keys.append(key_kl)
+            beta_coords.append((key_ij, k, l))
+        buckets.append({
+            'n_ij': n_ij, 'n_kl': n_kl,
+            'S': S_arr, 'K': K_arr,
+            'same': same_arr, 'item_idx': item_idx,
+            'kl_keys': kl_keys, 'beta_coords': beta_coords,
+        })
+
+    return {
+        'buckets': buckets,
+        'pairs_by_n_ij': pairs_by_n_ij,
+        'pair_to_slot': pair_to_slot,
+    }
+
+
+def compute_B_E_batched_v2(
+        strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
+        cc_ints, B_tilde_per_ij, pair_lmo_idx, nocc, _pool=None,
+        S_pao_full=None, s1e=None):
+    """Plan-cached + Cython-kernel rewrite of ``compute_B_E_batched``.
+
+    Same signature, same output semantics (B_all, E_all dicts keyed by
+    strong pairs).  Gains versus the reference come from:
+
+      - The (ij, kl) item structure, per-bucket stacks of S and K, the
+        same-flag and the output slot map are all constant across CCSD
+        cycles, so they are cached on the function object and the
+        per-cycle work reduces to gathering T (from t2_pno_all) and
+        β_kl / β_lk (from B_tilde_per_ij).
+      - Per-item B and E tiles come from a single nogil ``prange``
+        Cython kernel (``be_kernel``) that fuses the TB/UK build with
+        the S @ · @ S.T contraction into three hand-rolled triple
+        loops and one quadruple loop — no intermediate (N, n_kl, n_kl)
+        TB/UK allocation, no BLAS dispatch overhead at n ≈ 25.
+    """
+    from pyscf.cc.dlpno_tccsd._be_cy import be_kernel
+
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
+
+    plan_key = (tuple(sorted(strong_keys)), tuple(sorted(t2_pno_all.keys())))
+    _cache_attr = getattr(compute_B_E_batched_v2, '_plan_cache', None)
+    if _cache_attr is None:
+        _cache_attr = {}
+        compute_B_E_batched_v2._plan_cache = _cache_attr
+    plan = _cache_attr.get(plan_key)
+    if plan is None:
+        plan = _build_be_plan(
+            strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
+            cc_ints, _s_pno_get, nocc)
+        _cache_attr[plan_key] = plan
+
+    # Flat output buffers, one per n_ij bucket.
+    flat_B = {}
+    flat_E = {}
+    for n_ij, pairs in plan['pairs_by_n_ij'].items():
+        flat_B[n_ij] = np.zeros((len(pairs), n_ij, n_ij))
+        flat_E[n_ij] = np.zeros((len(pairs), n_ij, n_ij))
+
+    # Per-cycle gather + kernel dispatch, one bucket at a time.
+    for bucket in plan['buckets']:
+        n_ij = bucket['n_ij']
+        n_kl = bucket['n_kl']
+        N = len(bucket['kl_keys'])
+        T_arr = np.empty((N, n_kl, n_kl))
+        beta_kl_arr = np.empty(N)
+        beta_lk_arr = np.empty(N)
+        for n in range(N):
+            T_arr[n] = t2_pno_all[bucket['kl_keys'][n]]
+            key_ij, k, l = bucket['beta_coords'][n]
+            B_tilde = B_tilde_per_ij[key_ij]
+            beta_kl_arr[n] = B_tilde[k, l]
+            beta_lk_arr[n] = 0.0 if k == l else B_tilde[l, k]
+        be_kernel(bucket['S'], T_arr, bucket['K'],
+                  beta_kl_arr, beta_lk_arr, bucket['same'],
+                  bucket['item_idx'],
+                  flat_B[n_ij], flat_E[n_ij])
+
+    # Unpack flat outputs into dicts keyed by strong pair.
+    B_all = {}
+    E_all = {}
+    for n_ij, pairs in plan['pairs_by_n_ij'].items():
+        bb = flat_B[n_ij]
+        ee = flat_E[n_ij]
+        for slot, key_ij in enumerate(pairs):
+            B_all[key_ij] = bb[slot]
+            E_all[key_ij] = ee[slot]
+
+    # Keys that the reference returns as zero-sized outputs (n_ij == 0)
+    # still need entries for downstream lookups.
+    for key_ij in strong_keys:
+        if key_ij not in B_all:
+            n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
+            B_all[key_ij] = np.zeros((n_ij, n_ij))
+            E_all[key_ij] = np.zeros((n_ij, n_ij))
+
+    return B_all, E_all
+
+
 # =========================================================================
 # T2 residual: Psi4-compatible two-buffer formulation
 # =========================================================================

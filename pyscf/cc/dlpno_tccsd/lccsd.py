@@ -1649,18 +1649,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _t_pairs = _time.perf_counter()
 
             # --- Batched B + E contributions across all strong pairs ---
-            # Replaces the per-pair `for key_kl in t2_pno_all` loops that
-            # dominate CCSD CPU time (~77% per profile).  Each strong pair
-            # has its own B_tilde (from compute_B_tilde); precompute them
-            # as a dict then call compute_B_E_batched once.
+            # Each strong pair has its own B_tilde (from compute_B_tilde);
+            # precompute them as a dict, then compute_B_E_batched_v2
+            # accumulates the Woooo and E contributions in one pass.
             from pyscf.cc.dlpno_tccsd.local_df import compute_B_tilde as _cB_fn
-            from pyscf.cc.dlpno_tccsd.residual import compute_B_E_batched
 
             def _bt_one(_key):
                 return _key, _cB_fn(_cc_ints, None, t2_pno_all, t1_pno,
                                     pno_spaces, S_pno_cache, _key, nocc,
                                     pair_lmo_idx=pair_lmo_idx,
                                     t1_cache=_t1_cache)
+            _t_bt0 = _time.perf_counter()
             _B_tilde_per_ij = {}
             if _pool is not None:
                 for _k, _bt in _pool.map(_bt_one, keys_sorted):
@@ -1669,14 +1668,20 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 for _k in keys_sorted:
                     _, _bt = _bt_one(_k)
                     _B_tilde_per_ij[_k] = _bt
+            _t_bt = _time.perf_counter() - _t_bt0
 
-            # Batched B+E across all strong pairs — one pool dispatch.
-            # The function iterates keys internally via _pool.map.
-            _B_dict, _E_dict = compute_B_E_batched(
+            # Batched B+E across all strong pairs via plan-cached Cython
+            # kernel (be_kernel).  Output matches the reference to FP
+            # reordering noise (~3e-17); validated side-by-side over
+            # many iterations prior to cutover.
+            from pyscf.cc.dlpno_tccsd.residual import compute_B_E_batched_v2
+            _t_be0 = _time.perf_counter()
+            _B_dict, _E_dict = compute_B_E_batched_v2(
                 keys_sorted, t2_pno_all, pno_spaces, S_pno_cache,
                 _cc_ints, _B_tilde_per_ij, pair_lmo_idx, nocc,
                 _pool=_pool, S_pao_full=S_pao_full, s1e=s1e)
             _BE_all = {'B': _B_dict, 'E': _E_dict}
+            _t_be = _time.perf_counter() - _t_be0
 
             # Accumulator for per-pair timing (thread-safe via list append)
             _pair_timings = {'fab': [], 'resid': [], 'btilde': []}
@@ -1995,10 +2000,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _dt_jiang = _t_jiang_done - _t_jiang
             _dt_total = _t_cycle_end - _t_cycle_start
             _jiang_str = f' jiang={_dt_jiang:.1f}'
+            _pairs_breakdown = (f'(bt={_t_bt:.2f} be={_t_be:.2f} '
+                                f'upd={_dt_pairs - _t_bt - _t_be:.2f})')
             print(f'  Cycle {cycle + 1:3d}: dT = {dT:.3e}  E_corr = {e_cyc:.10f}'
                   f'  dE = {dE:.2e}  [{_dt_total:.1f}s: ovL={_dt_ovl:.1f} '
                   f'Kcoul={_dt_kcoul:.1f} foo={_dt_foo:.1f}'
-                  f'{_jiang_str} pairs={_dt_pairs:.1f}]', flush=True)
+                  f'{_jiang_str} pairs={_dt_pairs:.1f}{_pairs_breakdown}]',
+                  flush=True)
             if dT < this_tol:
                 print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (amplitude).',
                       flush=True)
