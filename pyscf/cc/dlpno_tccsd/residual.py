@@ -288,7 +288,7 @@ def compute_G_term_batched(strong_keys, t2_pno_all, pno_spaces,
         scaled (N, n_ij, n_ij) result ready for scatter-add."""
         n_ij = bucket['n_ij']
         n_ik = bucket['n_ik']
-        S_arr = bucket['S_arr']                # (N, n_ij, n_ik)
+        S_arr = bucket['S_arr']
         t2_keys = bucket['t2_keys']
         t2_transp = bucket['t2_transp']
         scalar_lmo = bucket['scalar_lmo']
@@ -302,15 +302,17 @@ def compute_G_term_batched(strong_keys, t2_pno_all, pno_spaces,
 
         scalars = G_tilde[k_idx, scalar_lmo]
 
-        tmp = np.matmul(S_arr, t2_arr)                 # (N, n_ij, n_ik)
+        # Numpy batched matmul beats both hand-rolled and direct-dgemm
+        # Cython variants at n_pno ~25 here — the G-term is a pure
+        # dgemm chain with no fusion opportunity, so BLAS's cache
+        # blocking + SIMD is already optimal.  Cython prange-over-items
+        # can't outrun BLAS's internal parallelism on this workload.
+        tmp = np.matmul(S_arr, t2_arr)
         out_batch = np.matmul(tmp, S_arr.swapaxes(1, 2))
         out_batch *= scalars[:, None, None]
         return out_batch
 
     def _process_buckets(buckets, flat_out):
-        # Parallel per-bucket compute (pool workers release the GIL
-        # inside numpy matmul), serial scatter-add (np.add.at isn't
-        # thread-safe across different output buffers anyway).
         if _pool is not None and len(buckets) > 1:
             results = list(_pool.map(_bucket_result, buckets))
         else:
