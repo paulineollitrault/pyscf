@@ -1,0 +1,4 @@
+# Cython build artifacts (re-generated from *.pyx via setup.py):
+*.c
+build/
+*.egg-info/
