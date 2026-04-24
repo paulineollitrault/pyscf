@@ -190,24 +190,32 @@ If yes, the hand-rolled serial Cython pattern loses to BLAS — skip.
 
 The big Cython wins on compute-dominated bodies require either:
 
-(a) **Cython + scipy.linalg.cython_blas.dgemm** — call BLAS from inside
-    the nogil block. Keeps BLAS performance; releases GIL around it.
-    Complexity: medium. `scipy.linalg.cython_blas` provides `cimport`
-    headers; our setup.py already links scipy. Worth a one-function
-    prototype (say, the Y contraction in t1_fock).
+(a) ~~**Cython + scipy.linalg.cython_blas.dgemm**~~ — **TRIED, FAILED**
+    on t1_fock. Correctness bit-exact (6/6 shapes). Microbench 0.92×
+    (rough break-even). End-to-end regressed +4.75s CCSD wall despite
+    Fock sub-timer improving 0.27 → 0.20 per cycle — the local win was
+    swamped by cross-phase contention (D +0.23, pairs +0.22 per
+    cycle). The Cython kernel packs shared BLAS threads + caches more
+    densely, starving concurrent C_tilde/D_tilde phases in the same
+    pool. See `feedback_cython_per_pair_pattern.md` for full lesson.
+    Reverted cleanly.
 
-(b) **Batched prange-across-pairs kernel** (v2's original design).
-    Bucket pairs by shape, stack inputs, prange over items. Plan
-    builder overhead justified only if parallelism across 64 threads
-    >> per-pair BLAS win. For 820 pairs in 149 buckets (top bucket
-    34 pairs), each prange has only ~10-30-way parallelism per bucket
-    — may not saturate 64 cores. Risky.
+(b) **Batched prange-across-pairs kernel** (v2's original design) with
+    a **separate** OpenMP team disjoint from the Python pool. Key
+    change vs v2's spec: isolate the Cython parallelism so it doesn't
+    share threads/caches with the concurrent phases. Still untested.
 
 (c) **Leave C/D/t1_fock alone.** Foo was the only easy win. The
     remaining ~7-8s gap vs Psi4 is in compute itself, not dispatch.
     Further gains need algorithmic rework (e.g., bigger BLAS tiles
     by merging per-pair matrices into batched GEMMs) or C++ with
     hand-tuned SIMD kernels.
+
+After two negative results on t1_fock (hand-rolled + BLAS-from-Cython),
+option (c) is looking increasingly correct for the current architecture.
+The system's phase interleaving is load-balanced well by the NumPy
+versions' natural dispatch cadence; tightening one phase disrupts the
+balance.
 
 ### Current state (2026-04-24, this session end)
 
