@@ -989,61 +989,176 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
             return np.asarray(pair_lmo_idx[key])
         return np.arange(nocc)
 
-    # Combined per-pair work (Step 1 Fkj contribution + Step 2 Fab)
-    def _per_pair(key):
-        ci = cc_ints.get(key)
-        if ci is None:
-            return key, None
-        i, j = key
-        npno = pno_spaces[key]['C_pno'].shape[1]
-        lmo_idx = _pair_domain(key)
-
-        # Phase 1: fancy-index the cached matrix.
-        T1_local = np.ascontiguousarray(
-            t1_cache[key][np.asarray(lmo_idx, dtype=np.intp)])
-
-        # Step 1 Fkj contributions — K_bar_* are (nocc, npno); restrict rows.
-        K_bar_chem_l = ci['K_bar_chem'][lmo_idx]
-        K_bar_ji_l = ci['K_bar_ji'][lmo_idx]
-        d_ij = (2.0 * np.sum(T1_local * K_bar_chem_l)
-                - np.sum(T1_local * K_bar_ji_l))
-        d_ji = None
-        if i != j:
-            K_bar_ij_l = ci['K_bar_ij'][lmo_idx]
-            d_ji = (2.0 * np.sum(T1_local * K_bar_chem_l)
-                    - np.sum(T1_local * K_bar_ij_l))
-
-        # Step 2 Fab
-        Qma = ci['Qma'][:, lmo_idx, :]       # (n_local, nlmo, npno)
-        Qab = ci['Qab']                       # (n_local, npno, npno)
-        e_pno = pno_spaces[key]['e_pno']
-        Fab = np.diag(e_pno)
-        gamma = Qma.reshape(Qma.shape[0], -1) @ T1_local.ravel()  # (n_local,)
-        Fab += 2.0 * np.tensordot(gamma, Qab, axes=(0, 0))
-        Y = Qab @ T1_local.T                  # (n_local, npno, nlmo)
-        Fab -= np.tensordot(Y, Qma, axes=((0, 2), (0, 1)))
-
-        Fia_bar = 2.0 * np.tensordot(gamma, Qma, axes=(0, 0))     # (nlmo, npno)
-        Z = T1_local @ Qma.transpose(0, 2, 1)                     # (n_local, nlmo, nlmo)
-        Fia_bar -= np.tensordot(Z, Qma, axes=((0, 1), (0, 1)))    # (nlmo, npno)
-        Fab -= T1_local.T @ Fia_bar
-        return key, (d_ij, d_ji, Fab)
+    # Batched prange kernel: replaces the per-pair pool.map with one
+    # Cython call that runs prange over all pairs in an isolated OpenMP
+    # team (not sharing threads with the Python pool). BLAS forced to
+    # 1 thread during the call to avoid oversubscription.
+    #
+    # Static gather (Qab, Qma, K_bar_*, e_pno, all shape/offset arrays,
+    # scratch buffers) is cached on the function across CCSD iterations —
+    # cc_ints is built once per CCSD run, so only T1 and output buffers
+    # are rebuilt each cycle.
+    from pyscf.cc.dlpno_tccsd._t1_fock_batched_cy import t1_fock_batched
+    from threadpoolctl import threadpool_limits
 
     Fkj = F_lmo.copy()
     Fab_all = {}
-    if _pool is not None:
-        results = list(_pool.map(_per_pair, keys))
-    else:
-        results = [_per_pair(k) for k in keys]
-    for key, payload in results:
-        if payload is None:
-            continue
-        d_ij, d_ji, Fab = payload
-        i, j = key
-        Fkj[i, j] += d_ij
-        if d_ji is not None:
-            Fkj[j, i] += d_ji
-        Fab_all[key] = Fab
+
+    valid_keys = [k for k in keys if cc_ints.get(k) is not None]
+    N = len(valid_keys)
+
+    if N > 0:
+        # Plan key — stable across CCSD iterations within one run.
+        plan_key = (id(cc_ints), tuple(valid_keys),
+                    id(pair_lmo_idx) if pair_lmo_idx is not None else 0)
+        plan = getattr(t1_fock, '_batched_plan', None)
+        if plan is None or plan.get('key') != plan_key:
+            nlmo_arr = np.zeros(N, dtype=np.int32)
+            npno_arr = np.zeros(N, dtype=np.int32)
+            n_local_arr = np.zeros(N, dtype=np.int32)
+            need_dji_arr = np.zeros(N, dtype=np.int32)
+
+            K_chem_list = [None] * N
+            K_ji_list = [None] * N
+            K_ij_list = [None] * N
+            Qma_list = [None] * N
+            Qab_list = [None] * N
+            e_pno_list = [None] * N
+            lmo_idx_list = [None] * N
+
+            for p, key in enumerate(valid_keys):
+                ci = cc_ints[key]
+                i, j = key
+                npno = pno_spaces[key]['C_pno'].shape[1]
+                lmo_idx = np.asarray(_pair_domain(key), dtype=np.intp)
+                nlmo = lmo_idx.size
+                n_local = ci['Qma'].shape[0]
+
+                lmo_idx_list[p] = lmo_idx
+                K_chem_list[p] = np.ascontiguousarray(
+                    ci['K_bar_chem'][lmo_idx])
+                K_ji_list[p] = np.ascontiguousarray(ci['K_bar_ji'][lmo_idx])
+                need_dji = (i != j)
+                K_ij_list[p] = (np.ascontiguousarray(ci['K_bar_ij'][lmo_idx])
+                                if need_dji else K_ji_list[p])
+                Qma_list[p] = np.ascontiguousarray(ci['Qma'][:, lmo_idx, :])
+                Qab_list[p] = np.ascontiguousarray(ci['Qab'])
+                e_pno_list[p] = np.ascontiguousarray(pno_spaces[key]['e_pno'])
+
+                nlmo_arr[p] = nlmo
+                npno_arr[p] = npno
+                n_local_arr[p] = n_local
+                need_dji_arr[p] = int(need_dji)
+
+            def _flat(arrs):
+                sizes = np.array([a.size for a in arrs], dtype=np.int64)
+                offsets = np.empty(len(arrs) + 1, dtype=np.int64)
+                offsets[0] = 0
+                offsets[1:] = np.cumsum(sizes)
+                buf = np.empty(int(offsets[-1]))
+                for idx, a in enumerate(arrs):
+                    buf[offsets[idx]:offsets[idx + 1]] = a.ravel()
+                return buf, offsets
+
+            K_chem_flat, K_chem_off = _flat(K_chem_list)
+            K_ji_flat, K_ji_off = _flat(K_ji_list)
+            K_ij_flat, K_ij_off = _flat(K_ij_list)
+            Qma_flat, Qma_off = _flat(Qma_list)
+            Qab_flat, Qab_off = _flat(Qab_list)
+            e_pno_flat, e_pno_off = _flat(e_pno_list)
+
+            # T1 offsets (reused each cycle, buffer rebuilt below)
+            T1_sizes = (nlmo_arr.astype(np.int64) * npno_arr.astype(np.int64))
+            T1_off = np.empty(N + 1, dtype=np.int64)
+            T1_off[0] = 0
+            T1_off[1:] = np.cumsum(T1_sizes)
+            T1_total = int(T1_off[-1])
+
+            Fab_sizes = (npno_arr.astype(np.int64) ** 2)
+            Fab_off = np.empty(N + 1, dtype=np.int64)
+            Fab_off[0] = 0
+            Fab_off[1:] = np.cumsum(Fab_sizes)
+            Fab_total = int(Fab_off[-1])
+
+            max_n_local = int(n_local_arr.max())
+            max_nlmo = int(nlmo_arr.max())
+            max_npno = int(npno_arr.max())
+            num_threads = min(32, N)  # 64 threads makes scratch 1.3GB; 32 halves it with same speedup
+
+            scratch = {
+                'gamma': np.empty((num_threads, max_n_local)),
+                'Y_trans': np.empty(
+                    (num_threads, max_n_local * max_npno * max_nlmo)),
+                'Y_alt': np.empty(
+                    (num_threads, max_n_local * max_nlmo * max_npno)),
+                'Fia': np.empty((num_threads, max_nlmo * max_npno)),
+                'Z_stacked': np.empty(
+                    (num_threads, max_n_local * max_nlmo * max_nlmo)),
+                'Z_xxx': np.empty(
+                    (num_threads, max_n_local * max_nlmo * max_nlmo)),
+            }
+            # First-touch scratch to pay the page-fault cost once.
+            for buf in scratch.values():
+                buf.fill(0.0)
+
+            plan = {
+                'key': plan_key,
+                'valid_keys': valid_keys,
+                'lmo_idx_list': lmo_idx_list,
+                'nlmo_arr': nlmo_arr, 'npno_arr': npno_arr,
+                'n_local_arr': n_local_arr, 'need_dji_arr': need_dji_arr,
+                'K_chem_flat': K_chem_flat, 'K_chem_off': K_chem_off,
+                'K_ji_flat': K_ji_flat, 'K_ji_off': K_ji_off,
+                'K_ij_flat': K_ij_flat, 'K_ij_off': K_ij_off,
+                'Qma_flat': Qma_flat, 'Qma_off': Qma_off,
+                'Qab_flat': Qab_flat, 'Qab_off': Qab_off,
+                'e_pno_flat': e_pno_flat, 'e_pno_off': e_pno_off,
+                'T1_off': T1_off, 'T1_total': T1_total,
+                'Fab_off': Fab_off, 'Fab_total': Fab_total,
+                'scratch': scratch, 'num_threads': num_threads,
+            }
+            t1_fock._batched_plan = plan
+
+        # Per-cycle: build T1_flat and output buffers.
+        T1_flat = np.empty(plan['T1_total'])
+        T1_off = plan['T1_off']
+        for p, key in enumerate(plan['valid_keys']):
+            lmo_idx = plan['lmo_idx_list'][p]
+            T1_flat[T1_off[p]:T1_off[p + 1]] = t1_cache[key][lmo_idx].ravel()
+
+        d_flat = np.zeros(N * 2)
+        Fab_flat = np.zeros(plan['Fab_total'])
+        sc = plan['scratch']
+
+        with threadpool_limits(limits=1, user_api='blas'):
+            t1_fock_batched(
+                T1_flat, T1_off,
+                plan['K_chem_flat'], plan['K_chem_off'],
+                plan['K_ji_flat'], plan['K_ji_off'],
+                plan['K_ij_flat'], plan['K_ij_off'],
+                plan['Qma_flat'], plan['Qma_off'],
+                plan['Qab_flat'], plan['Qab_off'],
+                plan['e_pno_flat'], plan['e_pno_off'],
+                plan['nlmo_arr'], plan['npno_arr'],
+                plan['n_local_arr'], plan['need_dji_arr'],
+                sc['gamma'], sc['Y_trans'], sc['Y_alt'],
+                sc['Fia'], sc['Z_stacked'], sc['Z_xxx'],
+                d_flat, Fab_flat, plan['Fab_off'],
+                plan['num_threads'],
+            )
+
+        # Scatter outputs
+        Fab_off_plan = plan['Fab_off']
+        npno_arr_plan = plan['npno_arr']
+        for p, key in enumerate(plan['valid_keys']):
+            i, j = key
+            npno = int(npno_arr_plan[p])
+            Fkj[i, j] += d_flat[p * 2]
+            if i != j:
+                Fkj[j, i] += d_flat[p * 2 + 1]
+            Fab_all[key] = (
+                Fab_flat[Fab_off_plan[p]:Fab_off_plan[p + 1]]
+                .reshape(npno, npno).copy())
 
     # Eq 94: Fkj += Σ_a Fia_bar_jj · t1_j — use local LMO domain of (jj, jj)
     for j_idx in range(nocc):
