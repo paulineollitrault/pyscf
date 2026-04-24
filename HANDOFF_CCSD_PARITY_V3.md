@@ -7,8 +7,10 @@ lever").
 
 ## Where we are now
 
-- Branch: `dlpno_restructure`, HEAD = `111d811d7` "DLPNO-CCSD:
-  einsum → tensordot in foo_dressed + G_tilde inner trace".
+- Branch: `dlpno_restructure`, HEAD = `8e7f4bca9` "DLPNO-CCSD: Cython
+  nogil port of foo_dressed_local._per_pair" (the v3 pilot).
+- Prior relevant commits: `111d811d7` (einsum→tensordot swap),
+  `80c74f8f2` (this handoff doc — now updated with lessons learned).
 - New correctness anchor (bit-equivalent to v2's): **E_tccsd =
   −2.13088299002238** on water10 / cc-pVDZ / Jiang TightPNO.
 - Wall time on this box: **CCSD = 128–130s** (two samples: 128.54s,
@@ -18,15 +20,31 @@ lever").
   evidence: foo=0.29→0.20 and G=0.52→0.48 per cycle (verified across
   steady-state cycles 4–14).
 
-## Why this session stopped short of the big lever
+## Pilot port validated (commit 8e7f4bca9)
 
-The v2 handoff identified **Cython nogil port of Phase 1 per-pair
-bodies** as "the biggest lever" — projected savings of 25–30 s/run.
-This port is real work (multiple hours, plan builder + kernel + plumbing
-+ correctness debugging), and stopping mid-way would leave the tree in
-a broken state. This session took the lower-risk tensordot-swap win,
-committed cleanly, and leaves the port for next session with a concrete
-design below.
+**The simple "per-pair Cython nogil kernel behind pool.map" pattern
+works.** foo_dressed was ported as the pilot:
+
+- Wrote `_foo_dressed_cy.pyx` with one function that takes typed
+  memoryviews for one pair's inputs, releases the GIL, and does the
+  per-pair math as hand-rolled loops. No plan builder, no prange
+  across pairs — the Python ThreadPoolExecutor.pool.map provides
+  cross-pair parallelism exactly as before.
+- Microbench per-pair showed only 1.2–1.75× speedup vs NumPy, but
+  **end-to-end foo sub-timer collapsed 0.20 → 0.06 s/cycle (3.3×)**
+  because releasing the GIL let the pool actually scale instead of
+  serializing on numpy internals. CCSD wall 129 → 124.7 s (−4.5s
+  real signal, not noise).
+
+**Key lesson:** don't over-engineer the first port. Plan builder +
+bucketed prange is not required for a meaningful win. A plain
+`with nogil` block around hand-rolled loops in a per-pair function is
+enough — the win is mostly from GIL release, not cache locality or
+FLOP reduction.
+
+**Correctness anchor (new):** `-2.13088299002219`; preserved to 10+
+digits vs prior anchors. 6 synthetic-shape tests in `/tmp/test_foo_cy.py`
+pass at 3e-12 max diff (FP reordering noise).
 
 ## First actions when you pick this up
 
@@ -133,21 +151,50 @@ overlap G with bt/be/cd, parallelize build_G_tilde outer-i, inline
 compute_CD_terms_batched, shared T1_cache wrapper, fine_pool sweep
 4/8/16/32.
 
-### Suggested session scope
+### Suggested session scope (updated after foo pilot)
 
-1. Write `_d_tilde_ph1_cy.pyx` with a per-pair kernel (single pair,
-   typed memoryviews, `with nogil`). Keep the Python `_process_ik_t12`
-   as an orchestration layer that gathers inputs and calls the kernel.
-   Validate correctness first (bit-exact E_tccsd).
-2. Benchmark. If nogil per-pair already wins (expect ~3–5s by removing
-   numpy dispatch), commit.
-3. Then batch: build a plan grouping by `(n_pno, n_local, n_domain)`
-   shape; write a bucketed kernel with prange over items. Expect
-   another 5–10 s when the ~820-wide parallelism lands.
-4. Repeat steps 1–3 for C_tilde Phase 1, then Fock and foo.
+The pilot proved the simple serial-per-pair nogil pattern wins (3.3×
+on the ported phase). Next session should follow the same pattern for
+the remaining bodies — **skip the batched/bucketed design unless the
+simple pattern stalls**.
 
-Total projected savings (across 4 targets): 15–25 s — brings CCSD to
-~100s, under 7× Psi4.
+1. Pick next target. Ordered by expected win (sub-timer × ~3×):
+   - `t1_fock._per_pair` (Fock=0.26/cycle → ~0.08, ~2.5s/run).
+     More math than foo: `gamma`, `Y`, `Fia_bar`, `Fab` chain — write
+     carefully with standalone bit-exact test first.
+   - `compute_C_tilde_batched._process_ki_terms12`
+     (C=0.85-1.05/cycle → ~0.30, ~8-10s/run). Biggest target, but
+     Phase 1 is only ~40% of total C — see commit 8e7f4bca9 memory
+     note for the `phase1_t12=370ms / tot=955ms` breakdown. Port just
+     the Phase-1 body, not the whole thing.
+   - `build_D_tilde_batched._process_ik_t12` (D=0.94-1.29/cycle →
+     Phase 1 portion similar to C). Has the most complex math of the
+     four (two terms, fancy-index gathers); do it last.
+
+2. Use foo as the template: new `_<name>_cy.pyx`, single function taking
+   typed memoryviews for one pair. Release GIL via `with nogil`. No
+   plan builder.
+
+3. Build pipeline:
+   ```bash
+   cd /home/ec2-user/Work/pyscf/pyscf/cc/dlpno_tccsd
+   /environments/miniconda3/envs/tmc/bin/python setup.py build_ext --inplace
+   cp _<name>_cy.cpython-312-x86_64-linux-gnu.so \
+      /environments/miniconda3/envs/tmc/lib/python3.12/site-packages/pyscf/cc/dlpno_tccsd/
+   cp lccsd.py (or residual.py) to the installed path too.
+   ```
+
+4. Validate before running CCSD: `/tmp/test_<name>_cy.py` on 4-6
+   synthetic shapes, asserting `max(|ref - cy|) < 1e-11`. Only when
+   green, run `/tmp/profile_dlpno.py` and check E_tccsd.
+
+5. Correctness anchor: **-2.13088299…** to 10+ digits.
+
+Total projected savings (across 3 remaining targets): ~12-15 s —
+brings CCSD to ~110s, under 8× Psi4. The v2 projection of 25–30s was
+optimistic; the per-pair-serial approach misses some parallelism that
+a true batched prange kernel would capture, but the engineering cost
+is much lower.
 
 ## Build sync caveat (from v2, still applies)
 
