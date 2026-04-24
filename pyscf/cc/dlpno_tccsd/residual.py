@@ -1604,73 +1604,220 @@ def compute_C_tilde_batched(
         _term2_precomputed = {ki: td['result'] for ki, td in term2_data.items()}
 
     # ------------------------------------------------------------------
-    # Phase 1: Terms 1 + 2 per-pair (same shape as reference; pool if given)
+    # Phase 1: Terms 1 + 2 per-pair.
+    # Batched prange kernel with isolated OpenMP team. Static per-pair
+    # data (k_Qa, Qab, Qma_sub, ooL_ki, shapes, offsets, scratch) cached
+    # across CCSD iterations. Per-iter we rebuild T1 inputs and outputs.
+    # Pairs not covered by cc_ints fall back to the original Python
+    # per-pair path (rare for typical molecules).
     # ------------------------------------------------------------------
-    def _process_ki_terms12(ki_tuple):
-        k, i = ki_tuple
+    from pyscf.cc.dlpno_tccsd._c_tilde_ph1_batched_cy import (
+        c_tilde_ph1_batched)
+    from threadpoolctl import threadpool_limits
+
+    all_pairs_list = list(all_pairs)
+    covered_pairs = []
+    fallback_pairs = []
+    for ki in all_pairs_list:
+        k, i = ki
         key_ki = (min(k, i), max(k, i))
         n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
         if n_ki == 0:
-            return ki_tuple, None
-
-        C_tilde_ki = np.zeros((n_ki, n_ki))
-
-        # --- Term 2 ---
+            continue
         if key_ki in cc_ints and cc_ints[key_ki] is not None:
-            ci_ki = cc_ints[key_ki]
-            k_Qa = ci_ki['i_Qa'] if key_ki[0] == k else ci_ki['j_Qa']
-            Qab_ki = ci_ki['Qab']
-            t1_i_ki = T1_cache.get((key_ki, i), np.zeros(n_ki))
-            z = k_Qa @ t1_i_ki
-            C_tilde_ki += np.tensordot(z, Qab_ki, axes=(0, 0))
-        elif (k, i) in _term2_precomputed:
-            C_tilde_ki += _term2_precomputed[(k, i)]
+            covered_pairs.append(ki)
+        else:
+            fallback_pairs.append(ki)
 
-        # --- Term 1: -Σ_l T1_all[l,a] · (ki|lc) ---
+    # --- Batched path for cc_ints-covered pairs ---
+    if covered_pairs:
+        N = len(covered_pairs)
+        plan_key = (id(cc_ints), tuple(covered_pairs),
+                    id(pair_lmo_idx) if pair_lmo_idx is not None else 0)
+        plan = getattr(compute_C_tilde_batched, '_ph1_plan', None)
+        if plan is None or plan.get('key') != plan_key:
+            n_pno_arr = np.zeros(N, dtype=np.int32)
+            n_local_arr = np.zeros(N, dtype=np.int32)
+            n_domain_arr = np.zeros(N, dtype=np.int32)
+            k_Qa_list = [None] * N
+            Qab_list = [None] * N
+            Qma_sub_list = [None] * N
+            ooL_ki_list = [None] * N
+            ll_idx_list = [None] * N
+            key_ki_list = [None] * N
+            i_idx_list = [None] * N
+
+            for p, ki in enumerate(covered_pairs):
+                k, i = ki
+                key_ki = (min(k, i), max(k, i))
+                ci_ki = cc_ints[key_ki]
+                n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+                if pair_lmo_idx is not None and key_ki in pair_lmo_idx:
+                    ll_idx = np.asarray(pair_lmo_idx[key_ki], dtype=np.intp)
+                else:
+                    ll_idx = np.arange(nocc, dtype=np.intp)
+                n_domain = ll_idx.size
+                n_local = ci_ki['Qma'].shape[0]
+
+                is_k_first = (key_ki[0] == k)
+                k_Qa_list[p] = np.ascontiguousarray(
+                    ci_ki['i_Qa'] if is_k_first else ci_ki['j_Qa'])
+                Qab_list[p] = np.ascontiguousarray(ci_ki['Qab'])
+                Qma_sub_list[p] = np.ascontiguousarray(
+                    ci_ki['Qma'][:, ll_idx, :])
+                ooL_arr = ci_ki['j_Qk'] if is_k_first else ci_ki['i_Qk']
+                ooL_ki_list[p] = np.ascontiguousarray(ooL_arr[:, k])
+
+                n_pno_arr[p] = n_ki
+                n_local_arr[p] = n_local
+                n_domain_arr[p] = n_domain
+                ll_idx_list[p] = ll_idx
+                key_ki_list[p] = key_ki
+                i_idx_list[p] = i
+
+            def _flat(arrs):
+                sizes = np.array([a.size for a in arrs], dtype=np.int64)
+                offsets = np.empty(len(arrs) + 1, dtype=np.int64)
+                offsets[0] = 0
+                offsets[1:] = np.cumsum(sizes)
+                buf = np.empty(int(offsets[-1]))
+                for idx, a in enumerate(arrs):
+                    buf[offsets[idx]:offsets[idx + 1]] = a.ravel()
+                return buf, offsets
+
+            k_Qa_flat, k_Qa_off = _flat(k_Qa_list)
+            Qab_flat, Qab_off = _flat(Qab_list)
+            Qma_sub_flat, Qma_sub_off = _flat(Qma_sub_list)
+            ooL_ki_flat, ooL_ki_off = _flat(ooL_ki_list)
+
+            t1_sizes = n_pno_arr.astype(np.int64)
+            t1_off = np.empty(N + 1, dtype=np.int64)
+            t1_off[0] = 0
+            t1_off[1:] = np.cumsum(t1_sizes)
+
+            T1_local_sizes = (n_domain_arr.astype(np.int64)
+                              * n_pno_arr.astype(np.int64))
+            T1_local_off = np.empty(N + 1, dtype=np.int64)
+            T1_local_off[0] = 0
+            T1_local_off[1:] = np.cumsum(T1_local_sizes)
+
+            C_sizes = n_pno_arr.astype(np.int64) ** 2
+            C_off = np.empty(N + 1, dtype=np.int64)
+            C_off[0] = 0
+            C_off[1:] = np.cumsum(C_sizes)
+
+            max_n_local = int(n_local_arr.max())
+            max_n_pno = int(n_pno_arr.max())
+            max_n_domain = int(n_domain_arr.max())
+            num_threads = min(32, N)
+
+            scratch = {
+                'z': np.empty((num_threads, max_n_local)),
+                'K_bar': np.empty(
+                    (num_threads, max_n_domain * max_n_pno)),
+            }
+            for buf in scratch.values():
+                buf.fill(0.0)
+
+            plan = {
+                'key': plan_key,
+                'covered_pairs': covered_pairs,
+                'key_ki_list': key_ki_list,
+                'i_idx_list': i_idx_list,
+                'll_idx_list': ll_idx_list,
+                'n_pno_arr': n_pno_arr, 'n_local_arr': n_local_arr,
+                'n_domain_arr': n_domain_arr,
+                'k_Qa_flat': k_Qa_flat, 'k_Qa_off': k_Qa_off,
+                'Qab_flat': Qab_flat, 'Qab_off': Qab_off,
+                'Qma_sub_flat': Qma_sub_flat, 'Qma_sub_off': Qma_sub_off,
+                'ooL_ki_flat': ooL_ki_flat, 'ooL_ki_off': ooL_ki_off,
+                't1_off': t1_off, 't1_total': int(t1_off[-1]),
+                'T1_local_off': T1_local_off,
+                'T1_local_total': int(T1_local_off[-1]),
+                'C_off': C_off, 'C_total': int(C_off[-1]),
+                'scratch': scratch, 'num_threads': num_threads,
+            }
+            compute_C_tilde_batched._ph1_plan = plan
+
+        t1_flat = np.empty(plan['t1_total'])
+        T1_local_flat = np.empty(plan['T1_local_total'])
+        t1_off_plan = plan['t1_off']
+        T1_local_off_plan = plan['T1_local_off']
+        zero_pno_cache = {}
+        for p in range(N):
+            key_ki = plan['key_ki_list'][p]
+            i = plan['i_idx_list'][p]
+            n_pno = int(plan['n_pno_arr'][p])
+            t1_i_ki = T1_cache.get((key_ki, i))
+            if t1_i_ki is None:
+                zv = zero_pno_cache.get(n_pno)
+                if zv is None:
+                    zv = np.zeros(n_pno)
+                    zero_pno_cache[n_pno] = zv
+                t1_i_ki = zv
+            t1_flat[t1_off_plan[p]:t1_off_plan[p + 1]] = t1_i_ki
+
+            ll_idx = plan['ll_idx_list'][p]
+            n_dom = ll_idx.size
+            rows_buf = T1_local_flat[
+                T1_local_off_plan[p]:T1_local_off_plan[p + 1]
+            ].reshape(n_dom, n_pno)
+            for li, ll in enumerate(ll_idx):
+                r = T1_cache.get((key_ki, int(ll)))
+                if r is None:
+                    rows_buf[li].fill(0.0)
+                else:
+                    rows_buf[li] = r
+
+        C_flat = np.zeros(plan['C_total'])
+        sc = plan['scratch']
+
+        with threadpool_limits(limits=1, user_api='blas'):
+            c_tilde_ph1_batched(
+                plan['k_Qa_flat'], plan['k_Qa_off'],
+                plan['Qab_flat'], plan['Qab_off'],
+                plan['Qma_sub_flat'], plan['Qma_sub_off'],
+                plan['ooL_ki_flat'], plan['ooL_ki_off'],
+                t1_flat, t1_off_plan,
+                T1_local_flat, T1_local_off_plan,
+                plan['n_pno_arr'], plan['n_local_arr'],
+                plan['n_domain_arr'],
+                sc['z'], sc['K_bar'],
+                C_flat, plan['C_off'],
+                plan['num_threads'],
+            )
+
+        C_off_plan = plan['C_off']
+        for p, ki in enumerate(plan['covered_pairs']):
+            n_pno = int(plan['n_pno_arr'][p])
+            C_tilde_all[ki] = (
+                C_flat[C_off_plan[p]:C_off_plan[p + 1]]
+                .reshape(n_pno, n_pno).copy())
+
+    # --- Fallback Python path for pairs not covered by cc_ints ---
+    for ki in fallback_pairs:
+        k, i = ki
+        key_ki = (min(k, i), max(k, i))
+        n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+        C_tilde_ki = np.zeros((n_ki, n_ki))
+        if _term2_precomputed is not None and (k, i) in _term2_precomputed:
+            C_tilde_ki += _term2_precomputed[(k, i)]
         if pair_lmo_idx is not None and key_ki in pair_lmo_idx:
             _ll_idx = np.asarray(pair_lmo_idx[key_ki], dtype=np.intp)
         else:
             _ll_idx = np.arange(nocc)
-
-        # Gather T1_local_ki and K_bar_chem_local as single tensor ops —
-        # replaces per-l dict lookups and per-l matmuls. For cc_ints-covered
-        # pairs we use the local-DF path (Qma + i_Qk / j_Qk); otherwise fall
-        # back to the bare ovL / ooL arrays.
         T1_rows = [T1_cache.get((key_ki, int(_ll))) for _ll in _ll_idx]
         T1_local_ki = np.ascontiguousarray(
             np.array([r if r is not None else np.zeros(n_ki)
                       for r in T1_rows]))
-
-        if key_ki in cc_ints and cc_ints[key_ki] is not None:
-            ci_ki2 = cc_ints[key_ki]
-            # get_local_ooL_vec(k, i, pair) maps l_arg=i to j_Qk[:,k]
-            # when key_ki[0] == k (canonical pair (k,i)) and to i_Qk[:,k]
-            # when key_ki[0] != k (canonical pair (i,k), with k > i).
-            _ooL_ki = (ci_ki2['j_Qk'][:, k] if key_ki[0] == k
-                       else ci_ki2['i_Qk'][:, k])
-            # K_bar_chem_local[l, c] = Σ_L Qma[L, l, c] * ooL_ki[L]
-            K_bar_chem_local = np.tensordot(
-                ci_ki2['Qma'][:, _ll_idx, :], _ooL_ki, axes=(0, 0))
-        else:
-            ooL_ki = ooL_bare[k, i, :]
-            K_bar_chem_local = np.zeros((len(_ll_idx), n_ki))
-            for _li, _ll in enumerate(_ll_idx):
-                ovL_l_ki = ovL_pno_bare.get((key_ki, int(_ll)))
-                if ovL_l_ki is not None:
-                    K_bar_chem_local[_li] = ovL_l_ki @ ooL_ki
-
+        ooL_ki = ooL_bare[k, i, :]
+        K_bar_chem_local = np.zeros((len(_ll_idx), n_ki))
+        for _li, _ll in enumerate(_ll_idx):
+            ovL_l_ki = ovL_pno_bare.get((key_ki, int(_ll)))
+            if ovL_l_ki is not None:
+                K_bar_chem_local[_li] = ovL_l_ki @ ooL_ki
         C_tilde_ki += -T1_local_ki.T @ K_bar_chem_local
-        return ki_tuple, C_tilde_ki
-
-    if _pool is not None:
-        for ki, val in _pool.map(_process_ki_terms12, list(all_pairs)):
-            if val is not None:
-                C_tilde_all[ki] = val
-    else:
-        for ki in all_pairs:
-            _, val = _process_ki_terms12(ki)
-            if val is not None:
-                C_tilde_all[ki] = val
+        C_tilde_all[ki] = C_tilde_ki
     _pt['phase1_t12'] = _time_dbg.perf_counter() - _t0; _t0 = _time_dbg.perf_counter()
 
     # ------------------------------------------------------------------
