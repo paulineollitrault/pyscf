@@ -315,6 +315,8 @@ def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
     pair's local aux. The contraction is identical in structure to the
     legacy version, just summed over local-aux instead of full naux.
     """
+    from pyscf.cc.dlpno_tccsd._foo_dressed_cy import foo_dressed_one
+
     def _per_pair(key_mq):
         t2_mq_raw = t2_pno_all.get(key_mq)
         if t2_mq_raw is None or t2_mq_raw.shape[0] == 0:
@@ -324,19 +326,14 @@ def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
             return key_mq, None
         m, q = key_mq
         Qma = ci['Qma']
-        ovL_m = Qma[:, m, :].T
-        theta_mq = 2.0 * t2_mq_raw.T - t2_mq_raw
-        X_mq = theta_mq @ ovL_m
-        # contrib_q[p] = sum_{L, a} Qma[L, p, a] * X_mq[a, L]
-        # tensordot contracts Qma axes (0, 2) with X_mq axes (1, 0) → (nocc,).
-        # Avoids einsum's Python-level path planner; dispatches to BLAS GEMM.
-        contrib_q = np.tensordot(Qma, X_mq, axes=[(0, 2), (1, 0)])
-        contrib_m = None
+        nocc = Qma.shape[1]
+        contrib_q = np.zeros(nocc)
         if m != q:
-            theta_qm = 2.0 * t2_mq_raw - t2_mq_raw.T
-            ovL_q = Qma[:, q, :].T
-            X_qm = theta_qm @ ovL_q
-            contrib_m = np.tensordot(Qma, X_qm, axes=[(0, 2), (1, 0)])
+            contrib_m = np.zeros(nocc)
+            foo_dressed_one(Qma, t2_mq_raw, m, q, contrib_q, contrib_m)
+        else:
+            contrib_m = None
+            foo_dressed_one(Qma, t2_mq_raw, m, q, contrib_q, contrib_q)
         return key_mq, (contrib_q, contrib_m)
 
     foo = np.zeros((nocc_lmo, nocc_lmo))
