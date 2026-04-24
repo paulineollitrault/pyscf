@@ -142,7 +142,9 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
             if not U_stack_list:
                 continue
             U_stack = np.stack(U_stack_list, axis=0)
-            traces = np.einsum('ab,nba->n', K_il, U_stack, optimize=True)
+            # trace[n] = sum_{a, b} K[a, b] * U[n, b, a] = Tr(K @ U[n]).
+            # tensordot skips einsum's Python path planner; dispatches to BLAS.
+            traces = np.tensordot(K_il, U_stack, axes=[(0, 1), (2, 1)])
             for n_j, j_idx in enumerate(j_valid):
                 row[j_idx] += traces[n_j]
         return i_idx, row
