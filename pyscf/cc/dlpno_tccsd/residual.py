@@ -106,8 +106,12 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
             t2_lj_d = t2_lj.T if l_idx > j_idx else t2_lj
             u_lj_cache[(l_idx, j_idx)] = (key_lj, 2.0 * t2_lj_d - t2_lj_d.T)
 
-    # Swap loop order to (i, l, j) so K_il / t2_il setup happens once per
-    # (i, l) instead of once per (i, l, j).
+    # Loop order (i, l) outer; inner j gathered per-(i, l) into a stack of
+    # projected U_lj arrays and the traces with K_il are evaluated as a
+    # single batched einsum. That collapses 40 per-j np.sum calls into one
+    # einsum, dropping most of the Python overhead in the inner loop.
+    # Per-(i, l) shape is (n_valid_j, n_pno_il, n_pno_il), which is uniform
+    # within a single (i, l) pass (U is already projected to PNO_il).
     for i_idx in range(nocc):
         for l_idx in range(nocc):
             key_il = (min(i_idx, l_idx), max(i_idx, l_idx))
@@ -119,7 +123,10 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
             K_il = get_local_K(cc_ints, key_il, i_idx, l_idx)
             if K_il is None:
                 continue
+            n_il = K_il.shape[0]
 
+            j_valid = []
+            U_stack_list = []
             for j_idx in range(nocc):
                 u_entry = u_lj_cache.get((l_idx, j_idx))
                 if u_entry is None:
@@ -133,9 +140,16 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                     if S_il_lj is None:
                         continue
                     U_lj_proj = S_il_lj @ u_lj @ S_il_lj.T
+                j_valid.append(j_idx)
+                U_stack_list.append(U_lj_proj)
 
-                # G[i,j] += K_il · U_lj.T = trace(K @ U.T)
-                G[i_idx, j_idx] += np.sum(K_il * U_lj_proj.T)
+            if not U_stack_list:
+                continue
+            U_stack = np.stack(U_stack_list, axis=0)    # (n_j_valid, n_il, n_il)
+            # traces[n] = Σ_{a,b} K_il[a,b] * U_stack[n, b, a] = Σ K · U.T
+            traces = np.einsum('ab,nba->n', K_il, U_stack, optimize=True)
+            for n_j, j_idx in enumerate(j_valid):
+                G[i_idx, j_idx] += traces[n_j]
 
     return G
 

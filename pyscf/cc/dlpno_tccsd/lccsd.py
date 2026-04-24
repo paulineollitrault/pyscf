@@ -1559,8 +1559,11 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             from pyscf.cc.dlpno_tccsd.local_df import t1_fock
             from pyscf.cc.dlpno_tccsd.residual import compute_C_tilde_batched
             compute_C_tilde_batched._dump_timing = (cycle == 5)
-            _tj0 = _time.perf_counter()
 
+            # Per-sub-phase wall timers so the cycle print shows which
+            # jiang steps are the serial/bottleneck blocks (user asked
+            # for this after observing htop low-CPU stretches).
+            _tj_c0 = _time.perf_counter()
             _jiang_C = compute_C_tilde_batched(
                 t1_pno, t2_pno_all, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
@@ -1569,6 +1572,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 pair_lmo_idx=pair_lmo_idx, _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
                 blas_threads=32, omp_threads=ncores)
+            _tj_C = _time.perf_counter() - _tj_c0
+
+            _tj_d0 = _time.perf_counter()
             from pyscf.cc.dlpno_tccsd.residual import build_D_tilde_batched
             _jiang_D = build_D_tilde_batched(
                 t1_pno, t2_pno_all, pno_spaces, nocc,
@@ -1578,39 +1584,36 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 pair_lmo_idx=pair_lmo_idx, _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
                 t1_cache=_t1_cache, omp_threads=ncores)
+            _tj_D = _time.perf_counter() - _tj_d0
+
+            _tj_f0 = _time.perf_counter()
             _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
                 _cc_ints, None, t1_pno, fov_pno, pno_spaces,
                 S_pno_cache, F_lmo, eps_lmo, foo_total,
                 _all_keys_j, nocc, _pool=(_fine_pool or _pool),
                 pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache)
-            _tj_C = _time.perf_counter() - _tj0
-            _tj_D = 0.0
-            _tj_FG = 0.0
-            _tj_Fab = 0.0
+            _tj_Fab = _time.perf_counter() - _tj_f0
 
-            # Mixed-domain integrals for C/D bold terms (negligible; serial is fine)
-            _tj0 = _time.perf_counter()
+            _tj_km0 = _time.perf_counter()
             _jiang_K_mixed = build_mixed_domain_integrals(
                 t2_pno_all, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache,
                 cc_ints=_cc_ints)
-            _tj_Km = _time.perf_counter() - _tj0
+            _tj_Km = _time.perf_counter() - _tj_km0
 
             _jiang_J_oo_d = None
 
+            _tj_g0 = _time.perf_counter()
             _local_df_G = build_G_tilde(
                 t2_pno_all, t1_pno, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache,
                 _local_Fkj, _local_foo_t1,
                 cc_ints=_cc_ints,
                 S_pao_full=S_pao_full, s1e=s1e)
+            _g_future = None
+            _tj_FG = _time.perf_counter() - _tj_g0
 
             _t_jiang_done = _time.perf_counter()
-            if getattr(_run_dlpno_lccsd, '_detail_jiang', False):
-                print(f'    [jiang] ovL_d={_tj_ovl:.3f} df={_tj_df:.3f} '
-                      f'C={_tj_C:.3f} D={_tj_D:.3f} FG={_tj_FG:.3f} '
-                      f'Km={_tj_Km:.3f} Fab={_tj_Fab:.3f} '
-                      f'total={_t_jiang_done-_t_jiang:.3f}s', flush=True)
 
             _jiang_cache = {
                 'C_tilde': _jiang_C, 'D_tilde': _jiang_D,
@@ -1687,6 +1690,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # pairs turns ~30 small matmuls per pair per iter into a
             # handful of large batched matmuls.  Plan is cached across
             # iterations (static structure).
+            # Join the backgrounded build_G_tilde before gterm needs it.
+            # With the overlap, G's 0.62s/iter serial work runs concurrently
+            # with bt + be + cd above, so its wall cost is absorbed.
+            if _g_future is not None:
+                _g_wait0 = _time.perf_counter()
+                _local_df_G = _g_future.result()
+                _tj_FG_wait = _time.perf_counter() - _g_wait0
+                _tj_FG += _tj_FG_wait
+
             from pyscf.cc.dlpno_tccsd.residual import compute_G_term_batched
             _t_g0 = _time.perf_counter()
             _G_term_all = compute_G_term_batched(
@@ -2011,19 +2023,19 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             dE = abs(e_cyc - e_prev) if cycle > 0 else float('inf')
             e_prev = e_cyc
             _t_cycle_end = _time.perf_counter()
-            _dt_ovl = _t_ovl_done - _t_ovl
-            _dt_kcoul = _t_kcoul_done - _t_kcoul
             _dt_foo = _t_foo_done - _t_foo
             _dt_pairs = _t_pairs_done - _t_pairs
             _dt_jiang = _t_jiang_done - _t_jiang
             _dt_total = _t_cycle_end - _t_cycle_start
-            _jiang_str = f' jiang={_dt_jiang:.1f}'
-            _pairs_breakdown = (f'(bt={_t_bt:.2f} be={_t_be:.2f} '
-                                f'upd={_dt_pairs - _t_bt - _t_be:.2f})')
-            print(f'  Cycle {cycle + 1:3d}: dT = {dT:.3e}  E_corr = {e_cyc:.10f}'
-                  f'  dE = {dE:.2e}  [{_dt_total:.1f}s: ovL={_dt_ovl:.1f} '
-                  f'Kcoul={_dt_kcoul:.1f} foo={_dt_foo:.1f}'
-                  f'{_jiang_str} pairs={_dt_pairs:.1f}{_pairs_breakdown}]',
+            _upd_rest = _dt_pairs - _t_bt - _t_be - _t_cd - _t_g
+            print(f'  Cycle {cycle + 1:3d}: dT = {dT:.3e}  '
+                  f'E_corr = {e_cyc:.10f}  dE = {dE:.2e}  '
+                  f'[{_dt_total:.1f}s: foo={_dt_foo:.2f} '
+                  f'jiang={_dt_jiang:.2f}'
+                  f'(C={_tj_C:.2f} D={_tj_D:.2f} Fock={_tj_Fab:.2f} '
+                  f'Km={_tj_Km:.2f} G={_tj_FG:.2f}) '
+                  f'pairs={_dt_pairs:.2f}(bt={_t_bt:.2f} be={_t_be:.2f} '
+                  f'cd={_t_cd:.2f} gterm={_t_g:.2f} upd={_upd_rest:.2f})]',
                   flush=True)
             if dT < this_tol:
                 print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (amplitude).',
