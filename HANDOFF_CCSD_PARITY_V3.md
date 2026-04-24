@@ -151,50 +151,92 @@ overlap G with bt/be/cd, parallelize build_G_tilde outer-i, inline
 compute_CD_terms_batched, shared T1_cache wrapper, fine_pool sweep
 4/8/16/32.
 
-### Suggested session scope (updated after foo pilot)
+### Suggested session scope (updated after foo pilot + t1_fock failure)
 
-The pilot proved the simple serial-per-pair nogil pattern wins (3.3×
-on the ported phase). Next session should follow the same pattern for
-the remaining bodies — **skip the batched/bucketed design unless the
-simple pattern stalls**.
+**IMPORTANT: the simple pattern does NOT generalize.** After the foo
+pilot succeeded (commit 8e7f4bca9), I tried the same template on
+`t1_fock._per_pair` (4b59e754a + attempted successor). The Cython
+kernel passed bit-exact correctness on 6 synthetic shapes but
+**microbench showed 3-5× SLOWER per-call than NumPy**, and end-to-end
+Fock sub-timer went 0.27 → 0.34 s/cycle (regression masked by cycle-1
+noise). Reverted without committing.
 
-1. Pick next target. Ordered by expected win (sub-timer × ~3×):
-   - `t1_fock._per_pair` (Fock=0.26/cycle → ~0.08, ~2.5s/run).
-     More math than foo: `gamma`, `Y`, `Fia_bar`, `Fab` chain — write
-     carefully with standalone bit-exact test first.
-   - `compute_C_tilde_batched._process_ki_terms12`
-     (C=0.85-1.05/cycle → ~0.30, ~8-10s/run). Biggest target, but
-     Phase 1 is only ~40% of total C — see commit 8e7f4bca9 memory
-     note for the `phase1_t12=370ms / tot=955ms` breakdown. Port just
-     the Phase-1 body, not the whole thing.
-   - `build_D_tilde_batched._process_ik_t12` (D=0.94-1.29/cycle →
-     Phase 1 portion similar to C). Has the most complex math of the
-     four (two terms, fancy-index gathers); do it last.
+**Root cause:** t1_fock is compute-dominated (3D tensor contractions
+like `Y[L, b, m] = sum_c Qab[L, b, c] * T1[m, c]` on shapes
+`n_local × npno × nlmo` with `n_local ≈ 170`). BLAS's tuned SIMD +
+cache tiling on these contractions beats hand-rolled nested loops
+even at `-O3 -ffast-math -march=native`. foo_dressed was a special
+case because its body was dispatch-dominated (2 small matmuls +
+2 tensordots); t1_fock/C_tilde/D_tilde Phase 1 are not.
 
-2. Use foo as the template: new `_<name>_cy.pyx`, single function taking
-   typed memoryviews for one pair. Release GIL via `with nogil`. No
-   plan builder.
+**Rule:** before porting, check whether the body has any outer loop
+over `n_local` (which is ~100-400) containing a matmul/tensordot.
+If yes, the hand-rolled serial Cython pattern loses to BLAS — skip.
 
-3. Build pipeline:
-   ```bash
-   cd /home/ec2-user/Work/pyscf/pyscf/cc/dlpno_tccsd
-   /environments/miniconda3/envs/tmc/bin/python setup.py build_ext --inplace
-   cp _<name>_cy.cpython-312-x86_64-linux-gnu.so \
-      /environments/miniconda3/envs/tmc/lib/python3.12/site-packages/pyscf/cc/dlpno_tccsd/
-   cp lccsd.py (or residual.py) to the installed path too.
-   ```
+### Revised targets
 
-4. Validate before running CCSD: `/tmp/test_<name>_cy.py` on 4-6
-   synthetic shapes, asserting `max(|ref - cy|) < 1e-11`. Only when
-   green, run `/tmp/profile_dlpno.py` and check E_tccsd.
+1. **C_tilde Phase 1 (`_process_ki_terms12`)** — has `k_Qa @ t1` (small)
+   and `tensordot(z, Qab, (0, 0))` (Qab is n_local × npno × npno,
+   BLAS-friendly). LIKELY loses to NumPy; microbench first before
+   spending port effort. Probably skip under the simple pattern.
 
-5. Correctness anchor: **-2.13088299…** to 10+ digits.
+2. **D_tilde Phase 1 (`_process_ik_t12`)** — two tensordot Terms on
+   similar shapes. Same caveat.
 
-Total projected savings (across 3 remaining targets): ~12-15 s —
-brings CCSD to ~110s, under 8× Psi4. The v2 projection of 25–30s was
-optimistic; the per-pair-serial approach misses some parallelism that
-a true batched prange kernel would capture, but the engineering cost
-is much lower.
+3. **t1_fock._per_pair** — already validated as a loss; do NOT retry
+   the simple pattern.
+
+### Remaining approaches that could still work
+
+The big Cython wins on compute-dominated bodies require either:
+
+(a) **Cython + scipy.linalg.cython_blas.dgemm** — call BLAS from inside
+    the nogil block. Keeps BLAS performance; releases GIL around it.
+    Complexity: medium. `scipy.linalg.cython_blas` provides `cimport`
+    headers; our setup.py already links scipy. Worth a one-function
+    prototype (say, the Y contraction in t1_fock).
+
+(b) **Batched prange-across-pairs kernel** (v2's original design).
+    Bucket pairs by shape, stack inputs, prange over items. Plan
+    builder overhead justified only if parallelism across 64 threads
+    >> per-pair BLAS win. For 820 pairs in 149 buckets (top bucket
+    34 pairs), each prange has only ~10-30-way parallelism per bucket
+    — may not saturate 64 cores. Risky.
+
+(c) **Leave C/D/t1_fock alone.** Foo was the only easy win. The
+    remaining ~7-8s gap vs Psi4 is in compute itself, not dispatch.
+    Further gains need algorithmic rework (e.g., bigger BLAS tiles
+    by merging per-pair matrices into batched GEMMs) or C++ with
+    hand-tuned SIMD kernels.
+
+### Current state (2026-04-24, this session end)
+
+- Branch: `dlpno_restructure`, HEAD = `4b59e754a` (v3 handoff).
+- Commits this session: `111d811d7` (tensordot swap), `8e7f4bca9`
+  (Cython foo port), `4b59e754a` (v3 handoff + lessons).
+- CCSD wall: 138.61 → 124.70 s (latest verified state).
+- E_tccsd = −2.13088299… preserved to 10+ digits throughout.
+
+### Build pipeline (unchanged)
+
+```bash
+cd /home/ec2-user/Work/pyscf/pyscf/cc/dlpno_tccsd
+/environments/miniconda3/envs/tmc/bin/python setup.py build_ext --inplace
+cp _<name>_cy.cpython-312-x86_64-linux-gnu.so \
+   /environments/miniconda3/envs/tmc/lib/python3.12/site-packages/pyscf/cc/dlpno_tccsd/
+cp lccsd.py (or residual.py / local_df.py) to the installed path too.
+```
+
+### Validate before running CCSD
+
+`/tmp/test_<name>_cy.py` on 4-6 synthetic shapes, max-diff < 1e-11.
+**Also microbench per-pair cost vs NumPy BEFORE integrating** — this
+is the lesson from t1_fock. If per-call is slower, the end-to-end
+will regress even if correctness is perfect.
+
+### Correctness anchor
+
+**E_tccsd = −2.13088299…** on water10/cc-pVDZ/TightPNO. 10+ digits.
 
 ## Build sync caveat (from v2, still applies)
 
