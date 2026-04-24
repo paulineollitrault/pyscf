@@ -956,15 +956,200 @@ def build_D_tilde_batched(
 
         return ik_tuple, D_tilde_ik
 
-    if _pool is not None:
-        for ik, val in _pool.map(_process_ik_t12, list(all_pairs)):
-            if val is not None:
-                D_tilde_all[ik] = val
-    else:
-        for ik in all_pairs:
-            _, val = _process_ik_t12(ik)
-            if val is not None:
-                D_tilde_all[ik] = val
+    # --- Phase 1 batched prange path (path b, commit a96438422 sibling) ---
+    # Same pattern as compute_C_tilde_batched: static per-pair buffers
+    # (k_Qa, Qab, Qma_sub, ooL_il_all, ooL_ik, ovL_k) cached across CCSD
+    # iterations; per-iter T1 inputs gathered fresh. Pairs not covered
+    # by cc_ints fall back to the per-pair Python path above.
+    from pyscf.cc.dlpno_tccsd._d_tilde_ph1_batched_cy import (
+        d_tilde_ph1_batched)
+    from threadpoolctl import threadpool_limits
+
+    all_pairs_list = list(all_pairs)
+    covered_pairs = []
+    fallback_pairs = []
+    for ik in all_pairs_list:
+        i_idx, k_idx = ik
+        key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
+        n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
+        if n_ik == 0:
+            continue
+        if key_ik in cc_ints and cc_ints[key_ik] is not None:
+            covered_pairs.append(ik)
+        else:
+            fallback_pairs.append(ik)
+
+    if covered_pairs:
+        N = len(covered_pairs)
+        plan_key = (id(cc_ints), tuple(covered_pairs),
+                    id(pair_lmo_idx) if pair_lmo_idx is not None else 0)
+        plan = getattr(build_D_tilde_batched, '_ph1_plan', None)
+        if plan is None or plan.get('key') != plan_key:
+            n_pno_arr = np.zeros(N, dtype=np.int32)
+            n_local_arr = np.zeros(N, dtype=np.int32)
+            n_domain_arr = np.zeros(N, dtype=np.int32)
+            k_Qa_list = [None] * N
+            Qab_list = [None] * N
+            Qma_sub_list = [None] * N
+            ooL_il_all_list = [None] * N
+            ooL_ik_list = [None] * N
+            ovL_k_list = [None] * N
+            ll_idx_list = [None] * N
+            key_ik_list = [None] * N
+            i_idx_list = [None] * N
+
+            for p, ik in enumerate(covered_pairs):
+                i_idx, k_idx = ik
+                key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
+                ci = cc_ints[key_ik]
+                n_ik = pno_spaces[key_ik]['C_pno'].shape[1]
+                if pair_lmo_idx is not None and key_ik in pair_lmo_idx:
+                    ll_idx = np.asarray(pair_lmo_idx[key_ik], dtype=np.intp)
+                else:
+                    ll_idx = np.arange(nocc, dtype=np.intp)
+                n_domain = ll_idx.size
+                n_local = ci['Qma'].shape[0]
+
+                is_k_first = (key_ik[0] == k_idx)
+                is_i_first = (key_ik[0] == i_idx)
+                k_Qa_list[p] = np.ascontiguousarray(
+                    ci['i_Qa'] if is_k_first else ci['j_Qa'])
+                Qab_list[p] = np.ascontiguousarray(ci['Qab'])
+                Qma_sub_list[p] = np.ascontiguousarray(
+                    ci['Qma'][:, ll_idx, :])
+                Qk_src = ci['i_Qk'] if is_i_first else ci['j_Qk']
+                ooL_il_all_list[p] = np.ascontiguousarray(Qk_src[:, ll_idx])
+                ooL_ik_list[p] = np.ascontiguousarray(Qk_src[:, k_idx])
+                ovL_k_list[p] = np.ascontiguousarray(
+                    ci['Qma'][:, k_idx, :])
+
+                n_pno_arr[p] = n_ik
+                n_local_arr[p] = n_local
+                n_domain_arr[p] = n_domain
+                ll_idx_list[p] = ll_idx
+                key_ik_list[p] = key_ik
+                i_idx_list[p] = i_idx
+
+            def _flat(arrs):
+                sizes = np.array([a.size for a in arrs], dtype=np.int64)
+                offsets = np.empty(len(arrs) + 1, dtype=np.int64)
+                offsets[0] = 0
+                offsets[1:] = np.cumsum(sizes)
+                buf = np.empty(int(offsets[-1]))
+                for idx, a in enumerate(arrs):
+                    buf[offsets[idx]:offsets[idx + 1]] = a.ravel()
+                return buf, offsets
+
+            k_Qa_flat, k_Qa_off = _flat(k_Qa_list)
+            Qab_flat, Qab_off = _flat(Qab_list)
+            Qma_sub_flat, Qma_sub_off = _flat(Qma_sub_list)
+            ooL_il_all_flat, ooL_il_all_off = _flat(ooL_il_all_list)
+            ooL_ik_flat, ooL_ik_off = _flat(ooL_ik_list)
+            ovL_k_flat, ovL_k_off = _flat(ovL_k_list)
+
+            t1_sizes = n_pno_arr.astype(np.int64)
+            t1_off = np.empty(N + 1, dtype=np.int64)
+            t1_off[0] = 0
+            t1_off[1:] = np.cumsum(t1_sizes)
+
+            T1_rows_sizes = (n_domain_arr.astype(np.int64)
+                             * n_pno_arr.astype(np.int64))
+            T1_rows_off = np.empty(N + 1, dtype=np.int64)
+            T1_rows_off[0] = 0
+            T1_rows_off[1:] = np.cumsum(T1_rows_sizes)
+
+            D_sizes = n_pno_arr.astype(np.int64) ** 2
+            D_off = np.empty(N + 1, dtype=np.int64)
+            D_off[0] = 0
+            D_off[1:] = np.cumsum(D_sizes)
+
+            max_n_local = int(n_local_arr.max())
+            max_n_pno = int(n_pno_arr.max())
+            max_n_domain = int(n_domain_arr.max())
+            num_threads = min(32, N)
+
+            scratch = {
+                'X':    np.empty((num_threads, max_n_local * max_n_pno)),
+                'w':    np.empty((num_threads, max_n_local)),
+                'temp': np.empty((num_threads, max_n_pno * max_n_pno)),
+                'ilkc': np.empty((num_threads, max_n_domain * max_n_pno)),
+                'iklc': np.empty((num_threads, max_n_domain * max_n_pno)),
+            }
+            for buf in scratch.values():
+                buf.fill(0.0)
+
+            plan = {
+                'key': plan_key,
+                'covered_pairs': covered_pairs,
+                'key_ik_list': key_ik_list,
+                'i_idx_list': i_idx_list,
+                'll_idx_list': ll_idx_list,
+                'n_pno_arr': n_pno_arr, 'n_local_arr': n_local_arr,
+                'n_domain_arr': n_domain_arr,
+                'k_Qa_flat': k_Qa_flat, 'k_Qa_off': k_Qa_off,
+                'Qab_flat': Qab_flat, 'Qab_off': Qab_off,
+                'Qma_sub_flat': Qma_sub_flat, 'Qma_sub_off': Qma_sub_off,
+                'ooL_il_all_flat': ooL_il_all_flat,
+                'ooL_il_all_off': ooL_il_all_off,
+                'ooL_ik_flat': ooL_ik_flat, 'ooL_ik_off': ooL_ik_off,
+                'ovL_k_flat': ovL_k_flat, 'ovL_k_off': ovL_k_off,
+                't1_off': t1_off, 't1_total': int(t1_off[-1]),
+                'T1_rows_off': T1_rows_off,
+                'T1_rows_total': int(T1_rows_off[-1]),
+                'D_off': D_off, 'D_total': int(D_off[-1]),
+                'scratch': scratch, 'num_threads': num_threads,
+            }
+            build_D_tilde_batched._ph1_plan = plan
+
+        t1_flat = np.empty(plan['t1_total'])
+        T1_rows_flat = np.empty(plan['T1_rows_total'])
+        t1_off_plan = plan['t1_off']
+        T1_rows_off_plan = plan['T1_rows_off']
+        for p in range(N):
+            key_ik = plan['key_ik_list'][p]
+            i_idx = plan['i_idx_list'][p]
+            n_pno = int(plan['n_pno_arr'][p])
+            ll_idx = plan['ll_idx_list'][p]
+            n_dom = ll_idx.size
+            T1_all_ik = t1_cache[key_ik]  # (nocc, n_pno)
+            t1_flat[t1_off_plan[p]:t1_off_plan[p + 1]] = T1_all_ik[i_idx]
+            rows_buf = T1_rows_flat[
+                T1_rows_off_plan[p]:T1_rows_off_plan[p + 1]
+            ].reshape(n_dom, n_pno)
+            rows_buf[:] = T1_all_ik[ll_idx]
+
+        D_flat = np.zeros(plan['D_total'])
+        sc = plan['scratch']
+
+        with threadpool_limits(limits=1, user_api='blas'):
+            d_tilde_ph1_batched(
+                plan['k_Qa_flat'], plan['k_Qa_off'],
+                plan['Qab_flat'], plan['Qab_off'],
+                plan['Qma_sub_flat'], plan['Qma_sub_off'],
+                plan['ooL_il_all_flat'], plan['ooL_il_all_off'],
+                plan['ooL_ik_flat'], plan['ooL_ik_off'],
+                plan['ovL_k_flat'], plan['ovL_k_off'],
+                t1_flat, t1_off_plan,
+                T1_rows_flat, T1_rows_off_plan,
+                plan['n_pno_arr'], plan['n_local_arr'],
+                plan['n_domain_arr'],
+                sc['X'], sc['w'], sc['temp'], sc['ilkc'], sc['iklc'],
+                D_flat, plan['D_off'],
+                plan['num_threads'],
+            )
+
+        D_off_plan = plan['D_off']
+        for p, ik in enumerate(plan['covered_pairs']):
+            n_pno = int(plan['n_pno_arr'][p])
+            D_tilde_all[ik] = (
+                D_flat[D_off_plan[p]:D_off_plan[p + 1]]
+                .reshape(n_pno, n_pno).copy())
+
+    # Fallback Python path for pairs not covered by cc_ints
+    for ik in fallback_pairs:
+        _, val = _process_ik_t12(ik)
+        if val is not None:
+            D_tilde_all[ik] = val
 
     # --- Phase 2: Terms 3 + 4 via plan-cached Cython kernels ---
     plan_key = tuple(sorted(t2_pno_all.keys()))
