@@ -77,7 +77,7 @@ def _chunked_map(pool, fn, items, chunks_per_worker=4):
 def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                   ovL_bare, ooL_bare, S_pno_cache,
                   Fkj, foo_t1, cc_ints=None,
-                  S_pao_full=None, s1e=None):
+                  S_pao_full=None, s1e=None, _pool=None):
     """Build G_tilde (Eq 86): double-dressed Fock oo.
 
     G_tilde[k,j] = F̃_{kj} + Σ_l u_lj × K_il (bare exchange)
@@ -87,6 +87,9 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
     Args:
         Fkj: (nocc, nocc) = F̃_{kj} = dressed Fock oo (from build_Fkj)
         foo_t1: (nocc, nocc) = T1 correction to Fock (from _compute_foo_t1)
+        _pool: optional ThreadPoolExecutor. The outer-i loop is
+            dispatched across it with disjoint row writes — `row_contrib`
+            is returned per-i and scattered into G in the main thread.
     """
     G = Fkj.copy()
     _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
@@ -106,13 +109,8 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
             t2_lj_d = t2_lj.T if l_idx > j_idx else t2_lj
             u_lj_cache[(l_idx, j_idx)] = (key_lj, 2.0 * t2_lj_d - t2_lj_d.T)
 
-    # Loop order (i, l) outer; inner j gathered per-(i, l) into a stack of
-    # projected U_lj arrays and the traces with K_il are evaluated as a
-    # single batched einsum. That collapses 40 per-j np.sum calls into one
-    # einsum, dropping most of the Python overhead in the inner loop.
-    # Per-(i, l) shape is (n_valid_j, n_pno_il, n_pno_il), which is uniform
-    # within a single (i, l) pass (U is already projected to PNO_il).
-    for i_idx in range(nocc):
+    def _per_i(i_idx):
+        row = np.zeros(nocc)
         for l_idx in range(nocc):
             key_il = (min(i_idx, l_idx), max(i_idx, l_idx))
             if key_il not in t2_pno_all:
@@ -123,7 +121,6 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
             K_il = get_local_K(cc_ints, key_il, i_idx, l_idx)
             if K_il is None:
                 continue
-            n_il = K_il.shape[0]
 
             j_valid = []
             U_stack_list = []
@@ -132,7 +129,6 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                 if u_entry is None:
                     continue
                 key_lj, u_lj = u_entry
-
                 if key_il == key_lj:
                     U_lj_proj = u_lj
                 else:
@@ -145,11 +141,19 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
 
             if not U_stack_list:
                 continue
-            U_stack = np.stack(U_stack_list, axis=0)    # (n_j_valid, n_il, n_il)
-            # traces[n] = Σ_{a,b} K_il[a,b] * U_stack[n, b, a] = Σ K · U.T
+            U_stack = np.stack(U_stack_list, axis=0)
             traces = np.einsum('ab,nba->n', K_il, U_stack, optimize=True)
             for n_j, j_idx in enumerate(j_valid):
-                G[i_idx, j_idx] += traces[n_j]
+                row[j_idx] += traces[n_j]
+        return i_idx, row
+
+    if _pool is not None:
+        for i_idx, row in _pool.map(_per_i, range(nocc)):
+            G[i_idx] += row
+    else:
+        for i_idx in range(nocc):
+            _, row = _per_i(i_idx)
+            G[i_idx] += row
 
     return G
 

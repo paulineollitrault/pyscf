@@ -1008,7 +1008,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # 64-worker pool) for coarse tasks like _update_pair and the
     # T1 residual per-LMO map.
     from concurrent.futures import ThreadPoolExecutor
-    _fine_pool = ThreadPoolExecutor(max_workers=8) if _pool is not None else None
+    import os as _os
+    _fine_n = int(_os.environ.get('DLPNO_FINE_POOL_SIZE', '8'))
+    _fine_pool = (ThreadPoolExecutor(max_workers=_fine_n)
+                  if _pool is not None else None)
 
     # ------------------------------------------------------------------
     # Pre-compute quantities needed by the pair-local residual
