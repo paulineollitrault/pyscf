@@ -853,102 +853,96 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     # B and A2 terms: loop over ordered pairs (k, l)
     # ===========================================================
     # For each ordered pair (k, l), compute B_ia and A2 contributions
-    # for each orbital i in pair (k,l)'s LMO domain.
-    # For us: nocc is small, treat all i as in every pair domain.
+    # for each orbital i in pair (k,l)'s LMO domain. r1_pno[i] receives
+    # contributions from many (key_kl, ordering) tuples → parallelize
+    # with a per-worker reduction: each task returns a dict of per-i
+    # contributions, accumulated serially in the main thread.
+    def _per_kl(arg):
+        key_kl, k, l = arg
+        local = {}  # i -> negative contribution summed locally
+        if pno_spaces[key_kl]['C_pno'].shape[1] == 0:
+            return local
+        n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
+        ci_kl = cc_ints.get(key_kl)
+        if ci_kl is None:
+            return local
+
+        t2_canon_kl = t2_pno_all[key_kl]
+        t2_kl = t2_canon_kl if k <= l else t2_canon_kl.T
+        Tt_kl = 2.0 * t2_kl - t2_kl.T
+        K_iajb_kl = ci_kl['K_iajb']
+        K_bar_kl = ci_kl['K_bar_ij'] if key_kl[0] == k else ci_kl['K_bar_ji']
+
+        T_n_kl = np.zeros((nocc, n_kl))
+        for m in range(nocc):
+            T_n_kl[m] = T_n.get((key_kl, m), np.zeros(n_kl))
+        K_kilc = K_bar_kl + T_n_kl @ K_iajb_kl
+        B_ia = Tt_kl @ K_kilc.T
+
+        if pair_lmo_idx is not None and key_kl in pair_lmo_idx:
+            _i_list = pair_lmo_idx[key_kl]
+        else:
+            _i_list = range(nocc)
+        for i in _i_list:
+            key_ii = (i, i)
+            if key_ii not in pno_spaces:
+                continue
+            if pno_spaces[key_ii]['C_pno'].shape[1] == 0:
+                continue
+            # B contribution
+            if key_kl == key_ii:
+                B_contrib = B_ia[:, i]
+            else:
+                S_ii_kl = S_pno_cache.get((key_ii, key_kl))
+                B_contrib = S_ii_kl @ B_ia[:, i] if S_ii_kl is not None else None
+            if B_contrib is not None:
+                prev = local.get(i)
+                local[i] = (prev - B_contrib) if prev is not None else (-B_contrib)
+
+            # A2 contribution (Psi4 ccsd.cc lines 2146-2152)
+            key_ki = (min(k, i), max(k, i))
+            if key_ki in t2_pno_all and key_ki in pno_spaces:
+                n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+                if n_ki > 0:
+                    t2_ki_canon = t2_pno_all[key_ki]
+                    t2_ki = t2_ki_canon if k <= i else t2_ki_canon.T
+                    Tt_ki = 2.0 * t2_ki - t2_ki.T
+                    S_kl_ki = S_pno_cache.get((key_kl, key_ki))
+                    S_ki_kl = S_pno_cache.get((key_ki, key_kl))
+                    if key_kl == key_ki:
+                        U_ki = Tt_ki
+                    elif S_kl_ki is not None and S_ki_kl is not None:
+                        U_ki = S_kl_ki @ Tt_ki @ S_ki_kl
+                    else:
+                        U_ki = None
+                    if U_ki is not None:
+                        scalar = np.sum(K_iajb_kl * U_ki)
+                        T_n_l_ii = T_n.get((key_ii, l), np.zeros(
+                            pno_spaces[key_ii]['C_pno'].shape[1]))
+                        if T_n_l_ii.size > 0:
+                            A2 = scalar * T_n_l_ii
+                            prev = local.get(i)
+                            local[i] = (prev - A2) if prev is not None else (-A2)
+        return local
+
+    _ba_work = []
     for key_kl in t2_pno_all:
         if pno_spaces[key_kl]['C_pno'].shape[1] == 0:
             continue
-        # Process both ordered (k, l) and (l, k) when k != l
-        k0, l0 = key_kl  # canonical
-        orderings = [(k0, l0)] if k0 == l0 else [(k0, l0), (l0, k0)]
+        k0, l0 = key_kl
+        if k0 == l0:
+            _ba_work.append((key_kl, k0, l0))
+        else:
+            _ba_work.append((key_kl, k0, l0))
+            _ba_work.append((key_kl, l0, k0))
 
-        for (k, l) in orderings:
-            n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
-            ci_kl = cc_ints.get(key_kl)
-            if ci_kl is None:
-                continue
-
-            # T2 in ordering (k, l)
-            t2_canon_kl = t2_pno_all[key_kl]
-            if k <= l:
-                t2_kl = t2_canon_kl
-            else:
-                t2_kl = t2_canon_kl.T
-            Tt_kl = 2.0 * t2_kl - t2_kl.T
-
-            # K_iajb[kl] in PNO_kl: bare exchange (kc|ld)
-            K_iajb_kl = ci_kl['K_iajb']
-
-            # K_bar[kl][m, c] = (mk|lc) — Psi4 stores as K_bar_ij[m, c] = (mi|jc)
-            # For our pair with k as i-side and l as j-side:
-            # If key_kl = (k, l) (k <= l), use K_bar_ij (q_io.T @ q_jv) where i_lmo=k, j_lmo=l
-            # If key_kl = (l, k) (k > l), use K_bar_ji (q_jo.T @ q_iv) where j_lmo=k, i_lmo=l
-            if key_kl[0] == k:
-                # k is at key[0]=i_lmo, l is at key[1]=j_lmo
-                K_bar_kl = ci_kl['K_bar_ij']  # (nocc, n_kl) = (m k | l c)
-            else:
-                # k is at key[1]=j_lmo, l is at key[0]=i_lmo
-                K_bar_kl = ci_kl['K_bar_ji']  # (nocc, n_kl) = (m k | l c)
-
-            # K_kilc = K_bar[kl] + T_n[kl] @ K_iajb[kl]
-            # T_n[kl][m, :] = t1_m projected to PNO_kl
-            T_n_kl = np.zeros((nocc, n_kl))
-            for m in range(nocc):
-                T_n_kl[m] = T_n.get((key_kl, m), np.zeros(n_kl))
-            K_kilc = K_bar_kl + T_n_kl @ K_iajb_kl  # (nocc, n_kl)
-
-            # B_ia[a_kl, m] = Σ_c Tt_kl[a, c] * K_kilc[m, c] = Tt_kl @ K_kilc.T
-            B_ia = Tt_kl @ K_kilc.T  # (n_kl, nocc)
-
-            # Only orbitals i in pair (k,l)'s LMO domain contribute (Psi4 line 2082-2083)
-            if pair_lmo_idx is not None and key_kl in pair_lmo_idx:
-                _i_list = pair_lmo_idx[key_kl]
-            else:
-                _i_list = range(nocc)
-            for i in _i_list:
-                key_ii = (i, i)
-                if key_ii not in pno_spaces:
-                    continue
-                if pno_spaces[key_ii]['C_pno'].shape[1] == 0:
-                    continue
-                # B contribution
-                if key_kl == key_ii:
-                    B_contrib = B_ia[:, i]
-                else:
-                    S_ii_kl = S_pno_cache.get((key_ii, key_kl))
-                    if S_ii_kl is not None:
-                        B_contrib = S_ii_kl @ B_ia[:, i]
-                    else:
-                        B_contrib = None
-                if B_contrib is not None:
-                    r1_pno[i] -= B_contrib
-
-                # A2 contribution (Psi4 ccsd.cc lines 2146-2152)
-                # R1[i,a] -= T_n[ii][l, a] * dot(K_iajb[kl], U_ki)
-                # where U_ki = S(kl, ki) @ Tt[ki] @ S(ki, kl)
-                key_ki = (min(k, i), max(k, i))
-                if key_ki in t2_pno_all and key_ki in pno_spaces:
-                    n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
-                    if n_ki > 0:
-                        t2_ki_canon = t2_pno_all[key_ki]
-                        t2_ki = t2_ki_canon if k <= i else t2_ki_canon.T
-                        Tt_ki = 2.0 * t2_ki - t2_ki.T
-                        # S(kl, ki) @ Tt[ki] @ S(ki, kl)
-                        S_kl_ki = S_pno_cache.get((key_kl, key_ki))
-                        S_ki_kl = S_pno_cache.get((key_ki, key_kl))
-                        if key_kl == key_ki:
-                            U_ki = Tt_ki
-                        elif S_kl_ki is not None and S_ki_kl is not None:
-                            U_ki = S_kl_ki @ Tt_ki @ S_ki_kl
-                        else:
-                            U_ki = None
-                        if U_ki is not None:
-                            scalar = np.sum(K_iajb_kl * U_ki)
-                            # T_n[ii][l, :] in PNO_ii basis
-                            T_n_l_ii = T_n.get((key_ii, l), np.zeros(
-                                pno_spaces[key_ii]['C_pno'].shape[1]))
-                            if T_n_l_ii.size > 0:
-                                r1_pno[i] -= scalar * T_n_l_ii
+    if _pool is not None:
+        _ba_results = list(_pool.map(_per_kl, _ba_work))
+    else:
+        _ba_results = [_per_kl(arg) for arg in _ba_work]
+    for local in _ba_results:
+        for i, contrib in local.items():
+            r1_pno[i] += contrib
 
     if _dbg_r1:
         for i in range(nocc):
