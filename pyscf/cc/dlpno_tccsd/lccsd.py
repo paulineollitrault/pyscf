@@ -538,7 +538,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                                fov_pno, F_lmo, eps_lmo,
                                nocc, S_pno_cache, cc_ints,
                                ovL_pno_cache=None, pair_lmo_idx=None,
-                               t1_cache=None):
+                               t1_cache=None, _pool=None):
     """T1 residual EXACTLY matching Psi4's structure (DePrince Eqs 19-22).
 
     R[i, a_ii] = Fai[i,a_ii] + A[i,a] + C[i,a] - B[i,a] - A2[i,a]
@@ -679,79 +679,8 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             Fij_bar[j0, i0] += (2.0 * np.sum(T_n_ij_mat * ci_ij['K_bar_chem'])
                                 - np.sum(T_n_ij_mat * ci_ij['K_bar_ij']))
 
-    for i in range(nocc):
-        key_ii = (i, i)
-        if key_ii not in pno_spaces:
-            continue
-        n_ii = pno_spaces[key_ii]['C_pno'].shape[1]
-        if n_ii == 0:
-            continue
-        e_pno_ii = pno_spaces[key_ii]['e_pno']
-        t1_i = t1_pno.get(i)
-        has_t1_i = t1_i is not None and t1_i.size > 0 and np.max(np.abs(t1_i)) > 1e-15
-
-        ci_ii = cc_ints.get(key_ii)
-        if ci_ii is None:
-            continue
-
-        Qma_ii = ci_ii['Qma']      # (n_local, nocc, n_ii)
-        Qab_ii = ci_ii['Qab']      # (n_local, n_ii, n_ii)
-        Qia_ii = ci_ii['i_Qa']     # (n_local, n_ii)
-        Qik_ii = ci_ii['i_Qk']     # (n_local, nocc)
-
-        # T_n_ii[m, c] = t1[m] projected to PNO_ii
-        T_n_ii = np.zeros((nocc, n_ii))
-        any_t1 = False
-        for m in range(nocc):
-            tn_m = T_n.get((key_ii, m))
-            if tn_m is not None and tn_m.size == n_ii:
-                T_n_ii[m] = tn_m
-                if np.max(np.abs(tn_m)) > 1e-15:
-                    any_t1 = True
-
-        # ---- Stage 1: Fai_bar T1 dressing (ccsd.cc lines 1631-1654) ----
-        if any_t1:
-            # gamma[q] = Σ_{m,c} Qma[q,m,c] * T_n[m,c]
-            gamma = Qma_ii.reshape(Qma_ii.shape[0], -1) @ T_n_ii.ravel()
-            # J: r1 += 2 * Qia.T @ gamma
-            r1_pno[i] += 2.0 * (Qia_ii.T @ gamma)
-            # K: r1 -= Σ_q Σ_k Qab[q,a,k] * (Σ_k' Qik[q,k'] * T_n[k',c]) ... wait
-            # Actually: y[q,c] = Σ_k Qik[q,k] * T_n[k,c]
-            y = Qik_ii @ T_n_ii                # (n_local, n_ii)
-            # r1[a] -= Σ_{q,c} Qab[q,a,c] * y[q,c] = Σ_q (Qab[q] @ y[q])[a]
-            # Flatten: (Qab * y[:,None,:]).sum((0,2)) — efficient via matmul
-            # = Σ_q,c Qab[q, :, c] * y[q, c] = Σ_q (Qab[q] @ y[q])[a]
-            r1_pno[i] -= np.einsum('qac,qc->a', Qab_ii, y, optimize=True)
-
-        # ---- Stage 2 & 3: Fab_bar @ t1 and -T_n.T @ Fia_bar @ t1 ----
-        if has_t1_i and any_t1:
-            # W[q, a, k] = Σ_b Qab[q,a,b] * T_n[k,b] = (Qab @ T_n.T)[q,a,k]
-            W_qak = Qab_ii @ T_n_ii.T          # (n_local, n_ii, nocc)
-            # Fab_bar = diag(e_pno) + 2*Σ_q gamma[q]*Qab[q] - Σ_{q,k} W[q,a,k]*Qma[q,k,c]
-            Fab_bar_ii = np.diag(e_pno_ii)
-            Fab_bar_ii += 2.0 * np.tensordot(gamma, Qab_ii, axes=(0, 0))
-            Fab_bar_ii -= np.tensordot(W_qak, Qma_ii, axes=((0, 2), (0, 1)))
-            r1_pno[i] += Fab_bar_ii @ t1_i
-
-            # Fia_bar[m, a] = 2*Σ_q gamma[q]*Qma[q,m,a] - Σ_{q,k} Z[q,m,k]*Qma[q,k,b]
-            # Z[q, m, k] = Σ_a Qma[q,m,a] * T_n[k,a] = Qma @ T_n.T
-            Z_qmk = Qma_ii @ T_n_ii.T          # (n_local, nocc, nocc)
-            Fia_bar_ii = 2.0 * np.tensordot(gamma, Qma_ii, axes=(0, 0))
-            Fia_bar_ii -= np.tensordot(Z_qmk, Qma_ii, axes=((0, 1), (0, 1)))
-            r1_pno[i] -= T_n_ii.T @ (Fia_bar_ii @ t1_i)
-        elif has_t1_i:
-            # No T1 dressing → bare Fab_bar = diag(e_pno)
-            r1_pno[i] += e_pno_ii * t1_i
-
-        # ---- Stage 4: -sum_k T_n[ii][k,a] * Fij_bar[k,i] ----
-        # (ccsd.cc line 1709)
-        # INCREMENT form: include ALL k (including k=i).  T_n_ii was already
-        # built above (nocc, n_ii) with row k = t1_k in PNO_ii basis;
-        # rows outside the cache are zero and contribute nothing, so this
-        # is one matvec instead of nocc _project_t1_to_pair calls.
-        r1_pno[i] -= Fij_bar[:, i] @ T_n_ii
-
-    # Helper: get integral (k a_ki | c d) from cc_ints
+    # Helper: get integral (k a_ki | c d) from cc_ints.
+    # Hoisted out of per-i loop so the merged _per_i closure can use it.
     def _get_ki_data(k, i_lmo):
         key_ki = (min(k, i_lmo), max(k, i_lmo))
         if key_ki not in pno_spaces:
@@ -766,13 +695,8 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
         return {'key': key_ki, 'n_ki': n_ki, 'k_Qa': k_Qa,
                 'Qab': ci['Qab'], 'i_Qk': ci.get('i_Qk'), 'j_Qk': ci.get('j_Qk')}
 
-    # ===========================================================
-    # A and C terms: loop over ordered pairs (i, k) for each i
-    # ===========================================================
     # Pre-compute LT1[(i, m)] = (key_im, L_im @ t1_m_in_im) once per (i, m).
-    # Inside the k-loop below the original code recomputed this for each
-    # of the nocc values of k; since LT1 depends only on (i, m) we can
-    # hoist it. The k-dependent part (S_ki_im projection) stays inside.
+    # Hoisted above the per-i loop so _per_i sees a fully-built cache.
     _LT1_cache = {}
     for m in range(nocc):
         t1_m = t1_pno.get(m)
@@ -792,105 +716,138 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             t1_m_in_im = t1_cache[key_im][m]
             _LT1_cache[(i_out, m)] = (key_im, L_im @ t1_m_in_im)
 
-    for i in range(nocc):
+    # =========================================================================
+    # Per-i residual: Stages 1-4 (Fai_bar / Fab_bar / Fia_bar / Fij_bar @ T_n)
+    # merged with A+C contributions. r1_pno[i] writes are disjoint per i, so
+    # this is dispatched across `_pool.map` when available.
+    # =========================================================================
+    def _per_i(i):
         key_ii = (i, i)
-        if key_ii not in pno_spaces or pno_spaces[key_ii]['C_pno'].shape[1] == 0:
-            continue
+        if key_ii not in pno_spaces:
+            return i, None
         n_ii = pno_spaces[key_ii]['C_pno'].shape[1]
+        if n_ii == 0:
+            return i, None
 
+        r1_i = np.zeros(n_ii)
+        e_pno_ii = pno_spaces[key_ii]['e_pno']
+        t1_i = t1_pno.get(i)
+        has_t1_i = t1_i is not None and t1_i.size > 0 and np.max(np.abs(t1_i)) > 1e-15
+
+        ci_ii = cc_ints.get(key_ii)
+        if ci_ii is not None:
+            Qma_ii = ci_ii['Qma']      # (n_local, nocc, n_ii)
+            Qab_ii = ci_ii['Qab']      # (n_local, n_ii, n_ii)
+            Qia_ii = ci_ii['i_Qa']     # (n_local, n_ii)
+            Qik_ii = ci_ii['i_Qk']     # (n_local, nocc)
+
+            # T_n_ii[m, c] = t1[m] projected to PNO_ii
+            T_n_ii = np.zeros((nocc, n_ii))
+            any_t1 = False
+            for m in range(nocc):
+                tn_m = T_n.get((key_ii, m))
+                if tn_m is not None and tn_m.size == n_ii:
+                    T_n_ii[m] = tn_m
+                    if np.max(np.abs(tn_m)) > 1e-15:
+                        any_t1 = True
+
+            # ---- Stage 1: Fai_bar T1 dressing (ccsd.cc lines 1631-1654) ----
+            if any_t1:
+                gamma = Qma_ii.reshape(Qma_ii.shape[0], -1) @ T_n_ii.ravel()
+                r1_i += 2.0 * (Qia_ii.T @ gamma)
+                y = Qik_ii @ T_n_ii                # (n_local, n_ii)
+                r1_i -= np.einsum('qac,qc->a', Qab_ii, y, optimize=True)
+
+            # ---- Stage 2 & 3: Fab_bar @ t1 and -T_n.T @ Fia_bar @ t1 ----
+            if has_t1_i and any_t1:
+                W_qak = Qab_ii @ T_n_ii.T          # (n_local, n_ii, nocc)
+                Fab_bar_ii = np.diag(e_pno_ii)
+                Fab_bar_ii += 2.0 * np.tensordot(gamma, Qab_ii, axes=(0, 0))
+                Fab_bar_ii -= np.tensordot(W_qak, Qma_ii, axes=((0, 2), (0, 1)))
+                r1_i += Fab_bar_ii @ t1_i
+
+                Z_qmk = Qma_ii @ T_n_ii.T          # (n_local, nocc, nocc)
+                Fia_bar_ii = 2.0 * np.tensordot(gamma, Qma_ii, axes=(0, 0))
+                Fia_bar_ii -= np.tensordot(Z_qmk, Qma_ii, axes=((0, 1), (0, 1)))
+                r1_i -= T_n_ii.T @ (Fia_bar_ii @ t1_i)
+            elif has_t1_i:
+                r1_i += e_pno_ii * t1_i
+
+            # ---- Stage 4: -sum_k T_n[ii][k,a] * Fij_bar[k,i] ----
+            r1_i -= Fij_bar[:, i] @ T_n_ii
+
+        # ---- A + C terms: inner k-loop over ordered pairs (i, k) / (k, i) ----
         for k in range(nocc):
             ki_data = _get_ki_data(k, i)
             if ki_data is None:
                 continue
             key_ki = ki_data['key']
-            n_ki = ki_data['n_ki']
             k_Qa = ki_data['k_Qa']
             Qab_ki = ki_data['Qab']
 
-            # Get T2 for ordered pair (k, i): Tt_ki[a, c]
             if key_ki not in t2_pno_all:
-                continue  # weak pair — no T2 amplitudes
+                continue
             t2_canon = t2_pno_all[key_ki]
             if k <= i:
-                # canonical key = (k, i), storage in (k,i) order
-                t2_ki = t2_canon  # T_iajb[(k,i)][a, c] = t2[k,i]^{a,c}
+                t2_ki = t2_canon
             else:
-                # canonical key = (i, k), storage in (i,k) order — transpose
                 t2_ki = t2_canon.T
-            Tt_ki = 2.0 * t2_ki - t2_ki.T  # antisymmetric in (a, c)
+            Tt_ki = 2.0 * t2_ki - t2_ki.T
 
             # ----- A term -----
-            # temp_A[d] = Σ_{a,c} (k a | c d) * Tt_ki[a, c]
-            # = Σ_{Q, a, c} k_Qa[Q,a] * Qab[Q,c,d] * Tt_ki[a,c]
-            # Z[Q, c] = Σ_a k_Qa[Q,a] * Tt_ki[a,c]
             Z = np.einsum('Qa,ac->Qc', k_Qa, Tt_ki)
             temp_A = np.einsum('Qc,Qcd->d', Z, Qab_ki)
-            # Project to PNO_ii via S(ki, ii)^T
             if key_ki == key_ii:
                 A_contrib = temp_A
             else:
                 S_ii_ki = S_pno_cache.get((key_ii, key_ki))
-                if S_ii_ki is not None:
-                    A_contrib = S_ii_ki @ temp_A
-                else:
-                    A_contrib = None
+                A_contrib = S_ii_ki @ temp_A if S_ii_ki is not None else None
             if A_contrib is not None:
-                r1_pno[i] += A_contrib
+                r1_i += A_contrib
 
             # ----- C term -----
-            # C_i^a = Σ_k S(ik,ii)^T @ Tt[ik] @ Fkc[ki]^T
-            # Fkc[ki] = fov[k] projected to PNO_ki (with T1 dressing,
-            # but at iter 0 t1=0 so Fkc = bare fov_k in PNO_ki)
-            # Get T2 for ordered pair (i, k): Tt_ik = T2[i,k] - T2[i,k].T (antisym in c,d)
             if i <= k:
-                t2_ik = t2_canon  # canonical = (i,k) = (min,max)
+                t2_ik = t2_canon
             else:
                 t2_ik = t2_canon.T
             Tt_ik = 2.0 * t2_ik - t2_ik.T
 
-            # Fkc[ki] = fov_k in PNO_ki basis
-            # Use T_n[(key_ki, k)] which is t1_k projected — but for Fkc we need
-            # fov_k projected, not t1_k. Project fov_k to PNO_ki basis.
             fov_k_in_ki = _project_t1_to_pair(
                 fov_pno, k, key_ki, S_pno_cache, pno_spaces)
 
-            # T1 dressing of Fkc (Psi4 ccsd.cc lines 1685-1692):
-            # Fkc[ij] += sum_m S(ij,im) @ L[im] @ S(im,mm) @ T1[m]
-            # where L[im] = 2*K[im] - K[im].T, and the sum is over m in
-            # the pair (i,k)'s LMO domain (for us: all m).
-            # Here ij=ki (ordered pair for C-term), so:
-            # Fkc_dress_ki = sum_m S(ki,im) @ L[im] @ S(im,mm) @ T1[m]
-            # This dressing is evaluated in PNO_ki basis.
+            # T1 dressing of Fkc (Psi4 ccsd.cc lines 1685-1692)
             fkc_dress = np.zeros_like(fov_k_in_ki)
             for m in range(nocc):
                 entry = _LT1_cache.get((i, m))
                 if entry is None:
                     continue
                 key_im, LT1 = entry
-                # S(ki, im) @ LT1 → project from PNO_im to PNO_ki
                 if key_ki == key_im:
                     fkc_dress += LT1
                 else:
                     S_ki_im = S_pno_cache.get((key_ki, key_im))
                     if S_ki_im is not None:
                         fkc_dress += S_ki_im @ LT1
-            # Psi4's Fkc_ is PURELY T1-dressed (no bare fov).
-            # The bare fov contribution enters through Fai_bar, not Fkc.
             fov_k_in_ki = fkc_dress
 
-            # contrib = Tt_ik @ fov_k_in_ki  (= Tt_ik @ Fkc)
-            # Note: PNO_ik == PNO_ki (same canonical pair)
             contrib_C_local = Tt_ik @ fov_k_in_ki
             if key_ki == key_ii:
                 C_contrib = contrib_C_local
             else:
                 S_ii_ik = S_pno_cache.get((key_ii, key_ki))
-                if S_ii_ik is not None:
-                    C_contrib = S_ii_ik @ contrib_C_local
-                else:
-                    C_contrib = None
+                C_contrib = S_ii_ik @ contrib_C_local if S_ii_ik is not None else None
             if C_contrib is not None:
-                r1_pno[i] += C_contrib
+                r1_i += C_contrib
+
+        return i, r1_i
+
+    if _pool is not None:
+        _per_i_results = list(_pool.map(_per_i, range(nocc)))
+    else:
+        _per_i_results = [_per_i(i) for i in range(nocc)]
+    for _i, _r1_i in _per_i_results:
+        if _r1_i is not None:
+            r1_pno[_i] = _r1_i
 
     # ===========================================================
     # B and A2 terms: loop over ordered pairs (k, l)
@@ -1047,6 +1004,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
 
     # Jiang uses bare integrals with explicit T1 dressing
     use_t1_transform = False
+
+    # Fine-grained pool: ~1000 small numpy tasks per pool.map (e.g.
+    # compute_C_tilde_batched Phase 1) scale poorly on a 64-worker
+    # pool due to GIL contention between BLAS calls. Benchmark on
+    # water10-scale work shows the sweet spot is 4-8 workers; past
+    # 16 workers parallelism degrades. Route the fine-grained per-
+    # pair builders through this smaller pool; keep `_pool` (full
+    # 64-worker pool) for coarse tasks like _update_pair and the
+    # T1 residual per-LMO map.
+    from concurrent.futures import ThreadPoolExecutor
+    _fine_pool = ThreadPoolExecutor(max_workers=8) if _pool is not None else None
 
     # ------------------------------------------------------------------
     # Pre-compute quantities needed by the pair-local residual
@@ -1545,13 +1513,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _time.perf_counter()
                 _t_foo = _time.perf_counter()
                 foo_total = _compute_foo_dressed_local(
-                    t2_pno_all, pno_spaces, nocc, _cc_ints, _pool=_pool)
+                    t2_pno_all, pno_spaces, nocc, _cc_ints,
+                    _pool=(_fine_pool or _pool))
                 foo_bare = foo_total
                 _t_foo_done = _time.perf_counter()
             else:
                 _t_ovl = _t_kcoul = _t_foo = _time.perf_counter()
                 foo_total = _compute_foo_dressed_local(
-                    t2_pno_all, pno_spaces, nocc, _cc_ints, _pool=_pool)
+                    t2_pno_all, pno_spaces, nocc, _cc_ints,
+                    _pool=(_fine_pool or _pool))
                 foo_bare = foo_total
                 _t_ovl_done = _t_kcoul_done = _t_foo_done = _time.perf_counter()
 
@@ -1575,17 +1545,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _jiang_ovL_d = None  # not needed (K_dressed_override per pair)
             _tj_ovl = _time.perf_counter() - _tj0
 
-            # Unified per-pair local-aux pass: fvv_t1, C/D Term 2, ladder.
-            # Reads from cc_ints['Qab', 'Qma'] (already fitted, local-aux
-            # per pair) — Psi4-equivalent. No global aux iteration.
-            from pyscf.cc.dlpno_tccsd.residual import compute_all_df_terms_local
-            _tj0 = _time.perf_counter()
-            _fvv_t1_pre, _c_t2_pre, _d_t2_pre, _jiang_ladder_all = \
-                compute_all_df_terms_local(
-                    t1_pno, fov_pno, t2_pno_all, pno_spaces, nocc,
-                    _cc_ints, S_pno_cache, keys_sorted, _pool=_pool,
-                    pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache)
-            _tj_df = _time.perf_counter() - _tj0
+            # compute_all_df_terms_local is skipped: for every pair covered
+            # by cc_ints (all pairs for non-CAS geometries like water10),
+            # downstream C_tilde / D_tilde take their "cc_ints branch" and
+            # ignore _term2_precomputed. fvv_t1_all and ladder_all were
+            # already unused. Pass empty dicts as the fallback is only
+            # hit for pairs missing from cc_ints — zero on this path.
+            _c_t2_pre = {}
+            _d_t2_pre = {}
+            _tj_df = 0.0
 
             # compute_C_tilde, build_D_tilde, t1_fock each dispatch their
             # own ~400 tasks via _pool.map. Running them in 3 driver
@@ -1604,7 +1572,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                 _term2_precomputed=_c_t2_pre,
                 cc_ints=_cc_ints,
-                pair_lmo_idx=pair_lmo_idx, _pool=_pool,
+                pair_lmo_idx=pair_lmo_idx, _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
                 blas_threads=32, omp_threads=ncores)
             from pyscf.cc.dlpno_tccsd.residual import build_D_tilde_batched
@@ -1613,13 +1581,13 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                 _term2_precomputed=_d_t2_pre,
                 cc_ints=_cc_ints,
-                pair_lmo_idx=pair_lmo_idx, _pool=_pool,
+                pair_lmo_idx=pair_lmo_idx, _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
                 t1_cache=_t1_cache, omp_threads=ncores)
             _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
                 _cc_ints, None, t1_pno, fov_pno, pno_spaces,
                 S_pno_cache, F_lmo, eps_lmo, foo_total,
-                _all_keys_j, nocc, _pool=_pool,
+                _all_keys_j, nocc, _pool=(_fine_pool or _pool),
                 pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache)
             _tj_C = _time.perf_counter() - _tj0
             _tj_D = 0.0
@@ -1658,7 +1626,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 'J_oo_d': None,
                 'K_mixed': _jiang_K_mixed,
                 'Fab_all': None,
-                'ladder_all': _jiang_ladder_all,
+                'ladder_all': None,
             }
 
             _t_pairs = _time.perf_counter()
@@ -1676,8 +1644,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                     t1_cache=_t1_cache)
             _t_bt0 = _time.perf_counter()
             _B_tilde_per_ij = {}
-            if _pool is not None:
-                for _k, _bt in _pool.map(_bt_one, keys_sorted):
+            _bt_pool = _fine_pool or _pool
+            if _bt_pool is not None:
+                for _k, _bt in _bt_pool.map(_bt_one, keys_sorted):
                     _B_tilde_per_ij[_k] = _bt
             else:
                 for _k in keys_sorted:
@@ -1694,7 +1663,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _B_dict, _E_dict = compute_B_E_batched_v2(
                 keys_sorted, t2_pno_all, pno_spaces, S_pno_cache,
                 _cc_ints, _B_tilde_per_ij, pair_lmo_idx, nocc,
-                _pool=_pool, S_pao_full=S_pao_full, s1e=s1e,
+                _pool=(_fine_pool or _pool),
+                S_pao_full=S_pao_full, s1e=s1e,
                 omp_threads=ncores)
             _BE_all = {'B': _B_dict, 'E': _E_dict}
             _t_be = _time.perf_counter() - _t_be0
@@ -1702,7 +1672,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # Batched C and D contractions (Phase 5e).  Precomputes the
             # per-pair C_term and D_term tiles once, across all (ij, k)
             # items at once, bypassing the per-pair k-loop inside
-            # compute_residual_v2.
+            # compute_residual_v2. Lever-C pilot of inlining these (2026-04-24)
+            # regressed water10 CCSD 128.5→139.5s (+8.6%): the Cython
+            # c_kernel/d_kernel beats the Python inline k-loop despite the
+            # extra gather/scatter.  Keep the batched path.
             from pyscf.cc.dlpno_tccsd.residual import compute_CD_terms_batched
             _t_cd0 = _time.perf_counter()
             _C_term_all, _D_term_all = compute_CD_terms_batched(
@@ -1938,7 +1911,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             r1_pno = _compute_t1_residual_psi4(
                 t1_pno, t2_pno_all, pno_spaces, _t1_fov, F_lmo, eps_lmo, nocc,
                 S_pno_cache, _cc_ints, ovL_pno_cache=_t1_ovL,
-                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache)
+                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache, _pool=_pool)
             t1_pno_new = {}
             for ii in range(nocc):
                 key_ii = (ii, ii)
@@ -2103,6 +2076,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         Tt = 2.0 * tau - tau.T
         e_ij = np.einsum('ab,ab->', K, Tt)
         e_total += e_ij if i == j else 2.0 * e_ij
+
+    if _fine_pool is not None:
+        _fine_pool.shutdown(wait=True)
 
     return e_total, t2_pno_all, t1_pno
 

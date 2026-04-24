@@ -885,36 +885,54 @@ def build_D_tilde_batched(
         elif _term2_precomputed and (i_idx, k_idx) in _term2_precomputed:
             D_tilde_ik += _term2_precomputed[(i_idx, k_idx)]
 
-        # Term 1 — per-LMO DF contractions, restricted to pair_lmo_idx
-        _domain_ik_t1 = (set(pair_lmo_idx[key_ik].tolist())
-                         if pair_lmo_idx is not None and key_ik in pair_lmo_idx
-                         else set(range(nocc)))
-        _use_local_d1 = (key_ik in cc_ints and cc_ints[key_ik] is not None)
-        for ll in range(nocc):
-            if ll not in _domain_ik_t1:
-                continue
-            if _use_local_d1:
-                _ovL_k = get_local_ovL(cc_ints, key_ik, k_idx)
-                _ovL_l = get_local_ovL(cc_ints, key_ik, ll)
-                _ooL_il = get_local_ooL_vec(cc_ints, i_idx, ll, key_ik)
-                _ooL_ik = get_local_ooL_vec(cc_ints, i_idx, k_idx, key_ik)
-                if (_ovL_k is not None and _ovL_l is not None
-                        and _ooL_il is not None and _ooL_ik is not None):
-                    ilkc = _ovL_k @ _ooL_il
-                    iklc = _ovL_l @ _ooL_ik
-                else:
-                    continue
+        # Term 1 — full pair-domain sum (matches Psi4 ccsd.cc:1913
+        # `L_bar_temp = 2*K_bar[ik] - K_bar_chem[ik]; -T_n_ij.T @ L_bar_temp`).
+        # NOTE: the prior implementation restricted `ll` to {i_idx, k_idx}
+        # because `get_local_ooL_vec` returns None outside those two (it only
+        # stores ooL[i_lmo_of_pair, :, Q] and ooL[j_lmo_of_pair, :, Q]). The
+        # i_Qk / j_Qk tensors actually cover the full LMO axis for that fixed
+        # LMO side, so we can gather the whole domain's ooL[i, l, Q] in one
+        # slice. Matching Psi4's full-domain sum drifts E_tccsd on water10 by
+        # ~13 μEh from the historical −2.1308345454 anchor; see the project
+        # memory for the revert recipe if needed.
+        if pair_lmo_idx is not None and key_ik in pair_lmo_idx:
+            _ll_idx = np.asarray(pair_lmo_idx[key_ik], dtype=np.intp)
+        else:
+            _ll_idx = np.arange(nocc)
+
+        if key_ik in cc_ints and cc_ints[key_ik] is not None:
+            ci_ik2 = cc_ints[key_ik]
+            # ooL_il[Q, l] = ooL[i_idx, l, Q] for l in domain. Use whichever
+            # Qk tensor corresponds to i_idx's position in the pair key.
+            if key_ik[0] == i_idx:
+                ooL_il_all = ci_ik2['i_Qk'][:, _ll_idx]   # (n_local, n_domain)
+                ooL_ik = ci_ik2['i_Qk'][:, k_idx]         # (n_local,)
             else:
-                ooL_il = ooL_bare[i_idx, ll, :]
-                ooL_ik = ooL_bare[i_idx, k_idx, :]
+                ooL_il_all = ci_ik2['j_Qk'][:, _ll_idx]
+                ooL_ik = ci_ik2['j_Qk'][:, k_idx]
+            Qma = ci_ik2['Qma']                           # (n_local, nocc, n_pno)
+            ovL_k = Qma[:, k_idx, :]                      # (n_local, n_pno)
+            # ilkc[l, c] = Σ_Q ovL[k, c, Q] * ooL[i, l, Q]
+            ilkc_all = ooL_il_all.T @ ovL_k               # (n_domain, n_pno)
+            # iklc[l, c] = Σ_Q ovL[l, c, Q] * ooL[i, k, Q]
+            iklc_all = np.tensordot(
+                Qma[:, _ll_idx, :], ooL_ik, axes=(0, 0))  # (n_domain, n_pno)
+            M_lc_all = 2.0 * ilkc_all - iklc_all
+            T1_rows = T1_all_ik[_ll_idx]                  # (n_domain, n_pno)
+            D_tilde_ik -= T1_rows.T @ M_lc_all
+        else:
+            # Fallback for pairs missing from cc_ints (e.g. CAS): per-l loop.
+            ooL_ik_bare = ooL_bare[i_idx, k_idx, :]
+            for _li, ll in enumerate(_ll_idx):
+                ooL_il = ooL_bare[i_idx, int(ll), :]
                 ovL_k_ik_entry = ovL_bare.get((key_ik, k_idx))
-                ovL_l_ik_entry = ovL_bare.get((key_ik, ll))
+                ovL_l_ik_entry = ovL_bare.get((key_ik, int(ll)))
                 if ovL_k_ik_entry is None or ovL_l_ik_entry is None:
                     continue
                 ilkc = ovL_k_ik_entry @ ooL_il
-                iklc = ovL_l_ik_entry @ ooL_ik
-            M_lc = 2.0 * ilkc - iklc
-            D_tilde_ik -= np.outer(T1_all_ik[ll], M_lc)
+                iklc = ovL_l_ik_entry @ ooL_ik_bare
+                M_lc = 2.0 * ilkc - iklc
+                D_tilde_ik -= np.outer(T1_all_ik[int(ll)], M_lc)
 
         return ik_tuple, D_tilde_ik
 
@@ -1590,31 +1608,32 @@ def compute_C_tilde_batched(
 
         # --- Term 1: -Σ_l T1_all[l,a] · (ki|lc) ---
         if pair_lmo_idx is not None and key_ki in pair_lmo_idx:
-            _ll_idx = np.asarray(pair_lmo_idx[key_ki])
+            _ll_idx = np.asarray(pair_lmo_idx[key_ki], dtype=np.intp)
         else:
             _ll_idx = np.arange(nocc)
 
-        T1_local_ki = np.zeros((len(_ll_idx), n_ki))
-        for _li, _ll in enumerate(_ll_idx):
-            T1_local_ki[_li] = T1_cache.get(
-                (key_ki, int(_ll)), np.zeros(n_ki))
+        # Gather T1_local_ki and K_bar_chem_local as single tensor ops —
+        # replaces per-l dict lookups and per-l matmuls. For cc_ints-covered
+        # pairs we use the local-DF path (Qma + i_Qk / j_Qk); otherwise fall
+        # back to the bare ovL / ooL arrays.
+        T1_rows = [T1_cache.get((key_ki, int(_ll))) for _ll in _ll_idx]
+        T1_local_ki = np.ascontiguousarray(
+            np.array([r if r is not None else np.zeros(n_ki)
+                      for r in T1_rows]))
 
-        K_bar_chem_local = np.zeros((len(_ll_idx), n_ki))
         if key_ki in cc_ints and cc_ints[key_ki] is not None:
-            _ooL_ki = get_local_ooL_vec(cc_ints, k, i, key_ki)
-            if _ooL_ki is not None:
-                for _li, _ll in enumerate(_ll_idx):
-                    _ovL_l = get_local_ovL(cc_ints, key_ki, int(_ll))
-                    if _ovL_l is not None:
-                        K_bar_chem_local[_li] = _ovL_l @ _ooL_ki
-            else:
-                ooL_ki = ooL_bare[k, i, :]
-                for _li, _ll in enumerate(_ll_idx):
-                    ovL_l_ki = ovL_pno_bare.get((key_ki, int(_ll)))
-                    if ovL_l_ki is not None:
-                        K_bar_chem_local[_li] = ovL_l_ki @ ooL_ki
+            ci_ki2 = cc_ints[key_ki]
+            # get_local_ooL_vec(k, i, pair) maps l_arg=i to j_Qk[:,k]
+            # when key_ki[0] == k (canonical pair (k,i)) and to i_Qk[:,k]
+            # when key_ki[0] != k (canonical pair (i,k), with k > i).
+            _ooL_ki = (ci_ki2['j_Qk'][:, k] if key_ki[0] == k
+                       else ci_ki2['i_Qk'][:, k])
+            # K_bar_chem_local[l, c] = Σ_L Qma[L, l, c] * ooL_ki[L]
+            K_bar_chem_local = np.tensordot(
+                ci_ki2['Qma'][:, _ll_idx, :], _ooL_ki, axes=(0, 0))
         else:
             ooL_ki = ooL_bare[k, i, :]
+            K_bar_chem_local = np.zeros((len(_ll_idx), n_ki))
             for _li, _ll in enumerate(_ll_idx):
                 ovL_l_ki = ovL_pno_bare.get((key_ki, int(_ll)))
                 if ovL_l_ki is not None:
@@ -1771,70 +1790,17 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         all_ordered.add((a, b))
         all_ordered.add((b, a))
 
+    # NOTE: fvv_t1_all and ladder_all are kept in the return signature for
+    # backward compat but are no longer computed here — both were dead:
+    #   * fvv_t1 was returned but never consumed anywhere.
+    #   * ladder_all ended up in _jiang_cache['ladder_all'] as a fallback,
+    #     but _update_pair always rebuilds its own _ladder_local via
+    #     compute_ladder() because every pair has cc_ints on our target
+    #     geometries.  Skipping the ~15 GFLOPs/iter these two produced.
     fvv_t1_all = {}
     c_term2_all = {}
     d_term2_all = {}
     ladder_all = {}
-
-    # ============================================================
-    # Per-pair: fvv_t1 + ladder. Pure function — safe to parallelize.
-    # ============================================================
-    def _fvv_ladder(pk):
-        n = pno_spaces[pk]['C_pno'].shape[1]
-        if n == 0:
-            return pk, np.zeros((n, n)), np.zeros((n, n))
-        ci = cc_ints.get(pk)
-        if ci is None:
-            return pk, np.zeros((n, n)), np.zeros((n, n))
-
-        Qab = ci['Qab']                 # (n_local, n, n)
-        Qma_full = ci['Qma']            # (n_local, nocc, n)
-        i, j = pk
-
-        # Restrict inner k-sum to pair's local LMO domain (Psi4
-        # lmopair_to_lmos_[ij]). For each k in the full nocc, the
-        # contribution is ~zero for k outside the domain; restricting
-        # collapses O(nocc·n²) tensor contractions to O(nlmo·n²).
-        if pair_lmo_idx is not None and pk in pair_lmo_idx:
-            lmo_idx = np.asarray(pair_lmo_idx[pk])
-        else:
-            lmo_idx = np.arange(nocc)
-        Qma = Qma_full[:, lmo_idx, :]   # (n_local, nlmo, n)
-
-        # Phase 1: fancy-index into cached (nocc, n_pno) projection matrix.
-        T1_local = np.ascontiguousarray(
-            t1_cache[pk][np.asarray(lmo_idx, dtype=np.intp)])
-
-        # fvv_t1
-        z = np.einsum('Lka,ka->L', Qma, T1_local, optimize=True)
-        fvv = 2.0 * np.einsum('L,Lab->ab', z, Qab, optimize=True)
-        tmp = np.einsum('Lab,kb->Lka', Qab, T1_local, optimize=True)
-        fvv -= np.einsum('Lka,Lkb->ab', tmp, Qma, optimize=True)
-
-        # ladder — t1_i and t1_j: cache has zero rows for out-of-domain
-        # LMOs, so indexing the cached matrix covers both paths in one line.
-        t1_i = t1_cache[pk][i]
-        t1_j = t1_cache[pk][j]
-        tau = t2_pno_all[pk] + np.outer(t1_i, t1_j)
-        corr = np.einsum('ka,Lkb->Lab', T1_local, Qma, optimize=True)
-        B_tilde = Qab - corr
-        X_L = np.matmul(B_tilde, tau)
-        ladder = (X_L.transpose(1, 0, 2).reshape(n, -1) @
-                  B_tilde.transpose(1, 0, 2).reshape(n, -1).T)
-        # Debug: print for diagonal (0,0), off-diag (0,5), diagonal (5,5)
-        _it = getattr(compute_all_df_terms_local, '_iter', 0)
-        if _it <= 2 and pk in [(0, 0), (0, 5), (5, 5)]:
-            print(f'  LADDER_DBG iter {_it} '
-                  f'pair{pk}: |T1_all|={np.linalg.norm(T1_local):.3e} '
-                  f'|T2|={np.linalg.norm(t2_pno_all[pk]):.3e} '
-                  f'|tau|={np.linalg.norm(tau):.3e} '
-                  f'|corr|={np.linalg.norm(corr):.3e} '
-                  f'|B_tilde|={np.linalg.norm(B_tilde):.3e} '
-                  f'|Qab|={np.linalg.norm(Qab):.3e} '
-                  f'|Qma|={np.linalg.norm(Qma):.3e} '
-                  f'|ladder|={np.linalg.norm(ladder):.3e}',
-                  flush=True)
-        return pk, fvv, ladder
 
     # ============================================================
     # C_tilde Term 2: per (k, i) ordered pair
@@ -1880,29 +1846,21 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
         result -= np.einsum('L,Lab->ab', y, Qab, optimize=True)
         return ik_tuple, result
 
-    # Unified dispatch: one _pool.map (chunked) covering all three
-    # task kinds. Removes 2 synchronization barriers per CCSD iteration
-    # and amortizes pool dispatch overhead across chunks.
+    # Unified dispatch: chunked pool.map over c_term2 + d_term2 items only.
+    # (fvv_ladder removed — see note above.)
     ordered_list = list(all_ordered)
-    work = ([('fvv_ladder', pk) for pk in pair_keys]
-            + [('c_term2', ki) for ki in ordered_list]
+    work = ([('c_term2', ki) for ki in ordered_list]
             + [('d_term2', ik) for ik in ordered_list])
 
     def _dispatch(item):
         kind, key = item
-        if kind == 'fvv_ladder':
-            return kind, _fvv_ladder(key)
-        elif kind == 'c_term2':
+        if kind == 'c_term2':
             return kind, _c_term2(key)
         else:  # d_term2
             return kind, _d_term2(key)
 
     for kind, payload in _chunked_map(_pool, _dispatch, work):
-        if kind == 'fvv_ladder':
-            pk, fvv, ladder = payload
-            fvv_t1_all[pk] = fvv
-            ladder_all[pk] = ladder
-        elif kind == 'c_term2':
+        if kind == 'c_term2':
             ki, val = payload
             if val is not None:
                 c_term2_all[ki] = val
@@ -1910,14 +1868,6 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
             ik, val = payload
             if val is not None:
                 d_term2_all[ik] = val
-
-    # Pad missing pair_keys with zeros (matching old API)
-    for pk in pair_keys:
-        n = pno_spaces[pk]['C_pno'].shape[1]
-        if pk not in fvv_t1_all:
-            fvv_t1_all[pk] = np.zeros((n, n))
-        if pk not in ladder_all:
-            ladder_all[pk] = np.zeros((n, n))
 
     return fvv_t1_all, c_term2_all, d_term2_all, ladder_all
 
