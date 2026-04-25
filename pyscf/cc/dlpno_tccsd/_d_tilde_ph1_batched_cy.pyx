@@ -5,39 +5,37 @@
 # cython: language_level=3
 """Batched Cython kernel for ``build_D_tilde_batched._process_ik_t12``.
 
-Same path-(b) pattern as `_c_tilde_ph1_batched_cy`. Processes all
-ordered pairs (i, k) in one prange over an isolated OpenMP team, BLAS
-forced to 1 thread. Static per-pair data cached across CCSD iterations.
+Version 2: algorithmic parity with Psi4 — Terms 1 and 2 both use
+precomputed static quantities (K_tilde_chem, K_bar_ij/ji, K_bar_chem),
+cutting per-iteration FLOPs by 7-13× vs the prior n_local-summing
+implementation.
 
-Math per pair (from residual.py:881 _process_ik_t12):
+Math per pair (from residual.py:881 _process_ik_t12, matches Psi4
+ccsd.cc:1876 compute_D_tilde):
 
-  Term 2 (3 BLAS + 1 transpose-accumulate):
-    X[L, a]      = sum_c Qab[L, a, c] * t1[c]              (dgemv on Qab flat)
-    D[a, b]     += 2 * sum_L X[L, a] * k_Qa[L, b]          (dgemm: X.T @ k_Qa)
-    w[L]         = sum_a k_Qa[L, a] * t1[a]                (dgemv)
-    temp[b, a]   = sum_L w[L] * Qab[L, b, a]               (dgemv on Qab flat)
-    D[a, b]     -= temp[b, a]                              (transpose-add loop)
+  Term 2 (2 dgemv + 1 accumulate loop):
+    part1[j*n_pno + p]  = sum_q K_tilde_chem_k[j, p*n_pno + q] * T1[q]
+    part2[a*n_pno + b]  = sum_c T1[c] * K_tilde_chem_k[c, a*n_pno + b]
+    D[a, b]            += 2 * part1[b*n_pno + a] - part2[b*n_pno + a]
+    (matches Psi4 compute_D_tilde L1898-1908.)
 
-  Term 1 (2 BLAS + 1 elementwise + 1 BLAS):
-    ilkc[l, c]   = sum_L ooL_il_all[L, l] * ovL_k[L, c]    (dgemm)
-    iklc[l, c]   = sum_L Qma_sub[L, l, c] * ooL_ik[L]      (dgemv)
-    M[l, c]      = 2*ilkc[l, c] - iklc[l, c]               (elementwise)
-    D[a, b]     -= sum_l T1_rows[l, a] * M[l, b]           (dgemm)
+  Term 1 (1 dgemm):
+    M_static[l, c] = 2 * K_bar_ij_or_ji[l, c] - K_bar_chem[l, c]   (precomputed)
+    D[a, b]       -= sum_l T1_rows[l, a] * M_static[l, b]
+    (matches Psi4 compute_D_tilde L1910-1913 L_bar_temp + doublet.)
 
-Total: 6 BLAS ops per pair (plus two tiny loops). No Qab pre-transpose
-needed — Term 2a and 2d share the same raw Qab buffer; Term 2d's
-transpose is done via a cheap scalar loop on the (n_pno, n_pno) output.
+Compare to prior 6-BLAS-op version: Term 2 was (dgemv Qab×T1)
+→ (dgemm X×k_Qa) → (dgemv k_Qa×T1) → (dgemv Qab×w) + transpose loop
+— all four dgemvs ran over n_local. Term 1 was (dgemm ooL_il×ovL_k)
+→ (dgemv Qma×ooL_ik) + elementwise + (dgemm T1×M). All n_local sums.
+New kernel: 3 BLAS ops on pure (n_pno) / (n_domain) tensors.
 
 Shapes per pair:
-  k_Qa:        (n_local, n_pno)
-  Qab:         (n_local, n_pno, n_pno)
-  Qma_sub:     (n_local, n_domain, n_pno)
-  ooL_il_all:  (n_local, n_domain)
-  ooL_ik:      (n_local,)
-  ovL_k:       (n_local, n_pno)
-  t1_i_ik:     (n_pno,)
-  T1_rows:     (n_domain, n_pno)
-  D_out:       (n_pno, n_pno)
+  K_tilde_chem_k:  (n_pno, n_pno²)          C-contig
+  M_static:        (n_domain, n_pno)        C-contig
+  t1_i_ik:         (n_pno,)                 C-contig
+  T1_rows:         (n_domain, n_pno)        C-contig
+  D_out:           (n_pno, n_pno)           C-contig
 """
 from scipy.linalg.cython_blas cimport dgemm, dgemv
 from cython.parallel cimport prange
@@ -47,19 +45,11 @@ import numpy as np
 
 
 def d_tilde_ph1_batched(
-    # Static flat per-pair buffers
-    double[::1] k_Qa_flat,
-    long[::1]   k_Qa_offsets,
-    double[::1] Qab_flat,
-    long[::1]   Qab_offsets,
-    double[::1] Qma_sub_flat,
-    long[::1]   Qma_sub_offsets,
-    double[::1] ooL_il_all_flat,
-    long[::1]   ooL_il_all_offsets,
-    double[::1] ooL_ik_flat,
-    long[::1]   ooL_ik_offsets,
-    double[::1] ovL_k_flat,
-    long[::1]   ovL_k_offsets,
+    # Static flat per-pair buffers (L already summed out)
+    double[::1] K_tilde_chem_flat,    # per pair: (n_pno, n_pno²)
+    long[::1]   K_tilde_chem_offsets,
+    double[::1] M_static_flat,        # per pair: (n_domain, n_pno)
+    long[::1]   M_static_offsets,
 
     # Per-iter flat buffers
     double[::1] t1_flat,
@@ -69,15 +59,11 @@ def d_tilde_ph1_batched(
 
     # Per-pair shapes
     int[::1] n_pno_arr,
-    int[::1] n_local_arr,
     int[::1] n_domain_arr,
 
-    # Per-thread scratch
-    double[:, ::1] X_scratch,         # (num_threads, max_n_local * max_n_pno)
-    double[:, ::1] w_scratch,         # (num_threads, max_n_local)
-    double[:, ::1] temp_scratch,      # (num_threads, max_n_pno * max_n_pno)
-    double[:, ::1] ilkc_scratch,      # (num_threads, max_n_domain * max_n_pno)
-    double[:, ::1] iklc_scratch,      # (num_threads, max_n_domain * max_n_pno)
+    # Per-thread scratch (for Term 2)
+    double[:, ::1] part1_scratch,     # (num_threads, max_n_pno²)
+    double[:, ::1] part2_scratch,     # (num_threads, max_n_pno²)
 
     # Output
     double[::1] D_flat,
@@ -88,58 +74,39 @@ def d_tilde_ph1_batched(
     cdef Py_ssize_t N = n_pno_arr.shape[0]
     cdef Py_ssize_t p
     cdef int tid
-    cdef Py_ssize_t n_pno, n_local, n_domain
-    cdef Py_ssize_t a, b, l, c
+    cdef Py_ssize_t n_pno, n_domain
+    cdef Py_ssize_t a, b
 
     cdef char N_flag = b'N', T_flag = b'T'
-    cdef double one = 1.0, zero = 0.0, two = 2.0, neg_one = -1.0
+    cdef double one = 1.0, zero = 0.0, neg_one = -1.0
     cdef int int_one = 1
-    cdef int int_n_pno, int_n_local, int_n_domain
-    cdef int int_npno2, int_dom_npno, int_local_npno
+    cdef int int_n_pno, int_n_domain, int_npno2
 
-    cdef double *k_Qa
-    cdef double *Qab
-    cdef double *Qma_sub
-    cdef double *ooL_il_all
-    cdef double *ooL_ik
-    cdef double *ovL_k
+    cdef double *K_tilde_chem
+    cdef double *M_static
     cdef double *t1
     cdef double *T1_rows
     cdef double *D_out
-    cdef double *X
-    cdef double *w
-    cdef double *temp
-    cdef double *ilkc
-    cdef double *iklc
+    cdef double *part1
+    cdef double *part2
 
     for p in prange(N, schedule='dynamic', nogil=True, num_threads=num_threads):
         tid = openmp.omp_get_thread_num()
         n_pno    = n_pno_arr[p]
-        n_local  = n_local_arr[p]
         n_domain = n_domain_arr[p]
 
-        k_Qa       = &k_Qa_flat[k_Qa_offsets[p]]
-        Qab        = &Qab_flat[Qab_offsets[p]]
-        Qma_sub    = &Qma_sub_flat[Qma_sub_offsets[p]]
-        ooL_il_all = &ooL_il_all_flat[ooL_il_all_offsets[p]]
-        ooL_ik     = &ooL_ik_flat[ooL_ik_offsets[p]]
-        ovL_k      = &ovL_k_flat[ovL_k_offsets[p]]
-        t1         = &t1_flat[t1_offsets[p]]
-        T1_rows    = &T1_rows_flat[T1_rows_offsets[p]]
-        D_out      = &D_flat[D_offsets[p]]
+        K_tilde_chem = &K_tilde_chem_flat[K_tilde_chem_offsets[p]]
+        M_static     = &M_static_flat[M_static_offsets[p]]
+        t1           = &t1_flat[t1_offsets[p]]
+        T1_rows      = &T1_rows_flat[T1_rows_offsets[p]]
+        D_out        = &D_flat[D_offsets[p]]
 
-        X    = &X_scratch[tid, 0]
-        w    = &w_scratch[tid, 0]
-        temp = &temp_scratch[tid, 0]
-        ilkc = &ilkc_scratch[tid, 0]
-        iklc = &iklc_scratch[tid, 0]
+        part1 = &part1_scratch[tid, 0]
+        part2 = &part2_scratch[tid, 0]
 
-        int_n_pno      = <int>n_pno
-        int_n_local    = <int>n_local
-        int_n_domain   = <int>n_domain
-        int_npno2      = <int>(n_pno * n_pno)
-        int_dom_npno   = <int>(n_domain * n_pno)
-        int_local_npno = <int>(n_local * n_pno)
+        int_n_pno    = <int>n_pno
+        int_n_domain = <int>n_domain
+        int_npno2    = <int>(n_pno * n_pno)
 
         # Init D = 0
         for a in range(n_pno):
@@ -147,90 +114,45 @@ def d_tilde_ph1_batched(
                 D_out[a * n_pno + b] = 0.0
 
         # ================================================================
-        # Term 2a: X[L, a] = sum_c Qab[L, a, c] * t1[c]
-        # Qab row-major (n_local, n_pno, n_pno); flat (n_local*n_pno, n_pno)
-        # with Qab_flat[L*n_pno + a, c] = Qab[L, a, c].
-        # X[L*n_pno + a] = sum_c Qab_flat[L*n_pno + a, c] * t1[c]
-        #               = (Qab_flat @ t1)[L*n_pno + a]
-        # Col-major Qab_F shape (n_pno, n_local*n_pno), lda=n_pno.
-        # Row-major X = Qab_flat @ t1 ⇔ col-major X_col = Qab_F^T @ t1.
-        # dgemv('T', n_pno, n_local*n_pno, 1, Qab, n_pno, t1, 1, 0, X, 1)
+        # Term 2 part 1: part1[j*n_pno + p] = sum_q K_tilde[j, p*n_pno + q] * T1[q]
+        # K_tilde row-major (n_pno, n_pno²) as (n_pno², n_pno) after reshape.
+        # Matches Psi4 L1899-1903: reshape + doublet with T_i.
+        # Col-major view of K_tilde with lda=n_pno: shape (n_pno, n_pno²).
+        # dgemv('T', m=n_pno, n=n_pno², 1, K_tilde, n_pno, T1, 1, 0, part1, 1)
         # ================================================================
-        dgemv(&T_flag, &int_n_pno, &int_local_npno,
-              &one, Qab, &int_n_pno,
+        dgemv(&T_flag, &int_n_pno, &int_npno2,
+              &one, K_tilde_chem, &int_n_pno,
               t1, &int_one,
-              &zero, X, &int_one)
+              &zero, part1, &int_one)
 
         # ================================================================
-        # Term 2b: D[a, b] += 2 * sum_L X[L, a] * k_Qa[L, b]
-        # = 2 * X.T @ k_Qa (row-major (n_pno, n_pno))
-        # Same col-major trick as C_tilde Term 1 last step:
-        # dgemm('N', 'T', n_pno, n_pno, n_local, 2, k_Qa, n_pno, X, n_pno, 1, D, n_pno)
+        # Term 2 part 2: part2[a*n_pno + b] = sum_c T1[c] * K_tilde[c, a*n_pno + b]
+        # Row-major (T1.T @ K_tilde) giving (n_pno²,).
+        # Col-major view of K_tilde with lda=n_pno² gives col-major (n_pno², n_pno).
+        # dgemv('N', m=n_pno², n=n_pno, 1, K_tilde, n_pno², T1, 1, 0, part2, 1)
         # ================================================================
-        dgemm(&N_flag, &T_flag,
-              &int_n_pno, &int_n_pno, &int_n_local,
-              &two, k_Qa, &int_n_pno,
-              X, &int_n_pno,
-              &one, D_out, &int_n_pno)
-
-        # ================================================================
-        # Term 2c: w[L] = sum_a k_Qa[L, a] * t1[a]
-        # (Same as C_tilde Term 2a — row-major k_Qa @ t1.)
-        # ================================================================
-        dgemv(&T_flag, &int_n_pno, &int_n_local,
-              &one, k_Qa, &int_n_pno,
+        dgemv(&N_flag, &int_npno2, &int_n_pno,
+              &one, K_tilde_chem, &int_npno2,
               t1, &int_one,
-              &zero, w, &int_one)
+              &zero, part2, &int_one)
 
         # ================================================================
-        # Term 2d: D[a, b] -= sum_L w[L] * Qab[L, b, a]
-        # Compute temp[b, a] = sum_L w[L] * Qab[L, b, a] via dgemv on Qab flat:
-        #   Qab_flat[L, k] where k = b*n_pno + a gives Qab[L, b, a].
-        #   temp_flat[k] = (Qab_flat.T @ w)[k]
-        # Then scalar loop: D[a, b] -= temp_flat[b*n_pno + a].
+        # Combine: D[a, b] += 2 * part1[b*n_pno + a] - part2[b*n_pno + a]
+        # (matches Psi4 L_temp.transpose() for both parts → transpose-add.)
         # ================================================================
-        dgemv(&N_flag, &int_npno2, &int_n_local,
-              &one, Qab, &int_npno2,
-              w, &int_one,
-              &zero, temp, &int_one)
         for a in range(n_pno):
             for b in range(n_pno):
-                D_out[a * n_pno + b] -= temp[b * n_pno + a]
+                D_out[a * n_pno + b] += (2.0 * part1[b * n_pno + a]
+                                         - part2[b * n_pno + a])
 
         # ================================================================
-        # Term 1a: ilkc[l, c] = sum_L ooL_il_all[L, l] * ovL_k[L, c]
-        # Row-major ilkc (n_domain, n_pno) = ooL_il_all.T @ ovL_k
-        # Col-major trick (same shape as before):
-        # dgemm('N', 'T', n_pno, n_domain, n_local, 1, ovL_k, n_pno, ooL_il_all, n_domain, 0, ilkc, n_pno)
-        # ================================================================
-        dgemm(&N_flag, &T_flag,
-              &int_n_pno, &int_n_domain, &int_n_local,
-              &one, ovL_k, &int_n_pno,
-              ooL_il_all, &int_n_domain,
-              &zero, ilkc, &int_n_pno)
-
-        # ================================================================
-        # Term 1b: iklc[l, c] = sum_L Qma_sub[L, l, c] * ooL_ik[L]
-        # Same dgemv pattern as C_tilde Term 1a.
-        # ================================================================
-        dgemv(&N_flag, &int_dom_npno, &int_n_local,
-              &one, Qma_sub, &int_dom_npno,
-              ooL_ik, &int_one,
-              &zero, iklc, &int_one)
-
-        # ================================================================
-        # M = 2*ilkc - iklc (elementwise, stored back into ilkc)
-        # ================================================================
-        for l in range(n_domain):
-            for c in range(n_pno):
-                ilkc[l * n_pno + c] = 2.0 * ilkc[l * n_pno + c] - iklc[l * n_pno + c]
-
-        # ================================================================
-        # Term 1c: D[a, b] -= sum_l T1_rows[l, a] * M[l, b]
-        # Same as C_tilde Term 1 last step.
+        # Term 1: D[a, b] -= sum_l T1_rows[l, a] * M_static[l, b]
+        # M_static = 2 * K_bar_ij_or_ji[ll_idx] - K_bar_chem[ll_idx],
+        # precomputed once in the plan (matches Psi4 L_bar_temp).
+        # dgemm('N', 'T', n_pno, n_pno, n_domain, -1, M_static, n_pno, T1_rows, n_pno, 1, D, n_pno)
         # ================================================================
         dgemm(&N_flag, &T_flag,
               &int_n_pno, &int_n_pno, &int_n_domain,
-              &neg_one, ilkc, &int_n_pno,
+              &neg_one, M_static, &int_n_pno,
               T1_rows, &int_n_pno,
               &one, D_out, &int_n_pno)

@@ -985,15 +985,14 @@ def build_D_tilde_batched(
                     id(pair_lmo_idx) if pair_lmo_idx is not None else 0)
         plan = getattr(build_D_tilde_batched, '_ph1_plan', None)
         if plan is None or plan.get('key') != plan_key:
+            # Fixes #3 + #1 + #2 algorithmic parity with Psi4:
+            # Precompute K_tilde_chem_k (L pre-summed k_Qa×Qab) and
+            # M_static = 2*K_bar_ij_or_ji[ll_idx] - K_bar_chem[ll_idx].
+            # Per-iter kernel is 2 dgemv + 1 dgemm on precomputed tensors.
             n_pno_arr = np.zeros(N, dtype=np.int32)
-            n_local_arr = np.zeros(N, dtype=np.int32)
             n_domain_arr = np.zeros(N, dtype=np.int32)
-            k_Qa_list = [None] * N
-            Qab_list = [None] * N
-            Qma_sub_list = [None] * N
-            ooL_il_all_list = [None] * N
-            ooL_ik_list = [None] * N
-            ovL_k_list = [None] * N
+            K_tilde_chem_list = [None] * N
+            M_static_list = [None] * N
             ll_idx_list = [None] * N
             key_ik_list = [None] * N
             i_idx_list = [None] * N
@@ -1012,19 +1011,23 @@ def build_D_tilde_batched(
 
                 is_k_first = (key_ik[0] == k_idx)
                 is_i_first = (key_ik[0] == i_idx)
-                k_Qa_list[p] = np.ascontiguousarray(
-                    ci['i_Qa'] if is_k_first else ci['j_Qa'])
-                Qab_list[p] = np.ascontiguousarray(ci['Qab'])
-                Qma_sub_list[p] = np.ascontiguousarray(
-                    ci['Qma'][:, ll_idx, :])
-                Qk_src = ci['i_Qk'] if is_i_first else ci['j_Qk']
-                ooL_il_all_list[p] = np.ascontiguousarray(Qk_src[:, ll_idx])
-                ooL_ik_list[p] = np.ascontiguousarray(Qk_src[:, k_idx])
-                ovL_k_list[p] = np.ascontiguousarray(
-                    ci['Qma'][:, k_idx, :])
+                k_Qa = (ci['i_Qa'] if is_k_first else ci['j_Qa'])
+                Qab = ci['Qab']
+                # K_tilde_chem_k[a', (a, b)] = sum_L k_Qa[L, a'] * Qab[L, a, b]
+                K_tilde_chem_list[p] = np.ascontiguousarray(
+                    k_Qa.T @ Qab.reshape(n_local, n_ik * n_ik))
+
+                # M_static = 2 * K_bar_ij_or_ji[ll_idx] - K_bar_chem[ll_idx]
+                # For ordered pair (i, k): if key[0]==i, ilkc = K_bar_ij; else K_bar_ji.
+                # Matches Psi4 compute_D_tilde L_bar_temp.
+                if is_i_first:
+                    K_bar_slice = ci['K_bar_ij'][ll_idx]
+                else:
+                    K_bar_slice = ci['K_bar_ji'][ll_idx]
+                M_static_list[p] = np.ascontiguousarray(
+                    2.0 * K_bar_slice - ci['K_bar_chem'][ll_idx])
 
                 n_pno_arr[p] = n_ik
-                n_local_arr[p] = n_local
                 n_domain_arr[p] = n_domain
                 ll_idx_list[p] = ll_idx
                 key_ik_list[p] = key_ik
@@ -1040,12 +1043,8 @@ def build_D_tilde_batched(
                     buf[offsets[idx]:offsets[idx + 1]] = a.ravel()
                 return buf, offsets
 
-            k_Qa_flat, k_Qa_off = _flat(k_Qa_list)
-            Qab_flat, Qab_off = _flat(Qab_list)
-            Qma_sub_flat, Qma_sub_off = _flat(Qma_sub_list)
-            ooL_il_all_flat, ooL_il_all_off = _flat(ooL_il_all_list)
-            ooL_ik_flat, ooL_ik_off = _flat(ooL_ik_list)
-            ovL_k_flat, ovL_k_off = _flat(ovL_k_list)
+            K_tilde_chem_flat, K_tilde_chem_off = _flat(K_tilde_chem_list)
+            M_static_flat, M_static_off = _flat(M_static_list)
 
             t1_sizes = n_pno_arr.astype(np.int64)
             t1_off = np.empty(N + 1, dtype=np.int64)
@@ -1063,17 +1062,12 @@ def build_D_tilde_batched(
             D_off[0] = 0
             D_off[1:] = np.cumsum(D_sizes)
 
-            max_n_local = int(n_local_arr.max())
             max_n_pno = int(n_pno_arr.max())
-            max_n_domain = int(n_domain_arr.max())
             num_threads = min(32, N)
 
             scratch = {
-                'X':    np.empty((num_threads, max_n_local * max_n_pno)),
-                'w':    np.empty((num_threads, max_n_local)),
-                'temp': np.empty((num_threads, max_n_pno * max_n_pno)),
-                'ilkc': np.empty((num_threads, max_n_domain * max_n_pno)),
-                'iklc': np.empty((num_threads, max_n_domain * max_n_pno)),
+                'part1': np.empty((num_threads, max_n_pno * max_n_pno)),
+                'part2': np.empty((num_threads, max_n_pno * max_n_pno)),
             }
             for buf in scratch.values():
                 buf.fill(0.0)
@@ -1084,15 +1078,12 @@ def build_D_tilde_batched(
                 'key_ik_list': key_ik_list,
                 'i_idx_list': i_idx_list,
                 'll_idx_list': ll_idx_list,
-                'n_pno_arr': n_pno_arr, 'n_local_arr': n_local_arr,
+                'n_pno_arr': n_pno_arr,
                 'n_domain_arr': n_domain_arr,
-                'k_Qa_flat': k_Qa_flat, 'k_Qa_off': k_Qa_off,
-                'Qab_flat': Qab_flat, 'Qab_off': Qab_off,
-                'Qma_sub_flat': Qma_sub_flat, 'Qma_sub_off': Qma_sub_off,
-                'ooL_il_all_flat': ooL_il_all_flat,
-                'ooL_il_all_off': ooL_il_all_off,
-                'ooL_ik_flat': ooL_ik_flat, 'ooL_ik_off': ooL_ik_off,
-                'ovL_k_flat': ovL_k_flat, 'ovL_k_off': ovL_k_off,
+                'K_tilde_chem_flat': K_tilde_chem_flat,
+                'K_tilde_chem_off': K_tilde_chem_off,
+                'M_static_flat': M_static_flat,
+                'M_static_off': M_static_off,
                 't1_off': t1_off, 't1_total': int(t1_off[-1]),
                 'T1_rows_off': T1_rows_off,
                 'T1_rows_total': int(T1_rows_off[-1]),
@@ -1111,7 +1102,7 @@ def build_D_tilde_batched(
             n_pno = int(plan['n_pno_arr'][p])
             ll_idx = plan['ll_idx_list'][p]
             n_dom = ll_idx.size
-            T1_all_ik = t1_cache[key_ik]  # (nocc, n_pno)
+            T1_all_ik = t1_cache[key_ik]
             t1_flat[t1_off_plan[p]:t1_off_plan[p + 1]] = T1_all_ik[i_idx]
             rows_buf = T1_rows_flat[
                 T1_rows_off_plan[p]:T1_rows_off_plan[p + 1]
@@ -1123,17 +1114,12 @@ def build_D_tilde_batched(
 
         with threadpool_limits(limits=1, user_api='blas'):
             d_tilde_ph1_batched(
-                plan['k_Qa_flat'], plan['k_Qa_off'],
-                plan['Qab_flat'], plan['Qab_off'],
-                plan['Qma_sub_flat'], plan['Qma_sub_off'],
-                plan['ooL_il_all_flat'], plan['ooL_il_all_off'],
-                plan['ooL_ik_flat'], plan['ooL_ik_off'],
-                plan['ovL_k_flat'], plan['ovL_k_off'],
+                plan['K_tilde_chem_flat'], plan['K_tilde_chem_off'],
+                plan['M_static_flat'], plan['M_static_off'],
                 t1_flat, t1_off_plan,
                 T1_rows_flat, T1_rows_off_plan,
-                plan['n_pno_arr'], plan['n_local_arr'],
-                plan['n_domain_arr'],
-                sc['X'], sc['w'], sc['temp'], sc['ilkc'], sc['iklc'],
+                plan['n_pno_arr'], plan['n_domain_arr'],
+                sc['part1'], sc['part2'],
                 D_flat, plan['D_off'],
                 plan['num_threads'],
             )
@@ -1821,13 +1807,15 @@ def compute_C_tilde_batched(
                     id(pair_lmo_idx) if pair_lmo_idx is not None else 0)
         plan = getattr(compute_C_tilde_batched, '_ph1_plan', None)
         if plan is None or plan.get('key') != plan_key:
+            # Fix #3 + #1 algorithmic parity with Psi4:
+            # Precompute K_tilde_chem_k (L pre-summed (k_Qa.T @ Qab)) and
+            # K_bar_chem_slice (row-slice of cc_ints['K_bar_chem']). Per-iter
+            # kernel is then 1 dgemv + 1 dgemm on small precomputed tensors —
+            # no n_local-axis sums in the hot path.
             n_pno_arr = np.zeros(N, dtype=np.int32)
-            n_local_arr = np.zeros(N, dtype=np.int32)
             n_domain_arr = np.zeros(N, dtype=np.int32)
-            k_Qa_list = [None] * N
-            Qab_list = [None] * N
-            Qma_sub_list = [None] * N
-            ooL_ki_list = [None] * N
+            K_tilde_chem_list = [None] * N
+            K_bar_chem_slice_list = [None] * N
             ll_idx_list = [None] * N
             key_ki_list = [None] * N
             i_idx_list = [None] * N
@@ -1845,16 +1833,20 @@ def compute_C_tilde_batched(
                 n_local = ci_ki['Qma'].shape[0]
 
                 is_k_first = (key_ki[0] == k)
-                k_Qa_list[p] = np.ascontiguousarray(
-                    ci_ki['i_Qa'] if is_k_first else ci_ki['j_Qa'])
-                Qab_list[p] = np.ascontiguousarray(ci_ki['Qab'])
-                Qma_sub_list[p] = np.ascontiguousarray(
-                    ci_ki['Qma'][:, ll_idx, :])
-                ooL_arr = ci_ki['j_Qk'] if is_k_first else ci_ki['i_Qk']
-                ooL_ki_list[p] = np.ascontiguousarray(ooL_arr[:, k])
+                k_Qa = (ci_ki['i_Qa'] if is_k_first else ci_ki['j_Qa'])
+                Qab = ci_ki['Qab']  # (n_local, n_pno, n_pno)
+                # K_tilde_chem_k[a', (a, b)] = sum_L k_Qa[L, a'] * Qab[L, a, b]
+                # Psi4 ccsd.cc:1402. Shape (n_pno, n_pno²).
+                K_tilde_chem_list[p] = np.ascontiguousarray(
+                    k_Qa.T @ Qab.reshape(n_local, n_ki * n_ki))
+                # K_bar_chem[l, c] = sum_L q_pair[L] * Qma[L, l, c];
+                # stored in cc_ints (full-nocc, zeros outside pair's LMO
+                # domain). Slicing by ll_idx gives the (n_domain, n_pno)
+                # input the kernel needs.
+                K_bar_chem_slice_list[p] = np.ascontiguousarray(
+                    ci_ki['K_bar_chem'][ll_idx])
 
                 n_pno_arr[p] = n_ki
-                n_local_arr[p] = n_local
                 n_domain_arr[p] = n_domain
                 ll_idx_list[p] = ll_idx
                 key_ki_list[p] = key_ki
@@ -1870,10 +1862,9 @@ def compute_C_tilde_batched(
                     buf[offsets[idx]:offsets[idx + 1]] = a.ravel()
                 return buf, offsets
 
-            k_Qa_flat, k_Qa_off = _flat(k_Qa_list)
-            Qab_flat, Qab_off = _flat(Qab_list)
-            Qma_sub_flat, Qma_sub_off = _flat(Qma_sub_list)
-            ooL_ki_flat, ooL_ki_off = _flat(ooL_ki_list)
+            K_tilde_chem_flat, K_tilde_chem_off = _flat(K_tilde_chem_list)
+            K_bar_chem_slice_flat, K_bar_chem_slice_off = _flat(
+                K_bar_chem_slice_list)
 
             t1_sizes = n_pno_arr.astype(np.int64)
             t1_off = np.empty(N + 1, dtype=np.int64)
@@ -1891,18 +1882,7 @@ def compute_C_tilde_batched(
             C_off[0] = 0
             C_off[1:] = np.cumsum(C_sizes)
 
-            max_n_local = int(n_local_arr.max())
-            max_n_pno = int(n_pno_arr.max())
-            max_n_domain = int(n_domain_arr.max())
             num_threads = min(32, N)
-
-            scratch = {
-                'z': np.empty((num_threads, max_n_local)),
-                'K_bar': np.empty(
-                    (num_threads, max_n_domain * max_n_pno)),
-            }
-            for buf in scratch.values():
-                buf.fill(0.0)
 
             plan = {
                 'key': plan_key,
@@ -1910,17 +1890,17 @@ def compute_C_tilde_batched(
                 'key_ki_list': key_ki_list,
                 'i_idx_list': i_idx_list,
                 'll_idx_list': ll_idx_list,
-                'n_pno_arr': n_pno_arr, 'n_local_arr': n_local_arr,
+                'n_pno_arr': n_pno_arr,
                 'n_domain_arr': n_domain_arr,
-                'k_Qa_flat': k_Qa_flat, 'k_Qa_off': k_Qa_off,
-                'Qab_flat': Qab_flat, 'Qab_off': Qab_off,
-                'Qma_sub_flat': Qma_sub_flat, 'Qma_sub_off': Qma_sub_off,
-                'ooL_ki_flat': ooL_ki_flat, 'ooL_ki_off': ooL_ki_off,
+                'K_tilde_chem_flat': K_tilde_chem_flat,
+                'K_tilde_chem_off': K_tilde_chem_off,
+                'K_bar_chem_slice_flat': K_bar_chem_slice_flat,
+                'K_bar_chem_slice_off': K_bar_chem_slice_off,
                 't1_off': t1_off, 't1_total': int(t1_off[-1]),
                 'T1_local_off': T1_local_off,
                 'T1_local_total': int(T1_local_off[-1]),
                 'C_off': C_off, 'C_total': int(C_off[-1]),
-                'scratch': scratch, 'num_threads': num_threads,
+                'num_threads': num_threads,
             }
             compute_C_tilde_batched._ph1_plan = plan
 
@@ -1955,19 +1935,14 @@ def compute_C_tilde_batched(
                     rows_buf[li] = r
 
         C_flat = np.zeros(plan['C_total'])
-        sc = plan['scratch']
 
         with threadpool_limits(limits=1, user_api='blas'):
             c_tilde_ph1_batched(
-                plan['k_Qa_flat'], plan['k_Qa_off'],
-                plan['Qab_flat'], plan['Qab_off'],
-                plan['Qma_sub_flat'], plan['Qma_sub_off'],
-                plan['ooL_ki_flat'], plan['ooL_ki_off'],
+                plan['K_tilde_chem_flat'], plan['K_tilde_chem_off'],
+                plan['K_bar_chem_slice_flat'], plan['K_bar_chem_slice_off'],
                 t1_flat, t1_off_plan,
                 T1_local_flat, T1_local_off_plan,
-                plan['n_pno_arr'], plan['n_local_arr'],
-                plan['n_domain_arr'],
-                sc['z'], sc['K_bar'],
+                plan['n_pno_arr'], plan['n_domain_arr'],
                 C_flat, plan['C_off'],
                 plan['num_threads'],
             )
