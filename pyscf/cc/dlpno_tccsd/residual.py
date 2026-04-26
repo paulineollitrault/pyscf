@@ -2901,6 +2901,357 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
     }
 
 
+def _get_or_build_cd_batched_view(plan, pno_spaces):
+    """Build (or fetch cached) flat per-item view across all c_/d_ buckets.
+
+    Concatenates the per-bucket S/J_bold static tensors into single flat
+    buffers, and pre-computes per-item offset arrays so a single kernel
+    call can process all items via prange. Cached on the plan dict.
+    """
+    bv = plan.get('_batched_view')
+    if bv is not None:
+        return bv
+
+    # ---- Output slot tables (per n_pno → list of pair keys) ----
+    pairs_by_n_pno = plan['pairs_by_n_pno']
+    # Flat output target offsets: each (n_pno, slot) maps to offset
+    # in a per-side flat buffer. We use one flat buffer per
+    # (side ∈ {ij, ji}) per term {C, D}; per item knows its absolute
+    # offset = (cumulative pair offset in flat) + 0 for the (n_pno, n_pno)
+    # tile starting position.
+    n_pno_offsets = {}     # n_pno -> starting offset in per-side flat buffer
+    flat_total = 0
+    for n_pno in sorted(pairs_by_n_pno):
+        n_pno_offsets[n_pno] = flat_total
+        flat_total += len(pairs_by_n_pno[n_pno]) * n_pno * n_pno
+
+    def _slot_to_off(n_pno, slot):
+        return n_pno_offsets[n_pno] + slot * n_pno * n_pno
+
+    # ---- C side: walk c_buckets, flatten per-item ----
+    c_n_pno_l, c_n_ct_l, c_n_other_l = [], [], []
+    c_S_big_off_l, c_S_mid_off_l, c_J_bold_off_l, c_S_outer_off_l = (
+        [], [], [], [])
+    c_ct_keys_l, c_t2_keys_l, c_t2_trans_l = [], [], []
+    c_target_off_ij_l, c_target_off_ji_l = [], []
+    c_S_big_pieces, c_S_mid_pieces, c_J_bold_pieces, c_S_outer_pieces = (
+        [], [], [], [])
+    c_S_big_run = c_S_mid_run = c_J_bold_run = c_S_outer_run = 0
+    c_ct_size_l, c_t2_size_l = [], []
+    c_tile_off = [0]
+    c_side_l = []
+    for bucket in plan['c_buckets']:
+        n_pno = bucket['n_pno']
+        n_ct = bucket['n_ct']
+        n_other = bucket['n_other']
+        side = bucket['side']
+        N_b = len(bucket['ct_keys'])
+        for nb in range(N_b):
+            c_n_pno_l.append(n_pno)
+            c_n_ct_l.append(n_ct)
+            c_n_other_l.append(n_other)
+            c_S_big_pieces.append(np.ascontiguousarray(
+                bucket['S_big'][nb]).ravel())
+            c_S_mid_pieces.append(np.ascontiguousarray(
+                bucket['S_mid'][nb]).ravel())
+            c_J_bold_pieces.append(np.ascontiguousarray(
+                bucket['J_bold'][nb]).ravel())
+            c_S_outer_pieces.append(np.ascontiguousarray(
+                bucket['S_outer'][nb]).ravel())
+            c_S_big_off_l.append(c_S_big_run);   c_S_big_run   += n_pno * n_ct
+            c_S_mid_off_l.append(c_S_mid_run);   c_S_mid_run   += n_ct * n_other
+            c_J_bold_off_l.append(c_J_bold_run); c_J_bold_run += n_pno * n_other
+            c_S_outer_off_l.append(c_S_outer_run); c_S_outer_run += n_pno * n_other
+            c_ct_keys_l.append(bucket['ct_keys'][nb])
+            c_t2_keys_l.append(bucket['t2_keys'][nb])
+            c_t2_trans_l.append(bool(bucket['t2_trans'][nb]))
+            c_ct_size_l.append(n_ct * n_ct)
+            c_t2_size_l.append(n_other * n_other)
+            c_side_l.append(side)
+            slot = int(bucket['item_idx'][nb])
+            c_tile_off.append(c_tile_off[-1] + n_pno * n_pno)
+            if side == 0:
+                c_target_off_ij_l.append(_slot_to_off(n_pno, slot))
+                c_target_off_ji_l.append(-1)
+            else:
+                c_target_off_ij_l.append(-1)
+                c_target_off_ji_l.append(_slot_to_off(n_pno, slot))
+
+    c_N = len(c_n_pno_l)
+    c_ct_off = np.zeros(c_N + 1, dtype=np.int64)
+    c_ct_off[1:] = np.cumsum(c_ct_size_l)
+    c_t2_off = np.zeros(c_N + 1, dtype=np.int64)
+    c_t2_off[1:] = np.cumsum(c_t2_size_l)
+
+    # ---- D side: walk d_buckets, flatten per-item ----
+    d_n_pno_l, d_n_A_l, d_n_B_l = [], [], []
+    d_S_a_off_l, d_S_b_off_l, d_S_c_off_l, d_KJ_off_l = [], [], [], []
+    d_t2_keys_l, d_t2_trans_l, d_dt_keys_l = [], [], []
+    d_target_off_ij_l, d_target_off_ji_l = [], []
+    d_S_a_pieces, d_S_b_pieces, d_S_c_pieces, d_KJ_pieces = [], [], [], []
+    d_S_a_run = d_S_b_run = d_S_c_run = d_KJ_run = 0
+    d_u_size_l, d_dt_size_l = [], []
+    d_tile_off = [0]
+    d_side_l = []
+    for bucket in plan['d_buckets']:
+        n_pno = bucket['n_pno']
+        n_A = bucket['n_A']
+        n_B = bucket['n_B']
+        side = bucket['side']
+        N_b = len(bucket['dt_keys'])
+        for nb in range(N_b):
+            d_n_pno_l.append(n_pno)
+            d_n_A_l.append(n_A)
+            d_n_B_l.append(n_B)
+            d_S_a_pieces.append(np.ascontiguousarray(bucket['S_a'][nb]).ravel())
+            d_S_b_pieces.append(np.ascontiguousarray(bucket['S_b'][nb]).ravel())
+            d_S_c_pieces.append(np.ascontiguousarray(bucket['S_c'][nb]).ravel())
+            d_KJ_pieces.append(np.ascontiguousarray(bucket['KJ'][nb]).ravel())
+            d_S_a_off_l.append(d_S_a_run); d_S_a_run += n_pno * n_A
+            d_S_b_off_l.append(d_S_b_run); d_S_b_run += n_A * n_B
+            d_S_c_off_l.append(d_S_c_run); d_S_c_run += n_pno * n_B
+            d_KJ_off_l.append(d_KJ_run);   d_KJ_run  += n_pno * n_A
+            d_t2_keys_l.append(bucket['t2_keys'][nb])
+            d_t2_trans_l.append(bool(bucket['t2_trans'][nb]))
+            d_dt_keys_l.append(bucket['dt_keys'][nb])
+            d_u_size_l.append(n_A * n_A)
+            d_dt_size_l.append(n_B * n_B)
+            d_side_l.append(side)
+            slot = int(bucket['item_idx'][nb])
+            d_tile_off.append(d_tile_off[-1] + n_pno * n_pno)
+            if side == 0:
+                d_target_off_ij_l.append(_slot_to_off(n_pno, slot))
+                d_target_off_ji_l.append(-1)
+            else:
+                d_target_off_ij_l.append(-1)
+                d_target_off_ji_l.append(_slot_to_off(n_pno, slot))
+
+    d_N = len(d_n_pno_l)
+    d_u_off = np.zeros(d_N + 1, dtype=np.int64)
+    d_u_off[1:] = np.cumsum(d_u_size_l)
+    d_dt_off = np.zeros(d_N + 1, dtype=np.int64)
+    d_dt_off[1:] = np.cumsum(d_dt_size_l)
+
+    bv = {
+        # C side
+        'c_N': c_N,
+        'c_n_pno': np.asarray(c_n_pno_l, dtype=np.int32),
+        'c_n_ct': np.asarray(c_n_ct_l, dtype=np.int32),
+        'c_n_other': np.asarray(c_n_other_l, dtype=np.int32),
+        'c_S_big_off': np.asarray(c_S_big_off_l, dtype=np.int64),
+        'c_S_mid_off': np.asarray(c_S_mid_off_l, dtype=np.int64),
+        'c_J_bold_off': np.asarray(c_J_bold_off_l, dtype=np.int64),
+        'c_S_outer_off': np.asarray(c_S_outer_off_l, dtype=np.int64),
+        'c_S_big_flat': (np.concatenate(c_S_big_pieces)
+                         if c_S_big_pieces else np.zeros(0)),
+        'c_S_mid_flat': (np.concatenate(c_S_mid_pieces)
+                         if c_S_mid_pieces else np.zeros(0)),
+        'c_J_bold_flat': (np.concatenate(c_J_bold_pieces)
+                          if c_J_bold_pieces else np.zeros(0)),
+        'c_S_outer_flat': (np.concatenate(c_S_outer_pieces)
+                           if c_S_outer_pieces else np.zeros(0)),
+        'c_ct_keys': c_ct_keys_l,
+        'c_t2_keys': c_t2_keys_l,
+        'c_t2_trans': np.asarray(c_t2_trans_l, dtype=bool),
+        'c_ct_off': c_ct_off,
+        'c_t2_off': c_t2_off,
+        'c_target_off_ij': np.asarray(c_target_off_ij_l, dtype=np.int64),
+        'c_target_off_ji': np.asarray(c_target_off_ji_l, dtype=np.int64),
+        'c_tile_off': np.asarray(c_tile_off, dtype=np.int64),
+        'c_side': np.asarray(c_side_l, dtype=np.int32),
+        # D side
+        'd_N': d_N,
+        'd_n_pno': np.asarray(d_n_pno_l, dtype=np.int32),
+        'd_n_A': np.asarray(d_n_A_l, dtype=np.int32),
+        'd_n_B': np.asarray(d_n_B_l, dtype=np.int32),
+        'd_S_a_off': np.asarray(d_S_a_off_l, dtype=np.int64),
+        'd_S_b_off': np.asarray(d_S_b_off_l, dtype=np.int64),
+        'd_S_c_off': np.asarray(d_S_c_off_l, dtype=np.int64),
+        'd_KJ_off': np.asarray(d_KJ_off_l, dtype=np.int64),
+        'd_S_a_flat': (np.concatenate(d_S_a_pieces)
+                       if d_S_a_pieces else np.zeros(0)),
+        'd_S_b_flat': (np.concatenate(d_S_b_pieces)
+                       if d_S_b_pieces else np.zeros(0)),
+        'd_S_c_flat': (np.concatenate(d_S_c_pieces)
+                       if d_S_c_pieces else np.zeros(0)),
+        'd_KJ_flat': (np.concatenate(d_KJ_pieces)
+                      if d_KJ_pieces else np.zeros(0)),
+        'd_t2_keys': d_t2_keys_l,
+        'd_t2_trans': np.asarray(d_t2_trans_l, dtype=bool),
+        'd_dt_keys': d_dt_keys_l,
+        'd_u_off': d_u_off,
+        'd_dt_off': d_dt_off,
+        'd_target_off_ij': np.asarray(d_target_off_ij_l, dtype=np.int64),
+        'd_target_off_ji': np.asarray(d_target_off_ji_l, dtype=np.int64),
+        'd_tile_off': np.asarray(d_tile_off, dtype=np.int64),
+        'd_side': np.asarray(d_side_l, dtype=np.int32),
+        # Output flat layout
+        'pairs_by_n_pno_keys': sorted(pairs_by_n_pno),
+        'n_pno_offsets': n_pno_offsets,
+        'flat_total': flat_total,
+    }
+    plan['_batched_view'] = bv
+    return bv
+
+
+def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
+                    flat_C_ij, flat_C_ji, flat_D_ij, flat_D_ji,
+                    omp_threads):
+    """Run the batched C and D kernels and scatter their per-item tiles
+    into the per-(n_pno, side) output buffers. Single Cython call per
+    side; serial scatter handles target-slot collisions."""
+    from pyscf.cc.dlpno_tccsd._cd_batched_cy import (
+        c_kernel_batched, d_kernel_batched,
+    )
+    from threadpoolctl import threadpool_limits
+
+    # ---- C side ----
+    c_N = bv['c_N']
+    if c_N > 0:
+        # Per-cycle gather: ct (from C_tilde_cache) and t2 (from t2_pno_all)
+        ct_flat = np.zeros(int(bv['c_ct_off'][-1]))
+        t2_flat = np.empty(int(bv['c_t2_off'][-1]))
+        c_n_ct = bv['c_n_ct']
+        c_n_other = bv['c_n_other']
+        c_ct_keys = bv['c_ct_keys']
+        c_t2_keys = bv['c_t2_keys']
+        c_t2_trans = bv['c_t2_trans']
+        c_ct_off = bv['c_ct_off']
+        c_t2_off = bv['c_t2_off']
+        for n in range(c_N):
+            ct_val = (C_tilde_cache.get(c_ct_keys[n])
+                      if C_tilde_cache is not None else None)
+            n_ct = int(c_n_ct[n])
+            slot_ct = ct_flat[c_ct_off[n]:c_ct_off[n + 1]]
+            if ct_val is not None and ct_val.shape[0] == n_ct:
+                slot_ct[:] = ct_val.ravel()
+            # else: zero-init from np.zeros above
+            t2 = t2_pno_all[c_t2_keys[n]]
+            n_other = int(c_n_other[n])
+            if c_t2_trans[n]:
+                t2_flat[c_t2_off[n]:c_t2_off[n + 1]] = t2.T.ravel()
+            else:
+                t2_flat[c_t2_off[n]:c_t2_off[n + 1]] = t2.ravel()
+
+        # Per-thread scratch
+        max_n_pno = int(bv['c_n_pno'].max(initial=1))
+        max_n_ct = int(bv['c_n_ct'].max(initial=1))
+        max_n_other = int(bv['c_n_other'].max(initial=1))
+        num_threads = min(64, c_N)
+
+        STB = np.empty((num_threads, max_n_pno * max_n_ct))
+        GAMMA = np.empty((num_threads, max_n_pno * max_n_other))
+        GT = np.empty((num_threads, max_n_pno * max_n_other))
+        c_tiles = np.zeros(int(bv['c_tile_off'][-1]))
+
+        with threadpool_limits(limits=1, user_api='blas'):
+            c_kernel_batched(
+                c_N, max_n_pno, max_n_ct, max_n_other,
+                bv['c_n_pno'], bv['c_n_ct'], bv['c_n_other'],
+                bv['c_S_big_off'], bv['c_ct_off'][:c_N],
+                bv['c_S_mid_off'], bv['c_J_bold_off'],
+                bv['c_t2_off'][:c_N], bv['c_S_outer_off'],
+                bv['c_tile_off'],
+                bv['c_S_big_flat'], bv['c_S_mid_flat'],
+                bv['c_J_bold_flat'], bv['c_S_outer_flat'],
+                ct_flat, t2_flat,
+                STB, GAMMA, GT,
+                c_tiles, num_threads,
+            )
+
+        # Serial scatter — flatten output buffers per n_pno per side
+        n_pno_offsets = bv['n_pno_offsets']
+        c_target_ij = bv['c_target_off_ij']
+        c_target_ji = bv['c_target_off_ji']
+        c_tile_off = bv['c_tile_off']
+        c_n_pno = bv['c_n_pno']
+        # Build flat views over flat_C_ij / flat_C_ji
+        flat_C_ij_views = {n_pno: flat_C_ij[n_pno].ravel()
+                            for n_pno in n_pno_offsets}
+        flat_C_ji_views = {n_pno: flat_C_ji[n_pno].ravel()
+                            for n_pno in n_pno_offsets}
+        for n in range(c_N):
+            n_pno = int(c_n_pno[n])
+            tile_size = n_pno * n_pno
+            tile = c_tiles[c_tile_off[n]:c_tile_off[n + 1]]
+            if c_target_ij[n] >= 0:
+                base = c_target_ij[n] - n_pno_offsets[n_pno]
+                flat_C_ij_views[n_pno][base:base + tile_size] -= tile
+            else:
+                base = c_target_ji[n] - n_pno_offsets[n_pno]
+                flat_C_ji_views[n_pno][base:base + tile_size] -= tile
+
+    # ---- D side ----
+    d_N = bv['d_N']
+    if d_N > 0:
+        u_flat = np.empty(int(bv['d_u_off'][-1]))
+        dt_flat = np.zeros(int(bv['d_dt_off'][-1]))
+        d_n_A = bv['d_n_A']
+        d_n_B = bv['d_n_B']
+        d_t2_keys = bv['d_t2_keys']
+        d_t2_trans = bv['d_t2_trans']
+        d_dt_keys = bv['d_dt_keys']
+        d_u_off = bv['d_u_off']
+        d_dt_off = bv['d_dt_off']
+        for n in range(d_N):
+            t2 = t2_pno_all[d_t2_keys[n]]
+            t2_d = t2.T if d_t2_trans[n] else t2
+            u_flat[d_u_off[n]:d_u_off[n + 1]] = (
+                2.0 * t2_d - t2_d.T).ravel()
+            dk = d_dt_keys[n]
+            n_B = int(d_n_B[n])
+            if dk is not None and D_tilde_cache is not None:
+                dt_val = D_tilde_cache.get(dk)
+                if dt_val is not None and dt_val.shape[0] == n_B:
+                    dt_flat[d_dt_off[n]:d_dt_off[n + 1]] = dt_val.ravel()
+
+        max_n_pno = int(bv['d_n_pno'].max(initial=1))
+        max_n_A = int(bv['d_n_A'].max(initial=1))
+        max_n_B = int(bv['d_n_B'].max(initial=1))
+        num_threads = min(64, d_N)
+
+        SU = np.empty((num_threads, max_n_pno * max_n_A))
+        UP = np.empty((num_threads, max_n_pno * max_n_B))
+        SCD = np.empty((num_threads, max_n_pno * max_n_B))
+        Bint = np.empty((num_threads, max_n_pno * max_n_A))
+        d_tiles = np.zeros(int(bv['d_tile_off'][-1]))
+
+        with threadpool_limits(limits=1, user_api='blas'):
+            d_kernel_batched(
+                d_N, max_n_pno, max_n_A, max_n_B,
+                bv['d_n_pno'], bv['d_n_A'], bv['d_n_B'],
+                bv['d_S_a_off'], bv['d_u_off'][:d_N],
+                bv['d_S_b_off'], bv['d_S_c_off'],
+                bv['d_dt_off'][:d_N], bv['d_KJ_off'],
+                bv['d_tile_off'],
+                bv['d_S_a_flat'], bv['d_S_b_flat'],
+                bv['d_S_c_flat'], bv['d_KJ_flat'],
+                u_flat, dt_flat,
+                SU, UP, SCD, Bint,
+                d_tiles, num_threads,
+            )
+
+        n_pno_offsets = bv['n_pno_offsets']
+        d_target_ij = bv['d_target_off_ij']
+        d_target_ji = bv['d_target_off_ji']
+        d_tile_off = bv['d_tile_off']
+        d_n_pno = bv['d_n_pno']
+        flat_D_ij_views = {n_pno: flat_D_ij[n_pno].ravel()
+                            for n_pno in n_pno_offsets}
+        flat_D_ji_views = {n_pno: flat_D_ji[n_pno].ravel()
+                            for n_pno in n_pno_offsets}
+        for n in range(d_N):
+            n_pno = int(d_n_pno[n])
+            tile_size = n_pno * n_pno
+            tile = d_tiles[d_tile_off[n]:d_tile_off[n + 1]]
+            if d_target_ij[n] >= 0:
+                base = d_target_ij[n] - n_pno_offsets[n_pno]
+                flat_D_ij_views[n_pno][base:base + tile_size] += 0.5 * tile
+            else:
+                base = d_target_ji[n] - n_pno_offsets[n_pno]
+                flat_D_ji_views[n_pno][base:base + tile_size] += 0.5 * tile
+
+
 def compute_CD_terms_batched(
         strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
         cc_ints, C_tilde_cache, D_tilde_cache,
@@ -2950,54 +3301,17 @@ def compute_CD_terms_batched(
         flat_D_ij[n_pno] = np.zeros(shp)
         flat_D_ji[n_pno] = np.zeros(shp)
 
-    with _omp_threads_ctx(omp_threads):
-        # --- C kernel, one call per (n_pno, n_ct, n_other, side) bucket ---
-        # Buckets are pre-split by side in _build_cd_plan; no per-cycle
-        # masking or np.ascontiguousarray(sel) copy required.
-        for bucket in plan['c_buckets']:
-            n_pno = bucket['n_pno']
-            n_ct = bucket['n_ct']
-            n_other = bucket['n_other']
-            N = len(bucket['ct_keys'])
-            ct_arr = np.zeros((N, n_ct, n_ct))
-            for n, ck in enumerate(bucket['ct_keys']):
-                ct_val = C_tilde_cache.get(ck) if C_tilde_cache else None
-                if ct_val is not None and ct_val.shape[0] == n_ct:
-                    ct_arr[n] = ct_val
-            t2_arr = np.empty((N, n_other, n_other))
-            for n in range(N):
-                t2 = t2_pno_all[bucket['t2_keys'][n]]
-                t2_arr[n] = t2.T if bucket['t2_trans'][n] else t2
-            out_flat = flat_C_ij[n_pno] if bucket['side'] == 0 else flat_C_ji[n_pno]
-            c_kernel(
-                bucket['S_big'], ct_arr, bucket['S_mid'],
-                bucket['J_bold'], t2_arr, bucket['S_outer'],
-                bucket['item_idx'], out_flat)
-
-        # --- D kernel, one call per (n_pno, n_A, n_B, side) bucket ---
-        for bucket in plan['d_buckets']:
-            n_pno = bucket['n_pno']
-            n_A = bucket['n_A']
-            n_B = bucket['n_B']
-            N = len(bucket['dt_keys'])
-            u_arr = np.empty((N, n_A, n_A))
-            for n in range(N):
-                t2 = t2_pno_all[bucket['t2_keys'][n]]
-                t2_d = t2.T if bucket['t2_trans'][n] else t2
-                u_arr[n] = 2.0 * t2_d - t2_d.T
-            dt_arr = np.zeros((N, n_B, n_B))
-            for n, dk in enumerate(bucket['dt_keys']):
-                if dk is None or D_tilde_cache is None:
-                    continue
-                dt_val = D_tilde_cache.get(dk)
-                if dt_val is not None and dt_val.shape[0] == n_B:
-                    dt_arr[n] = dt_val
-            out_flat = flat_D_ij[n_pno] if bucket['side'] == 0 else flat_D_ji[n_pno]
-            d_kernel(
-                bucket['S_a'], u_arr, bucket['S_b'],
-                bucket['S_c'], dt_arr, bucket['KJ'],
-                bucket['item_idx'], out_flat,
-                0.5)
+    # Single-call batched path: ONE c_kernel_batched + ONE d_kernel_batched
+    # per cycle replaces 4224 per-bucket kernel calls. Plan view (built
+    # once) flattens all items into per-item offset arrays; per-cycle
+    # gather populates ct/t2/u/dt flat buffers, kernel does prange
+    # compute, caller does serial scatter.
+    bv = _get_or_build_cd_batched_view(plan, pno_spaces)
+    _run_cd_batched(
+        plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
+        flat_C_ij, flat_C_ji, flat_D_ij, flat_D_ji,
+        omp_threads,
+    )
 
     # --- Assemble final C_term and D_term dicts, keyed by strong pair ---
     C_term = {}
