@@ -794,9 +794,19 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                 t2_ki = t2_canon.T
             Tt_ki = 2.0 * t2_ki - t2_ki.T
 
-            # ----- A term -----
-            Z = np.einsum('Qa,ac->Qc', k_Qa, Tt_ki)
-            temp_A = np.einsum('Qc,Qcd->d', Z, Qab_ki)
+            # ----- A term using precomputed K_tilde_chem (Psi4 parity) -----
+            # Old form (2 per-iter L-axis einsums):
+            #   Z = einsum('Qa,ac->Qc', k_Qa, Tt_ki)
+            #   temp_A = einsum('Qc,Qcd->d', Z, Qab_ki)
+            # New form (single matmul on cc_ints['K_tilde_chem_*']):
+            #   K[a, c, d] = sum_Q k_Qa[Q, a] * Qab[Q, c, d]    (precomputed)
+            #   temp_A[d] = sum_{a, c} Tt_ki[a, c] * K[a, c, d]
+            #             = Tt_ki.ravel() @ K.reshape(n_ki², n_ki)
+            ci_ki_full = cc_ints[key_ki]
+            K_tc = (ci_ki_full['K_tilde_chem_i'] if key_ki[0] == k
+                    else ci_ki_full['K_tilde_chem_j'])
+            n_ki = ki_data['n_ki']
+            temp_A = Tt_ki.ravel() @ K_tc.reshape(n_ki * n_ki, n_ki)
             if key_ki == key_ii:
                 A_contrib = temp_A
             else:
