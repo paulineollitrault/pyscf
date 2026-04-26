@@ -1936,11 +1936,12 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         _t1_fov[ii] = C_pno_ii.T @ (fock_ao @ _t1_C[:, ii])
                 else:
                     _t1_fov = fov_pno
-            _t1_start = _time.perf_counter()
+            _t1_resid_start = _time.perf_counter()
             r1_pno = _compute_t1_residual_psi4(
                 t1_pno, t2_pno_all, pno_spaces, _t1_fov, F_lmo, eps_lmo, nocc,
                 S_pno_cache, _cc_ints, ovL_pno_cache=_t1_ovL,
                 pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache, _pool=_pool)
+            _t1_resid_dt = _time.perf_counter() - _t1_resid_start
             t1_pno_new = {}
             for ii in range(nocc):
                 key_ii = (ii, ii)
@@ -1994,8 +1995,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             r1_vec = np.concatenate([r1_pno[ii].ravel() for ii in range(nocc)])
             r2_vec = _mask_cas(r2_all)
             err_vec = np.concatenate([r1_vec, r2_vec])
+            _diis_start = _time.perf_counter()
             if cycle >= diis_start_cycle and err_vec.size > 0:
                 amp_new = mydiis.update(amp_new, err_vec)
+            _diis_dt = _time.perf_counter() - _diis_start
 
             # ---- Unpack T1 and T2; restore CAS blocks ----
             offset = 0
@@ -2023,6 +2026,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # Compute energy for monitoring (Eq. 102 of Jiang et al.)
             # E = Σ_i F_ia t1_ia + Σ_ij K_ij^{ab} (2τ-τ^T)
             # Use BARE integrals (canonical energy formula).
+            _energy_start = _time.perf_counter()
             e_cyc = sum(np.dot(fov_pno[ii], t1_pno[ii])
                         for ii in range(nocc) if t1_pno[ii].size > 0)
             for pair in strong_pairs:
@@ -2045,12 +2049,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 e_cyc += e_p if pi == pj else 2.0 * e_p
             dE = abs(e_cyc - e_prev) if cycle > 0 else float('inf')
             e_prev = e_cyc
+            _energy_dt = _time.perf_counter() - _energy_start
             _t_cycle_end = _time.perf_counter()
             _dt_foo = _t_foo_done - _t_foo
             _dt_pairs = _t_pairs_done - _t_pairs
             _dt_jiang = _t_jiang_done - _t_jiang
             _dt_total = _t_cycle_end - _t_cycle_start
             _upd_rest = _dt_pairs - _t_bt - _t_be - _t_cd - _t_g
+            _other_dt = (_dt_total - _dt_foo - _dt_jiang - _dt_pairs
+                         - _t1_resid_dt - _diis_dt - _energy_dt)
             print(f'  Cycle {cycle + 1:3d}: dT = {dT:.3e}  '
                   f'E_corr = {e_cyc:.10f}  dE = {dE:.2e}  '
                   f'[{_dt_total:.1f}s: foo={_dt_foo:.2f} '
@@ -2058,7 +2065,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                   f'(C={_tj_C:.2f} D={_tj_D:.2f} Fock={_tj_Fab:.2f} '
                   f'Km={_tj_Km:.2f} G={_tj_FG:.2f}) '
                   f'pairs={_dt_pairs:.2f}(bt={_t_bt:.2f} be={_t_be:.2f} '
-                  f'cd={_t_cd:.2f} gterm={_t_g:.2f} upd={_upd_rest:.2f})]',
+                  f'cd={_t_cd:.2f} gterm={_t_g:.2f} upd={_upd_rest:.2f}) '
+                  f't1r={_t1_resid_dt:.2f} diis={_diis_dt:.2f} '
+                  f'eng={_energy_dt:.2f} oth={_other_dt:.2f}]',
                   flush=True)
             if dT < this_tol:
                 print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (amplitude).',

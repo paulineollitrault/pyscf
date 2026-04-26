@@ -832,6 +832,12 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         K_bar_ji = q_jo.T @ q_iv
         K_bar_chem = np.tensordot(q_pair, Qma, axes=(0, 0))
         J_ijab = np.tensordot(q_pair, Qab, axes=(0, 0))
+        # Psi4 ccsd.cc:1402 K_tilde_chem (L pre-summed (q_iv|Qab) tensors).
+        # Stored once here so compute_C_tilde, build_D_tilde, and the T1
+        # residual all share without per-iter rebuilds.
+        Qab_flat = Qab.reshape(n_local, npno * npno)
+        K_tilde_chem_i = np.ascontiguousarray(q_iv.T @ Qab_flat)
+        K_tilde_chem_j = np.ascontiguousarray(q_jv.T @ Qab_flat)
 
         J_ij_kj = {}
         K_ij_kj_dict = {}
@@ -864,6 +870,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             'K_bar_ij': K_bar_ij,
             'K_bar_ji': K_bar_ji,
             'K_bar_chem': K_bar_chem,  # (nlmo_p, npno) reduced
+            'K_tilde_chem_i': K_tilde_chem_i,  # (npno, npno²) Psi4 ccsd.cc:1402
+            'K_tilde_chem_j': K_tilde_chem_j,  # (npno, npno²) for j-direction
             'J_ijab': J_ijab,
             'J_ij_kj': J_ij_kj,
             'K_ij_kj': K_ij_kj_dict,

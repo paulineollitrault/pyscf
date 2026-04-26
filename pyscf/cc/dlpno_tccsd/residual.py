@@ -1107,11 +1107,10 @@ def build_D_tilde_batched(
 
                 is_k_first = (key_ik[0] == k_idx)
                 is_i_first = (key_ik[0] == i_idx)
-                k_Qa = (ci['i_Qa'] if is_k_first else ci['j_Qa'])
-                Qab = ci['Qab']
-                # K_tilde_chem_k[a', (a, b)] = sum_L k_Qa[L, a'] * Qab[L, a, b]
-                K_tilde_chem_list[p] = np.ascontiguousarray(
-                    k_Qa.T @ Qab.reshape(n_local, n_ik * n_ik))
+                # K_tilde_chem precomputed in cc_ints — shared across
+                # compute_C_tilde / build_D_tilde / T1 residual.
+                K_tilde_chem_list[p] = (ci['K_tilde_chem_i'] if is_k_first
+                                        else ci['K_tilde_chem_j'])
 
                 # M_static = 2 * K_bar_ij_or_ji[ll_idx] - K_bar_chem[ll_idx]
                 # For ordered pair (i, k): if key[0]==i, ilkc = K_bar_ij; else K_bar_ji.
@@ -1929,12 +1928,12 @@ def compute_C_tilde_batched(
                 n_local = ci_ki['Qma'].shape[0]
 
                 is_k_first = (key_ki[0] == k)
-                k_Qa = (ci_ki['i_Qa'] if is_k_first else ci_ki['j_Qa'])
-                Qab = ci_ki['Qab']  # (n_local, n_pno, n_pno)
-                # K_tilde_chem_k[a', (a, b)] = sum_L k_Qa[L, a'] * Qab[L, a, b]
-                # Psi4 ccsd.cc:1402. Shape (n_pno, n_pno²).
-                K_tilde_chem_list[p] = np.ascontiguousarray(
-                    k_Qa.T @ Qab.reshape(n_local, n_ki * n_ki))
+                # K_tilde_chem precomputed in cc_ints (local_df.py
+                # compute_cc_integrals_sparse) — same tensor as Psi4
+                # K_tilde_chem_[ki] (ccsd.cc:1402). Shared with build_D_tilde
+                # and the T1 residual.
+                K_tilde_chem_list[p] = (ci_ki['K_tilde_chem_i'] if is_k_first
+                                        else ci_ki['K_tilde_chem_j'])
                 # K_bar_chem[l, c] = sum_L q_pair[L] * Qma[L, l, c];
                 # stored in cc_ints (full-nocc, zeros outside pair's LMO
                 # domain). Slicing by ll_idx gives the (n_domain, n_pno)
