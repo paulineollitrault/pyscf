@@ -94,68 +94,164 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
     G = Fkj.copy()
     _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
 
-    # Pre-compute u_lj = 2*t2_lj - t2_lj.T for every (l, j) with non-empty t2.
-    # Only depends on (l, j); the original triple loop recomputed it across
-    # the i axis (nocc× redundant).
-    u_lj_cache = {}
-    for l_idx in range(nocc):
-        for j_idx in range(nocc):
-            key_lj = (min(l_idx, j_idx), max(l_idx, j_idx))
-            if key_lj not in t2_pno_all:
-                continue
-            t2_lj = t2_pno_all.get(key_lj)
-            if t2_lj is None or t2_lj.shape[0] == 0:
-                continue
-            t2_lj_d = t2_lj.T if l_idx > j_idx else t2_lj
-            u_lj_cache[(l_idx, j_idx)] = (key_lj, 2.0 * t2_lj_d - t2_lj_d.T)
+    # ------------------------------------------------------------------
+    # Path-(b) batched G_tilde: precompute per-triple `effective` tensor
+    # so each iteration is one ddot per triple. Plan structure mirrors
+    # Psi4 compute_G_tilde (ccsd.cc:1943): outer prange over (i, j) slots
+    # in [0, naocc²), inner serial accumulation over l. The prior SERIAL
+    # path with j-batched tensordot stays as a fallback for diagnostics.
+    # ------------------------------------------------------------------
+    from pyscf.cc.dlpno_tccsd._g_tilde_batched_cy import g_tilde_batched
 
-    def _per_i(i_idx):
-        row = np.zeros(nocc)
-        for l_idx in range(nocc):
-            key_il = (min(i_idx, l_idx), max(i_idx, l_idx))
-            if key_il not in t2_pno_all:
-                continue
-            t2_il = t2_pno_all.get(key_il)
-            if t2_il is None or t2_il.shape[0] == 0:
-                continue
-            K_il = get_local_K(cc_ints, key_il, i_idx, l_idx)
-            if K_il is None:
-                continue
-
-            j_valid = []
-            U_stack_list = []
-            for j_idx in range(nocc):
-                u_entry = u_lj_cache.get((l_idx, j_idx))
-                if u_entry is None:
+    plan_key = (id(cc_ints), id(t2_pno_all),
+                id(S_pno_cache), id(pno_spaces))
+    plan = getattr(build_G_tilde, '_batched_plan', None)
+    if plan is None or plan.get('key') != plan_key:
+        # Enumerate canonical pairs touched by t2_pno_all and assign
+        # contiguous indices for T2 buffer access.
+        canonical_pair_idx = {}
+        canonical_pairs = []
+        for key in t2_pno_all:
+            if key not in canonical_pair_idx:
+                t2 = t2_pno_all[key]
+                if t2 is None or t2.shape[0] == 0:
                     continue
-                key_lj, u_lj = u_entry
-                if key_il == key_lj:
-                    U_lj_proj = u_lj
-                else:
-                    S_il_lj = _s_pno_get(key_il, key_lj)
-                    if S_il_lj is None:
+                canonical_pair_idx[key] = len(canonical_pairs)
+                canonical_pairs.append(key)
+
+        # Per-canonical-pair n_pno + offsets for T2 flat buffer.
+        n_canon = len(canonical_pairs)
+        T2_sizes = np.empty(n_canon, dtype=np.int64)
+        canon_n_pno = np.empty(n_canon, dtype=np.int32)
+        for p, key in enumerate(canonical_pairs):
+            n_pno = pno_spaces[key]['C_pno'].shape[1]
+            canon_n_pno[p] = n_pno
+            T2_sizes[p] = n_pno * n_pno
+        T2_offsets = np.empty(n_canon + 1, dtype=np.int64)
+        T2_offsets[0] = 0
+        T2_offsets[1:] = np.cumsum(T2_sizes)
+
+        # Cache K_proj_static per UNIQUE (key_il, key_lj, i, l) tuple so
+        # different (i, j) outer slots that share these inputs reuse the
+        # static computation. K_proj depends on (key_il, key_lj) pair-pair
+        # and (i, l) — the LMO indices used to slice K_il = (Qma_i.T @ Qma_l).
+        # Two of the four orientation/transpose variants are needed:
+        #   case_le: 2*K_proj_T - K_proj   (used when l <= j)
+        #   case_gt: 2*K_proj   - K_proj_T (used when l >  j)
+        kproj_cache = {}  # (key_il, key_lj, i, l) -> (case_le_flat, case_gt_flat)
+
+        # Enumerate triples grouped by outer (i, j) slot.
+        ij_slots = []          # list of (i, j)
+        ij_triple_offsets = [0]
+        triple_eff_list = []
+        triple_n_lj = []
+        triple_T2_pair_idx = []
+
+        for i in range(nocc):
+            for j in range(nocc):
+                for l in range(nocc):
+                    key_il = (min(i, l), max(i, l))
+                    if key_il not in t2_pno_all:
                         continue
-                    U_lj_proj = S_il_lj @ u_lj @ S_il_lj.T
-                j_valid.append(j_idx)
-                U_stack_list.append(U_lj_proj)
+                    t2_il = t2_pno_all[key_il]
+                    if t2_il is None or t2_il.shape[0] == 0:
+                        continue
+                    key_lj = (min(l, j), max(l, j))
+                    if key_lj not in canonical_pair_idx:
+                        continue
+                    n_lj = pno_spaces[key_lj]['C_pno'].shape[1]
 
-            if not U_stack_list:
-                continue
-            U_stack = np.stack(U_stack_list, axis=0)
-            # trace[n] = sum_{a, b} K[a, b] * U[n, b, a] = Tr(K @ U[n]).
-            # tensordot skips einsum's Python path planner; dispatches to BLAS.
-            traces = np.tensordot(K_il, U_stack, axes=[(0, 1), (2, 1)])
-            for n_j, j_idx in enumerate(j_valid):
-                row[j_idx] += traces[n_j]
-        return i_idx, row
+                    cache_key = (key_il, key_lj, i, l)
+                    pair_kproj = kproj_cache.get(cache_key)
+                    if pair_kproj is None:
+                        K_il = get_local_K(cc_ints, key_il, i, l)
+                        if K_il is None:
+                            continue
+                        if key_il == key_lj:
+                            K_proj = K_il   # self-pair: S_il_lj = I
+                        else:
+                            S_il_lj = _s_pno_get(key_il, key_lj)
+                            if S_il_lj is None:
+                                continue
+                            K_proj = S_il_lj.T @ K_il @ S_il_lj
+                        K_proj_T = K_proj.T
+                        case_le = np.ascontiguousarray(
+                            2.0 * K_proj_T - K_proj)
+                        case_gt = np.ascontiguousarray(
+                            2.0 * K_proj - K_proj_T)
+                        pair_kproj = (case_le, case_gt)
+                        kproj_cache[cache_key] = pair_kproj
 
-    if _pool is not None:
-        for i_idx, row in _pool.map(_per_i, range(nocc)):
-            G[i_idx] += row
-    else:
-        for i_idx in range(nocc):
-            _, row = _per_i(i_idx)
-            G[i_idx] += row
+                    case_le, case_gt = pair_kproj
+                    eff = case_le if l <= j else case_gt
+                    triple_eff_list.append(eff)
+                    triple_n_lj.append(n_lj)
+                    triple_T2_pair_idx.append(canonical_pair_idx[key_lj])
+
+                ij_slots.append((i, j))
+                ij_triple_offsets.append(len(triple_eff_list))
+
+        if not ij_slots:
+            # Nothing to do — Fkj copy is the answer.
+            build_G_tilde._batched_plan = {'key': plan_key, 'empty': True}
+            return G
+
+        # Flatten effective per-triple buffers
+        eff_sizes = np.array([e.size for e in triple_eff_list], dtype=np.int64)
+        eff_offsets = np.empty(len(triple_eff_list) + 1, dtype=np.int64)
+        eff_offsets[0] = 0
+        eff_offsets[1:] = np.cumsum(eff_sizes)
+        effective_flat = np.empty(int(eff_offsets[-1]))
+        for k, e in enumerate(triple_eff_list):
+            effective_flat[eff_offsets[k]:eff_offsets[k + 1]] = e.ravel()
+
+        ij_i_arr = np.array([s[0] for s in ij_slots], dtype=np.int32)
+        ij_j_arr = np.array([s[1] for s in ij_slots], dtype=np.int32)
+        ij_triple_starts = np.array(ij_triple_offsets, dtype=np.int64)
+        triple_eff_off_arr = eff_offsets[:-1].astype(np.int64)
+        triple_n_lj_arr = np.array(triple_n_lj, dtype=np.int32)
+        triple_T2_pair_idx_arr = np.array(triple_T2_pair_idx, dtype=np.int64)
+
+        plan = {
+            'key': plan_key,
+            'empty': False,
+            'canonical_pairs': canonical_pairs,
+            'canonical_pair_idx': canonical_pair_idx,
+            'canon_n_pno': canon_n_pno,
+            'T2_offsets': T2_offsets,
+            'T2_total': int(T2_offsets[-1]),
+            'ij_i_arr': ij_i_arr,
+            'ij_j_arr': ij_j_arr,
+            'ij_triple_starts': ij_triple_starts,
+            'effective_flat': effective_flat,
+            'triple_eff_offset': triple_eff_off_arr,
+            'triple_n_lj': triple_n_lj_arr,
+            'triple_T2_pair_idx': triple_T2_pair_idx_arr,
+            'num_threads': min(32, len(ij_slots)) if ij_slots else 1,
+        }
+        build_G_tilde._batched_plan = plan
+
+    if plan.get('empty'):
+        return G
+
+    # Per-iter: build T2 flat buffer in canonical pair order.
+    T2_flat = np.empty(plan['T2_total'])
+    T2_offsets = plan['T2_offsets']
+    for p, key in enumerate(plan['canonical_pairs']):
+        t2 = t2_pno_all[key]
+        T2_flat[T2_offsets[p]:T2_offsets[p + 1]] = t2.ravel()
+
+    # G_addition is what the kernel adds onto G. Pass G itself; kernel does
+    # G[i, j] += sum_ij in place. (G already initialized to Fkj copy above.)
+    g_tilde_batched(
+        plan['triple_eff_offset'], plan['triple_T2_pair_idx'],
+        plan['triple_n_lj'],
+        plan['ij_triple_starts'], plan['ij_i_arr'], plan['ij_j_arr'],
+        plan['effective_flat'],
+        T2_flat, plan['T2_offsets'],
+        G,
+        plan['num_threads'],
+    )
 
     return G
 
