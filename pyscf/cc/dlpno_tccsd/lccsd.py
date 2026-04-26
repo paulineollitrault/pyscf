@@ -1632,19 +1632,32 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _t_pairs = _time.perf_counter()
 
             # --- Batched B + E contributions across all strong pairs ---
-            # Each strong pair has its own B_tilde (from compute_B_tilde);
-            # precompute them as a dict, then compute_B_E_batched_v2
-            # accumulates the Woooo and E contributions in one pass.
-            from pyscf.cc.dlpno_tccsd.local_df import compute_B_tilde as _cB_fn
+            # Hoist T1-dressing of DF integrals OUT of _update_pair: call
+            # t1_ints once for ALL strong pairs at iteration start, then
+            # compute_B_tilde and _update_pair both read from the shared
+            # `_t1_dressed_all` dict (matches Psi4 ccsd.cc:2066-2067 where
+            # t1_ints() runs once and populates i_Qk_t1_/i_Qa_t1_).
+            from pyscf.cc.dlpno_tccsd.local_df import (
+                t1_ints as _t1_ints_all,
+                compute_B_tilde as _cB_fn,
+                compute_ladder as _cL_fn,
+            )
+            _bt_pool = _fine_pool or _pool
+            _t1_dressed_all = _t1_ints_all(
+                _cc_ints, t1_pno, pno_spaces, S_pno_cache,
+                keys_sorted, nocc,
+                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
+                _pool=_bt_pool)
 
+            # B_tilde uses the shared dressed dict (no recomputation).
             def _bt_one(_key):
-                return _key, _cB_fn(_cc_ints, None, t2_pno_all, t1_pno,
+                return _key, _cB_fn(_cc_ints, _t1_dressed_all,
+                                    t2_pno_all, t1_pno,
                                     pno_spaces, S_pno_cache, _key, nocc,
                                     pair_lmo_idx=pair_lmo_idx,
                                     t1_cache=_t1_cache)
             _t_bt0 = _time.perf_counter()
             _B_tilde_per_ij = {}
-            _bt_pool = _fine_pool or _pool
             if _bt_pool is not None:
                 for _k, _bt in _bt_pool.map(_bt_one, keys_sorted):
                     _B_tilde_per_ij[_k] = _bt
@@ -1653,6 +1666,22 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _, _bt = _bt_one(_k)
                     _B_tilde_per_ij[_k] = _bt
             _t_bt = _time.perf_counter() - _t_bt0
+
+            # Hoist compute_ladder similarly: per-pair calls run via the
+            # same pool here, so _update_pair just looks up.
+            def _ladder_one(_key):
+                return _key, _cL_fn(_cc_ints, t2_pno_all, t1_pno,
+                                    pno_spaces, S_pno_cache, _key, nocc,
+                                    pair_lmo_idx=pair_lmo_idx,
+                                    t1_cache=_t1_cache)
+            _ladder_all = {}
+            if _bt_pool is not None:
+                for _k, _l in _bt_pool.map(_ladder_one, keys_sorted):
+                    _ladder_all[_k] = _l
+            else:
+                for _k in keys_sorted:
+                    _, _l = _ladder_one(_k)
+                    _ladder_all[_k] = _l
 
             # Batched B+E across all strong pairs via plan-cached Cython
             # kernel (be_kernel).  Output matches the reference to FP
@@ -1734,23 +1763,14 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _K_dressed_local = None
                 _ladder_local = None
                 if key in _cc_ints and _cc_ints[key] is not None:
-                    from pyscf.cc.dlpno_tccsd.local_df import (
-                        t1_ints, compute_ladder)
-                    # T1-dressed K̃ (local DF)
-                    _dressed = t1_ints(
-                        _cc_ints, t1_pno, pno_spaces, S_pno_cache,
-                        [key], nocc, pair_lmo_idx=pair_lmo_idx,
-                        t1_cache=_t1_cache)
-                    if key in _dressed:
-                        _K_dressed_local = (_dressed[key]['i_Qa_t1'].T
-                                            @ _dressed[key]['j_Qa_t1'])
-                    # B_tilde reused from precomputed dict
+                    # Read from hoisted shared dicts (no per-pair t1_ints /
+                    # compute_ladder calls — done once at iteration start).
+                    _dressed_entry = _t1_dressed_all.get(key)
+                    if _dressed_entry is not None:
+                        _K_dressed_local = (_dressed_entry['i_Qa_t1'].T
+                                            @ _dressed_entry['j_Qa_t1'])
                     _B_tilde_local = _B_tilde_per_ij.get(key)
-                    _ladder_local = compute_ladder(
-                        _cc_ints, t2_pno_all, t1_pno, pno_spaces,
-                        S_pno_cache, key, nocc,
-                        pair_lmo_idx=pair_lmo_idx,
-                        t1_cache=_t1_cache)
+                    _ladder_local = _ladder_all.get(key)
                     # Fab from local DF
                     if _local_df_Fab is not None and key in _local_df_Fab:
                         Fab_ij = _local_df_Fab[key]

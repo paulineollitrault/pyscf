@@ -902,15 +902,23 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
 
 
 def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
-            pair_lmo_idx=None, t1_cache=None):
+            pair_lmo_idx=None, t1_cache=None, _pool=None):
     """Build T1-dressed DF intermediates, matching Psi4 t1_ints().
 
     For each pair (ij), builds:
         i_Qa_t1[Q, a] = i_Qa[Q,a] - i_Qk[Q,:] @ T1_all[:,a]
                        + Σ_b (Qab[Q,a,b] - T1_all^T @ Qma[Q,:,b]) * t1_i[b]
+        i_Qk_t1[Q, k] = i_Qk[Q,k] + Σ_a Qma[Q, k, a] * t1_i[a]   (Psi4 ccsd.cc:1510-1519)
+        (and the j-counterparts)
 
     The implicit `k` sum inside this formula is restricted to
     pair_lmo_idx[key] (Psi4 lmopair_to_lmos_[ij]) when provided.
+
+    Returns: dict per key with 4 entries: i_Qa_t1, j_Qa_t1, i_Qk_t1, j_Qk_t1.
+    The Qk_t1 entries are the same quantities compute_B_tilde used to
+    rebuild inline; downstream consumers should read from this dict.
+
+    `_pool`: optional ThreadPoolExecutor for parallel per-key iteration.
     """
     # Phase 1: use pre-built t1 projection cache if provided; else build.
     if t1_cache is None:
@@ -922,41 +930,60 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
         t1_cache = build_t1_cache(
             t1_pno, _pi, S_pno_cache, pno_spaces)
 
-    dressed = {}
-    for key in keys:
+    def _dress_one_pair(key):
         ci = cc_ints.get(key)
         if ci is None:
-            continue
+            return key, None
         i, j = key
-        npno = pno_spaces[key]['C_pno'].shape[1]
 
         if pair_lmo_idx is not None and key in pair_lmo_idx:
             lmo_idx = np.asarray(pair_lmo_idx[key])
         else:
             lmo_idx = np.arange(nocc)
 
-        # Phase 1: fancy-index the cached matrix instead of per-k projection.
         T1_local = np.ascontiguousarray(
             t1_cache[key][np.asarray(lmo_idx, dtype=np.intp)])
-
         Qma = ci['Qma'][:, lmo_idx, :]       # (n_local, nlmo, npno)
         Qab = ci['Qab']                       # (n_local, npno, npno)
 
-        def _dress_one(lmo_global, Qa_key):
-            i_Qa = ci[Qa_key]                                 # (n_local, npno)
-            i_Qk_local = ci[Qa_key.replace('Qa', 'Qk')][:, lmo_idx]  # (n_local, nlmo)
+        def _dress(lmo_global, Qa_key):
+            Qa_full = ci[Qa_key]                                 # (n_local, npno)
+            Qk_local = ci[Qa_key.replace('Qa', 'Qk')][:, lmo_idx]  # (n_local, nlmo)
 
             t1_lmo = t1_cache[key][int(lmo_global)]
-            result = i_Qa - i_Qk_local @ T1_local              # (n_local, npno)
-            result += np.einsum('Qab,b->Qa', Qab, t1_lmo)
-            qma_t1 = np.einsum('Qmb,b->Qm', Qma, t1_lmo)       # (n_local, nlmo_p)
-            result -= qma_t1 @ T1_local                         # (n_local, npno)
-            return result
+            qma_t1 = np.einsum('Qmb,b->Qm', Qma, t1_lmo)         # (n_local, nlmo)
 
-        dressed[key] = {
-            'i_Qa_t1': _dress_one(i, 'i_Qa'),
-            'j_Qa_t1': _dress_one(j, 'j_Qa'),
+            # i_Qa_t1: Psi4 ccsd.cc:1521-1534
+            result_qa = Qa_full - Qk_local @ T1_local            # (n_local, npno)
+            result_qa += np.einsum('Qab,b->Qa', Qab, t1_lmo)
+            result_qa -= qma_t1 @ T1_local                       # (n_local, npno)
+
+            # i_Qk_t1: Psi4 ccsd.cc:1510-1519. Same quantity compute_B_tilde
+            # rebuilt inline; produce here so consumers can share.
+            result_qk = Qk_local + qma_t1                        # (n_local, nlmo)
+
+            return result_qa, result_qk
+
+        i_Qa_t1, i_Qk_t1 = _dress(i, 'i_Qa')
+        j_Qa_t1, j_Qk_t1 = _dress(j, 'j_Qa')
+
+        return key, {
+            'i_Qa_t1': i_Qa_t1,
+            'j_Qa_t1': j_Qa_t1,
+            'i_Qk_t1': i_Qk_t1,   # (n_local, nlmo) — pair-LMO-domain only
+            'j_Qk_t1': j_Qk_t1,
         }
+
+    dressed = {}
+    if _pool is not None:
+        for key, val in _pool.map(_dress_one_pair, list(keys)):
+            if val is not None:
+                dressed[key] = val
+    else:
+        for key in keys:
+            _, val = _dress_one_pair(key)
+            if val is not None:
+                dressed[key] = val
 
     return dressed
 
@@ -1239,28 +1266,33 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
     nlmo = len(lmo_idx)
 
     Qma = ci['Qma'][:, lmo_idx, :]           # (n_local, nlmo, npno)
-    i_Qk = ci['i_Qk'][:, lmo_idx]            # (n_local, nlmo)
-    j_Qk = ci['j_Qk'][:, lmo_idx]            # (n_local, nlmo)
 
-    # Phase 1: use pre-built cache if given; else build/fallback.
-    if t1_cache is not None:
-        t1_i = t1_cache[key][i]
-        t1_j = t1_cache[key][j]
-    elif t1_pno is not None:
-        from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
-        t1_i = _project_t1_to_pair(
-            t1_pno, i, key, S_pno_cache, pno_spaces)
-        t1_j = _project_t1_to_pair(
-            t1_pno, j, key, S_pno_cache, pno_spaces)
+    # Read T1-dressed Qk from precomputed dressed_ints if provided
+    # (matches Psi4 ccsd.cc:1688 which reads from i_Qk_t1_/j_Qk_t1_
+    # populated by t1_ints()). Falls back to inline if absent.
+    if (dressed_ints is not None and key in dressed_ints
+            and 'i_Qk_t1' in dressed_ints[key]):
+        i_Qk_t1 = dressed_ints[key]['i_Qk_t1']     # (n_local, nlmo)
+        j_Qk_t1 = dressed_ints[key]['j_Qk_t1']
     else:
-        t1_i = np.zeros(npno)
-        t1_j = np.zeros(npno)
-
-    # i_Qk_t1[Q, kl] = i_Qk[Q, kl] + Σ_a Qma[Q, kl, a] * t1_i[a]
-    i_Qk_t1 = i_Qk.copy()
-    i_Qk_t1 += np.einsum('Qka,a->Qk', Qma, t1_i)
-    j_Qk_t1 = j_Qk.copy()
-    j_Qk_t1 += np.einsum('Qka,a->Qk', Qma, t1_j)
+        i_Qk = ci['i_Qk'][:, lmo_idx]            # (n_local, nlmo)
+        j_Qk = ci['j_Qk'][:, lmo_idx]
+        if t1_cache is not None:
+            t1_i = t1_cache[key][i]
+            t1_j = t1_cache[key][j]
+        elif t1_pno is not None:
+            from pyscf.cc.dlpno_tccsd.lccsd import _project_t1_to_pair
+            t1_i = _project_t1_to_pair(
+                t1_pno, i, key, S_pno_cache, pno_spaces)
+            t1_j = _project_t1_to_pair(
+                t1_pno, j, key, S_pno_cache, pno_spaces)
+        else:
+            t1_i = np.zeros(npno)
+            t1_j = np.zeros(npno)
+        i_Qk_t1 = i_Qk.copy()
+        i_Qk_t1 += np.einsum('Qka,a->Qk', Qma, t1_i)
+        j_Qk_t1 = j_Qk.copy()
+        j_Qk_t1 += np.einsum('Qka,a->Qk', Qma, t1_j)
 
     B_local = i_Qk_t1.T @ j_Qk_t1            # (nlmo, nlmo)
 
