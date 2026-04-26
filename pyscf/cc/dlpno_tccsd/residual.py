@@ -1789,7 +1789,8 @@ def compute_C_tilde_batched(
         _term2_precomputed=None, cc_ints=None,
         pair_lmo_idx=None, _pool=None,
         S_pao_full=None, s1e=None,
-        blas_threads=32, omp_threads=None):
+        blas_threads=32, omp_threads=None,
+        t1_cache=None):
     """Drop-in replacement for compute_C_tilde with Terms 3+4 batched.
 
     Signature matches compute_C_tilde exactly plus one kwarg
@@ -1820,16 +1821,29 @@ def compute_C_tilde_batched(
         canonical_keys.add(key)
 
     # ------------------------------------------------------------------
-    # T1 projection cache: T1_cache[(canonical_pair, l)] = (n_pno,)
-    # Built once up front; every phase reads from it.
+    # T1 projection cache. When the driver passes its global ``t1_cache``
+    # (FlatTensorStore built once per CCSD iteration), reuse it directly:
+    # ``t1_cache[pk][l]`` already gives the same projection
+    # ``_project_t1_to_pair`` would build, with zeros for missing rows —
+    # so we just skip the per-(pair, l) rebuild and adapt downstream
+    # lookups via ``_t1_get`` (always returns an ndarray, never None).
+    # Fallback path builds the local dict for callers that don't pass
+    # ``t1_cache=`` (back-compat).
     # ------------------------------------------------------------------
-    T1_cache = {}
-    for pk in canonical_keys:
-        if pno_spaces[pk]['C_pno'].shape[1] == 0:
-            continue
-        for l in range(nocc):
-            T1_cache[(pk, l)] = _project_t1_to_pair(
-                t1_pno, l, pk, S_pno_cache, pno_spaces)
+    if t1_cache is not None:
+        T1_cache = None
+        def _t1_get(pk, l):
+            return t1_cache[pk][l]
+    else:
+        T1_cache = {}
+        for pk in canonical_keys:
+            if pno_spaces[pk]['C_pno'].shape[1] == 0:
+                continue
+            for l in range(nocc):
+                T1_cache[(pk, l)] = _project_t1_to_pair(
+                    t1_pno, l, pk, S_pno_cache, pno_spaces)
+        def _t1_get(pk, l):
+            return T1_cache.get((pk, l))
     _pt['T1_cache'] = _time_dbg.perf_counter() - _t0; _t0 = _time_dbg.perf_counter()
 
     # ------------------------------------------------------------------
@@ -1843,7 +1857,7 @@ def compute_C_tilde_batched(
             n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
             if n_ki == 0:
                 continue
-            t1_i_ki = T1_cache.get((key_ki, i))
+            t1_i_ki = _t1_get(key_ki, i)
             if t1_i_ki is None or np.max(np.abs(t1_i_ki)) < 1e-15:
                 continue
             ovL_i_ki = ovL_pno_bare.get((key_ki, i))
@@ -2008,7 +2022,7 @@ def compute_C_tilde_batched(
             key_ki = plan['key_ki_list'][p]
             i = plan['i_idx_list'][p]
             n_pno = int(plan['n_pno_arr'][p])
-            t1_i_ki = T1_cache.get((key_ki, i))
+            t1_i_ki = _t1_get(key_ki, i)
             if t1_i_ki is None:
                 zv = zero_pno_cache.get(n_pno)
                 if zv is None:
@@ -2022,12 +2036,16 @@ def compute_C_tilde_batched(
             rows_buf = T1_local_flat[
                 T1_local_off_plan[p]:T1_local_off_plan[p + 1]
             ].reshape(n_dom, n_pno)
-            for li, ll in enumerate(ll_idx):
-                r = T1_cache.get((key_ki, int(ll)))
-                if r is None:
-                    rows_buf[li].fill(0.0)
-                else:
-                    rows_buf[li] = r
+            if t1_cache is not None:
+                # Single fancy-index gather from the (nocc, n_pno) view
+                rows_buf[:] = t1_cache[key_ki][np.asarray(ll_idx, dtype=np.intp)]
+            else:
+                for li, ll in enumerate(ll_idx):
+                    r = T1_cache.get((key_ki, int(ll)))
+                    if r is None:
+                        rows_buf[li].fill(0.0)
+                    else:
+                        rows_buf[li] = r
 
         C_flat = np.zeros(plan['C_total'])
 
@@ -2061,7 +2079,7 @@ def compute_C_tilde_batched(
             _ll_idx = np.asarray(pair_lmo_idx[key_ki], dtype=np.intp)
         else:
             _ll_idx = np.arange(nocc)
-        T1_rows = [T1_cache.get((key_ki, int(_ll))) for _ll in _ll_idx]
+        T1_rows = [_t1_get(key_ki, int(_ll)) for _ll in _ll_idx]
         T1_local_ki = np.ascontiguousarray(
             np.array([r if r is not None else np.zeros(n_ki)
                       for r in T1_rows]))
@@ -2123,9 +2141,9 @@ def compute_C_tilde_batched(
         for bucket in plan['t3']:
             _tg = _time_dbg.perf_counter()
             t1i = np.ascontiguousarray(
-                np.array([T1_cache[key] for key in bucket['t1i_keys']]))
+                np.array([_t1_get(*key) for key in bucket['t1i_keys']]))
             T1l = np.ascontiguousarray(
-                np.array([T1_cache[key] for key in bucket['T1l_keys']]))
+                np.array([_t1_get(*key) for key in bucket['T1l_keys']]))
             _pt['t3_gather'] += _time_dbg.perf_counter() - _tg
 
             _tn = _time_dbg.perf_counter()

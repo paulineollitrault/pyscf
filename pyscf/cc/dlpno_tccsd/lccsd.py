@@ -538,7 +538,10 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                                fov_pno, F_lmo, eps_lmo,
                                nocc, S_pno_cache, cc_ints,
                                ovL_pno_cache=None, pair_lmo_idx=None,
-                               t1_cache=None, _pool=None):
+                               t1_cache=None, _pool=None,
+                               Fij_bar_precomputed=None,
+                               Fij_bar_precomputed_keys=None,
+                               cc_ints_flat=None, pair_index=None):
     """T1 residual EXACTLY matching Psi4's structure (DePrince Eqs 19-22).
 
     R[i, a_ii] = Fai[i,a_ii] + A[i,a] + C[i,a] - B[i,a] - A2[i,a]
@@ -583,21 +586,10 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
         t1_cache = build_t1_cache(
             t1_pno, _pi, S_pno_cache, pno_spaces)
 
-    # Pre-compute Tt for all canonical pairs (in their canonical PNO basis)
-    Tt_canon = {}
-    for key, t2 in t2_pno_all.items():
-        if t2 is not None and t2.shape[0] > 0:
-            Tt_canon[key] = 2.0 * t2 - t2.T
-
-    # T_n[(key, k)] = t1_k projected to pair key's PNO basis.
-    # Phase 1: fill directly from the cached (nocc, n_pno) matrix.
-    T_n = {}
-    for key in t2_pno_all:
-        if pno_spaces[key]['C_pno'].shape[1] == 0:
-            continue
-        cached_matrix = t1_cache[key]
-        for k in range(nocc):
-            T_n[(key, k)] = cached_matrix[k]
+    # T_n[(key, k)] semantics — t1_k projected into pair key's PNO basis —
+    # is exactly ``t1_cache[key][k]`` (FlatTensorStore zero-fills missing
+    # rows with the right shape). Consumers below read t1_cache directly,
+    # so the per-(key, k) dict is no longer materialized.
 
     # Initialize R1 from Fai_[i].  At iter 0 with T1=0, Fai_bar = 0 and
     # all dressing terms vanish, so R1 starts from just A + B.
@@ -649,8 +641,20 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     #     2 * T_n_ki . K_bar_chem_ki - T_n_ik . K_bar_ik
     # For all ordered pairs (i,j) in Psi4:
     #   Fij_bar(i,j) += 2*T_n[ij] . K_bar_chem[ij] - T_n[ij] . K_bar[ji]
-    Fij_bar = F_lmo.copy()
+    #
+    # Optional fast path: t1_fock already accumulated this for the keys in
+    # `Fij_bar_precomputed_keys` (strong + diagonals), so we reuse that
+    # snapshot and only loop over the remaining (weak) pairs here.
+    if Fij_bar_precomputed is not None:
+        Fij_bar = Fij_bar_precomputed.copy()
+        _skip_keys = (Fij_bar_precomputed_keys
+                      if Fij_bar_precomputed_keys is not None else set())
+    else:
+        Fij_bar = F_lmo.copy()
+        _skip_keys = set()
     for key_ij in t2_pno_all:
+        if key_ij in _skip_keys:
+            continue
         ci_ij = cc_ints.get(key_ij)
         if ci_ij is None:
             continue
@@ -658,12 +662,9 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
         n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
         if n_ij == 0:
             continue
-        # Build T_n_ij[m, c] for canonical pair
-        T_n_ij_mat = np.zeros((nocc, n_ij))
-        for m in range(nocc):
-            tn_m = T_n.get((key_ij, m))
-            if tn_m is not None:
-                T_n_ij_mat[m] = tn_m
+        # T_n_ij[m, c] = t1_m projected to canonical pair's PNO basis —
+        # already in t1_cache as a (nocc, n_ij) view.
+        T_n_ij_mat = t1_cache[key_ij]
         # Ordered pair (i0, j0): K_bar_chem = ci_ij['K_bar_chem'], K_bar_ji = ci_ij['K_bar_ji']
         # Fij_bar(i0, j0) += 2 * T_n . K_bar_chem - T_n . K_bar[ji]
         Fij_bar[i0, j0] += (2.0 * np.sum(T_n_ij_mat * ci_ij['K_bar_chem'])
@@ -721,6 +722,11 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     # merged with A+C contributions. r1_pno[i] writes are disjoint per i, so
     # this is dispatched across `_pool.map` when available.
     # =========================================================================
+    import time as _time_perI
+    _per_i_dump = getattr(_compute_t1_residual_psi4, '_per_i_dump_timing', False)
+    # stages_cy: Cython kernel call (Stages 1-3 fused); kloop: A+C k-loop
+    _per_i_t = {'stages_cy': 0.0, 's4': 0.0, 'kloop': 0.0, 'kloop_n': 0}
+
     def _per_i(i):
         key_ii = (i, i)
         if key_ii not in pno_spaces:
@@ -741,41 +747,49 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             Qia_ii = ci_ii['i_Qa']     # (n_local, n_ii)
             Qik_ii = ci_ii['i_Qk']     # (n_local, nocc)
 
-            # T_n_ii[m, c] = t1[m] projected to PNO_ii
-            T_n_ii = np.zeros((nocc, n_ii))
-            any_t1 = False
-            for m in range(nocc):
-                tn_m = T_n.get((key_ii, m))
-                if tn_m is not None and tn_m.size == n_ii:
-                    T_n_ii[m] = tn_m
-                    if np.max(np.abs(tn_m)) > 1e-15:
-                        any_t1 = True
+            # T_n_ii[m, c] = t1[m] projected to PNO_ii — read the
+            # (nocc, n_ii) view from the global t1_cache directly.
+            T_n_ii = t1_cache[key_ii]
+            any_t1 = T_n_ii.size > 0 and bool(
+                np.max(np.abs(T_n_ii)) > 1e-15)
 
-            # ---- Stage 1: Fai_bar T1 dressing (ccsd.cc lines 1631-1654) ----
-            if any_t1:
-                gamma = Qma_ii.reshape(Qma_ii.shape[0], -1) @ T_n_ii.ravel()
-                r1_i += 2.0 * (Qia_ii.T @ gamma)
-                y = Qik_ii @ T_n_ii                # (n_local, n_ii)
-                r1_i -= np.einsum('qac,qc->a', Qab_ii, y, optimize=True)
-
-            # ---- Stage 2 & 3: Fab_bar @ t1 and -T_n.T @ Fia_bar @ t1 ----
-            if has_t1_i and any_t1:
-                W_qak = Qab_ii @ T_n_ii.T          # (n_local, n_ii, nocc)
-                Fab_bar_ii = np.diag(e_pno_ii)
-                Fab_bar_ii += 2.0 * np.tensordot(gamma, Qab_ii, axes=(0, 0))
-                Fab_bar_ii -= np.tensordot(W_qak, Qma_ii, axes=((0, 2), (0, 1)))
-                r1_i += Fab_bar_ii @ t1_i
-
-                Z_qmk = Qma_ii @ T_n_ii.T          # (n_local, nocc, nocc)
-                Fia_bar_ii = 2.0 * np.tensordot(gamma, Qma_ii, axes=(0, 0))
-                Fia_bar_ii -= np.tensordot(Z_qmk, Qma_ii, axes=((0, 1), (0, 1)))
-                r1_i -= T_n_ii.T @ (Fia_bar_ii @ t1_i)
-            elif has_t1_i:
-                r1_i += e_pno_ii * t1_i
+            _ts1 = _time_perI.perf_counter() if _per_i_dump else 0.0
+            # ---- Stages 1-3 in one nogil Cython kernel ----
+            # Stages: gamma + Fai_bar dressing (1), Fab_bar*t1 (2),
+            # -T_n.T*Fia_bar*t1 (3). The chain runs for any_t1 (Stage 1)
+            # and additionally has_t1_i (Stages 2/3); the simple
+            # `r1 += e_pno * t1` shortcut handles has_t1_i without any_t1.
+            if any_t1 or has_t1_i:
+                from pyscf.cc.dlpno_tccsd._per_i_stages_cy import (
+                    per_i_stages123)
+                _Qma_c = np.ascontiguousarray(Qma_ii)
+                _Qab_c = np.ascontiguousarray(Qab_ii)
+                _Qia_c = np.ascontiguousarray(Qia_ii)
+                _Qik_c = np.ascontiguousarray(Qik_ii)
+                _Tn_c = np.ascontiguousarray(T_n_ii)
+                _epn_c = np.ascontiguousarray(e_pno_ii)
+                _t1_c = (np.ascontiguousarray(t1_i) if has_t1_i
+                         else np.zeros(n_ii))
+                if any_t1:
+                    per_i_stages123(
+                        _Qma_c, _Qab_c, _Qia_c, _Qik_c,
+                        _Tn_c, _t1_c, _epn_c,
+                        1 if (has_t1_i and any_t1) else 0,
+                        r1_i)
+                else:
+                    # any_t1 == 0 implies Stages 1/2/3 all skipped except
+                    # the has_t1_i shortcut: r1 += e_pno * t1
+                    r1_i += e_pno_ii * t1_i
+            _ts2 = _time_perI.perf_counter() if _per_i_dump else 0.0
 
             # ---- Stage 4: -sum_k T_n[ii][k,a] * Fij_bar[k,i] ----
             r1_i -= Fij_bar[:, i] @ T_n_ii
+            _tsk = _time_perI.perf_counter() if _per_i_dump else 0.0
+            if _per_i_dump:
+                _per_i_t['stages_cy'] += _ts2 - _ts1
+                _per_i_t['s4']        += _tsk - _ts2
 
+        _tk0 = _time_perI.perf_counter() if _per_i_dump else 0.0
         # ---- A + C terms: inner k-loop over ordered pairs (i, k) / (k, i) ----
         for k in range(nocc):
             ki_data = _get_ki_data(k, i)
@@ -849,8 +863,12 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             if C_contrib is not None:
                 r1_i += C_contrib
 
+        if _per_i_dump:
+            _per_i_t['kloop'] += _time_perI.perf_counter() - _tk0
+            _per_i_t['kloop_n'] += 1
         return i, r1_i
 
+    _per_i_wall_start = _time_perI.perf_counter() if _per_i_dump else 0.0
     if _pool is not None:
         _per_i_results = list(_pool.map(_per_i, range(nocc)))
     else:
@@ -858,6 +876,14 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     for _i, _r1_i in _per_i_results:
         if _r1_i is not None:
             r1_pno[_i] = _r1_i
+    _per_i_wall_end = _time_perI.perf_counter() if _per_i_dump else 0.0
+    if _per_i_dump:
+        print(f'  PER_I_DBG: wall={_per_i_wall_end - _per_i_wall_start:.3f}s '
+              f'stages_cy={_per_i_t["stages_cy"]*1e3:.1f}ms '
+              f's4={_per_i_t["s4"]*1e3:.1f}ms '
+              f'kloop={_per_i_t["kloop"]*1e3:.1f}ms '
+              f'kloop_n={_per_i_t["kloop_n"]}',
+              flush=True)
 
     # ===========================================================
     # B and A2 terms: loop over ordered pairs (k, l)
@@ -867,92 +893,447 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     # contributions from many (key_kl, ordering) tuples → parallelize
     # with a per-worker reduction: each task returns a dict of per-i
     # contributions, accumulated serially in the main thread.
-    def _per_kl(arg):
-        key_kl, k, l = arg
-        local = {}  # i -> negative contribution summed locally
-        if pno_spaces[key_kl]['C_pno'].shape[1] == 0:
-            return local
-        n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
-        ci_kl = cc_ints.get(key_kl)
-        if ci_kl is None:
-            return local
+    # ---- Static per-task plan: hoists every dict lookup out of the
+    # inner loop. Built once per CCSD run (keyed by t2_pno_all keys +
+    # pno_spaces id), then read directly each cycle.
+    # When cc_ints_flat and pair_index are passed (driver path), an
+    # additional FLAT plan is built that lets a single batched Cython
+    # kernel replace the per-task pool.map dispatch entirely.
+    _pkl_cache_attr = getattr(_compute_t1_residual_psi4, '_per_kl_plan_cache', None)
+    if _pkl_cache_attr is None:
+        _pkl_cache_attr = {}
+        _compute_t1_residual_psi4._per_kl_plan_cache = _pkl_cache_attr
+    _pkl_plan_key = (id(cc_ints), id(pno_spaces), id(S_pno_cache),
+                     id(pair_lmo_idx), id(t2_pno_all),
+                     id(cc_ints_flat), id(pair_index))
+    _pkl_plan = _pkl_cache_attr.get(_pkl_plan_key)
+    if _pkl_plan is None:
+        _ba_work = []
+        for key_kl in t2_pno_all:
+            if pno_spaces[key_kl]['C_pno'].shape[1] == 0:
+                continue
+            k0, l0 = key_kl
+            if k0 == l0:
+                _ba_work.append((key_kl, k0, l0))
+            else:
+                _ba_work.append((key_kl, k0, l0))
+                _ba_work.append((key_kl, l0, k0))
+
+        # Per-task: prebuild K_iajb_kl, K_bar_kl refs, k_first flag,
+        # transpose flag, and the i-list with all per-i lookups resolved.
+        _per_task_plan = []
+        for arg in _ba_work:
+            key_kl, k, l = arg
+            ci_kl = cc_ints.get(key_kl)
+            if ci_kl is None:
+                _per_task_plan.append(None)
+                continue
+            n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
+            K_iajb_kl = ci_kl['K_iajb']
+            K_bar_kl = (ci_kl['K_bar_ij'] if key_kl[0] == k
+                        else ci_kl['K_bar_ji'])
+            t2_swap_kl = (k > l)
+
+            i_list = (pair_lmo_idx[key_kl]
+                      if pair_lmo_idx is not None and key_kl in pair_lmo_idx
+                      else list(range(nocc)))
+            inners = []
+            for i in i_list:
+                key_ii = (i, i)
+                if key_ii not in pno_spaces:
+                    continue
+                n_pno_ii = pno_spaces[key_ii]['C_pno'].shape[1]
+                if n_pno_ii == 0:
+                    continue
+                # B-side static
+                S_ii_kl = (None if key_kl == key_ii
+                           else S_pno_cache.get((key_ii, key_kl)))
+                # A2-side static
+                key_ki = (min(k, i), max(k, i))
+                a2_n_ki = 0
+                S_kl_ki = None
+                S_ki_kl = None
+                t2_swap_ki = False
+                a2_diag = False
+                if (key_ki in t2_pno_all and key_ki in pno_spaces
+                        and pno_spaces[key_ki]['C_pno'].shape[1] > 0):
+                    a2_n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+                    t2_swap_ki = (k > i)
+                    if key_kl == key_ki:
+                        a2_diag = True
+                    else:
+                        S_kl_ki = S_pno_cache.get((key_kl, key_ki))
+                        S_ki_kl = S_pno_cache.get((key_ki, key_kl))
+                inners.append((i, key_ii, n_pno_ii, S_ii_kl,
+                               key_ki, a2_n_ki, t2_swap_ki, a2_diag,
+                               S_kl_ki, S_ki_kl))
+            _per_task_plan.append({
+                'key_kl': key_kl, 'k': k, 'l': l, 'n_kl': n_kl,
+                'K_iajb_kl': K_iajb_kl, 'K_bar_kl': K_bar_kl,
+                't2_swap_kl': t2_swap_kl, 'inners': inners,
+            })
+        # ---- Batched plan: flat per-task + per-(t,i) metadata that the
+        # single-call Cython kernel reads directly. Only built when the
+        # driver passes cc_ints_flat + pair_index (we need the underlying
+        # FlatTensorStore _buffers + _offsets).
+        _batched_plan = None
+        if (cc_ints_flat is not None and pair_index is not None
+                and hasattr(t2_pno_all, '_buffer')):
+            _b_n_kl = []
+            _b_t2_swap_kl = []
+            _b_K_iajb_off = []
+            _b_K_bar_off = []
+            _b_t2_kl_canon_off = []
+            _b_T_n_kl_off = []
+            _b_inner_off = [0]
+            _b_i_arr = []
+            _b_n_pno_ii = []
+            _b_is_diag_kl_ii = []
+            _b_has_S_ii_kl = []
+            _b_S_ii_kl_off = []
+            _b_has_A2 = []
+            _b_is_diag_kl_ki = []
+            _b_n_ki = []
+            _b_t2_swap_ki = []
+            _b_t2_ki_canon_off = []
+            _b_S_kl_ki_off = []
+            _b_S_ki_kl_off = []
+            _b_T_n_l_ii_off = []
+            _b_contrib_off = [0]
+            _b_K_iajb_pieces = []
+            _b_K_bar_pieces = []
+            _b_K_iajb_off_running = 0
+            _b_K_bar_off_running = 0
+
+            _t2_offsets = np.asarray(t2_pno_all._offsets)
+            # t1_cache offsets are stable across CCSD cycles: pno_spaces
+            # shapes don't change so build_t1_cache always allocates the
+            # same layout. Snapshot here.
+            _t1c_offsets = np.asarray(t1_cache._offsets)
+            _S_idx_matrix = S_pno_cache._idx_matrix
+            _S_offsets = np.asarray(S_pno_cache._offsets)
+            _canon_to_idx = pair_index.canonical_to_idx
+            _abort_batched = False
+            # Build our own consolidated S buffer that includes overflow
+            # entries (which other phases — compute_C_tilde, build_D_tilde
+            # — populate lazily before T1 residual runs). Plan-time offsets
+            # point into _S_local rather than S_pno_cache._buffer, so the
+            # kernel sees a single contiguous buffer that's complete.
+            _S_local_pieces = []
+            _S_local_off_running = 0
+            _S_local_overflow_off = {}   # (ia, ib) -> offset into _S_local
+
+            def _resolve_S(ia, ib):
+                """Return offset into _S_local for S[(ia,ib)] (None if missing)."""
+                idx = int(_S_idx_matrix[ia, ib])
+                if idx >= 0:
+                    return int(_S_offsets[idx])
+                if (ia, ib) in S_pno_cache._overflow:
+                    if (ia, ib) in _S_local_overflow_off:
+                        return _S_local_overflow_off[(ia, ib)]
+                    arr = S_pno_cache._overflow[(ia, ib)]
+                    arr = np.ascontiguousarray(arr)
+                    nonlocal _S_local_off_running
+                    off = _S_buffer_size + _S_local_off_running
+                    _S_local_overflow_off[(ia, ib)] = off
+                    _S_local_pieces.append(arr.ravel())
+                    _S_local_off_running += arr.size
+                    return off
+                return None
+
+            _S_buffer_size = int(S_pno_cache._buffer.shape[0])
+
+            for arg in _ba_work:
+                key_kl, k, l = arg
+                ci_kl = cc_ints.get(key_kl)
+                if ci_kl is None:
+                    # No-op task; preserve task slot with 0 inners
+                    _b_n_kl.append(0)
+                    _b_t2_swap_kl.append(0)
+                    _b_K_iajb_off.append(0)
+                    _b_K_bar_off.append(0)
+                    _b_t2_kl_canon_off.append(0)
+                    _b_T_n_kl_off.append(0)
+                    _b_inner_off.append(_b_inner_off[-1])
+                    continue
+                n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
+                canon_kl_idx = _canon_to_idx[key_kl]
+                # K_iajb_kl + K_bar_kl: copy into our own static flat
+                # buffers (own them, simpler than passing two cc_ints
+                # buffers + a k_first selector).
+                K_iajb_kl = np.ascontiguousarray(ci_kl['K_iajb'])
+                _b_K_iajb_pieces.append(K_iajb_kl.ravel())
+                _b_K_iajb_off.append(_b_K_iajb_off_running)
+                _b_K_iajb_off_running += K_iajb_kl.size
+                K_bar_kl = (ci_kl['K_bar_ij'] if key_kl[0] == k
+                            else ci_kl['K_bar_ji'])
+                K_bar_kl = np.ascontiguousarray(K_bar_kl)
+                _b_K_bar_pieces.append(K_bar_kl.ravel())
+                _b_K_bar_off.append(_b_K_bar_off_running)
+                _b_K_bar_off_running += K_bar_kl.size
+
+                _b_n_kl.append(n_kl)
+                _b_t2_swap_kl.append(1 if k > l else 0)
+                _b_t2_kl_canon_off.append(int(_t2_offsets[canon_kl_idx]))
+                _b_T_n_kl_off.append(int(_t1c_offsets[canon_kl_idx]))
+
+                i_list = (pair_lmo_idx[key_kl]
+                          if pair_lmo_idx is not None and key_kl in pair_lmo_idx
+                          else list(range(nocc)))
+                n_inner_for_task = 0
+                for i in i_list:
+                    key_ii = (i, i)
+                    if key_ii not in pno_spaces:
+                        continue
+                    n_pno_ii = pno_spaces[key_ii]['C_pno'].shape[1]
+                    if n_pno_ii == 0:
+                        continue
+                    canon_ii_idx = _canon_to_idx[key_ii]
+                    _b_i_arr.append(i)
+                    _b_n_pno_ii.append(n_pno_ii)
+                    _b_contrib_off.append(_b_contrib_off[-1] + n_pno_ii)
+                    n_inner_for_task += 1
+
+                    # B-side
+                    if key_kl == key_ii:
+                        _b_is_diag_kl_ii.append(1)
+                        _b_has_S_ii_kl.append(0)
+                        _b_S_ii_kl_off.append(0)
+                    else:
+                        s_off = _resolve_S(canon_ii_idx, canon_kl_idx)
+                        if s_off is not None:
+                            _b_is_diag_kl_ii.append(0)
+                            _b_has_S_ii_kl.append(1)
+                            _b_S_ii_kl_off.append(s_off)
+                        else:
+                            _b_is_diag_kl_ii.append(0)
+                            _b_has_S_ii_kl.append(0)
+                            _b_S_ii_kl_off.append(0)
+
+                    # A2-side
+                    key_ki = (min(k, i), max(k, i))
+                    a2_added = False
+                    if (key_ki in t2_pno_all and key_ki in pno_spaces
+                            and pno_spaces[key_ki]['C_pno'].shape[1] > 0):
+                        n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+                        canon_ki_idx = _canon_to_idx[key_ki]
+                        if key_kl == key_ki:
+                            _b_has_A2.append(1)
+                            _b_is_diag_kl_ki.append(1)
+                            _b_n_ki.append(n_ki)
+                            _b_t2_swap_ki.append(1 if k > i else 0)
+                            _b_t2_ki_canon_off.append(int(_t2_offsets[canon_ki_idx]))
+                            _b_S_kl_ki_off.append(0)
+                            _b_S_ki_kl_off.append(0)
+                            _b_T_n_l_ii_off.append(
+                                int(_t1c_offsets[canon_ii_idx]) + l * n_pno_ii)
+                            a2_added = True
+                        else:
+                            s_kl_ki_off = _resolve_S(canon_kl_idx, canon_ki_idx)
+                            s_ki_kl_off = _resolve_S(canon_ki_idx, canon_kl_idx)
+                            if s_kl_ki_off is not None and s_ki_kl_off is not None:
+                                _b_has_A2.append(1)
+                                _b_is_diag_kl_ki.append(0)
+                                _b_n_ki.append(n_ki)
+                                _b_t2_swap_ki.append(1 if k > i else 0)
+                                _b_t2_ki_canon_off.append(int(_t2_offsets[canon_ki_idx]))
+                                _b_S_kl_ki_off.append(s_kl_ki_off)
+                                _b_S_ki_kl_off.append(s_ki_kl_off)
+                                _b_T_n_l_ii_off.append(
+                                    int(_t1c_offsets[canon_ii_idx]) + l * n_pno_ii)
+                                a2_added = True
+                    if not a2_added:
+                        _b_has_A2.append(0)
+                        _b_is_diag_kl_ki.append(0)
+                        _b_n_ki.append(0)
+                        _b_t2_swap_ki.append(0)
+                        _b_t2_ki_canon_off.append(0)
+                        _b_S_kl_ki_off.append(0)
+                        _b_S_ki_kl_off.append(0)
+                        _b_T_n_l_ii_off.append(0)
+                _b_inner_off.append(_b_inner_off[-1] + n_inner_for_task)
+
+            if _b_K_iajb_pieces:
+                _K_iajb_static = np.concatenate(_b_K_iajb_pieces)
+                _K_bar_static = np.concatenate(_b_K_bar_pieces)
+                # Consolidated S buffer: original flat tier + lazy overflow.
+                if _S_local_pieces:
+                    _S_consolidated = np.concatenate(
+                        [S_pno_cache._buffer] + _S_local_pieces)
+                else:
+                    _S_consolidated = S_pno_cache._buffer
+                _max_n_kl = max(_b_n_kl) if _b_n_kl else 1
+                _max_n_ki = max(_b_n_ki) if _b_n_ki else 1
+                _batched_plan = {
+                    'M': nocc,
+                    'n_tasks': len(_b_n_kl),
+                    'n_total_inner': len(_b_i_arr),
+                    'n_kl_arr': np.asarray(_b_n_kl, dtype=np.int32),
+                    't2_swap_kl': np.asarray(_b_t2_swap_kl, dtype=np.int32),
+                    'K_iajb_off': np.asarray(_b_K_iajb_off, dtype=np.int64),
+                    'K_bar_off': np.asarray(_b_K_bar_off, dtype=np.int64),
+                    't2_kl_canon_off': np.asarray(_b_t2_kl_canon_off, dtype=np.int64),
+                    'T_n_kl_off': np.asarray(_b_T_n_kl_off, dtype=np.int64),
+                    'inner_off': np.asarray(_b_inner_off, dtype=np.int64),
+                    'i_arr': np.asarray(_b_i_arr, dtype=np.int32),
+                    'n_pno_ii_arr': np.asarray(_b_n_pno_ii, dtype=np.int32),
+                    'is_diag_kl_ii': np.asarray(_b_is_diag_kl_ii, dtype=np.int32),
+                    'has_S_ii_kl': np.asarray(_b_has_S_ii_kl, dtype=np.int32),
+                    'S_ii_kl_off': np.asarray(_b_S_ii_kl_off, dtype=np.int64),
+                    'has_A2': np.asarray(_b_has_A2, dtype=np.int32),
+                    'is_diag_kl_ki': np.asarray(_b_is_diag_kl_ki, dtype=np.int32),
+                    'n_ki_arr': np.asarray(_b_n_ki, dtype=np.int32),
+                    't2_swap_ki': np.asarray(_b_t2_swap_ki, dtype=np.int32),
+                    't2_ki_canon_off': np.asarray(_b_t2_ki_canon_off, dtype=np.int64),
+                    'S_kl_ki_off': np.asarray(_b_S_kl_ki_off, dtype=np.int64),
+                    'S_ki_kl_off': np.asarray(_b_S_ki_kl_off, dtype=np.int64),
+                    'T_n_l_ii_off': np.asarray(_b_T_n_l_ii_off, dtype=np.int64),
+                    'contrib_off': np.asarray(_b_contrib_off, dtype=np.int64),
+                    'K_iajb_static': _K_iajb_static,
+                    'K_bar_static': _K_bar_static,
+                    'S_consolidated': _S_consolidated,
+                    'max_n_kl': _max_n_kl,
+                    'max_n_ki': _max_n_ki,
+                }
+
+        _pkl_plan = {'_ba_work': _ba_work,
+                     '_per_task_plan': _per_task_plan,
+                     '_batched_plan': _batched_plan}
+        _pkl_cache_attr[_pkl_plan_key] = _pkl_plan
+    _ba_work = _pkl_plan['_ba_work']
+    _per_task_plan = _pkl_plan['_per_task_plan']
+    _batched_plan = _pkl_plan['_batched_plan']
+
+    def _per_kl(arg_with_plan):
+        plan = arg_with_plan
+        if plan is None:
+            return {}
+        local = {}
+        key_kl = plan['key_kl']
+        k = plan['k']; l = plan['l']; n_kl = plan['n_kl']
+        K_iajb_kl = plan['K_iajb_kl']
+        K_bar_kl = plan['K_bar_kl']
 
         t2_canon_kl = t2_pno_all[key_kl]
-        t2_kl = t2_canon_kl if k <= l else t2_canon_kl.T
+        t2_kl = t2_canon_kl.T if plan['t2_swap_kl'] else t2_canon_kl
         Tt_kl = 2.0 * t2_kl - t2_kl.T
-        K_iajb_kl = ci_kl['K_iajb']
-        K_bar_kl = ci_kl['K_bar_ij'] if key_kl[0] == k else ci_kl['K_bar_ji']
 
-        T_n_kl = np.zeros((nocc, n_kl))
-        for m in range(nocc):
-            T_n_kl[m] = T_n.get((key_kl, m), np.zeros(n_kl))
+        T_n_kl = t1_cache[key_kl]
         K_kilc = K_bar_kl + T_n_kl @ K_iajb_kl
         B_ia = Tt_kl @ K_kilc.T
 
-        if pair_lmo_idx is not None and key_kl in pair_lmo_idx:
-            _i_list = pair_lmo_idx[key_kl]
-        else:
-            _i_list = range(nocc)
-        for i in _i_list:
-            key_ii = (i, i)
-            if key_ii not in pno_spaces:
-                continue
-            if pno_spaces[key_ii]['C_pno'].shape[1] == 0:
-                continue
+        for (i, key_ii, n_pno_ii, S_ii_kl,
+             key_ki, a2_n_ki, t2_swap_ki, a2_diag,
+             S_kl_ki, S_ki_kl) in plan['inners']:
             # B contribution
-            if key_kl == key_ii:
-                B_contrib = B_ia[:, i]
-            else:
-                S_ii_kl = S_pno_cache.get((key_ii, key_kl))
-                B_contrib = S_ii_kl @ B_ia[:, i] if S_ii_kl is not None else None
-            if B_contrib is not None:
-                prev = local.get(i)
-                local[i] = (prev - B_contrib) if prev is not None else (-B_contrib)
+            if S_ii_kl is None and key_kl == key_ii:
+                B_contrib = -B_ia[:, i]
+                local[i] = B_contrib if i not in local else local[i] + B_contrib
+            elif S_ii_kl is not None:
+                B_contrib = -(S_ii_kl @ B_ia[:, i])
+                local[i] = B_contrib if i not in local else local[i] + B_contrib
 
-            # A2 contribution (Psi4 ccsd.cc lines 2146-2152)
-            key_ki = (min(k, i), max(k, i))
-            if key_ki in t2_pno_all and key_ki in pno_spaces:
-                n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
-                if n_ki > 0:
-                    t2_ki_canon = t2_pno_all[key_ki]
-                    t2_ki = t2_ki_canon if k <= i else t2_ki_canon.T
-                    Tt_ki = 2.0 * t2_ki - t2_ki.T
-                    S_kl_ki = S_pno_cache.get((key_kl, key_ki))
-                    S_ki_kl = S_pno_cache.get((key_ki, key_kl))
-                    if key_kl == key_ki:
-                        U_ki = Tt_ki
-                    elif S_kl_ki is not None and S_ki_kl is not None:
-                        U_ki = S_kl_ki @ Tt_ki @ S_ki_kl
-                    else:
-                        U_ki = None
-                    if U_ki is not None:
-                        scalar = np.sum(K_iajb_kl * U_ki)
-                        T_n_l_ii = T_n.get((key_ii, l), np.zeros(
-                            pno_spaces[key_ii]['C_pno'].shape[1]))
-                        if T_n_l_ii.size > 0:
-                            A2 = scalar * T_n_l_ii
-                            prev = local.get(i)
-                            local[i] = (prev - A2) if prev is not None else (-A2)
+            # A2 contribution
+            if a2_n_ki > 0:
+                t2_ki_canon = t2_pno_all[key_ki]
+                t2_ki = t2_ki_canon.T if t2_swap_ki else t2_ki_canon
+                Tt_ki = 2.0 * t2_ki - t2_ki.T
+                if a2_diag:
+                    U_ki = Tt_ki
+                elif S_kl_ki is not None and S_ki_kl is not None:
+                    U_ki = S_kl_ki @ Tt_ki @ S_ki_kl
+                else:
+                    U_ki = None
+                if U_ki is not None:
+                    scalar = np.sum(K_iajb_kl * U_ki)
+                    A2 = -(scalar * t1_cache[key_ii][l])
+                    local[i] = A2 if i not in local else local[i] + A2
         return local
 
-    _ba_work = []
-    for key_kl in t2_pno_all:
-        if pno_spaces[key_kl]['C_pno'].shape[1] == 0:
-            continue
-        k0, l0 = key_kl
-        if k0 == l0:
-            _ba_work.append((key_kl, k0, l0))
-        else:
-            _ba_work.append((key_kl, k0, l0))
-            _ba_work.append((key_kl, l0, k0))
+    _per_kl_wall_start = _time_perI.perf_counter() if _per_i_dump else 0.0
+    if _batched_plan is not None and _batched_plan['n_tasks'] > 0:
+        # Single batched Cython call replaces the entire pool.map dispatch.
+        from pyscf.cc.dlpno_tccsd._per_kl_batched_cy import per_kl_batched
+        from threadpoolctl import threadpool_limits
+        bp = _batched_plan
+        # Per-thread scratch — sized for max shapes across all tasks.
+        _bp_scratch = getattr(_compute_t1_residual_psi4,
+                              '_per_kl_batched_scratch', None)
+        _NTH = min(64, bp['n_tasks'])
+        _max_n_kl = bp['max_n_kl']
+        _max_n_ki = bp['max_n_ki']
+        _M = bp['M']
+        if (_bp_scratch is None
+                or _bp_scratch['num_threads'] != _NTH
+                or _bp_scratch['max_n_kl'] != _max_n_kl
+                or _bp_scratch['max_n_ki'] != _max_n_ki
+                or _bp_scratch['M'] != _M):
+            _bp_scratch = {
+                'num_threads': _NTH,
+                'max_n_kl': _max_n_kl, 'max_n_ki': _max_n_ki, 'M': _M,
+                'Tt_kl': np.empty((_NTH, _max_n_kl * _max_n_kl)),
+                'K_kilc': np.empty((_NTH, _M * _max_n_kl)),
+                'B_ia': np.empty((_NTH, _max_n_kl * _M)),
+                'Tt_ki': np.empty((_NTH, max(_max_n_ki, 1) ** 2)),
+                'X': np.empty((_NTH, max(_max_n_ki, 1) * _max_n_kl)),
+                'Z': np.empty((_NTH, max(_max_n_ki, 1) ** 2)),
+            }
+            _compute_t1_residual_psi4._per_kl_batched_scratch = _bp_scratch
 
-    if _pool is not None:
-        _ba_results = list(_pool.map(_per_kl, _ba_work))
+        contrib_flat = np.zeros(int(bp['contrib_off'][-1]))
+        with threadpool_limits(limits=1, user_api='blas'):
+            per_kl_batched(
+                bp['n_tasks'], _M,
+                bp['n_kl_arr'], bp['t2_swap_kl'],
+                bp['K_iajb_off'], bp['K_bar_off'],
+                bp['t2_kl_canon_off'], bp['T_n_kl_off'],
+                bp['inner_off'],
+                bp['i_arr'], bp['n_pno_ii_arr'],
+                bp['is_diag_kl_ii'], bp['has_S_ii_kl'], bp['S_ii_kl_off'],
+                bp['has_A2'], bp['is_diag_kl_ki'], bp['n_ki_arr'],
+                bp['t2_swap_ki'], bp['t2_ki_canon_off'],
+                bp['S_kl_ki_off'], bp['S_ki_kl_off'],
+                bp['T_n_l_ii_off'], bp['contrib_off'],
+                bp['K_iajb_static'], bp['K_bar_static'],
+                bp['S_consolidated'],
+                t2_pno_all._buffer, t1_cache._buffer,
+                _bp_scratch['Tt_kl'], _bp_scratch['K_kilc'],
+                _bp_scratch['B_ia'], _bp_scratch['Tt_ki'],
+                _bp_scratch['X'], _bp_scratch['Z'],
+                contrib_flat,
+                _NTH,
+            )
+        # Aggregate per-(t,i) contributions into r1_pno[i]
+        i_arr_np = bp['i_arr']
+        contrib_off_np = bp['contrib_off']
+        for ti in range(int(bp['n_total_inner'])):
+            i = int(i_arr_np[ti])
+            r1_pno[i] += contrib_flat[
+                contrib_off_np[ti]:contrib_off_np[ti + 1]]
+        if _per_i_dump:
+            print(f'  PER_KL_DBG[batched]: wall={_time_perI.perf_counter() - _per_kl_wall_start:.3f}s '
+                  f'n_tasks={bp["n_tasks"]} n_inner={bp["n_total_inner"]}',
+                  flush=True)
     else:
-        _ba_results = [_per_kl(arg) for arg in _ba_work]
-    for local in _ba_results:
-        for i, contrib in local.items():
-            r1_pno[i] += contrib
+        # Fall back to the pool.map + chunking path.
+        _CHUNK = 32
+
+        def _per_kl_chunk(chunk):
+            return [_per_kl(p) for p in chunk]
+
+        _chunks = [_per_task_plan[i:i + _CHUNK]
+                   for i in range(0, len(_per_task_plan), _CHUNK)]
+        if _pool is not None:
+            _chunked_results = list(_pool.map(_per_kl_chunk, _chunks))
+        else:
+            _chunked_results = [[_per_kl(p) for p in c] for c in _chunks]
+        for cr in _chunked_results:
+            for local in cr:
+                for i, contrib in local.items():
+                    r1_pno[i] += contrib
+        if _per_i_dump:
+            print(f'  PER_KL_DBG[python]: wall={_time_perI.perf_counter() - _per_kl_wall_start:.3f}s '
+                  f'n_tasks={len(_per_task_plan)}', flush=True)
 
     if _dbg_r1:
         for i in range(nocc):
@@ -1500,6 +1881,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _crv2._debug_pterm_all = (cycle <= 2) and getattr(_run_dlpno_lccsd, '_debug_pterm_iters', False)
             # Pass strong-pair set to T1 residual so it can optionally skip
             _compute_t1_residual_psi4._iter = cycle
+            _compute_t1_residual_psi4._per_i_dump_timing = (cycle == 5)
 
             # ---- T1-transformed MOs or bare integrals ----
             if use_t1_transform:
@@ -1584,7 +1966,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 cc_ints=_cc_ints,
                 pair_lmo_idx=pair_lmo_idx, _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
-                blas_threads=32, omp_threads=ncores)
+                blas_threads=32, omp_threads=ncores,
+                t1_cache=_t1_cache)
             _tj_C = _time.perf_counter() - _tj_c0
 
             _tj_d0 = _time.perf_counter()
@@ -1600,11 +1983,16 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _tj_D = _time.perf_counter() - _tj_d0
 
             _tj_f0 = _time.perf_counter()
-            _local_Fkj, _local_df_Fab, _local_foo_t1 = t1_fock(
+            _local_Fkj, _local_df_Fab, _local_foo_t1, _local_Fij_bar = t1_fock(
                 _cc_ints, None, t1_pno, fov_pno, pno_spaces,
                 S_pno_cache, F_lmo, eps_lmo, foo_total,
                 _all_keys_j, nocc, _pool=(_fine_pool or _pool),
                 pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache)
+            # Keys whose d_ij/d_ji additions are already baked into
+            # _local_Fij_bar — T1 residual augments only the remaining
+            # (weak) pairs to avoid double-counting.
+            _local_Fij_bar_keys = set(k for k in _all_keys_j
+                                       if _cc_ints.get(k) is not None)
             _tj_Fab = _time.perf_counter() - _tj_f0
 
             _tj_km0 = _time.perf_counter()
@@ -1950,7 +2338,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             r1_pno = _compute_t1_residual_psi4(
                 t1_pno, t2_pno_all, pno_spaces, _t1_fov, F_lmo, eps_lmo, nocc,
                 S_pno_cache, _cc_ints, ovL_pno_cache=_t1_ovL,
-                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache, _pool=_pool)
+                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache, _pool=_pool,
+                Fij_bar_precomputed=_local_Fij_bar,
+                Fij_bar_precomputed_keys=_local_Fij_bar_keys,
+                cc_ints_flat=_cc_ints_flat, pair_index=_pair_index)
             _t1_resid_dt = _time.perf_counter() - _t1_resid_start
             t1_pno_new = {}
             for ii in range(nocc):

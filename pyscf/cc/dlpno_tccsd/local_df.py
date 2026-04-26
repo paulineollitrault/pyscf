@@ -569,6 +569,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     cc_ints = {}
     key_set = set(keys)
 
+    from pyscf.cc.dlpno_tccsd._cc_ints_partner_cy import partner_apply
+
     def _process_pair(key):
         """Build cc_ints[key] entry. Pure function — safe for thread parallel."""
         if key not in pair_aux_idx:
@@ -587,7 +589,6 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         n_local = len(aux_idx)
         if n_local == 0:
             return key, None
-
         # Cross-pair partner enumeration, restricted to pair (i,j)'s local
         # LMO domain when pair_lmo_idx is provided.  This drops per-pair
         # cost from O(nocc) to O(nlmo_ij), turning cc_ints build from
@@ -764,37 +765,48 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             else:
                 proj_ij = None
 
+            # Per-partner work fused into one Cython kernel that reads
+            # proj_ij / qia_b directly with index arrays — avoids the
+            # forced copy on proj_ij[:, :, idx] (fancy on last axis) and
+            # eliminates per-partner Python+numpy dispatch overhead.
+            # Profile: this loop pair was 73.5% of cc_ints CPU.
+            local_Q_long = np.ascontiguousarray(local_Q, dtype=np.int64)
+            do_proj = 1 if proj_ij is not None else 0
+            _proj_arg = (proj_ij if proj_ij is not None
+                         else np.empty((1, 1, 1)))
             for k, X_kj, pp_kj, n_kj in kj_data:
-                k_s = riatom_to_lmos_ext_dense[centerQ, k]
+                k_s = int(riatom_to_lmos_ext_dense[centerQ, k])
                 kj_pao_pos = riatom_to_paos_ext_dense[centerQ, pp_kj]
                 kj_mask = kj_pao_pos >= 0
                 kj_u_in_pair = np.where(kj_mask)[0]
                 kj_u_in_Q = kj_pao_pos[kj_mask]
                 if len(kj_u_in_Q) == 0:
                     continue
-                X_kj_slice = X_kj[kj_u_in_pair]              # (|kj∩Q|, n_kj)
-                if k_s >= 0:
-                    raw_kv_kj[k][local_Q] = (qia_b[:, k_s, kj_u_in_Q]
-                                             @ X_kj_slice)
-                if proj_ij is not None:
-                    sub = proj_ij[:, :, kj_u_in_Q]           # (nQp, npno, npp_kj)
-                    raw_cross_kj[k][local_Q] = sub @ X_kj_slice
+                X_kj_slice = np.ascontiguousarray(X_kj[kj_u_in_pair])
+                kj_u_in_Q_long = np.ascontiguousarray(kj_u_in_Q, dtype=np.int64)
+                partner_apply(
+                    _proj_arg, qia_b, k_s,
+                    local_Q_long, kj_u_in_Q_long, X_kj_slice,
+                    raw_cross_kj[k], raw_kv_kj[k],
+                    do_proj,
+                )
 
             for k, X_ki, pp_ki, n_ki in ki_data:
-                k_s = riatom_to_lmos_ext_dense[centerQ, k]
+                k_s = int(riatom_to_lmos_ext_dense[centerQ, k])
                 ki_pao_pos = riatom_to_paos_ext_dense[centerQ, pp_ki]
                 ki_mask = ki_pao_pos >= 0
                 ki_u_in_pair = np.where(ki_mask)[0]
                 ki_u_in_Q = ki_pao_pos[ki_mask]
                 if len(ki_u_in_Q) == 0:
                     continue
-                X_ki_slice = X_ki[ki_u_in_pair]
-                if k_s >= 0:
-                    raw_kv_ki[k][local_Q] = (qia_b[:, k_s, ki_u_in_Q]
-                                             @ X_ki_slice)
-                if proj_ij is not None:
-                    sub = proj_ij[:, :, ki_u_in_Q]           # (nQp, npno, npp_ki)
-                    raw_cross_ji[k][local_Q] = sub @ X_ki_slice
+                X_ki_slice = np.ascontiguousarray(X_ki[ki_u_in_pair])
+                ki_u_in_Q_long = np.ascontiguousarray(ki_u_in_Q, dtype=np.int64)
+                partner_apply(
+                    _proj_arg, qia_b, k_s,
+                    local_Q_long, ki_u_in_Q_long, X_ki_slice,
+                    raw_cross_ji[k], raw_kv_ki[k],
+                    do_proj,
+                )
 
         # Apply local J^{-1/2}
         j2c_local = j2c[np.ix_(aux_idx, aux_idx)]
@@ -1002,9 +1014,11 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
     """Build dressed Fock matrices matching Psi4 t1_fock().
 
     Returns:
-        Fkj: (nocc, nocc) dressed occupied Fock
+        Fkj: (nocc, nocc) dressed occupied Fock (full, includes Eq 94)
         Fab_all: dict pair_key -> (npno, npno) dressed virtual Fock
         foo_t1: (nocc, nocc) T1 part of foo
+        Fij_bar_snapshot: (nocc, nocc) Fkj BEFORE Eq 94's Fia_bar_jj term —
+            shared with T1 residual to avoid recomputing per-pair d_ij/d_ji.
 
     LMO sums inside each per-pair dressing are restricted to
     pair_lmo_idx[key] (Psi4 lmopair_to_lmos_[ij]) when provided.
@@ -1195,6 +1209,13 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
                 Fab_flat[Fab_off_plan[p]:Fab_off_plan[p + 1]]
                 .reshape(npno, npno).copy())
 
+    # Snapshot Fij_bar (T1-dressed Fock minus Eq 94's Fia_bar_jj term)
+    # — shared with the T1 residual so it doesn't recompute the same per-pair
+    # d_ij / d_ji additions. The T1 residual augments with weak-pair
+    # contributions before use; Eq 94 stays exclusive to t1_fock's Fkj since
+    # the T1 residual builds Fia_bar_ii separately in Stage 3.
+    Fij_bar_snapshot = Fkj.copy()
+
     # Eq 94: Fkj += Σ_a Fia_bar_jj · t1_j — use local LMO domain of (jj, jj)
     for j_idx in range(nocc):
         key_jj = (j_idx, j_idx)
@@ -1246,7 +1267,7 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
     # workaround for a bug in build_G_tilde that skipped the i==j diagonal
     # contribution; that bug is now fixed.
 
-    return Fkj, Fab_all, foo_t1
+    return Fkj, Fab_all, foo_t1, Fij_bar_snapshot
 
 
 def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
