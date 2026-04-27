@@ -4294,19 +4294,66 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
             _t0 = _cd_time.perf_counter()
 
         with threadpool_limits(limits=1, user_api='blas'):
-            c_kernel_batched(
-                c_N, max_n_pno, max_n_ct, max_n_other,
-                bv['c_n_pno'], bv['c_n_ct'], bv['c_n_other'],
-                bv['c_S_big_off'], bv['c_ct_off'][:c_N],
-                bv['c_S_mid_off'], bv['c_J_bold_off'],
-                bv['c_t2_off'][:c_N], bv['c_S_outer_off'],
-                bv['c_tile_off'],
-                bv['c_S_big_flat'], bv['c_S_mid_flat'],
-                bv['c_J_bold_flat'], bv['c_S_outer_flat'],
-                ct_flat, t2_flat,
-                STB, GAMMA, GT,
-                c_tiles, num_threads,
-            )
+            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+                # Native-C path: see pyscf/lib/cc/dlpno_cd_term.c.
+                import ctypes as _ct
+                from pyscf import lib as _pyscflib
+                _libcc = getattr(compute_CD_terms_batched, '_libcc', None)
+                if _libcc is None:
+                    _libcc = _pyscflib.load_library('libcc')
+                    _libcc.DLPNOc_term_batched.restype = None
+                    _libcc.DLPNOc_term_batched.argtypes = (
+                        [_ct.c_int]
+                        + [_ct.c_void_p] * 16
+                        + [_ct.c_void_p, _ct.c_size_t] * 3
+                        + [_ct.c_void_p, _ct.c_int])
+                    _libcc.DLPNOd_term_batched.restype = None
+                    _libcc.DLPNOd_term_batched.argtypes = (
+                        [_ct.c_int]
+                        + [_ct.c_void_p] * 16
+                        + [_ct.c_void_p, _ct.c_size_t] * 4
+                        + [_ct.c_void_p, _ct.c_int])
+                    compute_CD_terms_batched._libcc = _libcc
+                c_t2_off_view = np.ascontiguousarray(bv['c_t2_off'][:c_N])
+                c_ct_off_view = np.ascontiguousarray(bv['c_ct_off'][:c_N])
+                _libcc.DLPNOc_term_batched(
+                    int(c_N),
+                    bv['c_n_pno'].ctypes.data_as(_ct.c_void_p),
+                    bv['c_n_ct'].ctypes.data_as(_ct.c_void_p),
+                    bv['c_n_other'].ctypes.data_as(_ct.c_void_p),
+                    bv['c_S_big_off'].ctypes.data_as(_ct.c_void_p),
+                    c_ct_off_view.ctypes.data_as(_ct.c_void_p),
+                    bv['c_S_mid_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['c_J_bold_off'].ctypes.data_as(_ct.c_void_p),
+                    c_t2_off_view.ctypes.data_as(_ct.c_void_p),
+                    bv['c_S_outer_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['c_tile_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['c_S_big_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['c_S_mid_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['c_J_bold_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['c_S_outer_flat'].ctypes.data_as(_ct.c_void_p),
+                    ct_flat.ctypes.data_as(_ct.c_void_p),
+                    t2_flat.ctypes.data_as(_ct.c_void_p),
+                    STB.ctypes.data_as(_ct.c_void_p), STB.shape[1],
+                    GAMMA.ctypes.data_as(_ct.c_void_p), GAMMA.shape[1],
+                    GT.ctypes.data_as(_ct.c_void_p), GT.shape[1],
+                    c_tiles.ctypes.data_as(_ct.c_void_p),
+                    int(num_threads),
+                )
+            else:
+                c_kernel_batched(
+                    c_N, max_n_pno, max_n_ct, max_n_other,
+                    bv['c_n_pno'], bv['c_n_ct'], bv['c_n_other'],
+                    bv['c_S_big_off'], bv['c_ct_off'][:c_N],
+                    bv['c_S_mid_off'], bv['c_J_bold_off'],
+                    bv['c_t2_off'][:c_N], bv['c_S_outer_off'],
+                    bv['c_tile_off'],
+                    bv['c_S_big_flat'], bv['c_S_mid_flat'],
+                    bv['c_J_bold_flat'], bv['c_S_outer_flat'],
+                    ct_flat, t2_flat,
+                    STB, GAMMA, GT,
+                    c_tiles, num_threads,
+                )
         if _cd_dump:
             _cd_t['c_kern'] = _cd_time.perf_counter() - _t0
             _t0 = _cd_time.perf_counter()
@@ -4390,19 +4437,50 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
             _t0 = _cd_time.perf_counter()
 
         with threadpool_limits(limits=1, user_api='blas'):
-            d_kernel_batched(
-                d_N, max_n_pno, max_n_A, max_n_B,
-                bv['d_n_pno'], bv['d_n_A'], bv['d_n_B'],
-                bv['d_S_a_off'], bv['d_u_off'][:d_N],
-                bv['d_S_b_off'], bv['d_S_c_off'],
-                bv['d_dt_off'][:d_N], bv['d_KJ_off'],
-                bv['d_tile_off'],
-                bv['d_S_a_flat'], bv['d_S_b_flat'],
-                bv['d_S_c_flat'], bv['d_KJ_flat'],
-                u_flat, dt_flat,
-                SU, UP, SCD, Bint,
-                d_tiles, num_threads,
-            )
+            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+                import ctypes as _ct
+                _libcc = compute_CD_terms_batched._libcc  # set above
+                d_u_off_view = np.ascontiguousarray(bv['d_u_off'][:d_N])
+                d_dt_off_view = np.ascontiguousarray(bv['d_dt_off'][:d_N])
+                _libcc.DLPNOd_term_batched(
+                    int(d_N),
+                    bv['d_n_pno'].ctypes.data_as(_ct.c_void_p),
+                    bv['d_n_A'].ctypes.data_as(_ct.c_void_p),
+                    bv['d_n_B'].ctypes.data_as(_ct.c_void_p),
+                    bv['d_S_a_off'].ctypes.data_as(_ct.c_void_p),
+                    d_u_off_view.ctypes.data_as(_ct.c_void_p),
+                    bv['d_S_b_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['d_S_c_off'].ctypes.data_as(_ct.c_void_p),
+                    d_dt_off_view.ctypes.data_as(_ct.c_void_p),
+                    bv['d_KJ_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['d_tile_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['d_S_a_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['d_S_b_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['d_S_c_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['d_KJ_flat'].ctypes.data_as(_ct.c_void_p),
+                    u_flat.ctypes.data_as(_ct.c_void_p),
+                    dt_flat.ctypes.data_as(_ct.c_void_p),
+                    SU.ctypes.data_as(_ct.c_void_p), SU.shape[1],
+                    UP.ctypes.data_as(_ct.c_void_p), UP.shape[1],
+                    SCD.ctypes.data_as(_ct.c_void_p), SCD.shape[1],
+                    Bint.ctypes.data_as(_ct.c_void_p), Bint.shape[1],
+                    d_tiles.ctypes.data_as(_ct.c_void_p),
+                    int(num_threads),
+                )
+            else:
+                d_kernel_batched(
+                    d_N, max_n_pno, max_n_A, max_n_B,
+                    bv['d_n_pno'], bv['d_n_A'], bv['d_n_B'],
+                    bv['d_S_a_off'], bv['d_u_off'][:d_N],
+                    bv['d_S_b_off'], bv['d_S_c_off'],
+                    bv['d_dt_off'][:d_N], bv['d_KJ_off'],
+                    bv['d_tile_off'],
+                    bv['d_S_a_flat'], bv['d_S_b_flat'],
+                    bv['d_S_c_flat'], bv['d_KJ_flat'],
+                    u_flat, dt_flat,
+                    SU, UP, SCD, Bint,
+                    d_tiles, num_threads,
+                )
         if _cd_dump:
             _cd_t['d_kern'] = _cd_time.perf_counter() - _t0
             _t0 = _cd_time.perf_counter()
