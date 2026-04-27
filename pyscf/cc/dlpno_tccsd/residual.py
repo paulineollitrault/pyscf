@@ -3318,10 +3318,43 @@ def compute_B_E_batched_v2(
                 else:
                     beta_kl_arr[n] = B_tilde[k, l]
                     beta_lk_arr[n] = 0.0 if k == l else B_tilde[l, k]
-            be_kernel(bucket['S'], T_arr, bucket['K'],
-                      beta_kl_arr, beta_lk_arr, bucket['same'],
-                      bucket['item_idx'],
-                      flat_B[n_ij], flat_E[n_ij])
+            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+                # Native-C path: see pyscf/lib/cc/dlpno_be.c::DLPNObe_kernel.
+                # Same N×(n_ij,n_kl) layout as the Cython kernel.
+                import ctypes as _ct
+                from pyscf import lib as _pyscflib
+                _libcc = getattr(compute_B_E_batched_v2, '_libcc', None)
+                if _libcc is None:
+                    _libcc = _pyscflib.load_library('libcc')
+                    _libcc.DLPNObe_kernel.restype = None
+                    _libcc.DLPNObe_kernel.argtypes = (
+                        [_ct.c_void_p] * 9 + [_ct.c_size_t] * 3 + [_ct.c_int])
+                    compute_B_E_batched_v2._libcc = _libcc
+                S_c = np.ascontiguousarray(bucket['S'])
+                T_c = np.ascontiguousarray(T_arr)
+                K_c = np.ascontiguousarray(bucket['K'])
+                beta_kl_c = np.ascontiguousarray(beta_kl_arr)
+                beta_lk_c = np.ascontiguousarray(beta_lk_arr)
+                same_c = np.ascontiguousarray(bucket['same']).astype(np.uint8, copy=False)
+                idx_c = np.ascontiguousarray(bucket['item_idx']).astype(np.int64, copy=False)
+                _libcc.DLPNObe_kernel(
+                    S_c.ctypes.data_as(_ct.c_void_p),
+                    T_c.ctypes.data_as(_ct.c_void_p),
+                    K_c.ctypes.data_as(_ct.c_void_p),
+                    beta_kl_c.ctypes.data_as(_ct.c_void_p),
+                    beta_lk_c.ctypes.data_as(_ct.c_void_p),
+                    same_c.ctypes.data_as(_ct.c_void_p),
+                    idx_c.ctypes.data_as(_ct.c_void_p),
+                    flat_B[n_ij].ctypes.data_as(_ct.c_void_p),
+                    flat_E[n_ij].ctypes.data_as(_ct.c_void_p),
+                    N, n_ij, n_kl,
+                    int(omp_threads if omp_threads else 16),
+                )
+            else:
+                be_kernel(bucket['S'], T_arr, bucket['K'],
+                          beta_kl_arr, beta_lk_arr, bucket['same'],
+                          bucket['item_idx'],
+                          flat_B[n_ij], flat_E[n_ij])
 
     # Unpack flat outputs into dicts keyed by strong pair.
     B_all = {}
