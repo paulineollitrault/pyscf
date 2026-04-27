@@ -874,13 +874,13 @@ def _process_one_triple(i, j, k,
     K_ooov = (ov_flat @ oo_flat.T).reshape(
         3, n_tno, 3, m_dom_size).transpose(0, 2, 1, 3)
 
-    # === Native-Cython w3_full_kernel path (disabled: draft kernel
-    # produces incorrect energy by ~40 mEh on water-4. Likely a layout
-    # mismatch between the kernel's expected K_ab_cache / t2_T_all
-    # convention and what we pass. Needs careful per-phase comparison
-    # vs _w3_intermediate before re-enabling. The kernel itself is
-    # built and tracked; the wiring below is left as scaffolding.) ===
-    if False and int(os.environ.get('DLPNO_C_CYCLE', '0')):
+    # === Native-Cython w3_full_kernel path (DLPNO_C_CYCLE=1) ===
+    # Single nogil kernel call replaces _w3_intermediate per triple.
+    # Validated against _w3_intermediate via side-by-side test
+    # (synthetic triples with non-trivial U + transpose flags) at
+    # machine-precision agreement; transpose_flag convention fixed
+    # below to match _proj_t2(p=l, q=r) ordering.
+    if int(os.environ.get('DLPNO_C_CYCLE', '0')):
         try:
             from pyscf.cc.dlpno_tccsd._w3_full_cy import w3_full_kernel
         except ImportError:
@@ -911,10 +911,12 @@ def _process_one_triple(i, j, k,
                     n_pno_arr[flat_idx] = n_pno_pk
                     U_blocks[flat_idx] = np.ascontiguousarray(U)
                     T2_blocks[flat_idx] = np.ascontiguousarray(t2_for_T[pk])
-                    # Convention: t2_for_T[pk] is stored canonical (min<=max).
-                    # For pair (r_global, l_global) in non-canonical order
-                    # (r > l), the T2 used in the projection needs transpose.
-                    transpose_flags[flat_idx] = 1 if r_global > l_global else 0
+                    # The kernel computes T_il[r] = projected T2 for pair
+                    # (l_lmo, r_lmo) — matching _proj_t2(p=l_global,
+                    # q=r_global). Convention: t2_for_T[pk] is canonical
+                    # (min <= max). The pair (l, r) is non-canonical when
+                    # l > r, so the kernel must transpose then.
+                    transpose_flags[flat_idx] = 1 if l_global > r_global else 0
 
             U_sizes = (n_pno_arr * n)        # n_pno × n_tno per item
             T2_sizes = (n_pno_arr * n_pno_arr)
