@@ -649,6 +649,11 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             + [_ctypes_cQ.c_void_p] * 4
             + [_ctypes_cQ.c_size_t] * 8
             + [_ctypes_cQ.c_void_p] * 8)
+        _libcc_centerQ.DLPNOcross_partner_assemble.restype = None
+        _libcc_centerQ.DLPNOcross_partner_assemble.argtypes = (
+            [_ctypes_cQ.c_int]
+            + [_ctypes_cQ.c_void_p] * 13
+            + [_ctypes_cQ.c_size_t] * 3)
 
     # === DBG_CCINTS section timers (read DLPNO_CCINTS_DBG=1) ===
     import time as _ccints_time
@@ -1023,30 +1028,110 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             _dbg_add('final_KJ',
                      _ccints_time.perf_counter() - _t_finalKJ_start)
         _t_cross_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
-        J_ij_kj = {}
-        K_ij_kj_dict = {}
-        for k, key_kj, _ in kj_partners:
-            cross_fitted = (jhi @ raw_cross_kj[k].reshape(n_local, -1)
-                            ).reshape(n_local, npno, raw_cross_kj[k].shape[2])
-            # q_io now uses the reduced (p_lmos) axis; k is a global LMO
-            # index, kj_partners is built from pair_lmo_idx[key], so k is
-            # guaranteed to be in p_lmos — map via p_lmos_dense.
-            k_loc = int(p_lmos_dense[k])
-            q_ik = q_io[:, k_loc]
-            J_ij_kj[(key, k)] = np.tensordot(q_ik, cross_fitted, axes=(0, 0))
-            q_kv_kj = jhi @ raw_kv_kj[k]
-            K_ij_kj_dict[(key, k)] = q_iv.T @ q_kv_kj
 
-        J_ji_ki = {}
-        K_ji_ki_dict = {}
-        for k, key_ki, _ in ki_partners:
-            cross_fitted = (jhi @ raw_cross_ji[k].reshape(n_local, -1)
-                            ).reshape(n_local, npno, raw_cross_ji[k].shape[2])
-            k_loc = int(p_lmos_dense[k])
-            q_jk = q_jo[:, k_loc]
-            J_ji_ki[(key, k)] = np.tensordot(q_jk, cross_fitted, axes=(0, 0))
-            q_kv_ki = jhi @ raw_kv_ki[k]
-            K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki
+        # === Cross-partner final J/K assembly: native-C path under
+        # DLPNO_C_CYCLE=1 (DLPNOcross_partner_assemble in
+        # pyscf/lib/cc/dlpno_cross_partner.c). Same math as the per-
+        # partner Python loop below; eliminates ~24K Python ctypes
+        # dispatches per CCSD run on water-10. ===
+        if _use_centerQ_c and (kj_partners or ki_partners):
+            # Z_iv = q_iv^T @ jhi  (npno, n_local), Z_jv = q_jv^T @ jhi
+            Z_iv = np.ascontiguousarray(q_iv.T @ jhi)
+            Z_jv = np.ascontiguousarray(q_jv.T @ jhi)
+            jhi_c = np.ascontiguousarray(jhi)
+            q_io_c = np.ascontiguousarray(q_io)
+            q_jo_c = np.ascontiguousarray(q_jo)
+
+            def _run_one_side(partners, raw_cross_dict, raw_kv_dict,
+                              q_io_or_jo_c, Z_iv_or_jv):
+                """Process all partners on one side (kj or ki) in one C call.
+                Returns (J_dict, K_dict) keyed by k (global LMO index)."""
+                if not partners:
+                    return {}, {}
+                n_partners = len(partners)
+                k_arr   = np.empty(n_partners, dtype=np.int64)
+                k_loc_arr = np.empty(n_partners, dtype=np.int64)
+                n_kj_arr  = np.empty(n_partners, dtype=np.int64)
+                cross_sizes = np.empty(n_partners, dtype=np.int64)
+                kv_sizes    = np.empty(n_partners, dtype=np.int64)
+                JK_sizes    = np.empty(n_partners, dtype=np.int64)
+                for p, (k, _key, n_kj) in enumerate(partners):
+                    k_arr[p] = k
+                    k_loc_arr[p] = int(p_lmos_dense[k])
+                    n_kj_arr[p] = n_kj
+                    cross_sizes[p] = n_local * npno * n_kj
+                    kv_sizes[p]    = n_local * n_kj
+                    JK_sizes[p]    = npno * n_kj
+                cross_off = np.empty(n_partners + 1, dtype=np.int64); cross_off[0] = 0
+                cross_off[1:] = np.cumsum(cross_sizes)
+                kv_off = np.empty(n_partners + 1, dtype=np.int64); kv_off[0] = 0
+                kv_off[1:] = np.cumsum(kv_sizes)
+                JK_off = np.empty(n_partners + 1, dtype=np.int64); JK_off[0] = 0
+                JK_off[1:] = np.cumsum(JK_sizes)
+                raw_cross_flat = np.empty(int(cross_off[-1]))
+                raw_kv_flat    = np.empty(int(kv_off[-1]))
+                for p, (k, _key, _n_kj) in enumerate(partners):
+                    raw_cross_flat[cross_off[p]:cross_off[p + 1]] = (
+                        raw_cross_dict[k].ravel())
+                    raw_kv_flat[kv_off[p]:kv_off[p + 1]] = (
+                        raw_kv_dict[k].ravel())
+                J_out_flat = np.empty(int(JK_off[-1]))
+                K_out_flat = np.empty(int(JK_off[-1]))
+                _libcc_centerQ.DLPNOcross_partner_assemble(
+                    int(n_partners),
+                    k_loc_arr.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    n_kj_arr.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    cross_off.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    raw_cross_flat.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    kv_off.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    raw_kv_flat.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    jhi_c.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    q_io_or_jo_c.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    Z_iv_or_jv.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    JK_off.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    J_out_flat.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    JK_off.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    K_out_flat.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    n_local, nlmo_p, npno,
+                )
+                J_dict, K_dict = {}, {}
+                for p, (k, _key, n_kj) in enumerate(partners):
+                    J_dict[k] = J_out_flat[
+                        JK_off[p]:JK_off[p + 1]].reshape(npno, n_kj).copy()
+                    K_dict[k] = K_out_flat[
+                        JK_off[p]:JK_off[p + 1]].reshape(npno, n_kj).copy()
+                return J_dict, K_dict
+
+            J_kj_byk, K_kj_byk = _run_one_side(
+                kj_partners, raw_cross_kj, raw_kv_kj, q_io_c, Z_iv)
+            J_ki_byk, K_ki_byk = _run_one_side(
+                ki_partners, raw_cross_ji, raw_kv_ki, q_jo_c, Z_jv)
+            J_ij_kj      = {(key, k): J_kj_byk[k] for k in J_kj_byk}
+            K_ij_kj_dict = {(key, k): K_kj_byk[k] for k in K_kj_byk}
+            J_ji_ki      = {(key, k): J_ki_byk[k] for k in J_ki_byk}
+            K_ji_ki_dict = {(key, k): K_ki_byk[k] for k in K_ki_byk}
+        else:
+            J_ij_kj = {}
+            K_ij_kj_dict = {}
+            for k, key_kj, _ in kj_partners:
+                cross_fitted = (jhi @ raw_cross_kj[k].reshape(n_local, -1)
+                                ).reshape(n_local, npno, raw_cross_kj[k].shape[2])
+                k_loc = int(p_lmos_dense[k])
+                q_ik = q_io[:, k_loc]
+                J_ij_kj[(key, k)] = np.tensordot(q_ik, cross_fitted, axes=(0, 0))
+                q_kv_kj = jhi @ raw_kv_kj[k]
+                K_ij_kj_dict[(key, k)] = q_iv.T @ q_kv_kj
+
+            J_ji_ki = {}
+            K_ji_ki_dict = {}
+            for k, key_ki, _ in ki_partners:
+                cross_fitted = (jhi @ raw_cross_ji[k].reshape(n_local, -1)
+                                ).reshape(n_local, npno, raw_cross_ji[k].shape[2])
+                k_loc = int(p_lmos_dense[k])
+                q_jk = q_jo[:, k_loc]
+                J_ji_ki[(key, k)] = np.tensordot(q_jk, cross_fitted, axes=(0, 0))
+                q_kv_ki = jhi @ raw_kv_ki[k]
+                K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki
 
         if _dbg_ccints:
             _dbg_add('cross_kj',
