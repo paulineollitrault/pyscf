@@ -437,8 +437,18 @@ def compute_G_term_batched(strong_keys, t2_pno_all, pno_spaces,
             buf = flat_out[bucket['n_ij']]
             np.add.at(buf, bucket['item_idx'], -out_batch)
 
+    import time as _gt_time
+    _gt_dump = getattr(compute_G_term_batched, '_dump_timing', False)
+    _gt_t0 = _gt_time.perf_counter() if _gt_dump else 0.0
     _process_buckets(plan['ik_buckets'], flat_G_ij)
+    _gt_t1 = _gt_time.perf_counter() if _gt_dump else 0.0
     _process_buckets(plan['jk_buckets'], flat_G_ji)
+    _gt_t2 = _gt_time.perf_counter() if _gt_dump else 0.0
+    if _gt_dump:
+        print(f'  [G_DBG] ik_buckets={len(plan["ik_buckets"])} '
+              f'wall={(_gt_t1 - _gt_t0)*1e3:.1f}ms  '
+              f'jk_buckets={len(plan["jk_buckets"])} '
+              f'wall={(_gt_t2 - _gt_t1)*1e3:.1f}ms', flush=True)
 
     # Unpack back into dict {key_ij: G_term}.  G_term = G_ij + G_ji.T
     G_term_all = {}
@@ -3113,7 +3123,7 @@ def _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
             flat_views[n_ki][base:base + tile_size] += tile
 
 
-def _get_or_build_cd_batched_view(plan, pno_spaces):
+def _get_or_build_cd_batched_view(plan, pno_spaces, t2_pno_all=None):
     """Build (or fetch cached) flat per-item view across all c_/d_ buckets.
 
     Concatenates the per-bucket S/J_bold static tensors into single flat
@@ -3194,6 +3204,19 @@ def _get_or_build_cd_batched_view(plan, pno_spaces):
     c_ct_off[1:] = np.cumsum(c_ct_size_l)
     c_t2_off = np.zeros(c_N + 1, dtype=np.int64)
     c_t2_off[1:] = np.cumsum(c_t2_size_l)
+    # Per-item absolute offset into t2_pno_all._buffer for the canonical
+    # t2 tile (transpose handled by the gather kernel). Used to build
+    # t2_flat per cycle in nogil prange instead of a Python loop.
+    if t2_pno_all is not None and hasattr(t2_pno_all, '_offsets'):
+        _t2_off_arr = np.asarray(t2_pno_all._offsets)
+        _canon_to_idx = t2_pno_all._canon_to_idx
+        c_t2_canon_off = np.array(
+            [_t2_off_arr[_canon_to_idx[k]] for k in c_t2_keys_l],
+            dtype=np.int64)
+        c_t2_trans_arr = np.asarray(c_t2_trans_l, dtype=np.int32)
+    else:
+        c_t2_canon_off = None
+        c_t2_trans_arr = None
 
     # ---- D side: walk d_buckets, flatten per-item ----
     d_n_pno_l, d_n_A_l, d_n_B_l = [], [], []
@@ -3243,6 +3266,14 @@ def _get_or_build_cd_batched_view(plan, pno_spaces):
     d_u_off[1:] = np.cumsum(d_u_size_l)
     d_dt_off = np.zeros(d_N + 1, dtype=np.int64)
     d_dt_off[1:] = np.cumsum(d_dt_size_l)
+    if t2_pno_all is not None and hasattr(t2_pno_all, '_offsets'):
+        d_t2_canon_off = np.array(
+            [_t2_off_arr[_canon_to_idx[k]] for k in d_t2_keys_l],
+            dtype=np.int64)
+        d_t2_trans_arr = np.asarray(d_t2_trans_l, dtype=np.int32)
+    else:
+        d_t2_canon_off = None
+        d_t2_trans_arr = None
 
     bv = {
         # C side
@@ -3265,6 +3296,8 @@ def _get_or_build_cd_batched_view(plan, pno_spaces):
         'c_ct_keys': c_ct_keys_l,
         'c_t2_keys': c_t2_keys_l,
         'c_t2_trans': np.asarray(c_t2_trans_l, dtype=bool),
+        'c_t2_canon_off': c_t2_canon_off,
+        'c_t2_trans_arr': c_t2_trans_arr,
         'c_ct_off': c_ct_off,
         'c_t2_off': c_t2_off,
         'c_target_off_ij': np.asarray(c_target_off_ij_l, dtype=np.int64),
@@ -3290,6 +3323,8 @@ def _get_or_build_cd_batched_view(plan, pno_spaces):
                       if d_KJ_pieces else np.zeros(0)),
         'd_t2_keys': d_t2_keys_l,
         'd_t2_trans': np.asarray(d_t2_trans_l, dtype=bool),
+        'd_t2_canon_off': d_t2_canon_off,
+        'd_t2_trans_arr': d_t2_trans_arr,
         'd_dt_keys': d_dt_keys_l,
         'd_u_off': d_u_off,
         'd_dt_off': d_dt_off,
@@ -3317,33 +3352,56 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
     )
     from threadpoolctl import threadpool_limits
 
+    import time as _cd_time
+    _cd_dump = getattr(_run_cd_batched, '_dump_timing', False)
+    _cd_t = {'c_gather': 0, 'c_kern': 0, 'c_scatter': 0,
+             'd_gather': 0, 'd_kern': 0, 'd_scatter': 0}
+
     # ---- C side ----
     c_N = bv['c_N']
     if c_N > 0:
-        # Per-cycle gather: ct (from C_tilde_cache) and t2 (from t2_pno_all)
+        _t0 = _cd_time.perf_counter() if _cd_dump else 0.0
+        # Per-cycle gather: ct (from C_tilde_cache, dict) Python loop —
+        # C_tilde_cache is a regular dict so per-item lookup is unavoidable
+        # without a wider restructure. t2 is gathered via the nogil prange
+        # kernel below using absolute offsets into t2_pno_all._buffer (which
+        # is a FlatTensorStore — same `_buffer` pointer across cycles, just
+        # values updated in-place).
         ct_flat = np.zeros(int(bv['c_ct_off'][-1]))
-        t2_flat = np.empty(int(bv['c_t2_off'][-1]))
         c_n_ct = bv['c_n_ct']
         c_n_other = bv['c_n_other']
         c_ct_keys = bv['c_ct_keys']
-        c_t2_keys = bv['c_t2_keys']
-        c_t2_trans = bv['c_t2_trans']
         c_ct_off = bv['c_ct_off']
-        c_t2_off = bv['c_t2_off']
         for n in range(c_N):
             ct_val = (C_tilde_cache.get(c_ct_keys[n])
                       if C_tilde_cache is not None else None)
-            n_ct = int(c_n_ct[n])
-            slot_ct = ct_flat[c_ct_off[n]:c_ct_off[n + 1]]
-            if ct_val is not None and ct_val.shape[0] == n_ct:
-                slot_ct[:] = ct_val.ravel()
-            # else: zero-init from np.zeros above
-            t2 = t2_pno_all[c_t2_keys[n]]
-            n_other = int(c_n_other[n])
-            if c_t2_trans[n]:
-                t2_flat[c_t2_off[n]:c_t2_off[n + 1]] = t2.T.ravel()
-            else:
-                t2_flat[c_t2_off[n]:c_t2_off[n + 1]] = t2.ravel()
+            if ct_val is not None and ct_val.shape[0] == int(c_n_ct[n]):
+                ct_flat[c_ct_off[n]:c_ct_off[n + 1]] = ct_val.ravel()
+
+        t2_flat = np.empty(int(bv['c_t2_off'][-1]))
+        if (bv['c_t2_canon_off'] is not None
+                and hasattr(t2_pno_all, '_buffer')):
+            from pyscf.cc.dlpno_tccsd._cd_gather_cy import (
+                gather_t2_with_transpose,
+            )
+            gather_t2_with_transpose(
+                c_N, c_n_other,
+                bv['c_t2_canon_off'], bv['c_t2_trans_arr'],
+                bv['c_t2_off'], t2_pno_all._buffer, t2_flat,
+                min(64, c_N),
+            )
+        else:
+            # Fallback: per-item Python loop (back-compat for non-FTS t2)
+            c_t2_keys = bv['c_t2_keys']
+            c_t2_trans = bv['c_t2_trans']
+            for n in range(c_N):
+                t2 = t2_pno_all[c_t2_keys[n]]
+                if c_t2_trans[n]:
+                    t2_flat[bv['c_t2_off'][n]:bv['c_t2_off'][n + 1]] = (
+                        t2.T.ravel())
+                else:
+                    t2_flat[bv['c_t2_off'][n]:bv['c_t2_off'][n + 1]] = (
+                        t2.ravel())
 
         # Per-thread scratch
         max_n_pno = int(bv['c_n_pno'].max(initial=1))
@@ -3355,6 +3413,9 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
         GAMMA = np.empty((num_threads, max_n_pno * max_n_other))
         GT = np.empty((num_threads, max_n_pno * max_n_other))
         c_tiles = np.zeros(int(bv['c_tile_off'][-1]))
+        if _cd_dump:
+            _cd_t['c_gather'] = _cd_time.perf_counter() - _t0
+            _t0 = _cd_time.perf_counter()
 
         with threadpool_limits(limits=1, user_api='blas'):
             c_kernel_batched(
@@ -3370,6 +3431,9 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
                 STB, GAMMA, GT,
                 c_tiles, num_threads,
             )
+        if _cd_dump:
+            _cd_t['c_kern'] = _cd_time.perf_counter() - _t0
+            _t0 = _cd_time.perf_counter()
 
         # Serial scatter — flatten output buffers per n_pno per side
         n_pno_offsets = bv['n_pno_offsets']
@@ -3392,24 +3456,42 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
             else:
                 base = c_target_ji[n] - n_pno_offsets[n_pno]
                 flat_C_ji_views[n_pno][base:base + tile_size] -= tile
+        if _cd_dump:
+            _cd_t['c_scatter'] = _cd_time.perf_counter() - _t0
 
     # ---- D side ----
     d_N = bv['d_N']
     if d_N > 0:
-        u_flat = np.empty(int(bv['d_u_off'][-1]))
-        dt_flat = np.zeros(int(bv['d_dt_off'][-1]))
+        _t0 = _cd_time.perf_counter() if _cd_dump else 0.0
         d_n_A = bv['d_n_A']
         d_n_B = bv['d_n_B']
-        d_t2_keys = bv['d_t2_keys']
-        d_t2_trans = bv['d_t2_trans']
         d_dt_keys = bv['d_dt_keys']
         d_u_off = bv['d_u_off']
         d_dt_off = bv['d_dt_off']
+
+        # u = 2*t2 - t2.T (anti-symmetrized); built via nogil prange kernel.
+        u_flat = np.empty(int(d_u_off[-1]))
+        if (bv['d_t2_canon_off'] is not None
+                and hasattr(t2_pno_all, '_buffer')):
+            from pyscf.cc.dlpno_tccsd._cd_gather_cy import gather_u_from_t2
+            gather_u_from_t2(
+                d_N, d_n_A,
+                bv['d_t2_canon_off'], bv['d_t2_trans_arr'],
+                d_u_off, t2_pno_all._buffer, u_flat,
+                min(64, d_N),
+            )
+        else:
+            d_t2_keys = bv['d_t2_keys']
+            d_t2_trans = bv['d_t2_trans']
+            for n in range(d_N):
+                t2 = t2_pno_all[d_t2_keys[n]]
+                t2_d = t2.T if d_t2_trans[n] else t2
+                u_flat[d_u_off[n]:d_u_off[n + 1]] = (
+                    2.0 * t2_d - t2_d.T).ravel()
+
+        # dt (D_tilde_cache, dict) — Python loop unavoidable.
+        dt_flat = np.zeros(int(d_dt_off[-1]))
         for n in range(d_N):
-            t2 = t2_pno_all[d_t2_keys[n]]
-            t2_d = t2.T if d_t2_trans[n] else t2
-            u_flat[d_u_off[n]:d_u_off[n + 1]] = (
-                2.0 * t2_d - t2_d.T).ravel()
             dk = d_dt_keys[n]
             n_B = int(d_n_B[n])
             if dk is not None and D_tilde_cache is not None:
@@ -3427,6 +3509,9 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
         SCD = np.empty((num_threads, max_n_pno * max_n_B))
         Bint = np.empty((num_threads, max_n_pno * max_n_A))
         d_tiles = np.zeros(int(bv['d_tile_off'][-1]))
+        if _cd_dump:
+            _cd_t['d_gather'] = _cd_time.perf_counter() - _t0
+            _t0 = _cd_time.perf_counter()
 
         with threadpool_limits(limits=1, user_api='blas'):
             d_kernel_batched(
@@ -3442,6 +3527,9 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
                 SU, UP, SCD, Bint,
                 d_tiles, num_threads,
             )
+        if _cd_dump:
+            _cd_t['d_kern'] = _cd_time.perf_counter() - _t0
+            _t0 = _cd_time.perf_counter()
 
         n_pno_offsets = bv['n_pno_offsets']
         d_target_ij = bv['d_target_off_ij']
@@ -3462,6 +3550,18 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
             else:
                 base = d_target_ji[n] - n_pno_offsets[n_pno]
                 flat_D_ji_views[n_pno][base:base + tile_size] += 0.5 * tile
+        if _cd_dump:
+            _cd_t['d_scatter'] = _cd_time.perf_counter() - _t0
+
+    if _cd_dump:
+        print(f'  [CD_DBG] c_N={c_N} '
+              f'gather={_cd_t["c_gather"]*1e3:.1f}ms '
+              f'kern={_cd_t["c_kern"]*1e3:.1f}ms '
+              f'scatter={_cd_t["c_scatter"]*1e3:.1f}ms  '
+              f'd_N={d_N} '
+              f'gather={_cd_t["d_gather"]*1e3:.1f}ms '
+              f'kern={_cd_t["d_kern"]*1e3:.1f}ms '
+              f'scatter={_cd_t["d_scatter"]*1e3:.1f}ms', flush=True)
 
 
 def compute_CD_terms_batched(
@@ -3518,7 +3618,7 @@ def compute_CD_terms_batched(
     # once) flattens all items into per-item offset arrays; per-cycle
     # gather populates ct/t2/u/dt flat buffers, kernel does prange
     # compute, caller does serial scatter.
-    bv = _get_or_build_cd_batched_view(plan, pno_spaces)
+    bv = _get_or_build_cd_batched_view(plan, pno_spaces, t2_pno_all)
     _run_cd_batched(
         plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
         flat_C_ij, flat_C_ji, flat_D_ij, flat_D_ji,
