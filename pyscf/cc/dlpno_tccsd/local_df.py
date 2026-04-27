@@ -1070,6 +1070,31 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
             if val is not None:
                 dressed[key] = val
 
+    # T1INTS_DUMP: parity dump vs Psi4 ccsd.cc:1491 t1_ints output.
+    # Psi4 stores ordered pairs (i,j) AND (j,i); each entry has i_Qk_t1
+    # for its "i-side". To match Psi4's total, our canonical-pair store
+    # contributes: diag: ‖i_Qk_t1‖² once; off-diag: ‖i_Qk_t1‖² + ‖j_Qk_t1‖².
+    if int(os.environ.get('DLPNO_DUMP_T1INTS', '0')):
+        _it = getattr(t1_ints, '_iter', 0)
+        t1_ints._iter = _it + 1
+        if _it <= 2:
+            iqk_fro2 = 0.0
+            iqa_fro2 = 0.0
+            n_strong_ordered = 0
+            for key, val in dressed.items():
+                i, j = key
+                iqk_fro2 += float(np.sum(val['i_Qk_t1'] ** 2))
+                iqa_fro2 += float(np.sum(val['i_Qa_t1'] ** 2))
+                n_strong_ordered += 1
+                if i != j:
+                    iqk_fro2 += float(np.sum(val['j_Qk_t1'] ** 2))
+                    iqa_fro2 += float(np.sum(val['j_Qa_t1'] ** 2))
+                    n_strong_ordered += 1
+            print(f"T1INTS_DUMP iter={_it} n_strong={n_strong_ordered} "
+                  f"iQk_fro2={iqk_fro2:.12e} "
+                  f"iQa_fro2={iqa_fro2:.12e}",
+                  flush=True)
+
     return dressed
 
 
@@ -1341,6 +1366,22 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
     # is added inside compute_G_tilde. Previously we added foo_t2 here as a
     # workaround for a bug in build_G_tilde that skipped the i==j diagonal
     # contribution; that bug is now fixed.
+
+    # FKJ_DUMP: parity dump vs Psi4 ccsd.cc t1_fock Fkj_ output.
+    if int(os.environ.get('DLPNO_DUMP_FKJ', '0')):
+        _it = getattr(t1_fock, '_iter', 0)
+        t1_fock._iter = _it + 1
+        if _it <= 2:
+            rms = float(np.sqrt((Fkj ** 2).mean()))
+            sm = float(Fkj.sum())
+            tr = float(np.trace(Fkj))
+            fro = float(np.linalg.norm(Fkj, 'fro'))
+            off = Fkj - np.diag(np.diag(Fkj))
+            off_fro = float(np.linalg.norm(off, 'fro'))
+            print(f"FKJ_DUMP iter={_it} nocc={Fkj.shape[0]} "
+                  f"rms={rms:.12e} sum={sm:.12e} tr={tr:.12e} "
+                  f"fro={fro:.12e} off_fro={off_fro:.12e}",
+                  flush=True)
 
     return Fkj, Fab_all, foo_t1, Fij_bar_snapshot
 
