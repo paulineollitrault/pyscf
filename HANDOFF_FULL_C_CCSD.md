@@ -55,7 +55,7 @@ One C source file per Psi4 function, matching ccsd.cc structure:
 |---|---|---|---|
 | `t1_ints` (ccsd.cc:1491) | `dlpno_t1_ints.c` | 100 | TODO |
 | `t1_fock` (ccsd.cc:1540) | `dlpno_t1_fock.c` | 200 | TODO |
-| `compute_B_tilde` (ccsd.cc:1688) | `dlpno_b_tilde.c` | 50 | TODO (good starter — small) |
+| `compute_B_tilde` (ccsd.cc:1688) | `dlpno_b_tilde.c` | 50 | DONE (session 1, 2026-04-27) |
 | `compute_C_tilde` (ccsd.cc:1809) | `dlpno_c_tilde.c` | 100 | TODO |
 | `compute_D_tilde` (ccsd.cc:1991) | `dlpno_d_tilde.c` | 100 | TODO |
 | `compute_G_tilde` (ccsd.cc:1969) | `dlpno_g_tilde.c` | 50 | TODO |
@@ -124,7 +124,7 @@ Each session: one C function, pattern matches the foo_dressed / per_i / partner 
 
 | Session | Function | Validation |
 |---|---|---|
-| 1 (THIS) | Plan + `dlpno_b_tilde.c` (smallest, ~50 lines) | water-4/10 anchor, BTILDE_DUMP diff |
+| 1 (DONE 2026-04-27) | `dlpno_b_tilde.c` (~100 lines incl. comments) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, BTILDE_DUMP py-vs-C max abs 1.1e-11 over 306 dumps |
 | 2 | `dlpno_g_tilde.c` (small, ~50 lines) | water-4/10 anchor, GTILDE_DUMP diff |
 | 3 | `dlpno_t1_ints.c` (~100 lines) | water-4/10 anchor, T1INTS_DUMP diff |
 | 4 | `dlpno_c_tilde.c` (~100 lines) | water-4/10 anchor, CTILDE_DUMP diff |

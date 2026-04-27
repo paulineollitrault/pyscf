@@ -1513,12 +1513,44 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
         j_Qk_t1 = j_Qk.copy()
         j_Qk_t1 += np.einsum('Qka,a->Qk', Qma, t1_j)
 
-    B_local = i_Qk_t1.T @ j_Qk_t1            # (nlmo, nlmo)
-
-    # voov dressing (bare T2 per Psi4)
     T2_ij = t2_pno_all[key]
-    P = np.einsum('ab,Qka->kbQ', T2_ij, Qma)     # (nlmo, npno, n_local)
-    B_local += np.einsum('kbQ,Qlb->kl', P, Qma)
+
+    if int(os.environ.get('DLPNO_C_CYCLE', '0')) and nlmo > 0 and npno > 0:
+        # Native-C path: matches Psi4 ccsd.cc:1742 compute_B_tilde.
+        # See pyscf/lib/cc/dlpno_b_tilde.c. Validation gates:
+        # water-4 E_TCCSD(T)=-304.98979787, water-10 E_TCCSD=-2.13088299002.
+        import ctypes
+        from pyscf import lib as _pyscflib
+        _libcc = getattr(compute_B_tilde, '_libcc', None)
+        if _libcc is None:
+            _libcc = _pyscflib.load_library('libcc')
+            _libcc.DLPNOcompute_B_tilde_pair.restype = None
+            _libcc.DLPNOcompute_B_tilde_pair.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+            ]
+            compute_B_tilde._libcc = _libcc
+        i_Qk_c = np.ascontiguousarray(i_Qk_t1)
+        j_Qk_c = np.ascontiguousarray(j_Qk_t1)
+        Qma_c = np.ascontiguousarray(Qma)
+        T2_c = np.ascontiguousarray(T2_ij)
+        n_local_c = i_Qk_c.shape[0]
+        B_local = np.empty((nlmo, nlmo))
+        _libcc.DLPNOcompute_B_tilde_pair(
+            B_local.ctypes.data_as(ctypes.c_void_p),
+            i_Qk_c.ctypes.data_as(ctypes.c_void_p),
+            j_Qk_c.ctypes.data_as(ctypes.c_void_p),
+            Qma_c.ctypes.data_as(ctypes.c_void_p),
+            T2_c.ctypes.data_as(ctypes.c_void_p),
+            n_local_c, nlmo, npno,
+        )
+    else:
+        B_local = i_Qk_t1.T @ j_Qk_t1            # (nlmo, nlmo)
+
+        # voov dressing (bare T2 per Psi4)
+        P = np.einsum('ab,Qka->kbQ', T2_ij, Qma)     # (nlmo, npno, n_local)
+        B_local += np.einsum('kbQ,Qlb->kl', P, Qma)
 
     # BTILDE_DUMP: parity dump vs Psi4 ccsd.cc compute_B_tilde.
     # Track per-key call count: first time we see (cc_ints, key) is iter 0.
