@@ -315,7 +315,20 @@ def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
     pair's local aux. The contraction is identical in structure to the
     legacy version, just summed over local-aux instead of full naux.
     """
-    from pyscf.cc.dlpno_tccsd._foo_dressed_cy import foo_dressed_one
+    # Phase II port: pyscf/lib/cc/dlpno_foo_dressed.c (PySCF native style).
+    # The C kernel takes Qma directly on the pair-domain axis (no scatter-back)
+    # and writes contributions only to nlmo_pair positions; caller scatters
+    # into the global foo via ci['p_lmos'].
+    import ctypes
+    from pyscf import lib as _pyscflib
+    _libcc = _pyscflib.load_library('libcc')
+    _libcc.DLPNOfoo_dressed_pair.restype = None
+    _libcc.DLPNOfoo_dressed_pair.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,            # out_q, out_m
+        ctypes.c_void_p, ctypes.c_void_p,            # Qma, t2
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,    # m_pos, q_pos, need_m
+        ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,  # n_local, nlmo_pair, n_pno
+    ]
 
     def _per_pair(key_mq):
         t2_mq_raw = t2_pno_all.get(key_mq)
@@ -325,22 +338,35 @@ def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
         if ci is None:
             return key_mq, None
         m, q = key_mq
-        # Qma reduced to (n_local, nlmo_p, npno); _foo_dressed_cy iterates
-        # over the second axis treating indices as global LMOs. Scatter
-        # back to (n_local, nocc, npno) to keep the kernel + aggregator
-        # unchanged. Will collapse this in the .pyx -> C sweep.
-        _Qma_red = ci['Qma']
-        Qma = np.zeros((_Qma_red.shape[0], nocc_lmo, _Qma_red.shape[2]))
-        Qma[:, ci['p_lmos'], :] = _Qma_red
-        nocc = Qma.shape[1]
-        contrib_q = np.zeros(nocc)
+        Qma = np.ascontiguousarray(ci['Qma'])  # (n_local, nlmo_p, npno)
+        t2_c = np.ascontiguousarray(t2_mq_raw)  # (n_pno, n_pno)
+        n_local, nlmo_p, n_pno = Qma.shape
+        m_pos = int(ci['p_lmos_dense'][m])
+        q_pos = int(ci['p_lmos_dense'][q])
+        if m_pos < 0 or q_pos < 0:
+            return key_mq, None  # pair endpoints always in p_lmos by construction
+        contrib_q = np.zeros(nlmo_p)
         if m != q:
-            contrib_m = np.zeros(nocc)
-            foo_dressed_one(Qma, t2_mq_raw, m, q, contrib_q, contrib_m)
+            contrib_m = np.zeros(nlmo_p)
+            _libcc.DLPNOfoo_dressed_pair(
+                contrib_q.ctypes.data_as(ctypes.c_void_p),
+                contrib_m.ctypes.data_as(ctypes.c_void_p),
+                Qma.ctypes.data_as(ctypes.c_void_p),
+                t2_c.ctypes.data_as(ctypes.c_void_p),
+                m_pos, q_pos, 1,
+                n_local, nlmo_p, n_pno,
+            )
         else:
             contrib_m = None
-            foo_dressed_one(Qma, t2_mq_raw, m, q, contrib_q, contrib_q)
-        return key_mq, (contrib_q, contrib_m)
+            _libcc.DLPNOfoo_dressed_pair(
+                contrib_q.ctypes.data_as(ctypes.c_void_p),
+                contrib_q.ctypes.data_as(ctypes.c_void_p),  # alias when m == q
+                Qma.ctypes.data_as(ctypes.c_void_p),
+                t2_c.ctypes.data_as(ctypes.c_void_p),
+                m_pos, q_pos, 0,
+                n_local, nlmo_p, n_pno,
+            )
+        return key_mq, (contrib_q, contrib_m, ci['p_lmos'])
 
     foo = np.zeros((nocc_lmo, nocc_lmo))
     pair_list = list(t2_pno_all.keys())
@@ -352,10 +378,10 @@ def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
         if payload is None:
             continue
         m, q = key_mq
-        contrib_q, contrib_m = payload
-        foo[:, q] += contrib_q
+        contrib_q, contrib_m, p_lmos = payload
+        foo[p_lmos, q] += contrib_q
         if contrib_m is not None:
-            foo[:, m] += contrib_m
+            foo[p_lmos, m] += contrib_m
     return foo
 
 
