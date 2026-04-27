@@ -1391,21 +1391,69 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
         sc = plan['scratch']
 
         with threadpool_limits(limits=1, user_api='blas'):
-            t1_fock_batched(
-                T1_flat, T1_off,
-                plan['K_chem_flat'], plan['K_chem_off'],
-                plan['K_ji_flat'], plan['K_ji_off'],
-                plan['K_ij_flat'], plan['K_ij_off'],
-                plan['Qma_flat'], plan['Qma_off'],
-                plan['Qab_flat'], plan['Qab_off'],
-                plan['e_pno_flat'], plan['e_pno_off'],
-                plan['nlmo_arr'], plan['npno_arr'],
-                plan['n_local_arr'], plan['need_dji_arr'],
-                sc['gamma'], sc['Y_trans'], sc['Y_alt'],
-                sc['Fia'], sc['Z_stacked'], sc['Z_xxx'],
-                d_flat, Fab_flat, plan['Fab_off'],
-                plan['num_threads'],
-            )
+            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+                # Native-C path: matches Psi4 ccsd.cc:1571 t1_fock Step 1
+                # (d_ij/d_ji) + Step 2 (Fia/Fab dressing). See
+                # pyscf/lib/cc/dlpno_t1_fock.c::DLPNOt1_fock_batched.
+                # Same flat-buffer plan + per-thread scratch as Cython.
+                import ctypes
+                from pyscf import lib as _pyscflib
+                _libcc = getattr(t1_fock, '_libcc', None)
+                if _libcc is None:
+                    _libcc = _pyscflib.load_library('libcc')
+                    _libcc.DLPNOt1_fock_batched.restype = None
+                    _libcc.DLPNOt1_fock_batched.argtypes = (
+                        [ctypes.c_void_p] * 18 +              # 7 ptr/off pairs + 4 shape arrays
+                        [ctypes.c_void_p, ctypes.c_size_t] * 6 +  # 6 scratch (ptr + stride)
+                        [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # d, Fab, Fab_off
+                         ctypes.c_size_t, ctypes.c_int])
+                    t1_fock._libcc = _libcc
+                _libcc.DLPNOt1_fock_batched(
+                    T1_flat.ctypes.data_as(ctypes.c_void_p),
+                    T1_off.ctypes.data_as(ctypes.c_void_p),
+                    plan['K_chem_flat'].ctypes.data_as(ctypes.c_void_p),
+                    plan['K_chem_off'].ctypes.data_as(ctypes.c_void_p),
+                    plan['K_ji_flat'].ctypes.data_as(ctypes.c_void_p),
+                    plan['K_ji_off'].ctypes.data_as(ctypes.c_void_p),
+                    plan['K_ij_flat'].ctypes.data_as(ctypes.c_void_p),
+                    plan['K_ij_off'].ctypes.data_as(ctypes.c_void_p),
+                    plan['Qma_flat'].ctypes.data_as(ctypes.c_void_p),
+                    plan['Qma_off'].ctypes.data_as(ctypes.c_void_p),
+                    plan['Qab_flat'].ctypes.data_as(ctypes.c_void_p),
+                    plan['Qab_off'].ctypes.data_as(ctypes.c_void_p),
+                    plan['e_pno_flat'].ctypes.data_as(ctypes.c_void_p),
+                    plan['e_pno_off'].ctypes.data_as(ctypes.c_void_p),
+                    plan['nlmo_arr'].ctypes.data_as(ctypes.c_void_p),
+                    plan['npno_arr'].ctypes.data_as(ctypes.c_void_p),
+                    plan['n_local_arr'].ctypes.data_as(ctypes.c_void_p),
+                    plan['need_dji_arr'].ctypes.data_as(ctypes.c_void_p),
+                    sc['gamma'].ctypes.data_as(ctypes.c_void_p), sc['gamma'].shape[1],
+                    sc['Y_trans'].ctypes.data_as(ctypes.c_void_p), sc['Y_trans'].shape[1],
+                    sc['Y_alt'].ctypes.data_as(ctypes.c_void_p), sc['Y_alt'].shape[1],
+                    sc['Fia'].ctypes.data_as(ctypes.c_void_p), sc['Fia'].shape[1],
+                    sc['Z_stacked'].ctypes.data_as(ctypes.c_void_p), sc['Z_stacked'].shape[1],
+                    sc['Z_xxx'].ctypes.data_as(ctypes.c_void_p), sc['Z_xxx'].shape[1],
+                    d_flat.ctypes.data_as(ctypes.c_void_p),
+                    Fab_flat.ctypes.data_as(ctypes.c_void_p),
+                    plan['Fab_off'].ctypes.data_as(ctypes.c_void_p),
+                    N, plan['num_threads'],
+                )
+            else:
+                t1_fock_batched(
+                    T1_flat, T1_off,
+                    plan['K_chem_flat'], plan['K_chem_off'],
+                    plan['K_ji_flat'], plan['K_ji_off'],
+                    plan['K_ij_flat'], plan['K_ij_off'],
+                    plan['Qma_flat'], plan['Qma_off'],
+                    plan['Qab_flat'], plan['Qab_off'],
+                    plan['e_pno_flat'], plan['e_pno_off'],
+                    plan['nlmo_arr'], plan['npno_arr'],
+                    plan['n_local_arr'], plan['need_dji_arr'],
+                    sc['gamma'], sc['Y_trans'], sc['Y_alt'],
+                    sc['Fia'], sc['Z_stacked'], sc['Z_xxx'],
+                    d_flat, Fab_flat, plan['Fab_off'],
+                    plan['num_threads'],
+                )
 
         # Scatter outputs
         Fab_off_plan = plan['Fab_off']

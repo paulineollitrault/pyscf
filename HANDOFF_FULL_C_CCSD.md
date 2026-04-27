@@ -54,7 +54,7 @@ One C source file per Psi4 function, matching ccsd.cc structure:
 | Psi4 function | New C file | Lines (est) | Status |
 |---|---|---|---|
 | `t1_ints` (ccsd.cc:1491) | `dlpno_t1_ints.c` | 100 | DONE (session 3, 2026-04-27) |
-| `t1_fock` (ccsd.cc:1540) | `dlpno_t1_fock.c` | 200 | TODO |
+| `t1_fock` (ccsd.cc:1571) | `dlpno_t1_fock.c` | 200 | DONE (session 6, 2026-04-27) — Step 1 (d_ij/d_ji) + Step 2 (Fia/Fab dressing) ported; Fkj LMO-domain dressing (Eq 94, ~20 lines) stays in Python |
 | `compute_B_tilde` (ccsd.cc:1688) | `dlpno_b_tilde.c` | 50 | DONE (session 1, 2026-04-27) |
 | `compute_C_tilde` (ccsd.cc:1809) | `dlpno_c_tilde.c` | 100 | Phase 1 (Terms 1+2) DONE (session 4, 2026-04-27); Phase 2 (Terms 3+4) TODO |
 | `compute_D_tilde` (ccsd.cc:1991) | `dlpno_d_tilde.c` | 100 | Phase 1 (Terms 1+2) DONE (session 5, 2026-04-27); Phase 2 (Terms 3+4) TODO |
@@ -129,7 +129,8 @@ Each session: one C function, pattern matches the foo_dressed / per_i / partner 
 | 3 (DONE 2026-04-27) | `dlpno_t1_ints.c` (~85 lines incl. comments) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, T1INTS_DUMP py-vs-C aggregates match to last 1-2 digits |
 | 4 (Phase 1 DONE 2026-04-27) | `dlpno_c_tilde.c` (~100 lines, Phase 1 only — Terms 1+2 dgemv+dgemm) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, synthetic-plan Cython-vs-C max abs 1.1e-14 / max rel 1.7e-12. Phase 2 (Terms 3+4 t3/t4 plan-cached kernels) deferred to a follow-up session. |
 | 5 (Phase 1 DONE 2026-04-27) | `dlpno_d_tilde.c` (~125 lines incl. comments, Phase 1 only — Terms 1+2: 2× dgemv + transpose-add + dgemm) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, synthetic-plan Cython-vs-C max abs 1.4e-14 / max rel 2.0e-12. Phase 2 (Terms 3+4 t3/t4 plan-cached) deferred. |
-| 6-7 | `dlpno_t1_fock.c` (~200 lines) | water-4/10 anchor, FKJ_DUMP diff |
+| 6 (DONE 2026-04-27) | `dlpno_t1_fock.c` (~210 lines incl. comments) — Step 1 + Step 2 (6 BLAS + 2 transpose copies per pair) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, synthetic-plan Cython-vs-C: d 2.8e-14, Fab 6.8e-12 abs / 3.7e-12 rel; FKJ_DUMP aggregates match to last 1-2 digits |
+| 7 (folded into 6) | (was Step-2 split) | combined into session 6 above |
 | 8-9 | `dlpno_t1_residual.c` (~200 lines) | water-4/10 anchor, R1 dumps |
 | 10-12 | `dlpno_t2_residual.c` (~400 lines, the big one) | water-4/10 anchor, R2 dumps |
 | 13-14 | `dlpno_ccsd_cycle.c` integration: glue function calling all the above; replaces the Python while-loop body | water-4/10/22 anchors, perf vs Psi4 |
