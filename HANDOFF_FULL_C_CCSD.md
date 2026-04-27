@@ -59,7 +59,7 @@ One C source file per Psi4 function, matching ccsd.cc structure:
 | `compute_C_tilde` (ccsd.cc:1809) | `dlpno_c_tilde.c` | 100 | Phase 1 (Terms 1+2) DONE (session 4, 2026-04-27); Phase 2 (Terms 3+4) TODO |
 | `compute_D_tilde` (ccsd.cc:1991) | `dlpno_d_tilde.c` | 100 | Phase 1 (Terms 1+2) DONE (session 5, 2026-04-27); Phase 2 (Terms 3+4) TODO |
 | `compute_G_tilde` (ccsd.cc:2085) | `dlpno_g_tilde.c` | 50 | DONE (session 2, 2026-04-27) |
-| T1 residual (ccsd.cc:2073-2230) | `dlpno_t1_residual.c` | 200 | TODO |
+| T1 residual (ccsd.cc:2073-2230) | `dlpno_t1_residual.c` | 200 | per-(k,l) B+A2 batched DONE (session 8, 2026-04-27); per-i Stages 4-5 + A+C k-loop still Python (small) |
 | T2 residual (ccsd.cc:2240-2500) | `dlpno_t2_residual.c` | 400 | TODO |
 | Cycle integration | `dlpno_ccsd_cycle.c` | 100 | TODO |
 | **Total** | | **~1300 lines** | |
@@ -131,7 +131,8 @@ Each session: one C function, pattern matches the foo_dressed / per_i / partner 
 | 5 (Phase 1 DONE 2026-04-27) | `dlpno_d_tilde.c` (~125 lines incl. comments, Phase 1 only — Terms 1+2: 2× dgemv + transpose-add + dgemm) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, synthetic-plan Cython-vs-C max abs 1.4e-14 / max rel 2.0e-12. Phase 2 (Terms 3+4 t3/t4 plan-cached) deferred. |
 | 6 (DONE 2026-04-27) | `dlpno_t1_fock.c` (~210 lines incl. comments) — Step 1 + Step 2 (6 BLAS + 2 transpose copies per pair) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, synthetic-plan Cython-vs-C: d 2.8e-14, Fab 6.8e-12 abs / 3.7e-12 rel; FKJ_DUMP aggregates match to last 1-2 digits |
 | 7 (folded into 6) | (was Step-2 split) | combined into session 6 above |
-| 8-9 | `dlpno_t1_residual.c` (~200 lines) | water-4/10 anchor, R1 dumps |
+| 8 (DONE 2026-04-27) | `dlpno_t1_residual.c` (~225 lines incl. comments) — per-(k,l) B+A2 reduction kernel ported (the 1600-tasks/cycle hot loop) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓. Per-i Stages 4-5 + A+C k-loop still Python; can be wrapped in a future session if needed. |
+| 9 (folded into 8) | (was per-i Stages 4-5) | per-i orchestration is small enough to leave in Python; collapsed into session 8 |
 | 10-12 | `dlpno_t2_residual.c` (~400 lines, the big one) | water-4/10 anchor, R2 dumps |
 | 13-14 | `dlpno_ccsd_cycle.c` integration: glue function calling all the above; replaces the Python while-loop body | water-4/10/22 anchors, perf vs Psi4 |
 | 15+ | Cleanup: delete legacy batched Python paths, delete Cython kernels superseded by C, finalize Python driver to ~200 lines | water-22 perf measurement |
