@@ -3901,17 +3901,54 @@ def _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
         Kt1_ki = np.empty((num_threads, max_n_ki))
         t3_tiles = np.zeros(int(bv['t3_tile_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            t3_kernel_batched(
-                t3_N, max_n_ki, max_n_kl,
-                bv['t3_n_kl'], bv['t3_n_ki'],
-                bv['t3_K_off'], bv['t3_S_off'],
-                bv['t3_t1i_off'], bv['t3_T1l_off'],
-                bv['t3_tile_off'],
-                bv['t3_K_flat'], bv['t3_S_flat'],
-                t1_cache._buffer,
-                Kt1, Kt1_ki,
-                t3_tiles, num_threads,
-            )
+            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+                import ctypes as _ct
+                from pyscf import lib as _pyscflib
+                _libcc = getattr(_run_t34_batched, '_libcc', None)
+                if _libcc is None:
+                    _libcc = _pyscflib.load_library('libcc')
+                    _libcc.DLPNOt3_kernel_batched.restype = None
+                    _libcc.DLPNOt3_kernel_batched.argtypes = (
+                        [_ct.c_int]
+                        + [_ct.c_void_p] * 10
+                        + [_ct.c_void_p, _ct.c_size_t] * 2
+                        + [_ct.c_void_p, _ct.c_int])
+                    _libcc.DLPNOt4_kernel_batched.restype = None
+                    _libcc.DLPNOt4_kernel_batched.argtypes = (
+                        [_ct.c_int]
+                        + [_ct.c_void_p] * 14
+                        + [_ct.c_void_p, _ct.c_size_t] * 3
+                        + [_ct.c_void_p, _ct.c_double, _ct.c_int])
+                    _run_t34_batched._libcc = _libcc
+                _libcc.DLPNOt3_kernel_batched(
+                    int(t3_N),
+                    bv['t3_n_kl'].ctypes.data_as(_ct.c_void_p),
+                    bv['t3_n_ki'].ctypes.data_as(_ct.c_void_p),
+                    bv['t3_K_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['t3_S_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['t3_t1i_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['t3_T1l_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['t3_tile_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['t3_K_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['t3_S_flat'].ctypes.data_as(_ct.c_void_p),
+                    t1_cache._buffer.ctypes.data_as(_ct.c_void_p),
+                    Kt1.ctypes.data_as(_ct.c_void_p), Kt1.shape[1],
+                    Kt1_ki.ctypes.data_as(_ct.c_void_p), Kt1_ki.shape[1],
+                    t3_tiles.ctypes.data_as(_ct.c_void_p),
+                    int(num_threads),
+                )
+            else:
+                t3_kernel_batched(
+                    t3_N, max_n_ki, max_n_kl,
+                    bv['t3_n_kl'], bv['t3_n_ki'],
+                    bv['t3_K_off'], bv['t3_S_off'],
+                    bv['t3_t1i_off'], bv['t3_T1l_off'],
+                    bv['t3_tile_off'],
+                    bv['t3_K_flat'], bv['t3_S_flat'],
+                    t1_cache._buffer,
+                    Kt1, Kt1_ki,
+                    t3_tiles, num_threads,
+                )
         # Scatter contrib tiles into flat_out (-= for both C and D —
         # the sign is absorbed into the kernel via the negative T1l).
         # Reference scatters with `out[idx] += contrib`, kernel stores
@@ -3976,18 +4013,45 @@ def _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
         tmp3 = np.empty((num_threads, max_n_ki * max_n_kl))
         t4_tiles = np.zeros(int(bv['t4_tile_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            t4_kernel_batched(
-                t4_N, max_n_ki, max_n_li, max_n_kl,
-                bv['t4_n_ki'], bv['t4_n_li'], bv['t4_n_kl'],
-                bv['t4_S_ki_li_off'], bv['t4_t2_off'][:t4_N],
-                bv['t4_S_li_kl_off'], bv['t4_K_off'],
-                bv['t4_S_kl_ki_off'], bv['t4_tile_off'],
-                bv['t4_S_ki_li_flat'], bv['t4_S_li_kl_flat'],
-                bv['t4_K_flat'], bv['t4_S_kl_ki_flat'],
-                t2_flat,
-                tmp1, tmp2, tmp3,
-                t4_tiles, t4_scale, num_threads,
-            )
+            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+                import ctypes as _ct
+                _libcc = _run_t34_batched._libcc
+                t4_t2_off_view = np.ascontiguousarray(bv['t4_t2_off'][:t4_N])
+                _libcc.DLPNOt4_kernel_batched(
+                    int(t4_N),
+                    bv['t4_n_ki'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_n_li'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_n_kl'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_S_ki_li_off'].ctypes.data_as(_ct.c_void_p),
+                    t4_t2_off_view.ctypes.data_as(_ct.c_void_p),
+                    bv['t4_S_li_kl_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_K_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_S_kl_ki_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_tile_off'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_S_ki_li_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_S_li_kl_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_K_flat'].ctypes.data_as(_ct.c_void_p),
+                    bv['t4_S_kl_ki_flat'].ctypes.data_as(_ct.c_void_p),
+                    t2_flat.ctypes.data_as(_ct.c_void_p),
+                    tmp1.ctypes.data_as(_ct.c_void_p), tmp1.shape[1],
+                    tmp2.ctypes.data_as(_ct.c_void_p), tmp2.shape[1],
+                    tmp3.ctypes.data_as(_ct.c_void_p), tmp3.shape[1],
+                    t4_tiles.ctypes.data_as(_ct.c_void_p),
+                    float(t4_scale), int(num_threads),
+                )
+            else:
+                t4_kernel_batched(
+                    t4_N, max_n_ki, max_n_li, max_n_kl,
+                    bv['t4_n_ki'], bv['t4_n_li'], bv['t4_n_kl'],
+                    bv['t4_S_ki_li_off'], bv['t4_t2_off'][:t4_N],
+                    bv['t4_S_li_kl_off'], bv['t4_K_off'],
+                    bv['t4_S_kl_ki_off'], bv['t4_tile_off'],
+                    bv['t4_S_ki_li_flat'], bv['t4_S_li_kl_flat'],
+                    bv['t4_K_flat'], bv['t4_S_kl_ki_flat'],
+                    t2_flat,
+                    tmp1, tmp2, tmp3,
+                    t4_tiles, t4_scale, num_threads,
+                )
         t4_tile_off = bv['t4_tile_off']
         t4_target = bv['t4_target_slot']
         t4_n_ki = bv['t4_n_ki']
