@@ -3255,6 +3255,37 @@ def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
             items_by_shape.setdefault((n_ij, n_kl), []).append(
                 (key_ij, key_kl, k, l, k == l, S, K_kl))
 
+    # Plan-time B_tilde flat-buffer layout (session 14a): pre-flatten the
+    # variable-shape per-pair B_local matrices so the C kernel can read
+    # β_kl / β_lk via absolute offsets — eliminates the per-bucket Python
+    # gather loop (~50 ms / cycle on water-10).
+    B_flat_off_per_pair = {}
+    B_pair_nlmo = {}
+    p_dense_per_pair = {}
+    B_flat_size = 0
+    for key_ij in strong_keys:
+        if pno_spaces[key_ij]['C_pno'].shape[1] == 0:
+            continue
+        if pair_lmo_idx is not None and key_ij in pair_lmo_idx:
+            lmo_idx = np.asarray(pair_lmo_idx[key_ij])
+        else:
+            lmo_idx = np.arange(nocc)
+        nlmo_ij = int(lmo_idx.size)
+        B_flat_off_per_pair[key_ij] = B_flat_size
+        B_pair_nlmo[key_ij] = nlmo_ij
+        p_dense = np.full(nocc, -1, dtype=np.int64)
+        p_dense[lmo_idx] = np.arange(nlmo_ij, dtype=np.int64)
+        p_dense_per_pair[key_ij] = p_dense
+        B_flat_size += nlmo_ij * nlmo_ij
+
+    # Per-item canonical T2 offset into t2_pno_all._buffer.
+    has_flat_t2 = (hasattr(t2_pno_all, '_buffer')
+                   and hasattr(t2_pno_all, '_offsets')
+                   and hasattr(t2_pno_all, '_canon_to_idx'))
+    if has_flat_t2:
+        canon_to_idx = t2_pno_all._canon_to_idx
+        t2_offsets_arr = t2_pno_all._offsets
+
     buckets = []
     for (n_ij, n_kl), items in items_by_shape.items():
         N = len(items)
@@ -3262,8 +3293,12 @@ def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         K_arr = np.empty((N, n_kl, n_kl))
         same_arr = np.empty(N, dtype=np.uint8)
         item_idx = np.empty(N, dtype=np.intp)
-        kl_keys = []       # per-item key_kl for T lookup
-        beta_coords = []   # per-item (key_ij, k, l) for β lookup
+        kl_keys = []
+        beta_coords = []
+        # Session 14a flat-offset arrays
+        t2_off = np.empty(N, dtype=np.int64) if has_flat_t2 else None
+        B_kl_off = np.empty(N, dtype=np.int64)
+        B_lk_off = np.empty(N, dtype=np.int64)
         for n, (key_ij, key_kl, k, l, same, S, K_kl) in enumerate(items):
             S_arr[n] = S
             K_arr[n] = K_kl
@@ -3271,17 +3306,32 @@ def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
             item_idx[n] = pair_to_slot[key_ij]
             kl_keys.append(key_kl)
             beta_coords.append((key_ij, k, l))
+            if t2_off is not None:
+                t2_off[n] = int(t2_offsets_arr[canon_to_idx[key_kl]])
+            nlmo_ij = B_pair_nlmo[key_ij]
+            base = B_flat_off_per_pair[key_ij]
+            p_dense = p_dense_per_pair[key_ij]
+            kp = int(p_dense[k])
+            lp = int(p_dense[l])
+            B_kl_off[n] = base + kp * nlmo_ij + lp
+            B_lk_off[n] = -1 if k == l else (base + lp * nlmo_ij + kp)
         buckets.append({
             'n_ij': n_ij, 'n_kl': n_kl,
             'S': S_arr, 'K': K_arr,
             'same': same_arr, 'item_idx': item_idx,
             'kl_keys': kl_keys, 'beta_coords': beta_coords,
+            't2_off': t2_off,
+            'B_kl_off': B_kl_off, 'B_lk_off': B_lk_off,
         })
 
     return {
         'buckets': buckets,
         'pairs_by_n_ij': pairs_by_n_ij,
         'pair_to_slot': pair_to_slot,
+        'B_flat_size': B_flat_size,
+        'B_flat_off_per_pair': B_flat_off_per_pair,
+        'B_pair_nlmo': B_pair_nlmo,
+        'has_flat_t2': has_flat_t2,
     }
 
 
@@ -3328,6 +3378,25 @@ def compute_B_E_batched_v2(
         flat_B[n_ij] = np.zeros((len(pairs), n_ij, n_ij))
         flat_E[n_ij] = np.zeros((len(pairs), n_ij, n_ij))
 
+    # Session 14a: build B_flat once per cycle (replaces per-item Python
+    # dict lookups + p_dense indexing in the inner bucket loop).
+    _use_v2 = (int(os.environ.get('DLPNO_C_CYCLE', '0'))
+               and plan.get('has_flat_t2', False))
+    B_flat = None
+    if _use_v2:
+        B_flat = np.zeros(plan['B_flat_size'])
+        for key_ij, off in plan['B_flat_off_per_pair'].items():
+            bt = B_tilde_per_ij.get(key_ij)
+            if bt is None:
+                continue
+            if isinstance(bt, tuple):
+                B_local, _ = bt
+            else:
+                B_local = bt
+            nlmo = plan['B_pair_nlmo'][key_ij]
+            if B_local is not None and B_local.size == nlmo * nlmo:
+                B_flat[off:off + nlmo * nlmo] = B_local.ravel()
+
     # Per-cycle gather + kernel dispatch, one bucket at a time.
     # Scope OpenMP to ``omp_threads`` so the nogil prange inside be_kernel
     # actually runs in parallel (the CCSD driver caps OMP=1 at import time
@@ -3337,6 +3406,34 @@ def compute_B_E_batched_v2(
             n_ij = bucket['n_ij']
             n_kl = bucket['n_kl']
             N = len(bucket['kl_keys'])
+            if _use_v2:
+                # Session 14a fast path: all per-item gathers fold into C.
+                import ctypes as _ct
+                from pyscf import lib as _pyscflib
+                _libcc = getattr(compute_B_E_batched_v2, '_libcc_v2', None)
+                if _libcc is None:
+                    _libcc = _pyscflib.load_library('libcc')
+                    _libcc.DLPNObe_kernel_v2.restype = None
+                    _libcc.DLPNObe_kernel_v2.argtypes = (
+                        [_ct.c_void_p] * 11
+                        + [_ct.c_size_t] * 3 + [_ct.c_int])
+                    compute_B_E_batched_v2._libcc_v2 = _libcc
+                _libcc.DLPNObe_kernel_v2(
+                    bucket['S'].ctypes.data_as(_ct.c_void_p),
+                    t2_pno_all._buffer.ctypes.data_as(_ct.c_void_p),
+                    bucket['t2_off'].ctypes.data_as(_ct.c_void_p),
+                    bucket['K'].ctypes.data_as(_ct.c_void_p),
+                    B_flat.ctypes.data_as(_ct.c_void_p),
+                    bucket['B_kl_off'].ctypes.data_as(_ct.c_void_p),
+                    bucket['B_lk_off'].ctypes.data_as(_ct.c_void_p),
+                    bucket['same'].ctypes.data_as(_ct.c_void_p),
+                    bucket['item_idx'].astype(np.int64, copy=False).ctypes.data_as(_ct.c_void_p),
+                    flat_B[n_ij].ctypes.data_as(_ct.c_void_p),
+                    flat_E[n_ij].ctypes.data_as(_ct.c_void_p),
+                    N, n_ij, n_kl,
+                    int(omp_threads if omp_threads else 16),
+                )
+                continue
             T_arr = np.empty((N, n_kl, n_kl))
             beta_kl_arr = np.empty(N)
             beta_lk_arr = np.empty(N)
