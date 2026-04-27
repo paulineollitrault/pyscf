@@ -325,15 +325,53 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
 
     # G_addition is what the kernel adds onto G. Pass G itself; kernel does
     # G[i, j] += sum_ij in place. (G already initialized to Fkj copy above.)
-    g_tilde_batched(
-        plan['triple_eff_offset'], plan['triple_T2_pair_idx'],
-        plan['triple_n_lj'],
-        plan['ij_triple_starts'], plan['ij_i_arr'], plan['ij_j_arr'],
-        plan['effective_flat'],
-        T2_flat, plan['T2_offsets'],
-        G,
-        plan['num_threads'],
-    )
+    if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+        # Native-C path: matches Psi4 ccsd.cc:2085 compute_G_tilde via
+        # the same plan-cached effective tensors. See
+        # pyscf/lib/cc/dlpno_g_tilde.c::DLPNOcompute_G_tilde_inner.
+        import ctypes
+        from pyscf import lib as _pyscflib
+        _libcc = getattr(build_G_tilde, '_libcc', None)
+        if _libcc is None:
+            _libcc = _pyscflib.load_library('libcc')
+            _libcc.DLPNOcompute_G_tilde_inner.restype = None
+            _libcc.DLPNOcompute_G_tilde_inner.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t, ctypes.c_size_t,
+            ]
+            build_G_tilde._libcc = _libcc
+        n_ij_slots = plan['ij_i_arr'].shape[0]
+        naocc = G.shape[0]
+        # Ensure G is C-contiguous and writable in place (Fkj.copy() above
+        # makes it so, but a defensive ascontiguousarray is cheap).
+        if not G.flags['C_CONTIGUOUS']:
+            G = np.ascontiguousarray(G)
+        _libcc.DLPNOcompute_G_tilde_inner(
+            plan['triple_eff_offset'].ctypes.data_as(ctypes.c_void_p),
+            plan['triple_T2_pair_idx'].ctypes.data_as(ctypes.c_void_p),
+            plan['triple_n_lj'].ctypes.data_as(ctypes.c_void_p),
+            plan['ij_triple_starts'].ctypes.data_as(ctypes.c_void_p),
+            plan['ij_i_arr'].ctypes.data_as(ctypes.c_void_p),
+            plan['ij_j_arr'].ctypes.data_as(ctypes.c_void_p),
+            plan['effective_flat'].ctypes.data_as(ctypes.c_void_p),
+            T2_flat.ctypes.data_as(ctypes.c_void_p),
+            plan['T2_offsets'].ctypes.data_as(ctypes.c_void_p),
+            G.ctypes.data_as(ctypes.c_void_p),
+            n_ij_slots, naocc,
+        )
+    else:
+        g_tilde_batched(
+            plan['triple_eff_offset'], plan['triple_T2_pair_idx'],
+            plan['triple_n_lj'],
+            plan['ij_triple_starts'], plan['ij_i_arr'], plan['ij_j_arr'],
+            plan['effective_flat'],
+            T2_flat, plan['T2_offsets'],
+            G,
+            plan['num_threads'],
+        )
 
     # GTILDE_DUMP: parity dump vs Psi4 ccsd.cc:1943 compute_G_tilde.
     # G is the full (nocc, nocc) double-dressed Fock oo. Track per-call

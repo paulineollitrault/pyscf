@@ -58,7 +58,7 @@ One C source file per Psi4 function, matching ccsd.cc structure:
 | `compute_B_tilde` (ccsd.cc:1688) | `dlpno_b_tilde.c` | 50 | DONE (session 1, 2026-04-27) |
 | `compute_C_tilde` (ccsd.cc:1809) | `dlpno_c_tilde.c` | 100 | TODO |
 | `compute_D_tilde` (ccsd.cc:1991) | `dlpno_d_tilde.c` | 100 | TODO |
-| `compute_G_tilde` (ccsd.cc:1969) | `dlpno_g_tilde.c` | 50 | TODO |
+| `compute_G_tilde` (ccsd.cc:2085) | `dlpno_g_tilde.c` | 50 | DONE (session 2, 2026-04-27) |
 | T1 residual (ccsd.cc:2073-2230) | `dlpno_t1_residual.c` | 200 | TODO |
 | T2 residual (ccsd.cc:2240-2500) | `dlpno_t2_residual.c` | 400 | TODO |
 | Cycle integration | `dlpno_ccsd_cycle.c` | 100 | TODO |
@@ -125,7 +125,7 @@ Each session: one C function, pattern matches the foo_dressed / per_i / partner 
 | Session | Function | Validation |
 |---|---|---|
 | 1 (DONE 2026-04-27) | `dlpno_b_tilde.c` (~100 lines incl. comments) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, BTILDE_DUMP py-vs-C max abs 1.1e-11 over 306 dumps |
-| 2 | `dlpno_g_tilde.c` (small, ~50 lines) | water-4/10 anchor, GTILDE_DUMP diff |
+| 2 (DONE 2026-04-27) | `dlpno_g_tilde.c` (~75 lines incl. comments) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, GTILDE_DUMP py-vs-C diff: last-digit FP-reorder noise across 3 iters |
 | 3 | `dlpno_t1_ints.c` (~100 lines) | water-4/10 anchor, T1INTS_DUMP diff |
 | 4 | `dlpno_c_tilde.c` (~100 lines) | water-4/10 anchor, CTILDE_DUMP diff |
 | 5 | `dlpno_d_tilde.c` (~100 lines) | water-4/10 anchor, DTILDE_DUMP diff |
@@ -144,7 +144,7 @@ Same algorithm location in our codebase + Psi4 (memorize these):
 | compute_B_tilde | `ccsd.cc:1688` | `local_df.py:1273` | `dlpno_b_tilde.c` |
 | compute_C_tilde | `ccsd.cc:1809` | `residual.py:compute_C_tilde_psi4` (already ported) | `dlpno_c_tilde.c` |
 | compute_D_tilde | `ccsd.cc:1991` | `residual.py:build_D_tilde_psi4` (already ported) | `dlpno_d_tilde.c` |
-| compute_G_tilde | `ccsd.cc:1969` | `residual.py:build_G_tilde_psi4` (already ported) | `dlpno_g_tilde.c` |
+| compute_G_tilde | `ccsd.cc:2085` | `residual.py:build_G_tilde_psi4` (Psi4-faithful) / `residual.py:build_G_tilde` (plan-cached, default; native-C path now lives here under DLPNO_C_CYCLE) | `dlpno_g_tilde.c` |
 | t1_ints | `ccsd.cc:1491` | `local_df.py:t1_ints` | `dlpno_t1_ints.c` |
 | t1_fock | `ccsd.cc:1540` | `local_df.py:t1_fock` | `dlpno_t1_fock.c` |
 | T1 residual | `ccsd.cc:2073` | `lccsd.py:_compute_t1_residual_psi4` | `dlpno_t1_residual.c` |
