@@ -14,7 +14,7 @@
 
 add_library(cc SHARED
   ccsd_pack.c ccsd_grad.c ccsd_t.c ccsd_t_lambda.c uccsd_t.c
-  dlpno_foo_dressed.c dlpno_per_i.c)
+  dlpno_foo_dressed.c dlpno_per_i.c dlpno_partner.c)
 add_dependencies(cc np_helper ao2mo)
 
 set_target_properties(cc PROPERTIES

@@ -594,7 +594,44 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     cc_ints = {}
     key_set = set(keys)
 
-    from pyscf.cc.dlpno_tccsd._cc_ints_partner_cy import partner_apply
+    # Phase II: pyscf/lib/cc/dlpno_partner.c — replaces _cc_ints_partner_cy.pyx.
+    import ctypes as _ctypes_pa
+    from pyscf import lib as _pyscflib_pa
+    _libcc_pa = _pyscflib_pa.load_library('libcc')
+    _libcc_pa.DLPNOpartner_apply.restype = None
+    _libcc_pa.DLPNOpartner_apply.argtypes = [
+        _ctypes_pa.c_void_p, _ctypes_pa.c_void_p,           # proj_ij, qia_b
+        _ctypes_pa.c_void_p, _ctypes_pa.c_void_p,           # local_Q, idx
+        _ctypes_pa.c_void_p,                                # X
+        _ctypes_pa.c_void_p, _ctypes_pa.c_void_p,           # raw_cross_out, raw_kv_out
+        _ctypes_pa.c_int, _ctypes_pa.c_int,                 # k_s, do_proj
+        _ctypes_pa.c_size_t, _ctypes_pa.c_size_t,           # nQp, npno
+        _ctypes_pa.c_size_t, _ctypes_pa.c_size_t,           # np_full, nl
+        _ctypes_pa.c_size_t, _ctypes_pa.c_size_t,           # n_kj, npp
+        _ctypes_pa.c_size_t,                                # n_local_total
+    ]
+
+    def partner_apply(proj_ij, qia_b, k_s,
+                      local_Q, idx, X,
+                      raw_cross_out, raw_kv_out, do_proj):
+        nQp = local_Q.shape[0]
+        npno = proj_ij.shape[1] if proj_ij is not None else 0
+        np_full = qia_b.shape[2]
+        nl = qia_b.shape[1]
+        n_kj = X.shape[1]
+        npp = idx.shape[0]
+        n_local_total = raw_cross_out.shape[0]
+        _libcc_pa.DLPNOpartner_apply(
+            proj_ij.ctypes.data_as(_ctypes_pa.c_void_p),
+            qia_b.ctypes.data_as(_ctypes_pa.c_void_p),
+            local_Q.ctypes.data_as(_ctypes_pa.c_void_p),
+            idx.ctypes.data_as(_ctypes_pa.c_void_p),
+            X.ctypes.data_as(_ctypes_pa.c_void_p),
+            raw_cross_out.ctypes.data_as(_ctypes_pa.c_void_p),
+            raw_kv_out.ctypes.data_as(_ctypes_pa.c_void_p),
+            int(k_s), int(do_proj),
+            nQp, npno, np_full, nl, n_kj, npp, n_local_total,
+        )
 
     def _process_pair(key):
         """Build cc_ints[key] entry. Pure function — safe for thread parallel."""
