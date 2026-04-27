@@ -1815,6 +1815,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         _pool=_pool)
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
+    _t_post_ccints = _time_cc.perf_counter()
 
     # ------------------------------------------------------------------
     # Phase 2c + 2e of the restructure — now happens in one block right
@@ -1885,6 +1886,22 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # via numpy @ / np.ix_, so ThreadPool scales near-linearly with
     # `_pool` size when OMP_NUM_THREADS=1.  Without the pool, falls
     # back to the serial path.
+    # Native-C S_pno builder: per-pair-A all-partners-B in one C call.
+    # Eliminates ~25k Python compute_S_pno dispatches on water-10 (~5s wall).
+    _use_spno_c = bool(int(os.environ.get('DLPNO_C_CYCLE', '0')))
+    if _use_spno_c:
+        import ctypes as _ct
+        from pyscf import lib as _pyscflib
+        _libcc_spno = _pyscflib.load_library('libcc')
+        _libcc_spno.DLPNObuild_S_pno_for_pair.restype = None
+        _libcc_spno.DLPNObuild_S_pno_for_pair.argtypes = (
+            [_ct.c_void_p, _ct.c_void_p,
+             _ct.c_int, _ct.c_int, _ct.c_int]
+            + [_ct.c_void_p] * 8
+            + [_ct.c_void_p, _ct.c_size_t])
+        _S_pao_full_c = np.ascontiguousarray(S_pao_full)
+        _n_pao_total = _S_pao_full_c.shape[0]
+
     def _build_one_key(key_ij):
         if pair_lmo_idx is not None and key_ij in pair_lmo_idx:
             _dom = [int(x) for x in pair_lmo_idx[key_ij]]
@@ -1894,12 +1911,103 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             ]
         else:
             _partner_keys = _all_pair_keys
-        out = {}
+
+        if not _use_spno_c:
+            out = {}
+            for key_kl in _partner_keys:
+                out[(key_ij, key_kl)] = _compute_S_pno(
+                    key_ij, key_kl, pno_spaces, S_pao_full, s1e)
+            return out
+
+        # C path: gather partner X / pair_paos into flat buffers and dispatch
+        # one DLPNObuild_S_pno_for_pair call per pair_a.
+        pd_a = pno_spaces[key_ij]
+        X_a_full = pd_a.get('X_pno')
+        pp_a = pd_a.get('pair_paos')
+        if X_a_full is None or pp_a is None:
+            # Some partner key_kl might also lack X_pno; fall back.
+            out = {}
+            for key_kl in _partner_keys:
+                out[(key_ij, key_kl)] = _compute_S_pno(
+                    key_ij, key_kl, pno_spaces, S_pao_full, s1e)
+            return out
+
+        # Filter partners to those with X_pno set (Psi4 path).
+        good = []
+        fallback = []
         for key_kl in _partner_keys:
+            pd_b = pno_spaces[key_kl]
+            if (pd_b.get('X_pno') is not None
+                    and pd_b.get('pair_paos') is not None):
+                good.append(key_kl)
+            else:
+                fallback.append(key_kl)
+
+        out = {}
+        for key_kl in fallback:
             out[(key_ij, key_kl)] = _compute_S_pno(
                 key_ij, key_kl, pno_spaces, S_pao_full, s1e)
+
+        if not good:
+            return out
+
+        n_pao_a = int(np.asarray(pp_a).size)
+        n_pno_a = int(X_a_full.shape[1])
+        n_partners = len(good)
+        partner_n_pao = np.empty(n_partners, dtype=np.int32)
+        partner_n_pno = np.empty(n_partners, dtype=np.int32)
+        for p, key_kl in enumerate(good):
+            pd_b = pno_spaces[key_kl]
+            partner_n_pao[p] = int(np.asarray(pd_b['pair_paos']).size)
+            partner_n_pno[p] = int(pd_b['X_pno'].shape[1])
+        pp_off = np.empty(n_partners + 1, dtype=np.int64)
+        pp_off[0] = 0
+        pp_off[1:] = np.cumsum(partner_n_pao.astype(np.int64))
+        X_sizes = (partner_n_pao.astype(np.int64)
+                   * partner_n_pno.astype(np.int64))
+        X_off = np.empty(n_partners + 1, dtype=np.int64)
+        X_off[0] = 0
+        X_off[1:] = np.cumsum(X_sizes)
+        S_sizes = (partner_n_pno.astype(np.int64) * n_pno_a)
+        S_off = np.empty(n_partners + 1, dtype=np.int64)
+        S_off[0] = 0
+        S_off[1:] = np.cumsum(S_sizes)
+
+        pp_flat = np.empty(int(pp_off[-1]), dtype=np.int64)
+        X_flat = np.empty(int(X_off[-1]))
+        for p, key_kl in enumerate(good):
+            pd_b = pno_spaces[key_kl]
+            pp_flat[pp_off[p]:pp_off[p + 1]] = np.asarray(
+                pd_b['pair_paos'], dtype=np.int64)
+            X_flat[X_off[p]:X_off[p + 1]] = np.ascontiguousarray(
+                pd_b['X_pno']).ravel()
+        S_flat = np.empty(int(S_off[-1]))
+
+        pp_a_arr = np.ascontiguousarray(pp_a, dtype=np.int64)
+        X_a_arr  = np.ascontiguousarray(X_a_full)
+        _libcc_spno.DLPNObuild_S_pno_for_pair(
+            pp_a_arr.ctypes.data_as(_ct.c_void_p),
+            X_a_arr.ctypes.data_as(_ct.c_void_p),
+            int(n_pao_a), int(n_pno_a), int(n_partners),
+            partner_n_pao.ctypes.data_as(_ct.c_void_p),
+            partner_n_pno.ctypes.data_as(_ct.c_void_p),
+            pp_off.ctypes.data_as(_ct.c_void_p),
+            pp_flat.ctypes.data_as(_ct.c_void_p),
+            X_off.ctypes.data_as(_ct.c_void_p),
+            X_flat.ctypes.data_as(_ct.c_void_p),
+            S_off.ctypes.data_as(_ct.c_void_p),
+            S_flat.ctypes.data_as(_ct.c_void_p),
+            _S_pao_full_c.ctypes.data_as(_ct.c_void_p),
+            _n_pao_total,
+        )
+        for p, key_kl in enumerate(good):
+            n_pno_b = int(partner_n_pno[p])
+            out[(key_ij, key_kl)] = (
+                S_flat[S_off[p]:S_off[p + 1]]
+                .reshape(n_pno_a, n_pno_b).copy())
         return out
 
+    _t_spno = _time_cc.perf_counter()
     S_pno_cache = {}
     if _pool is not None:
         for sub in _pool.map(_build_one_key, _all_pair_keys):
@@ -1907,6 +2015,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     else:
         for key_ij in _all_pair_keys:
             S_pno_cache.update(_build_one_key(key_ij))
+    print(f'  [STAGE5_DBG] S_pno_cache upfront build: '
+          f'{_time_cc.perf_counter() - _t_spno:.2f}s '
+          f'(pairs={len(_all_pair_keys)})', flush=True)
 
     # Phase 2d: snapshot the upfront S_pno_cache into a flat
     # pair-of-pair buffer.  Any subsequent miss inside `_s_pno_getter`
@@ -1976,6 +2087,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         # them here.  build_t1_cache is pulled in per-cycle.
         from pyscf.cc.dlpno_tccsd.pair_index import build_t1_cache
 
+        print(f'  [STAGE5_DBG] post-cc_ints setup before cycle loop: '
+              f'{_time_cc.perf_counter() - _t_post_ccints:.2f}s', flush=True)
+        _t_loop_start = _time_cc.perf_counter()
         for cycle in range(this_max):
             # Phase 1: pre-project t1 into every pair's PNO basis once
             # per cycle, replacing ~1.5 M lazy _project_t1_to_pair calls.

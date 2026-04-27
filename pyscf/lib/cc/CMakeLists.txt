@@ -20,7 +20,7 @@ add_library(cc SHARED
   dlpno_t1_residual.c dlpno_be.c dlpno_g_term.c
   dlpno_cd_term.c dlpno_t34.c dlpno_be_v2.c
   dlpno_pair_centerQ.c dlpno_cross_partner.c
-  dlpno_partners_centerQ.c)
+  dlpno_partners_centerQ.c dlpno_s_pno.c)
 add_dependencies(cc np_helper ao2mo)
 
 set_target_properties(cc PROPERTIES
