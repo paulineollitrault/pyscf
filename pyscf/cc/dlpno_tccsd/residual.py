@@ -363,6 +363,139 @@ def _build_g_term_plan(strong_keys, pno_spaces, pair_lmo_idx,
     }
 
 
+def _get_or_build_g_term_batched_view(plan, t2_pno_all):
+    """Build (or fetch cached) flat per-item view across all G_term
+    buckets. Concatenates S_arr static tensors; pre-computes per-item
+    absolute offsets into t2_pno_all._buffer; collects k_idx /
+    scalar_lmo / target slot arrays."""
+    bv = plan.get('_g_batched_view')
+    if bv is not None:
+        return bv
+
+    has_fts = hasattr(t2_pno_all, '_buffer')
+    if has_fts:
+        _t2_off_arr = np.asarray(t2_pno_all._offsets)
+        _canon_to_idx = t2_pno_all._canon_to_idx
+
+    def _build_side(buckets):
+        n_ij_l, n_ik_l = [], []
+        S_off_l, t2_off_l = [], []
+        S_pieces = []
+        S_run = 0
+        t2_size_l = []
+        tile_off = [0]
+        k_idx_l, scalar_lmo_l, target_slot_l = [], [], []
+        t2_canon_off_l, t2_trans_l = [], []
+        for bucket in buckets:
+            n_ij = bucket['n_ij']
+            n_ik = bucket['n_ik']
+            N_b = len(bucket['t2_keys'])
+            for nb in range(N_b):
+                n_ij_l.append(n_ij)
+                n_ik_l.append(n_ik)
+                S_pieces.append(np.ascontiguousarray(
+                    bucket['S_arr'][nb]).ravel())
+                S_off_l.append(S_run); S_run += n_ij * n_ik
+                t2_size_l.append(n_ik * n_ik)
+                tile_off.append(tile_off[-1] + n_ij * n_ij)
+                k_idx_l.append(int(bucket['k_idx'][nb]))
+                scalar_lmo_l.append(int(bucket['scalar_lmo'][nb]))
+                target_slot_l.append((n_ij, int(bucket['item_idx'][nb])))
+                if has_fts:
+                    t2_canon_off_l.append(
+                        int(_t2_off_arr[_canon_to_idx[bucket['t2_keys'][nb]]]))
+                    t2_trans_l.append(int(bucket['t2_transp'][nb]))
+        N = len(n_ij_l)
+        t2_off = np.zeros(N + 1, dtype=np.int64)
+        t2_off[1:] = np.cumsum(t2_size_l)
+        return {
+            'N': N,
+            'n_ij': np.asarray(n_ij_l, dtype=np.int32),
+            'n_ik': np.asarray(n_ik_l, dtype=np.int32),
+            'S_off': np.asarray(S_off_l, dtype=np.int64),
+            't2_off': t2_off,
+            'tile_off': np.asarray(tile_off, dtype=np.int64),
+            'k_idx': np.asarray(k_idx_l, dtype=np.int64),
+            'scalar_lmo': np.asarray(scalar_lmo_l, dtype=np.int64),
+            'target_slot': target_slot_l,
+            'S_flat': (np.concatenate(S_pieces) if S_pieces
+                       else np.zeros(0)),
+            't2_canon_off': (np.asarray(t2_canon_off_l, dtype=np.int64)
+                             if has_fts and t2_canon_off_l else None),
+            't2_trans_arr': (np.asarray(t2_trans_l, dtype=np.int32)
+                              if has_fts and t2_trans_l else None),
+        }
+
+    bv = {
+        'ik': _build_side(plan['ik_buckets']),
+        'jk': _build_side(plan['jk_buckets']),
+    }
+    plan['_g_batched_view'] = bv
+    return bv
+
+
+def _run_g_term_batched(plan, bv, t2_pno_all, G_tilde,
+                        flat_G_ij, flat_G_ji):
+    """Run batched G_term kernel for both sides; serial scatter into
+    flat_G_ij / flat_G_ji."""
+    from pyscf.cc.dlpno_tccsd._g_term_batched_cy import g_term_batched
+    from pyscf.cc.dlpno_tccsd._cd_gather_cy import gather_t2_with_transpose
+    from threadpoolctl import threadpool_limits
+
+    G_tilde_c = np.ascontiguousarray(G_tilde)
+
+    def _run_side(side_bv, flat_out):
+        N = side_bv['N']
+        if N == 0:
+            return
+        # Per-cycle t2 gather via Cython (uses absolute offsets into
+        # t2_pno_all._buffer; transpose handled in-kernel).
+        t2_flat = np.empty(int(side_bv['t2_off'][-1]))
+        if (side_bv['t2_canon_off'] is not None
+                and hasattr(t2_pno_all, '_buffer')):
+            gather_t2_with_transpose(
+                N, side_bv['n_ik'],
+                side_bv['t2_canon_off'], side_bv['t2_trans_arr'],
+                side_bv['t2_off'], t2_pno_all._buffer, t2_flat,
+                min(64, N),
+            )
+        else:
+            # Should not happen on the standard driver path (t2_pno_all is
+            # always a FlatTensorStore there); leave NotImplemented to
+            # surface any unexpected fallback during refactors.
+            raise NotImplementedError(
+                "g_term_batched fallback path requires t2_pno_all FTS")
+
+        max_n_ij = int(side_bv['n_ij'].max(initial=1))
+        max_n_ik = int(side_bv['n_ik'].max(initial=1))
+        num_threads = min(64, N)
+        tmp = np.empty((num_threads, max_n_ij * max_n_ik))
+        tiles = np.zeros(int(side_bv['tile_off'][-1]))
+        with threadpool_limits(limits=1, user_api='blas'):
+            g_term_batched(
+                N, max_n_ij, max_n_ik,
+                side_bv['n_ij'], side_bv['n_ik'],
+                side_bv['S_off'], side_bv['t2_off'][:N],
+                side_bv['tile_off'],
+                side_bv['k_idx'], side_bv['scalar_lmo'],
+                side_bv['S_flat'], t2_flat, G_tilde_c,
+                tmp, tiles, num_threads,
+            )
+        # Serial scatter — out -= Cc per item.
+        flat_views = {n_ij: buf.ravel() for n_ij, buf in flat_out.items()}
+        target_slot = side_bv['target_slot']
+        tile_off = side_bv['tile_off']
+        for n in range(N):
+            n_ij, slot = target_slot[n]
+            tile_size = n_ij * n_ij
+            base = slot * tile_size
+            tile = tiles[tile_off[n]:tile_off[n + 1]]
+            flat_views[n_ij][base:base + tile_size] -= tile
+
+    _run_side(bv['ik'], flat_G_ij)
+    _run_side(bv['jk'], flat_G_ji)
+
+
 def compute_G_term_batched(strong_keys, t2_pno_all, pno_spaces,
                           S_pno_cache, G_tilde, pair_lmo_idx, nocc,
                           S_pao_full=None, s1e=None, _pool=None):
@@ -399,56 +532,15 @@ def compute_G_term_batched(strong_keys, t2_pno_all, pno_spaces,
         flat_G_ij[n_ij] = np.zeros(shp)
         flat_G_ji[n_ij] = np.zeros(shp)
 
-    def _bucket_result(bucket):
-        """Compute one bucket's batched contraction, returning the
-        scaled (N, n_ij, n_ij) result ready for scatter-add."""
-        n_ij = bucket['n_ij']
-        n_ik = bucket['n_ik']
-        S_arr = bucket['S_arr']
-        t2_keys = bucket['t2_keys']
-        t2_transp = bucket['t2_transp']
-        scalar_lmo = bucket['scalar_lmo']
-        k_idx = bucket['k_idx']
-        N = len(t2_keys)
-
-        t2_arr = np.empty((N, n_ik, n_ik))
-        for n in range(N):
-            v = t2_pno_all[t2_keys[n]]
-            t2_arr[n] = v.T if t2_transp[n] else v
-
-        scalars = G_tilde[k_idx, scalar_lmo]
-
-        # Numpy batched matmul beats both hand-rolled and direct-dgemm
-        # Cython variants at n_pno ~25 here — the G-term is a pure
-        # dgemm chain with no fusion opportunity, so BLAS's cache
-        # blocking + SIMD is already optimal.  Cython prange-over-items
-        # can't outrun BLAS's internal parallelism on this workload.
-        tmp = np.matmul(S_arr, t2_arr)
-        out_batch = np.matmul(tmp, S_arr.swapaxes(1, 2))
-        out_batch *= scalars[:, None, None]
-        return out_batch
-
-    def _process_buckets(buckets, flat_out):
-        if _pool is not None and len(buckets) > 1:
-            results = list(_pool.map(_bucket_result, buckets))
-        else:
-            results = [_bucket_result(b) for b in buckets]
-        for bucket, out_batch in zip(buckets, results):
-            buf = flat_out[bucket['n_ij']]
-            np.add.at(buf, bucket['item_idx'], -out_batch)
-
-    import time as _gt_time
-    _gt_dump = getattr(compute_G_term_batched, '_dump_timing', False)
-    _gt_t0 = _gt_time.perf_counter() if _gt_dump else 0.0
-    _process_buckets(plan['ik_buckets'], flat_G_ij)
-    _gt_t1 = _gt_time.perf_counter() if _gt_dump else 0.0
-    _process_buckets(plan['jk_buckets'], flat_G_ji)
-    _gt_t2 = _gt_time.perf_counter() if _gt_dump else 0.0
-    if _gt_dump:
-        print(f'  [G_DBG] ik_buckets={len(plan["ik_buckets"])} '
-              f'wall={(_gt_t1 - _gt_t0)*1e3:.1f}ms  '
-              f'jk_buckets={len(plan["jk_buckets"])} '
-              f'wall={(_gt_t2 - _gt_t1)*1e3:.1f}ms', flush=True)
+    # Single-call batched path — replaces the per-bucket _pool.map loop
+    # with one nogil prange Cython call per side. Static plan view (built
+    # once) flattens per-bucket S_arr into a single concatenated buffer
+    # and pre-computes per-item absolute offsets into t2_pno_all._buffer
+    # for the t2 gather kernel. Per cycle: refill t2_flat via gather,
+    # then call g_term_batched.
+    bv = _get_or_build_g_term_batched_view(plan, t2_pno_all)
+    _run_g_term_batched(plan, bv, t2_pno_all, G_tilde,
+                        flat_G_ij, flat_G_ji)
 
     # Unpack back into dict {key_ij: G_term}.  G_term = G_ij + G_ji.T
     G_term_all = {}
