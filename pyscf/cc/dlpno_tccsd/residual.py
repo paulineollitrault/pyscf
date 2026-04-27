@@ -1275,7 +1275,7 @@ def build_D_tilde_batched(
     # per cycle replaces the per-bucket loop. Plan view (built once) flattens
     # all per-bucket K/S static tensors into single concatenated buffers and
     # pre-computes per-item t1 absolute offsets into t1_cache._buffer.
-    bv = _get_or_build_t34_batched_view(plan, t1_cache)
+    bv = _get_or_build_t34_batched_view(plan, t1_cache, t2_pno_all)
     _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
                      t4_use_u=True, t4_scale=0.5)
 
@@ -2132,7 +2132,7 @@ def compute_C_tilde_batched(
     # Single-call batched path: ONE t3+t4 prange call replaces the per-bucket
     # loop. compute_C_tilde uses scale=-0.5 and t2 directly (not 2*t2-t2.T).
     _tn_batch = _time_dbg.perf_counter()
-    bv = _get_or_build_t34_batched_view(plan, t1_cache)
+    bv = _get_or_build_t34_batched_view(plan, t1_cache, t2_pno_all)
     _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
                      t4_use_u=False, t4_scale=-0.5)
     _pt['t4_kern'] = _time_dbg.perf_counter() - _tn_batch
@@ -2872,7 +2872,7 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
     }
 
 
-def _get_or_build_t34_batched_view(plan, t1_cache):
+def _get_or_build_t34_batched_view(plan, t1_cache, t2_pno_all=None):
     """Build (or fetch cached) flat per-item view across all t3/t4 buckets
     in a compute_C_tilde / build_D_tilde Phase 2 plan.
 
@@ -2978,6 +2978,19 @@ def _get_or_build_t34_batched_view(plan, t1_cache):
 
     t4_t2_off = np.zeros(t4_N + 1, dtype=np.int64)
     t4_t2_off[1:] = np.cumsum(t4_t2_size_l)
+    # Per-item absolute offsets into t2_pno_all._buffer (FlatTensorStore)
+    # so the per-cycle t2/u gather can run as a nogil prange Cython kernel
+    # instead of a Python loop. Same trick as the cd batched gather.
+    if t2_pno_all is not None and hasattr(t2_pno_all, '_offsets'):
+        _t2_off_arr = np.asarray(t2_pno_all._offsets)
+        _canon_to_idx = t2_pno_all._canon_to_idx
+        t4_t2_canon_off = np.array(
+            [_t2_off_arr[_canon_to_idx[k]] for k in t4_t2_keys_l],
+            dtype=np.int64)
+        t4_t2_trans_arr = np.asarray(t4_t2_trans_l, dtype=np.int32)
+    else:
+        t4_t2_canon_off = None
+        t4_t2_trans_arr = None
 
     bv = {
         # ---- t3 ----
@@ -3013,6 +3026,8 @@ def _get_or_build_t34_batched_view(plan, t1_cache):
                              if t4_S_kl_ki_pieces else np.zeros(0)),
         't4_t2_keys': t4_t2_keys_l,
         't4_t2_trans': np.asarray(t4_t2_trans_l, dtype=bool),
+        't4_t2_canon_off': t4_t2_canon_off,
+        't4_t2_trans_arr': t4_t2_trans_arr,
         't4_t2_off': t4_t2_off,
         't4_target_slot': t4_target_slot_l,
         't4_tile_off': np.asarray(t4_tile_off, dtype=np.int64),
@@ -3076,20 +3091,43 @@ def _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
     # ---- t4 ----
     t4_N = bv['t4_N']
     if t4_N > 0:
-        # Per-cycle t2 flat buffer
-        t2_flat = np.empty(int(bv['t4_t2_off'][-1]))
-        t4_t2_keys = bv['t4_t2_keys']
-        t4_t2_trans = bv['t4_t2_trans']
+        # Per-cycle t2 flat buffer — built via nogil prange Cython kernel
+        # using absolute offsets into t2_pno_all._buffer (FlatTensorStore).
+        # Same gather pattern as the cd batched path.
         t4_t2_off = bv['t4_t2_off']
         t4_n_li = bv['t4_n_li']
-        for n in range(t4_N):
-            t2 = t2_pno_all[t4_t2_keys[n]]
-            t2_d = t2.T if t4_t2_trans[n] else t2
+        t2_flat = np.empty(int(t4_t2_off[-1]))
+        if (bv['t4_t2_canon_off'] is not None
+                and hasattr(t2_pno_all, '_buffer')):
+            from pyscf.cc.dlpno_tccsd._cd_gather_cy import (
+                gather_t2_with_transpose, gather_u_from_t2,
+            )
             if t4_use_u:
-                t2_flat[t4_t2_off[n]:t4_t2_off[n + 1]] = (
-                    2.0 * t2_d - t2_d.T).ravel()
+                gather_u_from_t2(
+                    t4_N, t4_n_li,
+                    bv['t4_t2_canon_off'], bv['t4_t2_trans_arr'],
+                    t4_t2_off, t2_pno_all._buffer, t2_flat,
+                    min(64, t4_N),
+                )
             else:
-                t2_flat[t4_t2_off[n]:t4_t2_off[n + 1]] = t2_d.ravel()
+                gather_t2_with_transpose(
+                    t4_N, t4_n_li,
+                    bv['t4_t2_canon_off'], bv['t4_t2_trans_arr'],
+                    t4_t2_off, t2_pno_all._buffer, t2_flat,
+                    min(64, t4_N),
+                )
+        else:
+            # Fallback: per-item Python loop
+            t4_t2_keys = bv['t4_t2_keys']
+            t4_t2_trans = bv['t4_t2_trans']
+            for n in range(t4_N):
+                t2 = t2_pno_all[t4_t2_keys[n]]
+                t2_d = t2.T if t4_t2_trans[n] else t2
+                if t4_use_u:
+                    t2_flat[t4_t2_off[n]:t4_t2_off[n + 1]] = (
+                        2.0 * t2_d - t2_d.T).ravel()
+                else:
+                    t2_flat[t4_t2_off[n]:t4_t2_off[n + 1]] = t2_d.ravel()
 
         max_n_ki = int(bv['t4_n_ki'].max(initial=1))
         max_n_li = int(bv['t4_n_li'].max(initial=1))
