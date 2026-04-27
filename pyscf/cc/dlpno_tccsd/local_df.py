@@ -1074,6 +1074,27 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
         t1_cache = build_t1_cache(
             t1_pno, _pi, S_pno_cache, pno_spaces)
 
+    _use_c_cycle = bool(int(os.environ.get('DLPNO_C_CYCLE', '0')))
+    if _use_c_cycle:
+        # Lazy-init libcc for the t1_ints C kernel. See
+        # pyscf/lib/cc/dlpno_t1_ints.c::DLPNOt1_ints_pair_side.
+        import ctypes
+        from pyscf import lib as _pyscflib
+        _libcc_t1 = getattr(t1_ints, '_libcc', None)
+        if _libcc_t1 is None:
+            _libcc_t1 = _pyscflib.load_library('libcc')
+            _libcc_t1.DLPNOt1_ints_pair_side.restype = None
+            _libcc_t1.DLPNOt1_ints_pair_side.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,                # Qa_t1_out, Qk_t1_out
+                ctypes.c_void_p, ctypes.c_void_p,                # Qa_full, Qk_local
+                ctypes.c_void_p, ctypes.c_void_p,                # Qma, Qab
+                ctypes.c_void_p, ctypes.c_void_p,                # t1_lmo, T1_local
+                ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,  # n_local, nlmo, npno
+            ]
+            t1_ints._libcc = _libcc_t1
+    else:
+        _libcc_t1 = None
+
     def _dress_one_pair(key):
         ci = cc_ints.get(key)
         if ci is None:
@@ -1093,24 +1114,54 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
         Qma = ci['Qma'][:, _lmo_idx_in_p, :]  # (n_local, nlmo, npno)
         Qab = ci['Qab']                       # (n_local, npno, npno)
 
-        def _dress(lmo_global, Qa_key):
-            Qa_full = ci[Qa_key]                                 # (n_local, npno)
-            # i_Qk/j_Qk reduced; translate global lmo_idx -> p_lmos position.
-            Qk_local = ci[Qa_key.replace('Qa', 'Qk')][:, _lmo_idx_in_p]  # (n_local, nlmo)
+        if _libcc_t1 is not None:
+            import ctypes
+            Qma_c = np.ascontiguousarray(Qma)
+            Qab_c = np.ascontiguousarray(Qab)
+            T1_local_c = np.ascontiguousarray(T1_local)
+            n_local_c = Qma_c.shape[0]
+            nlmo_c = Qma_c.shape[1]
+            npno_c = Qma_c.shape[2]
 
-            t1_lmo = t1_cache[key][int(lmo_global)]
-            qma_t1 = np.einsum('Qmb,b->Qm', Qma, t1_lmo)         # (n_local, nlmo)
+            def _dress(lmo_global, Qa_key):
+                Qa_full = np.ascontiguousarray(ci[Qa_key])
+                Qk_local = np.ascontiguousarray(
+                    ci[Qa_key.replace('Qa', 'Qk')][:, _lmo_idx_in_p])
+                t1_lmo = np.ascontiguousarray(
+                    t1_cache[key][int(lmo_global)])
+                result_qa = np.empty((n_local_c, npno_c))
+                result_qk = np.empty((n_local_c, nlmo_c))
+                _libcc_t1.DLPNOt1_ints_pair_side(
+                    result_qa.ctypes.data_as(ctypes.c_void_p),
+                    result_qk.ctypes.data_as(ctypes.c_void_p),
+                    Qa_full.ctypes.data_as(ctypes.c_void_p),
+                    Qk_local.ctypes.data_as(ctypes.c_void_p),
+                    Qma_c.ctypes.data_as(ctypes.c_void_p),
+                    Qab_c.ctypes.data_as(ctypes.c_void_p),
+                    t1_lmo.ctypes.data_as(ctypes.c_void_p),
+                    T1_local_c.ctypes.data_as(ctypes.c_void_p),
+                    n_local_c, nlmo_c, npno_c,
+                )
+                return result_qa, result_qk
+        else:
+            def _dress(lmo_global, Qa_key):
+                Qa_full = ci[Qa_key]                                 # (n_local, npno)
+                # i_Qk/j_Qk reduced; translate global lmo_idx -> p_lmos position.
+                Qk_local = ci[Qa_key.replace('Qa', 'Qk')][:, _lmo_idx_in_p]  # (n_local, nlmo)
 
-            # i_Qa_t1: Psi4 ccsd.cc:1521-1534
-            result_qa = Qa_full - Qk_local @ T1_local            # (n_local, npno)
-            result_qa += np.einsum('Qab,b->Qa', Qab, t1_lmo)
-            result_qa -= qma_t1 @ T1_local                       # (n_local, npno)
+                t1_lmo = t1_cache[key][int(lmo_global)]
+                qma_t1 = np.einsum('Qmb,b->Qm', Qma, t1_lmo)         # (n_local, nlmo)
 
-            # i_Qk_t1: Psi4 ccsd.cc:1510-1519. Same quantity compute_B_tilde
-            # rebuilt inline; produce here so consumers can share.
-            result_qk = Qk_local + qma_t1                        # (n_local, nlmo)
+                # i_Qa_t1: Psi4 ccsd.cc:1521-1534
+                result_qa = Qa_full - Qk_local @ T1_local            # (n_local, npno)
+                result_qa += np.einsum('Qab,b->Qa', Qab, t1_lmo)
+                result_qa -= qma_t1 @ T1_local                       # (n_local, npno)
 
-            return result_qa, result_qk
+                # i_Qk_t1: Psi4 ccsd.cc:1510-1519. Same quantity compute_B_tilde
+                # rebuilt inline; produce here so consumers can share.
+                result_qk = Qk_local + qma_t1                        # (n_local, nlmo)
+
+                return result_qa, result_qk
 
         i_Qa_t1, i_Qk_t1 = _dress(i, 'i_Qa')
         j_Qa_t1, j_Qk_t1 = _dress(j, 'j_Qa')

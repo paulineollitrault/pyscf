@@ -53,7 +53,7 @@ One C source file per Psi4 function, matching ccsd.cc structure:
 
 | Psi4 function | New C file | Lines (est) | Status |
 |---|---|---|---|
-| `t1_ints` (ccsd.cc:1491) | `dlpno_t1_ints.c` | 100 | TODO |
+| `t1_ints` (ccsd.cc:1491) | `dlpno_t1_ints.c` | 100 | DONE (session 3, 2026-04-27) |
 | `t1_fock` (ccsd.cc:1540) | `dlpno_t1_fock.c` | 200 | TODO |
 | `compute_B_tilde` (ccsd.cc:1688) | `dlpno_b_tilde.c` | 50 | DONE (session 1, 2026-04-27) |
 | `compute_C_tilde` (ccsd.cc:1809) | `dlpno_c_tilde.c` | 100 | TODO |
@@ -126,7 +126,7 @@ Each session: one C function, pattern matches the foo_dressed / per_i / partner 
 |---|---|---|
 | 1 (DONE 2026-04-27) | `dlpno_b_tilde.c` (~100 lines incl. comments) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, BTILDE_DUMP py-vs-C max abs 1.1e-11 over 306 dumps |
 | 2 (DONE 2026-04-27) | `dlpno_g_tilde.c` (~75 lines incl. comments) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, GTILDE_DUMP py-vs-C diff: last-digit FP-reorder noise across 3 iters |
-| 3 | `dlpno_t1_ints.c` (~100 lines) | water-4/10 anchor, T1INTS_DUMP diff |
+| 3 (DONE 2026-04-27) | `dlpno_t1_ints.c` (~85 lines incl. comments) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, T1INTS_DUMP py-vs-C aggregates match to last 1-2 digits |
 | 4 | `dlpno_c_tilde.c` (~100 lines) | water-4/10 anchor, CTILDE_DUMP diff |
 | 5 | `dlpno_d_tilde.c` (~100 lines) | water-4/10 anchor, DTILDE_DUMP diff |
 | 6-7 | `dlpno_t1_fock.c` (~200 lines) | water-4/10 anchor, FKJ_DUMP diff |
