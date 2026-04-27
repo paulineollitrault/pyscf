@@ -786,6 +786,96 @@ def _process_one_triple(i, j, k,
         _W_pao_tno = None
     _U_cache = {}
 
+    # === Pre-populate _U_cache via batched C kernel (DLPNO_C_CYCLE=1) ===
+    # Per-triple work that used to dominate (T) wall (cProfile: 10.7s
+    # tottime on water-10): each _U_for(pk) call did one fancy-index +
+    # one small dgemm in Python. Batched into one C call: gather all
+    # ~60 unique pks needed for this triple, build U for each in C
+    # via dgemm(W_sub @ X), populate the dict so subsequent _U_for
+    # calls hit the cache.
+    if (_pao_basis and int(os.environ.get('DLPNO_C_CYCLE', '0'))):
+        # Enumerate unique pks the rest of _process_one_triple will ask
+        # for: (m, r) for m ∈ triple_domain ∪ triple_lmo, r ∈ triple_lmo,
+        # plus diagonals (r, r) for the T1 path.
+        _u_pks_seen = set()
+        _u_pks = []
+        def _add_pk(pk_):
+            if pk_ in _u_pks_seen:
+                return
+            if pk_ not in pno_spaces:
+                return
+            pd = pno_spaces[pk_]
+            if pd.get('X_pno') is None or pd.get('pair_paos') is None:
+                return
+            if pd['X_pno'].shape[1] == 0:
+                return
+            _u_pks_seen.add(pk_)
+            _u_pks.append(pk_)
+        for r_global in triple_lmo:
+            for m_global in triple_domain:
+                _add_pk((min(r_global, m_global), max(r_global, m_global)))
+            _add_pk((r_global, r_global))
+        for r_global in triple_lmo:
+            for r2_global in triple_lmo:
+                _add_pk((min(r_global, r2_global), max(r_global, r2_global)))
+
+        if _u_pks:
+            import ctypes as _ct
+            from pyscf import lib as _pl
+            _libcc_u = getattr(_process_one_triple, '_libcc_u', None)
+            if _libcc_u is None:
+                _libcc_u = _pl.load_library('libcc')
+                _libcc_u.DLPNObuild_U_for_triple.restype = None
+                _libcc_u.DLPNObuild_U_for_triple.argtypes = (
+                    [_ct.c_int, _ct.c_void_p, _ct.c_int, _ct.c_int]
+                    + [_ct.c_void_p] * 8)
+                _process_one_triple._libcc_u = _libcc_u
+
+            n_pairs_u = len(_u_pks)
+            n_pao_arr_u = np.empty(n_pairs_u, dtype=np.int32)
+            n_pno_arr_u = np.empty(n_pairs_u, dtype=np.int32)
+            for p, pk_ in enumerate(_u_pks):
+                pd = pno_spaces[pk_]
+                n_pao_arr_u[p] = int(np.asarray(pd['pair_paos']).size)
+                n_pno_arr_u[p] = int(pd['X_pno'].shape[1])
+            pp_off_u = np.empty(n_pairs_u + 1, dtype=np.int64); pp_off_u[0] = 0
+            pp_off_u[1:] = np.cumsum(n_pao_arr_u.astype(np.int64))
+            X_off_u = np.empty(n_pairs_u + 1, dtype=np.int64); X_off_u[0] = 0
+            X_off_u[1:] = np.cumsum(
+                n_pao_arr_u.astype(np.int64) * n_pno_arr_u.astype(np.int64))
+            U_off_u = np.empty(n_pairs_u + 1, dtype=np.int64); U_off_u[0] = 0
+            U_off_u[1:] = np.cumsum(n_pno_arr_u.astype(np.int64) * n_tno)
+
+            pp_flat_u = np.empty(int(pp_off_u[-1]), dtype=np.int64)
+            X_flat_u  = np.empty(int(X_off_u[-1]))
+            for p, pk_ in enumerate(_u_pks):
+                pd = pno_spaces[pk_]
+                pp_flat_u[pp_off_u[p]:pp_off_u[p + 1]] = np.asarray(
+                    pd['pair_paos'], dtype=np.int64)
+                X_flat_u[X_off_u[p]:X_off_u[p + 1]] = np.ascontiguousarray(
+                    pd['X_pno']).ravel()
+            U_flat_u = np.empty(int(U_off_u[-1]))
+
+            _W_pao_tno_c = np.ascontiguousarray(_W_pao_tno)
+            _libcc_u.DLPNObuild_U_for_triple(
+                int(n_pairs_u),
+                _W_pao_tno_c.ctypes.data_as(_ct.c_void_p),
+                int(n_tno), int(_W_pao_tno_c.shape[0]),
+                n_pao_arr_u.ctypes.data_as(_ct.c_void_p),
+                n_pno_arr_u.ctypes.data_as(_ct.c_void_p),
+                pp_off_u.ctypes.data_as(_ct.c_void_p),
+                pp_flat_u.ctypes.data_as(_ct.c_void_p),
+                X_off_u.ctypes.data_as(_ct.c_void_p),
+                X_flat_u.ctypes.data_as(_ct.c_void_p),
+                U_off_u.ctypes.data_as(_ct.c_void_p),
+                U_flat_u.ctypes.data_as(_ct.c_void_p),
+            )
+            for p, pk_ in enumerate(_u_pks):
+                n_pno = int(n_pno_arr_u[p])
+                _U_cache[pk_] = U_flat_u[
+                    U_off_u[p]:U_off_u[p + 1]
+                ].reshape(n_pno, n_tno).copy()
+
     def _U_for(pk):
         if pk in _U_cache:
             return _U_cache[pk]
