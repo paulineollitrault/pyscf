@@ -842,21 +842,47 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
 
         q_iv = jhi @ raw_iv
         q_jv = jhi @ raw_jv
-        q_io_red = jhi @ raw_io                  # (n_local, nlmo_p) reduced
-        q_jo_red = jhi @ raw_jo                  # (n_local, nlmo_p) reduced
+        q_io_pfit = jhi @ raw_io                # (n_local, nlmo_p) p_lmos-axis
+        q_jo_pfit = jhi @ raw_jo
         q_pair = jhi @ raw_pair
-        # raw_ma is reduced (n_local, nlmo_p, npno) — small jhi matmul.
-        Qma_red = (jhi @ raw_ma.reshape(n_local, -1)
+        Qma_pfit = (jhi @ raw_ma.reshape(n_local, -1)
                     ).reshape(n_local, nlmo_p, npno)
         Qab = (jhi @ raw_ab.reshape(n_local, -1)).reshape(n_local, npno, npno)
 
-        # All reduced fitted quantities now stored on the p_lmos axis
-        # directly; consumers translate global LMO -> p_lmos position via
-        # ci['p_lmos_dense']. Saves ~3-4× memory at water-22 on Qma alone.
-        # NOTE: pair_lmo_idx-axis (Psi4-truly-faithful, smaller subset)
-        # was attempted but drifted water-10 by 0.26-1.22 mEh — needs the
-        # algorithmic restructure of T1/T2 residuals (handoff Steps 7-9,
-        # multi-week) before consumers stop reading p_lmos-only rows.
+        # Phase III: project to pair_lmo_idx-axis (Psi4-truly-faithful,
+        # smaller subset). With Phase II kernels 1+2 in C taking pair-domain
+        # inputs natively, the only remaining scatter-back is the per_kl
+        # K_bar one (still scatters to nocc; insensitive to axis size).
+        # The pair_lmo_idx construction always includes endpoints i, j
+        # below so helpers like get_local_K never see a missing pair.
+        if pair_lmo_idx is not None and key in pair_lmo_idx:
+            pair_lmos = np.asarray(pair_lmo_idx[key], dtype=np.int64)
+            # Defensive: ensure i, j are in pair_lmos (Psi4-faithful).
+            i, j = key
+            if i not in pair_lmos:
+                pair_lmos = np.append(pair_lmos, i)
+            if j != i and j not in pair_lmos:
+                pair_lmos = np.append(pair_lmos, j)
+            pair_lmos = np.sort(pair_lmos.astype(np.int64))
+        else:
+            pair_lmos = p_lmos
+        nlmo_pair = len(pair_lmos)
+        pair_in_p = (p_lmos_dense[pair_lmos]).astype(np.int64)
+        if nlmo_pair == 0 or (pair_in_p < 0).any():
+            raise RuntimeError(
+                f"pair_lmo_idx[{key}] not subset of p_lmos: "
+                f"missing {pair_lmos[pair_in_p < 0].tolist()}")
+        q_io_red = q_io_pfit[:, pair_in_p]      # (n_local, nlmo_pair)
+        q_jo_red = q_jo_pfit[:, pair_in_p]
+        Qma_red  = Qma_pfit[:, pair_in_p, :]
+
+        # Override p_lmos / p_lmos_dense to pair_lmo_idx semantics — the
+        # axis is now the smallest possible (Psi4's lmopair_to_lmos_[ij]).
+        p_lmos = pair_lmos
+        nlmo_p = nlmo_pair
+        p_lmos_dense = np.full(nocc, -1, dtype=np.int64)
+        p_lmos_dense[p_lmos] = np.arange(nlmo_p)
+
         q_io = q_io_red
         q_jo = q_jo_red
         Qma = Qma_red
