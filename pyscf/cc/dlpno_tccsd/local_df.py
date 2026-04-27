@@ -398,6 +398,10 @@ def get_local_ovL(cc_ints, pair_key, lmo_idx):
     # Qma reduced to (n_local, nlmo_p, npno); translate global lmo_idx.
     lmo_in_p = int(ci['p_lmos_dense'][lmo_idx])
     if lmo_in_p < 0:
+        if int(os.environ.get('DLPNO_DEBUG_OOD', '0')):
+            _c = getattr(get_local_ovL, '_ood', {})
+            _c[(pair_key, lmo_idx)] = _c.get((pair_key, lmo_idx), 0) + 1
+            get_local_ovL._ood = _c
         return None
     return ci['Qma'][:, lmo_in_p, :].T  # (npno, n_local)
 
@@ -414,6 +418,10 @@ def get_local_ooL_vec(cc_ints, k, l, pair_key):
     # i_Qk/j_Qk reduced to (n_local, nlmo_p); translate global k -> p_dense.
     k_red = int(ci['p_lmos_dense'][k])
     if k_red < 0:
+        if int(os.environ.get('DLPNO_DEBUG_OOD', '0')):
+            _c = getattr(get_local_ooL_vec, '_ood', {})
+            _c[(pair_key, k, l)] = _c.get((pair_key, k, l), 0) + 1
+            get_local_ooL_vec._ood = _c
         return None
     if l == i_lmo:
         return ci['i_Qk'][:, k_red]
@@ -443,6 +451,10 @@ def get_local_K(cc_ints, pair_key, lmo1, lmo2):
         p_dense = ci['p_lmos_dense']
         l1, l2 = int(p_dense[lmo1]), int(p_dense[lmo2])
         if l1 < 0 or l2 < 0:
+            if int(os.environ.get('DLPNO_DEBUG_OOD', '0')):
+                _c = getattr(get_local_K, '_ood', {})
+                _c[(pair_key, lmo1, lmo2)] = _c.get((pair_key, lmo1, lmo2), 0) + 1
+                get_local_K._ood = _c
             return None
         # ovL_lmo[Q, a] = Qma[Q, lmo, a]; K[a,b] = Σ_Q ovL1[Q,a]*ovL2[Q,b]
         K = Qma[:, l1, :].T @ Qma[:, l2, :]
@@ -842,7 +854,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         # directly; consumers translate global LMO -> p_lmos position via
         # ci['p_lmos_dense']. Saves ~3-4× memory at water-22 on Qma alone.
         # NOTE: pair_lmo_idx-axis (Psi4-truly-faithful, smaller subset)
-        # was attempted but drifted water-10 by 1.22 mEh — needs the
+        # was attempted but drifted water-10 by 0.26-1.22 mEh — needs the
         # algorithmic restructure of T1/T2 residuals (handoff Steps 7-9,
         # multi-week) before consumers stop reading p_lmos-only rows.
         q_io = q_io_red
@@ -928,6 +940,44 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         for key in keys:
             k, entry = _process_pair(key)
             cc_ints[k] = entry
+
+    # Debug: zero p_lmos\pair_lmo_idx rows in selected cc_ints fields, to
+    # localize which consumer(s) drift the energy when those rows go away.
+    # Set env DLPNO_ZERO_EXTRA_LMOS to a comma-separated subset of:
+    #   {Qma, i_Qk, j_Qk, K_bar_chem, K_bar_ij, K_bar_ji, all}
+    _zero_fields_env = os.environ.get('DLPNO_ZERO_EXTRA_LMOS', '')
+    if _zero_fields_env and pair_lmo_idx is not None:
+        _zero_set = set(_zero_fields_env.split(','))
+        if 'all' in _zero_set:
+            _zero_set = {'Qma', 'i_Qk', 'j_Qk',
+                         'K_bar_chem', 'K_bar_ij', 'K_bar_ji'}
+        n_pairs_touched = 0
+        n_extras_total = 0
+        for key, ci in cc_ints.items():
+            if ci is None or key not in pair_lmo_idx:
+                continue
+            pdom = set(int(x) for x in pair_lmo_idx[key])
+            p_lmos_arr = ci['p_lmos']
+            extras = np.array(
+                [i for i, l in enumerate(p_lmos_arr)
+                 if int(l) not in pdom], dtype=np.intp)
+            if extras.size == 0:
+                continue
+            n_pairs_touched += 1
+            n_extras_total += int(extras.size)
+            for fld in _zero_set:
+                if fld == 'Qma':
+                    ci['Qma'][:, extras, :] = 0.0
+                elif fld == 'i_Qk':
+                    ci['i_Qk'][:, extras] = 0.0
+                elif fld == 'j_Qk':
+                    ci['j_Qk'][:, extras] = 0.0
+                elif fld in ('K_bar_chem', 'K_bar_ij', 'K_bar_ji'):
+                    ci[fld][extras] = 0.0
+        print(f"[DLPNO_ZERO_EXTRA_LMOS={_zero_fields_env}] "
+              f"zeroed {n_extras_total} p_lmos\\pair_lmo_idx rows across "
+              f"{n_pairs_touched} pairs in fields {sorted(_zero_set)}",
+              flush=True)
 
     return cc_ints
 
