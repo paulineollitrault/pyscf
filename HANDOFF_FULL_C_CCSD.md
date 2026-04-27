@@ -57,7 +57,7 @@ One C source file per Psi4 function, matching ccsd.cc structure:
 | `t1_fock` (ccsd.cc:1540) | `dlpno_t1_fock.c` | 200 | TODO |
 | `compute_B_tilde` (ccsd.cc:1688) | `dlpno_b_tilde.c` | 50 | DONE (session 1, 2026-04-27) |
 | `compute_C_tilde` (ccsd.cc:1809) | `dlpno_c_tilde.c` | 100 | Phase 1 (Terms 1+2) DONE (session 4, 2026-04-27); Phase 2 (Terms 3+4) TODO |
-| `compute_D_tilde` (ccsd.cc:1991) | `dlpno_d_tilde.c` | 100 | TODO |
+| `compute_D_tilde` (ccsd.cc:1991) | `dlpno_d_tilde.c` | 100 | Phase 1 (Terms 1+2) DONE (session 5, 2026-04-27); Phase 2 (Terms 3+4) TODO |
 | `compute_G_tilde` (ccsd.cc:2085) | `dlpno_g_tilde.c` | 50 | DONE (session 2, 2026-04-27) |
 | T1 residual (ccsd.cc:2073-2230) | `dlpno_t1_residual.c` | 200 | TODO |
 | T2 residual (ccsd.cc:2240-2500) | `dlpno_t2_residual.c` | 400 | TODO |
@@ -128,7 +128,7 @@ Each session: one C function, pattern matches the foo_dressed / per_i / partner 
 | 2 (DONE 2026-04-27) | `dlpno_g_tilde.c` (~75 lines incl. comments) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, GTILDE_DUMP py-vs-C diff: last-digit FP-reorder noise across 3 iters |
 | 3 (DONE 2026-04-27) | `dlpno_t1_ints.c` (~85 lines incl. comments) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, T1INTS_DUMP py-vs-C aggregates match to last 1-2 digits |
 | 4 (Phase 1 DONE 2026-04-27) | `dlpno_c_tilde.c` (~100 lines, Phase 1 only — Terms 1+2 dgemv+dgemm) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, synthetic-plan Cython-vs-C max abs 1.1e-14 / max rel 1.7e-12. Phase 2 (Terms 3+4 t3/t4 plan-cached kernels) deferred to a follow-up session. |
-| 5 | `dlpno_d_tilde.c` (~100 lines) | water-4/10 anchor, DTILDE_DUMP diff |
+| 5 (Phase 1 DONE 2026-04-27) | `dlpno_d_tilde.c` (~125 lines incl. comments, Phase 1 only — Terms 1+2: 2× dgemv + transpose-add + dgemm) | water-4 −304.98979787 ✓, water-10 −2.13088299002 ✓, synthetic-plan Cython-vs-C max abs 1.4e-14 / max rel 2.0e-12. Phase 2 (Terms 3+4 t3/t4 plan-cached) deferred. |
 | 6-7 | `dlpno_t1_fock.c` (~200 lines) | water-4/10 anchor, FKJ_DUMP diff |
 | 8-9 | `dlpno_t1_residual.c` (~200 lines) | water-4/10 anchor, R1 dumps |
 | 10-12 | `dlpno_t2_residual.c` (~400 lines, the big one) | water-4/10 anchor, R2 dumps |
