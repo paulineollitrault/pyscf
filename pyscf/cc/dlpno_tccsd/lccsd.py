@@ -28,6 +28,7 @@ References:
     Lang et al., JCTC 2020, 16, 3028  [DLPNO-TCCSD]
 """
 
+import os
 import numpy as np
 from functools import reduce
 from pyscf import lib, scf, ao2mo
@@ -2009,14 +2010,19 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # own pass — avoids contention while keeping per-kernel
             # parallelism intact.
             from pyscf.cc.dlpno_tccsd.local_df import t1_fock
-            from pyscf.cc.dlpno_tccsd.residual import compute_C_tilde_batched
-            compute_C_tilde_batched._dump_timing = (cycle == 5)
+            # Phase II Psi4-style port: compute_C_tilde_psi4 is the
+            # line-by-line port of Psi4 ccsd.cc:1809; compute_C_tilde_batched
+            # is the legacy batched/cached implementation. Toggle via env
+            # for A/B comparison; default to Psi4-style.
+            _use_psi4_C = (os.environ.get('DLPNO_C_TILDE_LEGACY', '0') != '1')
+            if _use_psi4_C:
+                from pyscf.cc.dlpno_tccsd.residual import compute_C_tilde_psi4 as _cC_fn
+            else:
+                from pyscf.cc.dlpno_tccsd.residual import compute_C_tilde_batched as _cC_fn
+                _cC_fn._dump_timing = (cycle == 5)
 
-            # Per-sub-phase wall timers so the cycle print shows which
-            # jiang steps are the serial/bottleneck blocks (user asked
-            # for this after observing htop low-CPU stretches).
             _tj_c0 = _time.perf_counter()
-            _jiang_C = compute_C_tilde_batched(
+            _jiang_C = _cC_fn(
                 t1_pno, t2_pno_all, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                 _term2_precomputed=_c_t2_pre,
