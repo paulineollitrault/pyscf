@@ -75,6 +75,87 @@ def _chunked_map(pool, fn, items, chunks_per_worker=4):
 
 
 
+def build_G_tilde_psi4(t2_pno_all, t1_pno, pno_spaces, nocc,
+                       ovL_bare, ooL_bare, S_pno_cache,
+                       Fkj, foo_t1, cc_ints=None,
+                       S_pao_full=None, s1e=None, _pool=None):
+    """Build G_tilde — Psi4 per-pair port matching ccsd.cc:1969 line-by-line.
+
+    G_tilde[i, j] = Fkj[i, j]
+                    + Σ_l   K_iajb[il_ord]^T : U_lj
+        with U_lj  = S(il, lj) @ Tt_iajb[lj_ord] @ S(lj, il)
+             Tt_iajb[lj_ord] = 2*T_iajb[lj_ord] - T_iajb[lj_ord].T
+
+    Outer loop: all (i, j) ∈ [0, naocc)². Inner: l ∈ [0, naocc).
+    Skips (i, j, l) where (i, l) or (l, j) is not a stored pair.
+
+    Drop-in replacement for build_G_tilde (the batched plan-cached
+    implementation). Default-on via env DLPNO_G_TILDE_LEGACY.
+    """
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
+
+    G = Fkj.copy()
+
+    def _t2_ordered(a, b):
+        canon = (min(a, b), max(a, b))
+        t2 = t2_pno_all.get(canon)
+        if t2 is None or t2.shape[0] == 0:
+            return None
+        return t2 if (a, b) == canon else t2.T
+
+    def _K_iajb_ordered(canonical_key, a, b):
+        ci = cc_ints.get(canonical_key) if cc_ints is not None else None
+        if ci is None:
+            return None
+        K_canon = ci['K_iajb']
+        return K_canon if (a, b) == canonical_key else K_canon.T
+
+    def _per_ij(ij_tuple):
+        i, j = ij_tuple
+        contrib = 0.0
+        for l in range(nocc):
+            il_canon = (min(i, l), max(i, l))
+            lj_canon = (min(l, j), max(l, j))
+            if (il_canon not in pno_spaces
+                    or lj_canon not in pno_spaces):
+                continue
+            n_il = pno_spaces[il_canon]['C_pno'].shape[1]
+            n_lj = pno_spaces[lj_canon]['C_pno'].shape[1]
+            if n_il == 0 or n_lj == 0:
+                continue
+            t2_lj_ord = _t2_ordered(l, j)
+            if t2_lj_ord is None:
+                continue
+            K_iajb_il_ord = _K_iajb_ordered(il_canon, i, l)
+            if K_iajb_il_ord is None:
+                continue
+            Tt_lj = 2.0 * t2_lj_ord - t2_lj_ord.T          # (n_lj, n_lj)
+            S_il_lj = (np.eye(n_il) if il_canon == lj_canon
+                       else _s_pno_get(il_canon, lj_canon))
+            S_lj_il = (np.eye(n_lj) if lj_canon == il_canon
+                       else _s_pno_get(lj_canon, il_canon))
+            if S_il_lj is None or S_lj_il is None:
+                continue
+            U_lj = S_il_lj @ Tt_lj @ S_lj_il               # (n_il, n_il)
+            # Psi4: G[i, j] += K_iajb[il].vector_dot(U_lj.T)
+            #              = sum_{a, b} K_iajb[il][a, b] * U_lj[b, a]
+            contrib += np.sum(K_iajb_il_ord * U_lj.T)
+        return ij_tuple, contrib
+
+    # Outer parallel: (i, j) slots disjoint in G[i, j] writes.
+    ij_pairs = [(i, j) for i in range(nocc) for j in range(nocc)]
+    if _pool is not None:
+        for ij, c in _pool.map(_per_ij, ij_pairs):
+            i, j = ij
+            G[i, j] += c
+    else:
+        for ij in ij_pairs:
+            _, c = _per_ij(ij)
+            i, j = ij
+            G[i, j] += c
+    return G
+
+
 def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                   ovL_bare, ooL_bare, S_pno_cache,
                   Fkj, foo_t1, cc_ints=None,

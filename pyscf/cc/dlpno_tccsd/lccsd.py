@@ -2072,12 +2072,18 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _jiang_J_oo_d = None
 
             _tj_g0 = _time.perf_counter()
-            _local_df_G = build_G_tilde(
+            _use_psi4_G = (os.environ.get('DLPNO_G_TILDE_LEGACY', '0') != '1')
+            if _use_psi4_G:
+                from pyscf.cc.dlpno_tccsd.residual import build_G_tilde_psi4 as _bG_fn
+            else:
+                _bG_fn = build_G_tilde
+            _local_df_G = _bG_fn(
                 t2_pno_all, t1_pno, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache,
                 _local_Fkj, _local_foo_t1,
                 cc_ints=_cc_ints,
-                S_pao_full=S_pao_full, s1e=s1e)
+                S_pao_full=S_pao_full, s1e=s1e,
+                _pool=(_fine_pool or _pool))
             _g_future = None
             _tj_FG = _time.perf_counter() - _tj_g0
 
