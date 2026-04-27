@@ -2034,8 +2034,12 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _tj_C = _time.perf_counter() - _tj_c0
 
             _tj_d0 = _time.perf_counter()
-            from pyscf.cc.dlpno_tccsd.residual import build_D_tilde_batched
-            _jiang_D = build_D_tilde_batched(
+            _use_psi4_D = (os.environ.get('DLPNO_D_TILDE_LEGACY', '0') != '1')
+            if _use_psi4_D:
+                from pyscf.cc.dlpno_tccsd.residual import build_D_tilde_psi4 as _bD_fn
+            else:
+                from pyscf.cc.dlpno_tccsd.residual import build_D_tilde_batched as _bD_fn
+            _jiang_D = _bD_fn(
                 t1_pno, t2_pno_all, pno_spaces, nocc,
                 ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
                 _term2_precomputed=_d_t2_pre,

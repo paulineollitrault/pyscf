@@ -1016,6 +1016,208 @@ def _build_d_tilde_t34_plan(
     }
 
 
+def build_D_tilde_psi4(
+        t1_pno, t2_pno_all, pno_spaces, nocc,
+        ovL_bare, ooL_bare, S_pno_cache, with_df,
+        _term2_precomputed=None, cc_ints=None,
+        pair_lmo_idx=None, _pool=None,
+        S_pao_full=None, s1e=None,
+        t1_cache=None, omp_threads=None):
+    """Compute D_tilde — Psi4 per-pair port matching ccsd.cc:1991 line-by-line.
+
+    For each ordered pair (i, k):
+      Term 2 (Psi4 2013-2023): T_i = S(ik, ii) @ T_ia[i]
+                               L_temp_A = (2*K_tilde_chem[ki] reshape (n²,n)) @ T_i
+                               D_tilde[ik] += L_temp_A.reshape(n,n).T
+                               L_temp_B = T_i.T @ K_tilde_chem[ki]   reshape(n,n)
+                               D_tilde[ik] -= L_temp_B.T
+      Term 1 (Psi4 2025-2028): L_bar = 2*K_bar[ik] - K_bar_chem[ik]
+                               D_tilde[ik] -= T_n_ij[ik].T @ L_bar
+      Term 3 (Psi4 2030-2039): for l in lmopair_to_lmos_[ik]:
+                                   T_l   = S(ik, ll) @ T_ia[l]
+                                   T_i_lk = S(lk, ii) @ T_ia[i]
+                                   L_lk = T_i_lk.T @ L_iajb[lk_ord] @ S(lk, ik)
+                                   D_tilde[ik] -= np.outer(T_l, L_lk)
+      Term 4 (Psi4 2041-2050): for l in lmopair_to_lmos_[ik]:
+                                   X = Tt_iajb[il_ord] @ S(il, lk) @ L_iajb[lk_ord]
+                                   Y = S(ik, il) @ X @ S(lk, ik)
+                                   D_tilde[ik] += 0.5 * Y
+
+    L_iajb_[ord] = 2 * K_iajb_[ord] - K_iajb_[ord].T  (Psi4 convention).
+    Tt_iajb_[ord] = 2 * T_iajb_[ord] - T_iajb_[ord].T.
+    """
+    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
+
+    all_ordered = []
+    for key in t2_pno_all:
+        a, b = key
+        all_ordered.append((a, b))
+        if a != b:
+            all_ordered.append((b, a))
+
+    if t1_cache is None:
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            PairIndex, build_t1_cache,
+        )
+        _pi = PairIndex(
+            pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+        t1_cache = build_t1_cache(t1_pno, _pi, S_pno_cache, pno_spaces)
+
+    def _t2_ordered(a, b):
+        canon = (min(a, b), max(a, b))
+        t2 = t2_pno_all.get(canon)
+        if t2 is None or t2.shape[0] == 0:
+            return None
+        return t2 if (a, b) == canon else t2.T
+
+    def _K_iajb_ordered(canonical_key, a, b):
+        """Return K_iajb for ordered (a, b); reads canonical and swaps."""
+        ci = cc_ints.get(canonical_key) if cc_ints is not None else None
+        if ci is None:
+            return None
+        K_canon = ci['K_iajb']
+        return K_canon if (a, b) == canonical_key else K_canon.T
+
+    def _per_pair(key_ik):
+        i, k = key_ik
+        canonical = (min(i, k), max(i, k))
+        n_ik = pno_spaces[canonical]['C_pno'].shape[1]
+        if n_ik == 0:
+            return key_ik, np.zeros((0, 0))
+        ci_ik = cc_ints.get(canonical) if cc_ints is not None else None
+        if ci_ik is None:
+            return key_ik, np.zeros((n_ik, n_ik))
+
+        ii = (i, i)
+        n_ii = pno_spaces[ii]['C_pno'].shape[1] if ii in pno_spaces else 0
+        D_tilde = np.zeros((n_ik, n_ik))
+
+        # ---- Term 2 (Psi4 ccsd.cc:2013-2023) ----
+        # T_i_in_ik = S(ik, ii) @ t1[i]
+        # K_tilde_chem[ki ordered] (n_ik, n_ik²): if k is canonical's first
+        # idx, K_tilde_chem_[ki ordered] uses k-side (which is canonical's
+        # i-side aux) → ci['K_tilde_chem_i']. ki ordered (k, i): k=k, i=i.
+        # Canonical for ki = (min(k,i), max(k,i)) = same canonical as ik.
+        # So K_tilde_chem orientation: if canonical[0] == k → use _i, else _j.
+        t1_i_pno = t1_pno.get(i)
+        if (t1_i_pno is not None and t1_i_pno.size > 0
+                and np.max(np.abs(t1_i_pno)) > 1e-15
+                and ii in pno_spaces and n_ii > 0):
+            S_ik_ii = (np.eye(n_ik) if canonical == ii
+                       else _s_pno_get(canonical, ii))
+            if S_ik_ii is not None:
+                T_i_in_ik = S_ik_ii @ t1_i_pno          # (n_ik,)
+                # K_tilde_chem for ordered ki=(k, i):
+                is_k_first = (canonical[0] == k)
+                K_tilde_chem = (ci_ik['K_tilde_chem_i'] if is_k_first
+                                else ci_ik['K_tilde_chem_j'])
+                # Reshape to (n_ik, n_ik, n_ik): K[a, b, c] = (k a | b c)
+                K3 = K_tilde_chem.reshape(n_ik, n_ik, n_ik)
+                # Part A: D_tilde[b, a] += 2 * Σ_c K[a, b, c] * T_i[c]
+                D_tilde += 2.0 * np.einsum(
+                    'abc,c->ba', K3, T_i_in_ik, optimize=True)
+                # Part B: D_tilde[c, b] -= Σ_a T_i[a] * K[a, b, c]
+                D_tilde -= np.einsum(
+                    'abc,a->cb', K3, T_i_in_ik, optimize=True)
+
+        # ---- Term 1 (Psi4 ccsd.cc:2025-2028) ----
+        # L_bar = 2*K_bar[ik ordered] - K_bar_chem[ik]
+        # K_bar[ik ordered]: ordered (i, k). canonical first idx is ?
+        # if i == canonical[0]: K_bar_ij; else K_bar_ji.
+        p_lmos = ci_ik['p_lmos']
+        T_n_ik = t1_cache[canonical][p_lmos]            # (nlmo_pair, n_ik)
+        K_bar_chem = ci_ik['K_bar_chem']                # (nlmo_pair, n_ik)
+        is_i_first = (canonical[0] == i)
+        K_bar_ord = (ci_ik['K_bar_ij'] if is_i_first
+                     else ci_ik['K_bar_ji'])
+        L_bar = 2.0 * K_bar_ord - K_bar_chem
+        D_tilde -= T_n_ik.T @ L_bar
+
+        domain = ([int(x) for x in pair_lmo_idx[canonical]]
+                  if pair_lmo_idx is not None and canonical in pair_lmo_idx
+                  else list(range(nocc)))
+
+        # ---- Term 3 (Psi4 ccsd.cc:2030-2039): outer product per l ----
+        # L_lk = T_i_lk.T @ L_iajb_[lk ordered] @ S(lk, ik)
+        # ordered lk = (l, k); canonical (min(l,k), max(l,k)).
+        # L_iajb = 2*K_iajb_[ordered] - K_iajb_[ordered].T.
+        for l in domain:
+            lk_canon = (min(l, k), max(l, k))
+            ll_key = (l, l)
+            if lk_canon not in pno_spaces or ll_key not in pno_spaces:
+                continue
+            n_lk = pno_spaces[lk_canon]['C_pno'].shape[1]
+            if n_lk == 0:
+                continue
+            t1_l_pno = t1_pno.get(l)
+            if t1_l_pno is None or t1_l_pno.size == 0:
+                continue
+            t1_i_pno_loc = t1_pno.get(i)
+            if t1_i_pno_loc is None or t1_i_pno_loc.size == 0:
+                continue
+            K_iajb_ord = _K_iajb_ordered(lk_canon, l, k)
+            if K_iajb_ord is None:
+                continue
+            L_iajb_ord = 2.0 * K_iajb_ord - K_iajb_ord.T
+            S_ik_ll = (np.eye(n_ik) if canonical == ll_key
+                       else _s_pno_get(canonical, ll_key))
+            S_lk_ii = (np.eye(n_lk) if lk_canon == ii
+                       else _s_pno_get(lk_canon, ii))
+            S_lk_ik = (np.eye(n_lk) if lk_canon == canonical
+                       else _s_pno_get(lk_canon, canonical))
+            if S_ik_ll is None or S_lk_ii is None or S_lk_ik is None:
+                continue
+            T_l = S_ik_ll @ t1_l_pno                          # (n_ik,)
+            T_i_lk = S_lk_ii @ t1_i_pno_loc                   # (n_lk,)
+            L_lk = T_i_lk @ L_iajb_ord @ S_lk_ik              # (n_ik,)
+            D_tilde -= np.outer(T_l, L_lk)
+
+        # ---- Term 4 (Psi4 ccsd.cc:2041-2050): triplet sandwich per l ----
+        # ordered il = (i, l); canonical (min(i,l), max(i,l)).
+        # ordered lk = (l, k) as above.
+        # Tt_iajb_[il ord] = 2*T_iajb_[il ord] - T_iajb_[il ord].T
+        for l in domain:
+            il_canon = (min(i, l), max(i, l))
+            lk_canon = (min(l, k), max(l, k))
+            if il_canon not in pno_spaces or lk_canon not in pno_spaces:
+                continue
+            n_il = pno_spaces[il_canon]['C_pno'].shape[1]
+            n_lk = pno_spaces[lk_canon]['C_pno'].shape[1]
+            if n_il == 0 or n_lk == 0:
+                continue
+            t2_il_ord = _t2_ordered(i, l)
+            if t2_il_ord is None:
+                continue
+            Tt_il = 2.0 * t2_il_ord - t2_il_ord.T            # (n_il, n_il)
+            K_iajb_lk_ord = _K_iajb_ordered(lk_canon, l, k)
+            if K_iajb_lk_ord is None:
+                continue
+            L_iajb_ord = 2.0 * K_iajb_lk_ord - K_iajb_lk_ord.T
+            S_il_lk = (np.eye(n_il) if il_canon == lk_canon
+                       else _s_pno_get(il_canon, lk_canon))
+            S_ik_il = (np.eye(n_il) if canonical == il_canon
+                       else _s_pno_get(canonical, il_canon))
+            S_lk_ik = (np.eye(n_lk) if lk_canon == canonical
+                       else _s_pno_get(lk_canon, canonical))
+            if S_il_lk is None or S_ik_il is None or S_lk_ik is None:
+                continue
+            X = Tt_il @ S_il_lk @ L_iajb_ord                 # (n_il, n_lk)
+            Y = S_ik_il @ X @ S_lk_ik                        # (n_ik, n_ik)
+            D_tilde += 0.5 * Y
+
+        return key_ik, D_tilde
+
+    D_tilde_all = {}
+    if _pool is not None:
+        for key, val in _pool.map(_per_pair, all_ordered):
+            D_tilde_all[key] = val
+    else:
+        for key in all_ordered:
+            _, val = _per_pair(key)
+            D_tilde_all[key] = val
+    return D_tilde_all
+
+
 def build_D_tilde_batched(
         t1_pno, t2_pno_all, pno_spaces, nocc,
         ovL_bare, ooL_bare, S_pno_cache, with_df,
