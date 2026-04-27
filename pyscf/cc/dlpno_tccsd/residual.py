@@ -611,15 +611,50 @@ def _run_g_term_batched(plan, bv, t2_pno_all, G_tilde,
         tmp = np.empty((num_threads, max_n_ij * max_n_ik))
         tiles = np.zeros(int(side_bv['tile_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            g_term_batched(
-                N, max_n_ij, max_n_ik,
-                side_bv['n_ij'], side_bv['n_ik'],
-                side_bv['S_off'], side_bv['t2_off'][:N],
-                side_bv['tile_off'],
-                side_bv['k_idx'], side_bv['scalar_lmo'],
-                side_bv['S_flat'], t2_flat, G_tilde_c,
-                tmp, tiles, num_threads,
-            )
+            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+                # Native-C path: see pyscf/lib/cc/dlpno_g_term.c.
+                import ctypes as _ct
+                from pyscf import lib as _pyscflib
+                _libcc = getattr(_run_g_term_batched, '_libcc', None)
+                if _libcc is None:
+                    _libcc = _pyscflib.load_library('libcc')
+                    _libcc.DLPNOg_term_batched.restype = None
+                    _libcc.DLPNOg_term_batched.argtypes = (
+                        [_ct.c_int]
+                        + [_ct.c_void_p] * 10
+                        + [_ct.c_size_t,
+                           _ct.c_void_p, _ct.c_size_t,
+                           _ct.c_void_p, _ct.c_int])
+                    _run_g_term_batched._libcc = _libcc
+                t2_off_view = np.ascontiguousarray(side_bv['t2_off'][:N])
+                G_c = np.ascontiguousarray(G_tilde_c)
+                _libcc.DLPNOg_term_batched(
+                    int(N),
+                    side_bv['n_ij'].ctypes.data_as(_ct.c_void_p),
+                    side_bv['n_ik'].ctypes.data_as(_ct.c_void_p),
+                    side_bv['S_off'].ctypes.data_as(_ct.c_void_p),
+                    t2_off_view.ctypes.data_as(_ct.c_void_p),
+                    side_bv['tile_off'].ctypes.data_as(_ct.c_void_p),
+                    side_bv['k_idx'].ctypes.data_as(_ct.c_void_p),
+                    side_bv['scalar_lmo'].ctypes.data_as(_ct.c_void_p),
+                    side_bv['S_flat'].ctypes.data_as(_ct.c_void_p),
+                    t2_flat.ctypes.data_as(_ct.c_void_p),
+                    G_c.ctypes.data_as(_ct.c_void_p),
+                    G_c.shape[0],
+                    tmp.ctypes.data_as(_ct.c_void_p), tmp.shape[1],
+                    tiles.ctypes.data_as(_ct.c_void_p),
+                    int(num_threads),
+                )
+            else:
+                g_term_batched(
+                    N, max_n_ij, max_n_ik,
+                    side_bv['n_ij'], side_bv['n_ik'],
+                    side_bv['S_off'], side_bv['t2_off'][:N],
+                    side_bv['tile_off'],
+                    side_bv['k_idx'], side_bv['scalar_lmo'],
+                    side_bv['S_flat'], t2_flat, G_tilde_c,
+                    tmp, tiles, num_threads,
+                )
         # Serial scatter — out -= Cc per item.
         flat_views = {n_ij: buf.ravel() for n_ij, buf in flat_out.items()}
         target_slot = side_bv['target_slot']

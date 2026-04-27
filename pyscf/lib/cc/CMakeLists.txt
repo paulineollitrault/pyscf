@@ -17,7 +17,7 @@ add_library(cc SHARED
   dlpno_foo_dressed.c dlpno_per_i.c dlpno_partner.c
   dlpno_b_tilde.c dlpno_g_tilde.c dlpno_t1_ints.c
   dlpno_c_tilde.c dlpno_d_tilde.c dlpno_t1_fock.c
-  dlpno_t1_residual.c dlpno_be.c)
+  dlpno_t1_residual.c dlpno_be.c dlpno_g_term.c)
 add_dependencies(cc np_helper ao2mo)
 
 set_target_properties(cc PROPERTIES
