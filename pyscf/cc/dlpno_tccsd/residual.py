@@ -220,8 +220,8 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
         # Two of the four orientation/transpose variants are needed:
         #   case_le: 2*K_proj_T - K_proj   (used when l <= j)
         #   case_gt: 2*K_proj   - K_proj_T (used when l >  j)
-        kproj_cache = {}  # (key_il, key_lj, i, l) -> (case_le_flat, case_gt_flat)
-
+        # Cache K_proj_static per UNIQUE (key_il, key_lj, i, l) tuple.
+        kproj_cache = {}
         # Enumerate triples grouped by outer (i, j) slot.
         ij_slots = []          # list of (i, j)
         ij_triple_offsets = [0]
@@ -246,6 +246,8 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                     cache_key = (key_il, key_lj, i, l)
                     pair_kproj = kproj_cache.get(cache_key)
                     if pair_kproj is None:
+                        # Python fallback: only hit when not _use_g_kproj_c
+                        # OR when the C path skipped a task (K_il / S None).
                         K_il = get_local_K(cc_ints, key_il, i, l)
                         if K_il is None:
                             continue
