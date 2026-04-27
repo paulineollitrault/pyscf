@@ -31,6 +31,7 @@ References:
     ccsd_t_slow.py: canonical reference formula
 """
 
+import os
 import numpy as np
 from functools import reduce
 from pyscf.lib import logger
@@ -872,6 +873,103 @@ def _process_one_triple(i, j, k,
     oo_flat = _ooL_for_w3.reshape(3 * m_dom_size, naux_ijk)
     K_ooov = (ov_flat @ oo_flat.T).reshape(
         3, n_tno, 3, m_dom_size).transpose(0, 2, 1, 3)
+
+    # === Native-Cython w3_full_kernel path (disabled: draft kernel
+    # produces incorrect energy by ~40 mEh on water-4. Likely a layout
+    # mismatch between the kernel's expected K_ab_cache / t2_T_all
+    # convention and what we pass. Needs careful per-phase comparison
+    # vs _w3_intermediate before re-enabling. The kernel itself is
+    # built and tracked; the wiring below is left as scaffolding.) ===
+    if False and int(os.environ.get('DLPNO_C_CYCLE', '0')):
+        try:
+            from pyscf.cc.dlpno_tccsd._w3_full_cy import w3_full_kernel
+        except ImportError:
+            w3_full_kernel = None
+        if w3_full_kernel is not None:
+            n = n_tno
+            m_dom = m_dom_size
+
+            # Build U_flat / T2_flat for per-m vooo: 3 * m_dom items.
+            # Item flat_idx = r * m_dom + l_ijk for r in [0,3), l in [0,m_dom).
+            n_tasks = 3 * m_dom
+            n_pno_arr = np.zeros(n_tasks, dtype=np.int64)
+            transpose_flags = np.zeros(n_tasks, dtype=np.int8)
+            U_blocks = [None] * n_tasks
+            T2_blocks = [None] * n_tasks
+            for r_local in range(3):
+                r_global = triple_lmo[r_local]
+                for l_local in range(m_dom):
+                    l_global = triple_domain[l_local]
+                    pk = (min(r_global, l_global), max(r_global, l_global))
+                    if pk not in t2_for_T:
+                        continue
+                    U = _U_for(pk)
+                    if U is None:
+                        continue
+                    n_pno_pk = U.shape[0]
+                    flat_idx = r_local * m_dom + l_local
+                    n_pno_arr[flat_idx] = n_pno_pk
+                    U_blocks[flat_idx] = np.ascontiguousarray(U)
+                    T2_blocks[flat_idx] = np.ascontiguousarray(t2_for_T[pk])
+                    # Convention: t2_for_T[pk] is stored canonical (min<=max).
+                    # For pair (r_global, l_global) in non-canonical order
+                    # (r > l), the T2 used in the projection needs transpose.
+                    transpose_flags[flat_idx] = 1 if r_global > l_global else 0
+
+            U_sizes = (n_pno_arr * n)        # n_pno × n_tno per item
+            T2_sizes = (n_pno_arr * n_pno_arr)
+            U_offsets = np.empty(n_tasks + 1, dtype=np.int64)
+            U_offsets[0] = 0
+            U_offsets[1:] = np.cumsum(U_sizes)
+            T2_offsets = np.empty(n_tasks + 1, dtype=np.int64)
+            T2_offsets[0] = 0
+            T2_offsets[1:] = np.cumsum(T2_sizes)
+            n_pno_max = int(n_pno_arr.max(initial=0))
+            U_flat = np.empty(int(U_offsets[-1]))
+            T2_flat = np.empty(int(T2_offsets[-1]))
+            for t in range(n_tasks):
+                if n_pno_arr[t] == 0:
+                    continue
+                U_flat[U_offsets[t]:U_offsets[t + 1]] = U_blocks[t].ravel()
+                T2_flat[T2_offsets[t]:T2_offsets[t + 1]] = T2_blocks[t].ravel()
+
+            # K_ab_cache (3, n, n, n): K_ab_cache[ip, a, b, f] from ovL_ijk[ip] @ vvL_sc
+            K_ab_cache = np.empty((3, n, n, n))
+            for ip in range(3):
+                t = np.tensordot(ovL_ijk[ip], vvL_sc, axes=([1], [2]))
+                K_ab_cache[ip] = t.transpose(0, 2, 1)
+
+            # t2_T_all (3, 3, n, n): t2_block transposed on virtual axes.
+            t2_T_all = np.ascontiguousarray(t2_block.transpose(0, 1, 3, 2))
+
+            has_t1 = 1 if (t1_lmo is not None and fvo is not None) else 0
+            if has_t1:
+                K_jk = ovL_ijk[1] @ ovL_ijk[2].T
+                K_ik = ovL_ijk[0] @ ovL_ijk[2].T
+                K_ij = ovL_ijk[0] @ ovL_ijk[1].T
+                t1_sc_arr = np.ascontiguousarray(t1_lmo)
+            else:
+                K_jk = np.zeros((n, n))
+                K_ik = np.zeros((n, n))
+                K_ij = np.zeros((n, n))
+                t1_sc_arr = np.zeros((3, n))
+
+            dij = int(i == j); djk = int(j == k); dik = int(i == k)
+            occ_denom = 1 + dij + djk + dik + 2 * dij * djk * dik
+
+            return w3_full_kernel(
+                K_ab_cache, t2_T_all,
+                np.ascontiguousarray(K_jk),
+                np.ascontiguousarray(K_ik),
+                np.ascontiguousarray(K_ij),
+                np.ascontiguousarray(K_ooov),
+                U_flat, U_offsets, n_pno_arr,
+                T2_flat, T2_offsets, transpose_flags,
+                np.ascontiguousarray(eps_occ),
+                np.ascontiguousarray(eps_tno_sc),
+                t1_sc_arr, has_t1, occ_denom,
+                int(n), int(m_dom), int(n_pno_max),
+            )
 
     return _w3_intermediate(t2_block, ovL_ijk, None, vvL_sc,
                             eps_occ, eps_tno_sc,
