@@ -633,6 +633,36 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             nQp, npno, np_full, nl, n_kj, npp, n_local_total,
         )
 
+    # === Native-C centerQ kernel (DLPNO_C_CYCLE=1): replaces the Python
+    # body of the inner `for centerQ in unique_centers:` loop with a
+    # single C call per centerQ. See pyscf/lib/cc/dlpno_pair_centerQ.c.
+    _use_centerQ_c = bool(int(os.environ.get('DLPNO_C_CYCLE', '0')))
+    _libcc_centerQ = None
+    if _use_centerQ_c:
+        import ctypes as _ctypes_cQ
+        from pyscf import lib as _pyscflib_cQ
+        _libcc_centerQ = _pyscflib_cQ.load_library('libcc')
+        _libcc_centerQ.DLPNOpair_centerQ_step.restype = None
+        _libcc_centerQ.DLPNOpair_centerQ_step.argtypes = (
+            [_ctypes_cQ.c_void_p] * 3
+            + [_ctypes_cQ.c_void_p, _ctypes_cQ.c_int, _ctypes_cQ.c_int]
+            + [_ctypes_cQ.c_void_p] * 4
+            + [_ctypes_cQ.c_size_t] * 8
+            + [_ctypes_cQ.c_void_p] * 8)
+
+    # === DBG_CCINTS section timers (read DLPNO_CCINTS_DBG=1) ===
+    import time as _ccints_time
+    import threading as _ccints_threading
+    _dbg_ccints = bool(int(os.environ.get('DLPNO_CCINTS_DBG', '0')))
+    _dbg_acc = {'setup': 0.0, 'centerQ_loop': 0.0, 'jhi_eigh': 0.0,
+                'jhi_apply': 0.0, 'final_KJ': 0.0, 'cross_kj': 0.0,
+                'partner_calls': 0.0, 'centerQ_inner': 0.0}
+    _dbg_lock = _ccints_threading.Lock()
+    def _dbg_add(k, v):
+        if _dbg_ccints:
+            with _dbg_lock:
+                _dbg_acc[k] += v
+
     def _process_pair(key):
         """Build cc_ints[key] entry. Pure function — safe for thread parallel."""
         if key not in pair_aux_idx:
@@ -733,6 +763,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             pp_ki = np.asarray(pno_spaces[key_ki]['pair_paos'])
             ki_data.append((k, X_ki, pp_ki, n_ki))
 
+        _t_centerQ_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         for centerQ in unique_centers:
             ext_lmos = riatom_to_lmos_ext[centerQ]
             if len(ext_lmos) == 0 or qij_atom[centerQ] is None:
@@ -773,59 +804,101 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 ext_kept_pos = np.where(keep_mask)[0]       # rows of qij_b
                 ext_kept_lmos = ext_local[keep_mask]        # cols of raw_io
 
-            # raw_io[local_Q, p_lmos_local] = qij_b[:, i_s, kept]
-            if i_s >= 0 and ext_kept_lmos.size > 0:
-                raw_io[np.ix_(local_Q, ext_kept_lmos)] = \
-                    qij_b[:, i_s, :][:, ext_kept_pos]
-            if j_s >= 0 and ext_kept_lmos.size > 0:
-                raw_jo[np.ix_(local_Q, ext_kept_lmos)] = \
-                    qij_b[:, j_s, :][:, ext_kept_pos]
-            if i_s >= 0 and j_s >= 0:
-                raw_pair[local_Q] = qij_b[:, i_s, j_s]
-
-            if len(ij_u_in_Q) > 0:
-                # qia restricted to pair's PAOs:
-                qia_b_pp = qia_b[:, :, ij_u_in_Q]            # (nQp, nl, npp)
-                if i_s >= 0:
-                    raw_iv[local_Q] = qia_b_pp[:, i_s, :] @ X_ij_slice
-                if j_s >= 0:
-                    raw_jv[local_Q] = qia_b_pp[:, j_s, :] @ X_ij_slice
-
-                # raw_ma: keep only ext_lmos that are in p_lmos
-                if ext_kept_lmos.size > 0:
-                    nQp = len(local_Q)
-                    qia_b_pp_kept = qia_b_pp[:, ext_kept_pos, :]  # (nQp, n_kept, npp)
-                    ma_b_kept = (
-                        qia_b_pp_kept.reshape(nQp * ext_kept_pos.size, -1)
-                        @ X_ij_slice
-                    ).reshape(nQp, ext_kept_pos.size, npno)
-                    raw_ma[np.ix_(local_Q, ext_kept_lmos)] = ma_b_kept
-
-                # raw_ab: X^T qab_b_pp X — one big reshape+gemm for tmp,
-                # then batched gemm over Q for the second contraction.
-                qab_b_pp = qab_b[:, ij_u_in_Q[:, None], ij_u_in_Q[None, :]]
-                tmp = (qab_b_pp.reshape(nQp * len(ij_u_in_Q), -1)
-                       @ X_ij_slice).reshape(nQp, len(ij_u_in_Q), npno)
-                raw_ab[local_Q] = np.matmul(X_ij_slice.T, tmp)
-
-            # Cross-pair partners.
-            # Optimization: project the IJ side first ONCE per (pair, centerQ)
-            # via X_ij.T @ qab_b. Then per-partner work reduces to one 1D
-            # fancy slice + one batched matmul (nQp, npno, npp_kj) @ (npp_kj,
-            # n_kj). Empirically ~10× faster than per-partner 2D fancy index
-            # at sizes where pair_paos is large (medium systems).
             np_full = qab_b.shape[1]
-            if len(ij_u_in_Q) > 0:
-                # qab_ij[Q, u, v] = qab_b[Q, ij_u_in_Q[u], v]
-                if len(ij_u_in_Q) == np_full and np.array_equal(
-                        ij_u_in_Q, np.arange(np_full)):
-                    qab_ij = qab_b
+            if _use_centerQ_c:
+                # Native-C path: one call computes all of raw_io/jo/pair/
+                # iv/jv/ma/ab + proj_ij for this (pair, centerQ).
+                _local_Q_long = np.ascontiguousarray(local_Q, dtype=np.int64)
+                _ij_u_in_Q_long = (
+                    np.ascontiguousarray(ij_u_in_Q, dtype=np.int64)
+                    if len(ij_u_in_Q) > 0
+                    else np.zeros(0, dtype=np.int64))
+                _ekp = np.ascontiguousarray(ext_kept_pos, dtype=np.int64)
+                _ekl = np.ascontiguousarray(ext_kept_lmos, dtype=np.int64)
+                _X_slice = np.ascontiguousarray(X_ij_slice)
+                _qij_b = np.ascontiguousarray(qij_b)
+                _qia_b = np.ascontiguousarray(qia_b)
+                _qab_b = np.ascontiguousarray(qab_b)
+                _nQp_c = _qij_b.shape[0]
+                _nl_c = _qij_b.shape[1]
+                _np_full_c = np_full
+                _npp_c = int(len(ij_u_in_Q))
+                _n_kept_c = int(_ekp.size)
+                if _npp_c > 0:
+                    proj_ij = np.empty((_nQp_c, npno, _np_full_c))
                 else:
-                    qab_ij = qab_b[:, ij_u_in_Q, :]      # (nQp, npp_ij, np_full)
-                # proj_ij[Q, A_ij, v] = sum_u X_ij_slice[u, A_ij] * qab_ij[Q, u, v]
-                proj_ij = np.matmul(X_ij_slice.T, qab_ij)  # (nQp, npno, np_full)
+                    proj_ij = None
+                _proj_ptr = (proj_ij if proj_ij is not None
+                             else np.empty(0))
+                _libcc_centerQ.DLPNOpair_centerQ_step(
+                    _qij_b.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _qia_b.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _qab_b.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _local_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    int(i_s), int(j_s),
+                    _ij_u_in_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _ekp.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _ekl.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _X_slice.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _nQp_c, _nl_c, _np_full_c,
+                    npno, _npp_c, _n_kept_c, n_local, nlmo_p,
+                    raw_io.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    raw_jo.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    raw_iv.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    raw_jv.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    raw_pair.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    raw_ma.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    raw_ab.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _proj_ptr.ctypes.data_as(_ctypes_cQ.c_void_p),
+                )
             else:
-                proj_ij = None
+                # raw_io[local_Q, p_lmos_local] = qij_b[:, i_s, kept]
+                if i_s >= 0 and ext_kept_lmos.size > 0:
+                    raw_io[np.ix_(local_Q, ext_kept_lmos)] = \
+                        qij_b[:, i_s, :][:, ext_kept_pos]
+                if j_s >= 0 and ext_kept_lmos.size > 0:
+                    raw_jo[np.ix_(local_Q, ext_kept_lmos)] = \
+                        qij_b[:, j_s, :][:, ext_kept_pos]
+                if i_s >= 0 and j_s >= 0:
+                    raw_pair[local_Q] = qij_b[:, i_s, j_s]
+
+                if len(ij_u_in_Q) > 0:
+                    # qia restricted to pair's PAOs:
+                    qia_b_pp = qia_b[:, :, ij_u_in_Q]            # (nQp, nl, npp)
+                    if i_s >= 0:
+                        raw_iv[local_Q] = qia_b_pp[:, i_s, :] @ X_ij_slice
+                    if j_s >= 0:
+                        raw_jv[local_Q] = qia_b_pp[:, j_s, :] @ X_ij_slice
+
+                    # raw_ma: keep only ext_lmos that are in p_lmos
+                    if ext_kept_lmos.size > 0:
+                        nQp = len(local_Q)
+                        qia_b_pp_kept = qia_b_pp[:, ext_kept_pos, :]
+                        ma_b_kept = (
+                            qia_b_pp_kept.reshape(
+                                nQp * ext_kept_pos.size, -1)
+                            @ X_ij_slice
+                        ).reshape(nQp, ext_kept_pos.size, npno)
+                        raw_ma[np.ix_(local_Q, ext_kept_lmos)] = ma_b_kept
+
+                    # raw_ab: X^T qab_b_pp X
+                    qab_b_pp = qab_b[
+                        :, ij_u_in_Q[:, None], ij_u_in_Q[None, :]]
+                    tmp = (qab_b_pp.reshape(nQp * len(ij_u_in_Q), -1)
+                           @ X_ij_slice).reshape(
+                               nQp, len(ij_u_in_Q), npno)
+                    raw_ab[local_Q] = np.matmul(X_ij_slice.T, tmp)
+
+                # proj_ij for cross-pair partners
+                if len(ij_u_in_Q) > 0:
+                    if len(ij_u_in_Q) == np_full and np.array_equal(
+                            ij_u_in_Q, np.arange(np_full)):
+                        qab_ij = qab_b
+                    else:
+                        qab_ij = qab_b[:, ij_u_in_Q, :]
+                    proj_ij = np.matmul(X_ij_slice.T, qab_ij)
+                else:
+                    proj_ij = None
 
             # Per-partner work fused into one Cython kernel that reads
             # proj_ij / qia_b directly with index arrays — avoids the
@@ -870,6 +943,10 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     do_proj,
                 )
 
+        if _dbg_ccints:
+            _dbg_add('centerQ_loop',
+                     _ccints_time.perf_counter() - _t_centerQ_start)
+        _t_jhi_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         # Apply local J^{-1/2}
         j2c_local = j2c[np.ix_(aux_idx, aux_idx)]
         eigvals, eigvecs = np.linalg.eigh(j2c_local)
@@ -924,6 +1001,10 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         q_jo = q_jo_red
         Qma = Qma_red
 
+        if _dbg_ccints:
+            _dbg_add('jhi_apply',
+                     _ccints_time.perf_counter() - _t_jhi_start)
+        _t_finalKJ_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         K_iajb = q_iv.T @ q_jv
         # K_mnij removed: dead code (built but never read by any consumer).
         # K_bar_ij/ji/chem all reduced on the p_lmos axis: (nlmo_p, npno).
@@ -938,6 +1019,10 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         K_tilde_chem_i = np.ascontiguousarray(q_iv.T @ Qab_flat)
         K_tilde_chem_j = np.ascontiguousarray(q_jv.T @ Qab_flat)
 
+        if _dbg_ccints:
+            _dbg_add('final_KJ',
+                     _ccints_time.perf_counter() - _t_finalKJ_start)
+        _t_cross_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         J_ij_kj = {}
         K_ij_kj_dict = {}
         for k, key_kj, _ in kj_partners:
@@ -963,6 +1048,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             q_kv_ki = jhi @ raw_kv_ki[k]
             K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki
 
+        if _dbg_ccints:
+            _dbg_add('cross_kj',
+                     _ccints_time.perf_counter() - _t_cross_start)
         return key, {
             'K_iajb': K_iajb,
             'K_bar_ij': K_bar_ij,
@@ -1003,6 +1091,11 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         for key in keys:
             k, entry = _process_pair(key)
             cc_ints[k] = entry
+
+    if _dbg_ccints:
+        _items = sorted(_dbg_acc.items(), key=lambda kv: -kv[1])
+        _summary = ' '.join(f'{n}={v:.2f}s' for n, v in _items if v > 0.0)
+        print(f"[CCINTS_DBG] (n_pairs={len(keys)}) {_summary}", flush=True)
 
     # Debug: zero p_lmos\pair_lmo_idx rows in selected cc_ints fields, to
     # localize which consumer(s) drift the energy when those rows go away.
