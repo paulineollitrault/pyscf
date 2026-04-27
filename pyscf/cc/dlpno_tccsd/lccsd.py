@@ -769,46 +769,58 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
 
         ci_ii = cc_ints.get(key_ii)
         if ci_ii is not None:
-            Qma_ii = ci_ii['Qma']      # (n_local, nocc, n_ii)
+            # Phase II: kernel takes pair-domain Qma directly. M = nlmo_pair.
+            Qma_ii = ci_ii['Qma']      # (n_local, nlmo_p, n_ii)
             Qab_ii = ci_ii['Qab']      # (n_local, n_ii, n_ii)
             Qia_ii = ci_ii['i_Qa']     # (n_local, n_ii)
-            # i_Qk reduced to (n_local, nlmo_p); per_i_stages123 kernel
-            # iterates over the second axis as a global LMO, so scatter
-            # back to (n_local, nocc) here. Will collapse this when we
-            # sweep .pyx -> pyscf/lib/cc/dlpno_*.c.
-            _Qik_red = ci_ii['i_Qk']   # (n_local, nlmo_p)
-            Qik_ii = np.zeros((_Qik_red.shape[0], nocc))
-            Qik_ii[:, ci_ii['p_lmos']] = _Qik_red
+            Qik_ii = ci_ii['i_Qk']     # (n_local, nlmo_p) — no scatter-back
 
-            # T_n_ii[m, c] = t1[m] projected to PNO_ii — read the
-            # (nocc, n_ii) view from the global t1_cache directly.
-            T_n_ii = t1_cache[key_ii]
-            any_t1 = T_n_ii.size > 0 and bool(
-                np.max(np.abs(T_n_ii)) > 1e-15)
+            # T_n_ii_full[m, c] = t1[m] projected to PNO_ii (nocc, n_ii) —
+            # used for Stage 4 (Fij_bar @ T_n on full-nocc axis).
+            T_n_ii_full = t1_cache[key_ii]
+            # Pair-domain T_n for the kernel (nlmo_p, n_ii).
+            p_lmos_ii = ci_ii['p_lmos']
+            T_n_ii_pair = np.ascontiguousarray(T_n_ii_full[p_lmos_ii])
+            any_t1 = T_n_ii_full.size > 0 and bool(
+                np.max(np.abs(T_n_ii_full)) > 1e-15)
 
             _ts1 = _time_perI.perf_counter() if _per_i_dump else 0.0
-            # ---- Stages 1-3 in one nogil Cython kernel ----
-            # Stages: gamma + Fai_bar dressing (1), Fab_bar*t1 (2),
-            # -T_n.T*Fia_bar*t1 (3). The chain runs for any_t1 (Stage 1)
-            # and additionally has_t1_i (Stages 2/3); the simple
-            # `r1 += e_pno * t1` shortcut handles has_t1_i without any_t1.
+            # ---- Stages 1-3 in one C kernel: pyscf/lib/cc/dlpno_per_i.c ----
             if any_t1 or has_t1_i:
-                from pyscf.cc.dlpno_tccsd._per_i_stages_cy import (
-                    per_i_stages123)
+                import ctypes
+                from pyscf import lib as _pyscflib
+                _libcc_pi = _pyscflib.load_library('libcc')
+                _libcc_pi.DLPNOper_i_stages123.restype = None
+                _libcc_pi.DLPNOper_i_stages123.argtypes = [
+                    ctypes.c_void_p,                          # r1_inout
+                    ctypes.c_void_p, ctypes.c_void_p,         # Qma, Qab
+                    ctypes.c_void_p, ctypes.c_void_p,         # Qia, Qik
+                    ctypes.c_void_p, ctypes.c_void_p,         # T_n, t1_i
+                    ctypes.c_void_p,                          # e_pno
+                    ctypes.c_int,                             # do_stage_23
+                    ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,  # L, M, A
+                ]
                 _Qma_c = np.ascontiguousarray(Qma_ii)
                 _Qab_c = np.ascontiguousarray(Qab_ii)
                 _Qia_c = np.ascontiguousarray(Qia_ii)
                 _Qik_c = np.ascontiguousarray(Qik_ii)
-                _Tn_c = np.ascontiguousarray(T_n_ii)
                 _epn_c = np.ascontiguousarray(e_pno_ii)
                 _t1_c = (np.ascontiguousarray(t1_i) if has_t1_i
                          else np.zeros(n_ii))
                 if any_t1:
-                    per_i_stages123(
-                        _Qma_c, _Qab_c, _Qia_c, _Qik_c,
-                        _Tn_c, _t1_c, _epn_c,
+                    _L_dim, _M_dim, _A_dim = _Qma_c.shape
+                    _libcc_pi.DLPNOper_i_stages123(
+                        r1_i.ctypes.data_as(ctypes.c_void_p),
+                        _Qma_c.ctypes.data_as(ctypes.c_void_p),
+                        _Qab_c.ctypes.data_as(ctypes.c_void_p),
+                        _Qia_c.ctypes.data_as(ctypes.c_void_p),
+                        _Qik_c.ctypes.data_as(ctypes.c_void_p),
+                        T_n_ii_pair.ctypes.data_as(ctypes.c_void_p),
+                        _t1_c.ctypes.data_as(ctypes.c_void_p),
+                        _epn_c.ctypes.data_as(ctypes.c_void_p),
                         1 if (has_t1_i and any_t1) else 0,
-                        r1_i)
+                        _L_dim, _M_dim, _A_dim,
+                    )
                 else:
                     # any_t1 == 0 implies Stages 1/2/3 all skipped except
                     # the has_t1_i shortcut: r1 += e_pno * t1
@@ -816,7 +828,8 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             _ts2 = _time_perI.perf_counter() if _per_i_dump else 0.0
 
             # ---- Stage 4: -sum_k T_n[ii][k,a] * Fij_bar[k,i] ----
-            r1_i -= Fij_bar[:, i] @ T_n_ii
+            # Uses the full-nocc T_n because Fij_bar is a global (nocc, nocc).
+            r1_i -= Fij_bar[:, i] @ T_n_ii_full
             _tsk = _time_perI.perf_counter() if _per_i_dump else 0.0
             if _per_i_dump:
                 _per_i_t['stages_cy'] += _ts2 - _ts1
