@@ -72,10 +72,11 @@
 #include <stddef.h>
 
 void DLPNOpair_centerQ_step(
-        const double *qij_b,
-        const double *qia_b,
-        const double *qab_b,
+        const double *qij_atom_full,   /* (nQ_at_atom, nl, nl) */
+        const double *qia_atom_full,   /* (nQ_at_atom, nl, np_full) */
+        const double *qab_atom_full,   /* (nQ_at_atom, np_full, np_full) */
         const long   *local_Q,
+        const long   *atom_pos,        /* (nQp,) — page index into atom stack */
         const int     i_s,
         const int     j_s,
         const long   *ij_u_in_Q,
@@ -99,6 +100,14 @@ void DLPNOpair_centerQ_step(
         double       *raw_ab,
         double       *proj_ij_out)
 {
+    /* atom_pos[q] selects which page of the atom's stack belongs to this
+     * pair's q-th aux at this centerQ. The Python fancy-index
+     * `qij_atom[centerQ][atom_pos]` is replaced by reading
+     * `qij_atom_full[atom_pos[q] * stride + ...]` on demand. */
+    const double *qij_b = qij_atom_full;
+    const double *qia_b = qia_atom_full;
+    const double *qab_b = qab_atom_full;
+
     const size_t qij_q = nl * nl;
     const size_t qij_l = nl;
     const size_t qia_q = nl * np_full;
@@ -121,7 +130,8 @@ void DLPNOpair_centerQ_step(
 
     for (size_t q = 0; q < nQp; q++) {
         const size_t row_lq = (size_t)local_Q[q];
-        const double *qij_q_ptr = qij_b + q * qij_q;
+        const size_t pg = (size_t)atom_pos[q];
+        const double *qij_q_ptr = qij_b + pg * qij_q;
 
         /* raw_io / raw_jo / raw_pair */
         if (has_i && n_kept > 0) {
@@ -144,8 +154,8 @@ void DLPNOpair_centerQ_step(
 
         if (!has_pair_paos) continue;
 
-        const double *qia_q_ptr = qia_b + q * qia_q;
-        const double *qab_q_ptr = qab_b + q * qab_q;
+        const double *qia_q_ptr = qia_b + pg * qia_q;
+        const double *qab_q_ptr = qab_b + pg * qab_q;
 
         /* raw_iv[local_Q[q], a] = sum_u qia_b[q, i_s, ij_u_in_Q[u]] * X_ij[u, a] */
         if (has_i) {

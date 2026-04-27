@@ -48,7 +48,8 @@
 
 void DLPNOpartners_centerQ_step(
         const double *proj_ij,                /* (nQp, npno, np_full) */
-        const double *qia_b,                  /* (nQp, nl, np_full) */
+        const double *qia_atom_full,          /* (nQ_at_atom, nl, np_full) */
+        const long   *atom_pos,               /* (nQp,) */
         const long   *local_Q,                /* (nQp,) */
         const long   *riatom_to_paos_dense_at,/* (nao_pao_total,) */
         const long   *riatom_to_lmos_dense_at,/* (nocc,) */
@@ -146,11 +147,14 @@ void DLPNOpartners_centerQ_step(
             }
         }
 
-        /* raw_kv_p[local_Q[q], m] = sum_u qia_b[q, k_s, kj_u_in_Q[u]] * X_k_slice[u, m] */
+        /* raw_kv_p[local_Q[q], m] = sum_u qia[atom_pos[q], k_s, kj_u_in_Q[u]]
+         *                          * X_k_slice[u, m] */
         if (k_s >= 0) {
             for (size_t q = 0; q < nQp; q++) {
                 const size_t row = (size_t)local_Q[q];
-                const double *qia_qk = qia_b + q * qia_q + (size_t)k_s * qia_l;
+                const size_t pg  = (size_t)atom_pos[q];
+                const double *qia_qk = qia_atom_full + pg * qia_q
+                                       + (size_t)k_s * qia_l;
                 double *kv_row = raw_kv_p + row * (size_t)n_kj;
                 for (long m = 0; m < n_kj; m++) {
                     double s = 0.0;

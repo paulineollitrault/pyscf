@@ -644,11 +644,12 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         _libcc_centerQ = _pyscflib_cQ.load_library('libcc')
         _libcc_centerQ.DLPNOpair_centerQ_step.restype = None
         _libcc_centerQ.DLPNOpair_centerQ_step.argtypes = (
-            [_ctypes_cQ.c_void_p] * 3
-            + [_ctypes_cQ.c_void_p, _ctypes_cQ.c_int, _ctypes_cQ.c_int]
-            + [_ctypes_cQ.c_void_p] * 4
-            + [_ctypes_cQ.c_size_t] * 8
-            + [_ctypes_cQ.c_void_p] * 8)
+            [_ctypes_cQ.c_void_p] * 3                     # qij/qia/qab atom-full
+            + [_ctypes_cQ.c_void_p, _ctypes_cQ.c_void_p]   # local_Q, atom_pos
+            + [_ctypes_cQ.c_int, _ctypes_cQ.c_int]         # i_s, j_s
+            + [_ctypes_cQ.c_void_p] * 4                    # ij_u_in_Q, ext_kept_pos/lmos, X_ij
+            + [_ctypes_cQ.c_size_t] * 8                    # shapes
+            + [_ctypes_cQ.c_void_p] * 8)                   # outputs
         _libcc_centerQ.DLPNOcross_partner_assemble.restype = None
         _libcc_centerQ.DLPNOcross_partner_assemble.argtypes = (
             [_ctypes_cQ.c_int]
@@ -656,7 +657,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             + [_ctypes_cQ.c_size_t] * 3)
         _libcc_centerQ.DLPNOpartners_centerQ_step.restype = None
         _libcc_centerQ.DLPNOpartners_centerQ_step.argtypes = (
-            [_ctypes_cQ.c_void_p] * 5            # proj, qia, local_Q, paos_dense, lmos_dense
+            [_ctypes_cQ.c_void_p] * 6            # proj, qia_atom, atom_pos, local_Q, paos_dense, lmos_dense
             + [_ctypes_cQ.c_int]                  # n_partners
             + [_ctypes_cQ.c_void_p] * 8           # 8 flat partner arrays
             + [_ctypes_cQ.c_size_t] * 7           # nQp..nocc
@@ -850,10 +851,15 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             local_Q = np.where(mask_C)[0]                   # positions in n_local
             global_Q = aux_idx[local_Q]                     # global aux indices
             atom_pos = aux_pos_in_atom[global_Q]            # positions in atom's stack
-            # Slice the per-atom stacks to just this pair's Q's
-            qij_b = qij_atom[centerQ][atom_pos]             # (nQp, nl, nl)
-            qia_b = qia_atom[centerQ][atom_pos]             # (nQp, nl, np)
-            qab_b = qab_atom[centerQ][atom_pos]             # (nQp, np, np)
+            # Slice the per-atom stacks to just this pair's Q's. Skipped
+            # on the C path (atom_pos indirection happens inside the
+            # kernel) to avoid 3 fancy-index copies per centerQ.
+            if not _use_centerQ_c:
+                qij_b = qij_atom[centerQ][atom_pos]         # (nQp, nl, nl)
+                qia_b = qia_atom[centerQ][atom_pos]         # (nQp, nl, np)
+                qab_b = qab_atom[centerQ][atom_pos]         # (nQp, np, np)
+            else:
+                qij_b = qia_b = qab_b = None
 
             # Pair (ij)'s PAOs that fall inside centerQ's PAO neighborhood
             ij_pao_pos = riatom_to_paos_ext_dense[centerQ, pair_paos_ij]
@@ -880,11 +886,18 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 ext_kept_pos = np.where(keep_mask)[0]       # rows of qij_b
                 ext_kept_lmos = ext_local[keep_mask]        # cols of raw_io
 
-            np_full = qab_b.shape[1]
+            np_full = (qab_atom[centerQ].shape[1] if qab_b is None
+                       else qab_b.shape[1])
             if _use_centerQ_c:
-                # Native-C path: one call computes all of raw_io/jo/pair/
-                # iv/jv/ma/ab + proj_ij for this (pair, centerQ).
+                # Native-C path: pass FULL per-atom stacks + atom_pos.
+                # The kernel does the atom-page indirection internally;
+                # Python no longer pre-slices `qij_atom[centerQ][atom_pos]`
+                # (eliminates 3 fancy-index copies per centerQ).
+                _qij_full = qij_atom[centerQ]
+                _qia_full = qia_atom[centerQ]
+                _qab_full = qab_atom[centerQ]
                 _local_Q_long = np.ascontiguousarray(local_Q, dtype=np.int64)
+                _atom_pos_long = np.ascontiguousarray(atom_pos, dtype=np.int64)
                 _ij_u_in_Q_long = (
                     np.ascontiguousarray(ij_u_in_Q, dtype=np.int64)
                     if len(ij_u_in_Q) > 0
@@ -892,12 +905,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 _ekp = np.ascontiguousarray(ext_kept_pos, dtype=np.int64)
                 _ekl = np.ascontiguousarray(ext_kept_lmos, dtype=np.int64)
                 _X_slice = np.ascontiguousarray(X_ij_slice)
-                _qij_b = np.ascontiguousarray(qij_b)
-                _qia_b = np.ascontiguousarray(qia_b)
-                _qab_b = np.ascontiguousarray(qab_b)
-                _nQp_c = _qij_b.shape[0]
-                _nl_c = _qij_b.shape[1]
-                _np_full_c = np_full
+                _nQp_c = int(_local_Q_long.size)
+                _nl_c = int(_qij_full.shape[1])
+                _np_full_c = int(_qab_full.shape[1])
                 _npp_c = int(len(ij_u_in_Q))
                 _n_kept_c = int(_ekp.size)
                 if _npp_c > 0:
@@ -907,10 +917,11 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 _proj_ptr = (proj_ij if proj_ij is not None
                              else np.empty(0))
                 _libcc_centerQ.DLPNOpair_centerQ_step(
-                    _qij_b.ctypes.data_as(_ctypes_cQ.c_void_p),
-                    _qia_b.ctypes.data_as(_ctypes_cQ.c_void_p),
-                    _qab_b.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _qij_full.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _qia_full.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _qab_full.ctypes.data_as(_ctypes_cQ.c_void_p),
                     _local_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _atom_pos_long.ctypes.data_as(_ctypes_cQ.c_void_p),
                     int(i_s), int(j_s),
                     _ij_u_in_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
                     _ekp.ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -994,17 +1005,19 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     riatom_to_paos_ext_dense[centerQ].astype(np.int64))
                 _lmos_dense_at = np.ascontiguousarray(
                     riatom_to_lmos_ext_dense[centerQ].astype(np.int64))
-                _qia_b_c = np.ascontiguousarray(qia_b)
+                _qia_full = qia_atom[centerQ]
+                _atom_pos_long = np.ascontiguousarray(atom_pos, dtype=np.int64)
                 _proj_c = np.ascontiguousarray(_proj_arg)
                 _nQp = local_Q_long.shape[0]
-                _nl_at = qia_b.shape[1]
-                _np_full = qia_b.shape[2]
+                _nl_at = _qia_full.shape[1]
+                _np_full = _qia_full.shape[2]
                 _nao_pao_total = riatom_to_paos_ext_dense.shape[1]
 
                 if _kj_flat is not None and do_proj:
                     _libcc_centerQ.DLPNOpartners_centerQ_step(
                         _proj_c.ctypes.data_as(_ctypes_cQ.c_void_p),
-                        _qia_b_c.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _qia_full.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _atom_pos_long.ctypes.data_as(_ctypes_cQ.c_void_p),
                         local_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _paos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _lmos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1025,7 +1038,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 if _ki_flat is not None and do_proj:
                     _libcc_centerQ.DLPNOpartners_centerQ_step(
                         _proj_c.ctypes.data_as(_ctypes_cQ.c_void_p),
-                        _qia_b_c.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _qia_full.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _atom_pos_long.ctypes.data_as(_ctypes_cQ.c_void_p),
                         local_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _paos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _lmos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
