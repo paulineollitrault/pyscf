@@ -11,6 +11,7 @@ Matches Psi4's architecture exactly:
 All integrals for pair (ij) use pair (ij)'s local aux domain with J_local^{-1/2}.
 """
 
+import os
 import numpy as np
 
 
@@ -394,7 +395,11 @@ def get_local_ovL(cc_ints, pair_key, lmo_idx):
     ci = cc_ints.get(pair_key)
     if ci is None:
         return None
-    return ci['Qma'][:, lmo_idx, :].T  # (npno, n_local)
+    # Qma reduced to (n_local, nlmo_p, npno); translate global lmo_idx.
+    lmo_in_p = int(ci['p_lmos_dense'][lmo_idx])
+    if lmo_in_p < 0:
+        return None
+    return ci['Qma'][:, lmo_in_p, :].T  # (npno, n_local)
 
 
 def get_local_ooL_vec(cc_ints, k, l, pair_key):
@@ -406,10 +411,14 @@ def get_local_ooL_vec(cc_ints, k, l, pair_key):
     if ci is None:
         return None
     i_lmo, j_lmo = pair_key
+    # i_Qk/j_Qk reduced to (n_local, nlmo_p); translate global k -> p_dense.
+    k_red = int(ci['p_lmos_dense'][k])
+    if k_red < 0:
+        return None
     if l == i_lmo:
-        return ci['i_Qk'][:, k]
+        return ci['i_Qk'][:, k_red]
     elif l == j_lmo:
-        return ci['j_Qk'][:, k]
+        return ci['j_Qk'][:, k_red]
     else:
         return None
 
@@ -430,9 +439,13 @@ def get_local_K(cc_ints, pair_key, lmo1, lmo2):
     k = (lmo1, lmo2)
     K = cache.get(k)
     if K is None:
-        Qma = ci['Qma']  # (n_local, nocc, npno)
+        Qma = ci['Qma']  # (n_local, nlmo_p, npno) reduced
+        p_dense = ci['p_lmos_dense']
+        l1, l2 = int(p_dense[lmo1]), int(p_dense[lmo2])
+        if l1 < 0 or l2 < 0:
+            return None
         # ovL_lmo[Q, a] = Qma[Q, lmo, a]; K[a,b] = Σ_Q ovL1[Q,a]*ovL2[Q,b]
-        K = Qma[:, lmo1, :].T @ Qma[:, lmo2, :]
+        K = Qma[:, l1, :].T @ Qma[:, l2, :]
         cache[k] = K
     return K
 
@@ -825,24 +838,23 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     ).reshape(n_local, nlmo_p, npno)
         Qab = (jhi @ raw_ab.reshape(n_local, -1)).reshape(n_local, npno, npno)
 
-        # Scatter reduced fitted quantities into full-nocc shape so
-        # downstream consumers (compute_B_tilde, t1_fock Fij_bar,
-        # lccsd.py Fij_bar update, etc.) that index by global LMO
-        # continue to work unchanged. The compute savings come from
-        # the small jhi matmul above; memory footprint is the same as
-        # before (full-nocc) but zeros in rows outside p_lmos.
-        q_io = np.zeros((n_local, nocc))
-        q_jo = np.zeros((n_local, nocc))
-        Qma = np.zeros((n_local, nocc, npno))
-        q_io[:, p_lmos] = q_io_red
-        q_jo[:, p_lmos] = q_jo_red
-        Qma[:, p_lmos, :] = Qma_red
+        # All reduced fitted quantities now stored on the p_lmos axis
+        # directly; consumers translate global LMO -> p_lmos position via
+        # ci['p_lmos_dense']. Saves ~3-4× memory at water-22 on Qma alone.
+        # NOTE: pair_lmo_idx-axis (Psi4-truly-faithful, smaller subset)
+        # was attempted but drifted water-10 by 1.22 mEh — needs the
+        # algorithmic restructure of T1/T2 residuals (handoff Steps 7-9,
+        # multi-week) before consumers stop reading p_lmos-only rows.
+        q_io = q_io_red
+        q_jo = q_jo_red
+        Qma = Qma_red
 
         K_iajb = q_iv.T @ q_jv
-        K_mnij = q_io.T @ q_jo                    # (nocc, nocc) full
-        K_bar_ij = q_io.T @ q_jv
-        K_bar_ji = q_jo.T @ q_iv
-        K_bar_chem = np.tensordot(q_pair, Qma, axes=(0, 0))
+        # K_mnij removed: dead code (built but never read by any consumer).
+        # K_bar_ij/ji/chem all reduced on the p_lmos axis: (nlmo_p, npno).
+        K_bar_ij = q_io_red.T @ q_jv
+        K_bar_ji = q_jo_red.T @ q_iv
+        K_bar_chem = np.tensordot(q_pair, Qma_red, axes=(0, 0))
         J_ijab = np.tensordot(q_pair, Qab, axes=(0, 0))
         # Psi4 ccsd.cc:1402 K_tilde_chem (L pre-summed (q_iv|Qab) tensors).
         # Stored once here so compute_C_tilde, build_D_tilde, and the T1
@@ -878,7 +890,6 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
 
         return key, {
             'K_iajb': K_iajb,
-            'K_mnij': K_mnij,       # (nlmo_p, nlmo_p) reduced
             'K_bar_ij': K_bar_ij,
             'K_bar_ji': K_bar_ji,
             'K_bar_chem': K_bar_chem,  # (nlmo_p, npno) reduced
@@ -891,8 +902,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             'K_ji_ki': K_ji_ki_dict,
             'i_Qa': q_iv.copy(),
             'j_Qa': q_jv.copy(),
-            'i_Qk': q_io.copy(),     # (n_local, nlmo_p) reduced
-            'j_Qk': q_jo.copy(),     # (n_local, nlmo_p) reduced
+            'i_Qk': q_io_red.copy(),     # (n_local, nlmo_p) reduced
+            'j_Qk': q_jo_red.copy(),     # (n_local, nlmo_p) reduced
             'Qma': Qma,              # (n_local, nlmo_p, npno) reduced
             'Qab': Qab,
             'n_local': n_local,
@@ -963,12 +974,16 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
 
         T1_local = np.ascontiguousarray(
             t1_cache[key][np.asarray(lmo_idx, dtype=np.intp)])
-        Qma = ci['Qma'][:, lmo_idx, :]       # (n_local, nlmo, npno)
+        # Qma reduced to (n_local, nlmo_p, npno); translate global lmo_idx.
+        _lmo_idx_in_p = np.asarray(
+            ci['p_lmos_dense'])[lmo_idx].astype(np.intp)
+        Qma = ci['Qma'][:, _lmo_idx_in_p, :]  # (n_local, nlmo, npno)
         Qab = ci['Qab']                       # (n_local, npno, npno)
 
         def _dress(lmo_global, Qa_key):
             Qa_full = ci[Qa_key]                                 # (n_local, npno)
-            Qk_local = ci[Qa_key.replace('Qa', 'Qk')][:, lmo_idx]  # (n_local, nlmo)
+            # i_Qk/j_Qk reduced; translate global lmo_idx -> p_lmos position.
+            Qk_local = ci[Qa_key.replace('Qa', 'Qk')][:, _lmo_idx_in_p]  # (n_local, nlmo)
 
             t1_lmo = t1_cache[key][int(lmo_global)]
             qma_t1 = np.einsum('Qmb,b->Qm', Qma, t1_lmo)         # (n_local, nlmo)
@@ -1084,13 +1099,20 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
                 n_local = ci['Qma'].shape[0]
 
                 lmo_idx_list[p] = lmo_idx
+                # K_bar_chem/ij/ji are reduced to (nlmo_p, npno); translate
+                # global lmo_idx -> position within p_lmos before fancy-index.
+                _lmo_idx_in_p = np.asarray(
+                    ci['p_lmos_dense'])[lmo_idx].astype(np.intp)
                 K_chem_list[p] = np.ascontiguousarray(
-                    ci['K_bar_chem'][lmo_idx])
-                K_ji_list[p] = np.ascontiguousarray(ci['K_bar_ji'][lmo_idx])
+                    ci['K_bar_chem'][_lmo_idx_in_p])
+                K_ji_list[p] = np.ascontiguousarray(
+                    ci['K_bar_ji'][_lmo_idx_in_p])
                 need_dji = (i != j)
-                K_ij_list[p] = (np.ascontiguousarray(ci['K_bar_ij'][lmo_idx])
+                K_ij_list[p] = (np.ascontiguousarray(
+                                ci['K_bar_ij'][_lmo_idx_in_p])
                                 if need_dji else K_ji_list[p])
-                Qma_list[p] = np.ascontiguousarray(ci['Qma'][:, lmo_idx, :])
+                Qma_list[p] = np.ascontiguousarray(
+                    ci['Qma'][:, _lmo_idx_in_p, :])
                 Qab_list[p] = np.ascontiguousarray(ci['Qab'])
                 e_pno_list[p] = np.ascontiguousarray(pno_spaces[key]['e_pno'])
 
@@ -1230,7 +1252,10 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
         # Phase 1: fancy-index the cached matrix.
         T1_local = np.ascontiguousarray(
             t1_cache[key_jj][np.asarray(lmo_idx, dtype=np.intp)])
-        Qma_jj = ci['Qma'][:, lmo_idx, :]     # (n_local, nlmo, npno)
+        # Qma reduced; translate global lmo_idx -> p_lmos position.
+        _lmo_idx_in_p = np.asarray(
+            ci['p_lmos_dense'])[lmo_idx].astype(np.intp)
+        Qma_jj = ci['Qma'][:, _lmo_idx_in_p, :]   # (n_local, nlmo, npno)
         gamma = Qma_jj.reshape(Qma_jj.shape[0], -1) @ T1_local.ravel()
         Fia_bar_jj = 2.0 * np.tensordot(gamma, Qma_jj, axes=(0, 0))
         Z_jj = T1_local @ Qma_jj.transpose(0, 2, 1)
@@ -1275,15 +1300,22 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
                     pair_lmo_idx=None, t1_cache=None):
     """Build B_tilde for pair (ij) matching Psi4's precomputed B_tilde.
 
-    B_tilde[k,l] = (ki|lj)_dressed + Σ_{a,b} tau[a,b] * (ka|lb)
+    B_tilde[k_ij, l_ij] = (ki|lj)_dressed + Σ_{a,b} tau[a,b] * (ka|lb)
 
     The k, l sums are restricted to pair_lmo_idx[key] (Psi4's
-    lmopair_to_lmos_[ij]) when provided.  Local entries are scattered into
-    a (nocc, nocc) output so downstream residual.py indexing is unchanged.
+    lmopair_to_lmos_[ij]) when provided. Returns a tuple
+
+        (B_local, p_lmos_dense)
+
+    matching Psi4's per-pair (nlmo_ij, nlmo_ij) storage. ``B_local`` is the
+    pair-domain matrix; ``p_lmos_dense`` is a (nocc,) int array mapping a
+    global LMO index k → its pair-domain position k_ij (or -1 if k is not
+    in the pair domain). Consumers do ``B_local[p_lmos_dense[k],
+    p_lmos_dense[l]]``. Returns ``None`` if the pair has no integrals.
     """
     ci = cc_ints.get(key)
     if ci is None:
-        return np.zeros((nocc, nocc))
+        return None
 
     i, j = key
     npno = pno_spaces[key]['C_pno'].shape[1]
@@ -1294,7 +1326,11 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
         lmo_idx = np.arange(nocc)
     nlmo = len(lmo_idx)
 
-    Qma = ci['Qma'][:, lmo_idx, :]           # (n_local, nlmo, npno)
+    # Qma reduced to (n_local, nlmo_p, npno); translate global lmo_idx
+    # -> p_lmos position. Reused by fallback Qk slicing below.
+    _lmo_idx_in_p = np.asarray(
+        ci['p_lmos_dense'])[lmo_idx].astype(np.intp)
+    Qma = ci['Qma'][:, _lmo_idx_in_p, :]     # (n_local, nlmo, npno)
 
     # Read T1-dressed Qk from precomputed dressed_ints if provided
     # (matches Psi4 ccsd.cc:1688 which reads from i_Qk_t1_/j_Qk_t1_
@@ -1304,8 +1340,8 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
         i_Qk_t1 = dressed_ints[key]['i_Qk_t1']     # (n_local, nlmo)
         j_Qk_t1 = dressed_ints[key]['j_Qk_t1']
     else:
-        i_Qk = ci['i_Qk'][:, lmo_idx]            # (n_local, nlmo)
-        j_Qk = ci['j_Qk'][:, lmo_idx]
+        i_Qk = ci['i_Qk'][:, _lmo_idx_in_p]      # (n_local, nlmo)
+        j_Qk = ci['j_Qk'][:, _lmo_idx_in_p]
         if t1_cache is not None:
             t1_i = t1_cache[key][i]
             t1_j = t1_cache[key][j]
@@ -1330,10 +1366,31 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
     P = np.einsum('ab,Qka->kbQ', T2_ij, Qma)     # (nlmo, npno, n_local)
     B_local += np.einsum('kbQ,Qlb->kl', P, Qma)
 
-    # Scatter local (nlmo × nlmo) into global (nocc × nocc) output
-    B_tilde = np.zeros((nocc, nocc))
-    B_tilde[np.ix_(lmo_idx, lmo_idx)] = B_local
-    return B_tilde
+    # BTILDE_DUMP: parity dump vs Psi4 ccsd.cc compute_B_tilde.
+    # Track per-key call count: first time we see (cc_ints, key) is iter 0.
+    if int(os.environ.get('DLPNO_DUMP_BTILDE', '0')):
+        _counts = getattr(compute_B_tilde, '_counts', None)
+        if _counts is None:
+            _counts = {}
+            compute_B_tilde._counts = _counts
+        counts_key = (id(cc_ints), key)
+        _it = _counts.get(counts_key, 0)
+        _counts[counts_key] = _it + 1
+        if _it <= 2:
+            i, j = key
+            rms = float(np.sqrt((B_local ** 2).mean())) if B_local.size else 0.0
+            sm = float(B_local.sum())
+            li = ','.join(str(int(x)) for x in lmo_idx)
+            flat = ','.join(f'{v:.12e}' for v in B_local.ravel())
+            print(f"BTILDE_DUMP iter={_it} pair=({i},{j}) nlmo={nlmo} "
+                  f"rms={rms:.12e} sum={sm:.12e} lmo_idx=[{li}] B=[{flat}]",
+                  flush=True)
+
+    # Per-pair Psi4 layout: return reduced (nlmo, nlmo) plus a global→pair-domain
+    # map so consumers do B_local[p_dense[k], p_dense[l]] without scattering.
+    p_lmos_dense = np.full(nocc, -1, dtype=np.intp)
+    p_lmos_dense[lmo_idx] = np.arange(nlmo, dtype=np.intp)
+    return B_local, p_lmos_dense
 
 
 def compute_ladder(cc_ints, t2_pno_all, t1_pno, pno_spaces,
@@ -1355,13 +1412,16 @@ def compute_ladder(cc_ints, t2_pno_all, t1_pno, pno_spaces,
     i, j = key
     npno = pno_spaces[key]['C_pno'].shape[1]
     Qab = ci['Qab']
-    Qma_full = ci['Qma']   # (n_local, nocc, npno)
+    Qma_full = ci['Qma']   # (n_local, nlmo_p, npno) reduced
 
     if pair_lmo_idx is not None and key in pair_lmo_idx:
         lmo_idx = np.asarray(pair_lmo_idx[key])
     else:
         lmo_idx = np.arange(nocc)
-    Qma = Qma_full[:, lmo_idx, :]            # (n_local, nlmo, npno)
+    # Translate global lmo_idx -> position within p_lmos.
+    _lmo_idx_in_p = np.asarray(
+        ci['p_lmos_dense'])[lmo_idx].astype(np.intp)
+    Qma = Qma_full[:, _lmo_idx_in_p, :]      # (n_local, nlmo, npno)
 
     # Phase 1: use cache if given; otherwise build or fall back to zero.
     if t1_cache is not None:
@@ -1380,4 +1440,25 @@ def compute_ladder(cc_ints, t2_pno_all, t1_pno, pno_spaces,
     # Qab_t1[Q,a,b] = Qab[Q,a,b] - Σ_{k ∈ lmo_idx} T1_local[k,a] * Qma[Q,k,b]
     Qab_t1 = Qab - (T1_local.T @ Qma)
     X = Qab_t1 @ T2_ij                        # (Q, npno, npno)
-    return np.tensordot(X, Qab_t1, axes=((0, 2), (0, 2)))
+    A_local = np.tensordot(X, Qab_t1, axes=((0, 2), (0, 2)))
+
+    # LADDER_DUMP: parity dump vs Psi4 ccsd.cc:2317. Track per-key call count.
+    if int(os.environ.get('DLPNO_DUMP_LADDER', '0')):
+        _counts = getattr(compute_ladder, '_counts', None)
+        if _counts is None:
+            _counts = {}
+            compute_ladder._counts = _counts
+        counts_key = (id(cc_ints), key)
+        _it = _counts.get(counts_key, 0)
+        _counts[counts_key] = _it + 1
+        if _it <= 2 and A_local.size:
+            i, j = key
+            rms = float(np.sqrt((A_local ** 2).mean()))
+            sm = float(A_local.sum())
+            fro = float(np.linalg.norm(A_local, 'fro'))
+            tr = float(np.trace(A_local))
+            print(f"LADDER_DUMP iter={_it} pair=({i},{j}) npno={npno} "
+                  f"rms={rms:.12e} sum={sm:.12e} fro={fro:.12e} tr={tr:.12e}",
+                  flush=True)
+
+    return A_local

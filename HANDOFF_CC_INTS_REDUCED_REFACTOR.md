@@ -269,6 +269,24 @@ The Fkj scatter `Fkj[lmo_idx, j_idx] += ...` already uses lmo_idx == p_lmos.
 
 ### Step 5 — `compute_B_tilde` ([local_df.py:1283-1346](pyscf/cc/dlpno_tccsd/local_df.py#L1283))
 
+**STATUS (2026-04-27): DONE.** compute_B_tilde now returns
+`(B_local, p_lmos_dense)` tuple — no scatter. 3 consumers updated to
+`B_local[p_dense[k], p_dense[l]]`:
+- `compute_B_E_batched` ([residual.py:2417](pyscf/cc/dlpno_tccsd/residual.py#L2417))
+- `compute_B_E_batched_v2` ([residual.py:2647](pyscf/cc/dlpno_tccsd/residual.py#L2647))
+- `compute_residual_v2` Woooo ([residual.py:3937](pyscf/cc/dlpno_tccsd/residual.py#L3937))
+
+Energy `E_TCCSD = -304.98979787` preserved bit-perfect on water-4.
+BTILDE_DUMP infra in place both sides (Psi4 [ccsd.cc:1714](environments/psi4_jiang/psi4/src/psi4/dlpno/ccsd.cc#L1714); ours under `DLPNO_DUMP_BTILDE=1`).
+Same-to-same diff: 306/306 dumps match to 2.84e-11 (FP-reorder noise).
+
+The Step 5 description below is the original guidance from the prior
+analysis; superseded by the actual approach taken (tuple return +
+isinstance dispatch in consumers, no internal slicing change since
+inputs are still full-nocc).
+
+
+
 ```python
 lmo_idx = pair_lmo_idx[key]   # global LMO indices
 nlmo = len(lmo_idx)
@@ -289,6 +307,13 @@ The final scatter `B_tilde[np.ix_(lmo_idx, lmo_idx)] = B_local` works
 unchanged because lmo_idx == p_lmos.
 
 ### Step 6 — `compute_ladder` (similar; same file)
+
+**STATUS (2026-04-27): NO PORT NEEDED — already Psi4-faithful.**
+Cross-code LADDER_DUMP validated (Psi4 inline at [ccsd.cc:2317](environments/psi4_jiang/psi4/src/psi4/dlpno/ccsd.cc#L2317), ours under `DLPNO_DUMP_LADDER=1`):
+diagonal pairs Σ tr match at 0.00-0.08% rel err, Σ fro at 0.31-0.37%.
+Output is already (npno, npno) and the LMO sum is restricted via the
+existing `[:, lmo_idx, :]` slicing. The "drop lmo_idx slicing" step
+applies only AFTER Step 1 (cc_ints['Qma'] storage reduction).
 
 Same pattern — drop `[lmo_idx]` slicing on Qma. Currently
 [local_df.py:1397-1410](pyscf/cc/dlpno_tccsd/local_df.py#L1397).

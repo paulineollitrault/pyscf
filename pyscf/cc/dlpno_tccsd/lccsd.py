@@ -325,7 +325,13 @@ def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
         if ci is None:
             return key_mq, None
         m, q = key_mq
-        Qma = ci['Qma']
+        # Qma reduced to (n_local, nlmo_p, npno); _foo_dressed_cy iterates
+        # over the second axis treating indices as global LMOs. Scatter
+        # back to (n_local, nocc, npno) to keep the kernel + aggregator
+        # unchanged. Will collapse this in the .pyx -> C sweep.
+        _Qma_red = ci['Qma']
+        Qma = np.zeros((_Qma_red.shape[0], nocc_lmo, _Qma_red.shape[2]))
+        Qma[:, ci['p_lmos'], :] = _Qma_red
         nocc = Qma.shape[1]
         contrib_q = np.zeros(nocc)
         if m != q:
@@ -665,20 +671,15 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
         # T_n_ij[m, c] = t1_m projected to canonical pair's PNO basis —
         # already in t1_cache as a (nocc, n_ij) view.
         T_n_ij_mat = t1_cache[key_ij]
-        # Ordered pair (i0, j0): K_bar_chem = ci_ij['K_bar_chem'], K_bar_ji = ci_ij['K_bar_ji']
+        # K_bar_chem/ij/ji are now reduced to (nlmo_p, npno); gather T_n
+        # on p_lmos once for all three elementwise products.
+        T_n_red = T_n_ij_mat[ci_ij['p_lmos']]
         # Fij_bar(i0, j0) += 2 * T_n . K_bar_chem - T_n . K_bar[ji]
-        Fij_bar[i0, j0] += (2.0 * np.sum(T_n_ij_mat * ci_ij['K_bar_chem'])
-                            - np.sum(T_n_ij_mat * ci_ij['K_bar_ji']))
+        Fij_bar[i0, j0] += (2.0 * np.sum(T_n_red * ci_ij['K_bar_chem'])
+                            - np.sum(T_n_red * ci_ij['K_bar_ji']))
         if i0 != j0:
-            # Ordered pair (j0, i0): K_bar_chem_ji, K_bar_ij
-            # Psi4 builds K_bar_chem for ordered pair (j,i) from the ji index
-            # K_bar_chem[ji] = q_pair_ji . Qma_ji — but our cc_ints stores for canonical (i0,j0)
-            # For ordered (j0,i0): K_bar_chem uses j0 as "i-side", i0 as "j-side"
-            # Equivalent: swap i_Qa↔j_Qa roles; q_pair unchanged
-            # K_bar_chem_ji[m,a] = sum_Q q_pair[Q] * Qma[Q,m,a] (same as canonical)
-            # K_bar[ij] for ordered (j0,i0) = K_bar_ij from our storage
-            Fij_bar[j0, i0] += (2.0 * np.sum(T_n_ij_mat * ci_ij['K_bar_chem'])
-                                - np.sum(T_n_ij_mat * ci_ij['K_bar_ij']))
+            Fij_bar[j0, i0] += (2.0 * np.sum(T_n_red * ci_ij['K_bar_chem'])
+                                - np.sum(T_n_red * ci_ij['K_bar_ij']))
 
     # Helper: get integral (k a_ki | c d) from cc_ints.
     # Hoisted out of per-i loop so the merged _per_i closure can use it.
@@ -745,7 +746,13 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             Qma_ii = ci_ii['Qma']      # (n_local, nocc, n_ii)
             Qab_ii = ci_ii['Qab']      # (n_local, n_ii, n_ii)
             Qia_ii = ci_ii['i_Qa']     # (n_local, n_ii)
-            Qik_ii = ci_ii['i_Qk']     # (n_local, nocc)
+            # i_Qk reduced to (n_local, nlmo_p); per_i_stages123 kernel
+            # iterates over the second axis as a global LMO, so scatter
+            # back to (n_local, nocc) here. Will collapse this when we
+            # sweep .pyx -> pyscf/lib/cc/dlpno_*.c.
+            _Qik_red = ci_ii['i_Qk']   # (n_local, nlmo_p)
+            Qik_ii = np.zeros((_Qik_red.shape[0], nocc))
+            Qik_ii[:, ci_ii['p_lmos']] = _Qik_red
 
             # T_n_ii[m, c] = t1[m] projected to PNO_ii — read the
             # (nocc, n_ii) view from the global t1_cache directly.
@@ -930,8 +937,15 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                 continue
             n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
             K_iajb_kl = ci_kl['K_iajb']
-            K_bar_kl = (ci_kl['K_bar_ij'] if key_kl[0] == k
-                        else ci_kl['K_bar_ji'])
+            # K_bar_ij/ji reduced to (nlmo_p, n_kl) in cc_ints; the existing
+            # per-task plan + Cython kernel iterate over global LMOs, so
+            # scatter back to (nocc, n_kl) at this callsite. Kernels stay
+            # live during the correctness port; will collapse this when we
+            # sweep .pyx -> pyscf/lib/cc/dlpno_*.c.
+            _K_bar_red = (ci_kl['K_bar_ij'] if key_kl[0] == k
+                          else ci_kl['K_bar_ji'])
+            K_bar_kl = np.zeros((nocc, n_kl))
+            K_bar_kl[ci_kl['p_lmos']] = _K_bar_red
             t2_swap_kl = (k > l)
 
             i_list = (pair_lmo_idx[key_kl]
@@ -1065,8 +1079,12 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                 _b_K_iajb_pieces.append(K_iajb_kl.ravel())
                 _b_K_iajb_off.append(_b_K_iajb_off_running)
                 _b_K_iajb_off_running += K_iajb_kl.size
-                K_bar_kl = (ci_kl['K_bar_ij'] if key_kl[0] == k
-                            else ci_kl['K_bar_ji'])
+                # K_bar reduced (nlmo_p, n_kl) -> scatter to (nocc, n_kl)
+                # so the Cython kernel keeps its global-LMO iteration.
+                _K_bar_red = (ci_kl['K_bar_ij'] if key_kl[0] == k
+                              else ci_kl['K_bar_ji'])
+                K_bar_kl = np.zeros((nocc, n_kl))
+                K_bar_kl[ci_kl['p_lmos']] = _K_bar_red
                 K_bar_kl = np.ascontiguousarray(K_bar_kl)
                 _b_K_bar_pieces.append(K_bar_kl.ravel())
                 _b_K_bar_off.append(_b_K_bar_off_running)

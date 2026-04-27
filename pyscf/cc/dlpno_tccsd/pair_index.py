@@ -812,7 +812,7 @@ def build_t1_cache(
 _CC_INTS_FLAT_FIELDS_3D = ("Qab", "Qma")
 _CC_INTS_FLAT_FIELDS_2D = (
     "i_Qa", "j_Qa", "i_Qk", "j_Qk",
-    "K_iajb", "K_mnij", "K_bar_ij", "K_bar_ji", "K_bar_chem", "J_ijab",
+    "K_iajb", "K_bar_ij", "K_bar_ji", "K_bar_chem", "J_ijab",
 )
 
 

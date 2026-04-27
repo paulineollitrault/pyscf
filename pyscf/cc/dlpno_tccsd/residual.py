@@ -1122,19 +1122,24 @@ def build_D_tilde_batched(
             ci_ik2 = cc_ints[key_ik]
             # ooL_il[Q, l] = ooL[i_idx, l, Q] for l in domain. Use whichever
             # Qk tensor corresponds to i_idx's position in the pair key.
+            # i_Qk/j_Qk reduced to (n_local, nlmo_p); translate _ll_idx and
+            # k_idx -> position within p_lmos.
+            _ll_idx_in_p = np.asarray(
+                ci_ik2['p_lmos_dense'])[_ll_idx].astype(np.intp)
+            _k_idx_in_p = int(ci_ik2['p_lmos_dense'][k_idx])
             if key_ik[0] == i_idx:
-                ooL_il_all = ci_ik2['i_Qk'][:, _ll_idx]   # (n_local, n_domain)
-                ooL_ik = ci_ik2['i_Qk'][:, k_idx]         # (n_local,)
+                ooL_il_all = ci_ik2['i_Qk'][:, _ll_idx_in_p]  # (n_local, n_domain)
+                ooL_ik = ci_ik2['i_Qk'][:, _k_idx_in_p]       # (n_local,)
             else:
-                ooL_il_all = ci_ik2['j_Qk'][:, _ll_idx]
-                ooL_ik = ci_ik2['j_Qk'][:, k_idx]
-            Qma = ci_ik2['Qma']                           # (n_local, nocc, n_pno)
-            ovL_k = Qma[:, k_idx, :]                      # (n_local, n_pno)
+                ooL_il_all = ci_ik2['j_Qk'][:, _ll_idx_in_p]
+                ooL_ik = ci_ik2['j_Qk'][:, _k_idx_in_p]
+            Qma = ci_ik2['Qma']                           # (n_local, nlmo_p, n_pno)
+            ovL_k = Qma[:, _k_idx_in_p, :]                # (n_local, n_pno)
             # ilkc[l, c] = Σ_Q ovL[k, c, Q] * ooL[i, l, Q]
             ilkc_all = ooL_il_all.T @ ovL_k               # (n_domain, n_pno)
             # iklc[l, c] = Σ_Q ovL[l, c, Q] * ooL[i, k, Q]
             iklc_all = np.tensordot(
-                Qma[:, _ll_idx, :], ooL_ik, axes=(0, 0))  # (n_domain, n_pno)
+                Qma[:, _ll_idx_in_p, :], ooL_ik, axes=(0, 0))  # (n_domain, n_pno)
             M_lc_all = 2.0 * ilkc_all - iklc_all
             T1_rows = T1_all_ik[_ll_idx]                  # (n_domain, n_pno)
             D_tilde_ik -= T1_rows.T @ M_lc_all
@@ -1215,14 +1220,16 @@ def build_D_tilde_batched(
                                         else ci['K_tilde_chem_j'])
 
                 # M_static = 2 * K_bar_ij_or_ji[ll_idx] - K_bar_chem[ll_idx]
-                # For ordered pair (i, k): if key[0]==i, ilkc = K_bar_ij; else K_bar_ji.
-                # Matches Psi4 compute_D_tilde L_bar_temp.
+                # All three K_bar_* are reduced to (nlmo_p, npno); translate
+                # ll_idx -> p_lmos-domain position before indexing.
+                _ll_idx_in_p = np.asarray(
+                    ci['p_lmos_dense'])[ll_idx].astype(np.intp)
                 if is_i_first:
-                    K_bar_slice = ci['K_bar_ij'][ll_idx]
+                    K_bar_slice = ci['K_bar_ij'][_ll_idx_in_p]
                 else:
-                    K_bar_slice = ci['K_bar_ji'][ll_idx]
+                    K_bar_slice = ci['K_bar_ji'][_ll_idx_in_p]
                 M_static_list[p] = np.ascontiguousarray(
-                    2.0 * K_bar_slice - ci['K_bar_chem'][ll_idx])
+                    2.0 * K_bar_slice - ci['K_bar_chem'][_ll_idx_in_p])
 
                 n_pno_arr[p] = n_ik
                 n_domain_arr[p] = n_domain
@@ -2035,11 +2042,12 @@ def compute_C_tilde_batched(
                 K_tilde_chem_list[p] = (ci_ki['K_tilde_chem_i'] if is_k_first
                                         else ci_ki['K_tilde_chem_j'])
                 # K_bar_chem[l, c] = sum_L q_pair[L] * Qma[L, l, c];
-                # stored in cc_ints (full-nocc, zeros outside pair's LMO
-                # domain). Slicing by ll_idx gives the (n_domain, n_pno)
-                # input the kernel needs.
+                # reduced to (nlmo_p, npno) in cc_ints. Translate global
+                # ll_idx -> position within p_lmos before indexing.
+                _ll_idx_in_p = np.asarray(
+                    ci_ki['p_lmos_dense'])[ll_idx].astype(np.intp)
                 K_bar_chem_slice_list[p] = np.ascontiguousarray(
-                    ci_ki['K_bar_chem'][ll_idx])
+                    ci_ki['K_bar_chem'][_ll_idx_in_p])
 
                 n_pno_arr[p] = n_ki
                 n_domain_arr[p] = n_domain
@@ -2322,7 +2330,11 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
             return ki_tuple, None
         Qma = ci['Qma']
         Qab = ci['Qab']
-        z_i = Qma[:, i, :] @ t1_i
+        # Qma reduced; translate global LMO i -> p_lmos position.
+        i_red = int(ci['p_lmos_dense'][i])
+        if i_red < 0:
+            return ki_tuple, None
+        z_i = Qma[:, i_red, :] @ t1_i
         return ki_tuple, np.einsum('L,Lab->ab', z_i, Qab, optimize=True)
 
     # ============================================================
@@ -2342,9 +2354,13 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
             return ik_tuple, None
         Qma = ci['Qma']
         Qab = ci['Qab']
-        ovL_k = Qma[:, k_idx, :].T
+        # Qma reduced; translate global LMO k_idx -> p_lmos position.
+        k_red = int(ci['p_lmos_dense'][k_idx])
+        if k_red < 0:
+            return ik_tuple, None
+        ovL_k = Qma[:, k_red, :].T
         z_c = Qab @ t1_i
-        y = Qma[:, k_idx, :] @ t1_i
+        y = Qma[:, k_red, :] @ t1_i
         result = 2.0 * (ovL_k @ z_c)
         result -= np.einsum('L,Lab->ab', y, Qab, optimize=True)
         return ik_tuple, result
@@ -2414,7 +2430,13 @@ def compute_B_E_batched(strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
         if n_ij == 0:
             return key_ij, np.zeros((n_ij, n_ij)), np.zeros((n_ij, n_ij))
 
-        B_tilde = B_tilde_per_ij[key_ij]
+        # Psi4-layout B_tilde: tuple (B_local (nlmo,nlmo), p_dense (nocc,) -> k_ij).
+        B_tilde_entry = B_tilde_per_ij[key_ij]
+        if isinstance(B_tilde_entry, tuple):
+            B_local, p_dense = B_tilde_entry
+            _btilde_lookup = lambda k, l: B_local[p_dense[k], p_dense[l]]
+        else:
+            _btilde_lookup = lambda k, l: B_tilde_entry[k, l]
         domain = (set(int(x) for x in pair_lmo_idx[key_ij])
                   if pair_lmo_idx is not None and key_ij in pair_lmo_idx
                   else set(range(nocc)))
@@ -2436,8 +2458,8 @@ def compute_B_E_batched(strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
             if K_kl is None:
                 continue
             same = (k == l)
-            beta_kl = B_tilde[k, l]
-            beta_lk = 0.0 if same else B_tilde[l, k]
+            beta_kl = _btilde_lookup(k, l)
+            beta_lk = 0.0 if same else _btilde_lookup(l, k)
             n_kl = t2_kl.shape[0]
             buckets.setdefault(n_kl, []).append(
                 (S, t2_kl, K_kl, beta_kl, beta_lk, same))
@@ -2638,8 +2660,15 @@ def compute_B_E_batched_v2(
                 T_arr[n] = t2_pno_all[bucket['kl_keys'][n]]
                 key_ij, k, l = bucket['beta_coords'][n]
                 B_tilde = B_tilde_per_ij[key_ij]
-                beta_kl_arr[n] = B_tilde[k, l]
-                beta_lk_arr[n] = 0.0 if k == l else B_tilde[l, k]
+                if isinstance(B_tilde, tuple):
+                    B_local, p_dense = B_tilde
+                    beta_kl_arr[n] = B_local[p_dense[k], p_dense[l]]
+                    beta_lk_arr[n] = (
+                        0.0 if k == l
+                        else B_local[p_dense[l], p_dense[k]])
+                else:
+                    beta_kl_arr[n] = B_tilde[k, l]
+                    beta_lk_arr[n] = 0.0 if k == l else B_tilde[l, k]
             be_kernel(bucket['S'], T_arr, bucket['K'],
                       beta_kl_arr, beta_lk_arr, bucket['same'],
                       bucket['item_idx'],
@@ -3924,6 +3953,12 @@ def compute_residual_v2(
     if B_term_override is not None:
         B_term = B_term_override
     else:
+        # Psi4-layout B_tilde: tuple (B_local, p_dense) for the per-pair port.
+        if isinstance(B_tilde, tuple):
+            _Bt_local, _Bt_pdense = B_tilde
+            _btilde_lookup = lambda k, l: _Bt_local[_Bt_pdense[k], _Bt_pdense[l]]
+        else:
+            _btilde_lookup = lambda k, l: B_tilde[k, l]
         B_term = np.zeros((n_pno, n_pno))
         for key_kl, t2_kl in t2_pno_all.items():
             if t2_kl is None or t2_kl.shape[0] == 0:
@@ -3933,9 +3968,9 @@ def compute_residual_v2(
                 continue
             S_proj = _get_S(key_kl)
             t2_kl_proj = S_proj @ t2_kl @ S_proj.T
-            beta_kl = B_tilde[k, l]
+            beta_kl = _btilde_lookup(k, l)
             if k != l:
-                beta_lk = B_tilde[l, k]
+                beta_lk = _btilde_lookup(l, k)
                 B_term += beta_kl * t2_kl_proj + beta_lk * t2_kl_proj.T
             else:
                 B_term += beta_kl * t2_kl_proj
