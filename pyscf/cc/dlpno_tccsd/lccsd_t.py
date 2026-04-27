@@ -914,16 +914,30 @@ def _process_one_triple(i, j, k,
         return t2_proj
 
     m_dom_size = len(triple_domain)
-    t2_mr = np.zeros((m_dom_size, 3, n_tno, n_tno))
-    for r_local, r_global in enumerate(triple_lmo):
-        for m_local, m_global in enumerate(triple_domain):
-            t2_mr[m_local, r_local] = _proj_t2(m_global, r_global)
+    # On the C path the per-m vooo restructure inside w3_full_kernel
+    # projects pair-PNO T2 on the fly using U_flat / T2_flat — the dense
+    # t2_mr (m_dom × 3 × n_tno × n_tno) is never read.  Skip its
+    # construction (avg ~50 _proj_t2 calls per triple in Python) when
+    # the kernel path is active.
+    _skip_t2_mr = bool(int(os.environ.get('DLPNO_C_CYCLE', '0')))
+    if _skip_t2_mr:
+        # Only the 3×3 t2_block is needed (used by Phase 1 K_ovvv).
+        t2_mr = None
+        t2_block = np.zeros((3, 3, n_tno, n_tno))
+        for p in range(3):
+            for q in range(3):
+                t2_block[p, q] = _proj_t2(triple_lmo[p], triple_lmo[q])
+    else:
+        t2_mr = np.zeros((m_dom_size, 3, n_tno, n_tno))
+        for r_local, r_global in enumerate(triple_lmo):
+            for m_local, m_global in enumerate(triple_domain):
+                t2_mr[m_local, r_local] = _proj_t2(m_global, r_global)
 
-    # T2 block for the 3 triple LMOs (used by _w3_intermediate)
-    t2_block = np.zeros((3, 3, n_tno, n_tno))
-    for p in range(3):
-        for q in range(3):
-            t2_block[p, q] = t2_mr[_m_pos[triple_lmo[p]], q]
+        # T2 block for the 3 triple LMOs (used by _w3_intermediate)
+        t2_block = np.zeros((3, 3, n_tno, n_tno))
+        for p in range(3):
+            for q in range(3):
+                t2_block[p, q] = t2_mr[_m_pos[triple_lmo[p]], q]
 
     # Project local T1 to TNO basis for the V intermediate.
     t1_lmo = None
