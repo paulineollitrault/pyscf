@@ -2697,15 +2697,52 @@ def compute_C_tilde_batched(
         C_flat = np.zeros(plan['C_total'])
 
         with threadpool_limits(limits=1, user_api='blas'):
-            c_tilde_ph1_batched(
-                plan['K_tilde_chem_flat'], plan['K_tilde_chem_off'],
-                plan['K_bar_chem_slice_flat'], plan['K_bar_chem_slice_off'],
-                t1_flat, t1_off_plan,
-                T1_local_flat, T1_local_off_plan,
-                plan['n_pno_arr'], plan['n_domain_arr'],
-                C_flat, plan['C_off'],
-                plan['num_threads'],
-            )
+            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+                # Native-C path: matches Psi4 ccsd.cc:1809 compute_C_tilde
+                # Phase 1 (Terms 1+2). See pyscf/lib/cc/dlpno_c_tilde.c::
+                # DLPNOcompute_C_tilde_ph1_batched. Same flat-buffer plan
+                # as the Cython kernel.
+                import ctypes
+                from pyscf import lib as _pyscflib
+                _libcc = getattr(compute_C_tilde_batched, '_libcc', None)
+                if _libcc is None:
+                    _libcc = _pyscflib.load_library('libcc')
+                    _libcc.DLPNOcompute_C_tilde_ph1_batched.restype = None
+                    _libcc.DLPNOcompute_C_tilde_ph1_batched.argtypes = [
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_void_p, ctypes.c_void_p,
+                        ctypes.c_size_t,
+                    ]
+                    compute_C_tilde_batched._libcc = _libcc
+                _libcc.DLPNOcompute_C_tilde_ph1_batched(
+                    plan['K_tilde_chem_flat'].ctypes.data_as(ctypes.c_void_p),
+                    plan['K_tilde_chem_off'].ctypes.data_as(ctypes.c_void_p),
+                    plan['K_bar_chem_slice_flat'].ctypes.data_as(ctypes.c_void_p),
+                    plan['K_bar_chem_slice_off'].ctypes.data_as(ctypes.c_void_p),
+                    t1_flat.ctypes.data_as(ctypes.c_void_p),
+                    t1_off_plan.ctypes.data_as(ctypes.c_void_p),
+                    T1_local_flat.ctypes.data_as(ctypes.c_void_p),
+                    T1_local_off_plan.ctypes.data_as(ctypes.c_void_p),
+                    plan['n_pno_arr'].ctypes.data_as(ctypes.c_void_p),
+                    plan['n_domain_arr'].ctypes.data_as(ctypes.c_void_p),
+                    C_flat.ctypes.data_as(ctypes.c_void_p),
+                    plan['C_off'].ctypes.data_as(ctypes.c_void_p),
+                    len(plan['covered_pairs']),
+                )
+            else:
+                c_tilde_ph1_batched(
+                    plan['K_tilde_chem_flat'], plan['K_tilde_chem_off'],
+                    plan['K_bar_chem_slice_flat'], plan['K_bar_chem_slice_off'],
+                    t1_flat, t1_off_plan,
+                    T1_local_flat, T1_local_off_plan,
+                    plan['n_pno_arr'], plan['n_domain_arr'],
+                    C_flat, plan['C_off'],
+                    plan['num_threads'],
+                )
 
         C_off_plan = plan['C_off']
         for p, ki in enumerate(plan['covered_pairs']):
