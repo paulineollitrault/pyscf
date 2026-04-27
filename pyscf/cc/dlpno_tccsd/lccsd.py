@@ -2010,11 +2010,11 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # own pass — avoids contention while keeping per-kernel
             # parallelism intact.
             from pyscf.cc.dlpno_tccsd.local_df import t1_fock
-            # Phase II Psi4-style port: compute_C_tilde_psi4 is the
-            # line-by-line port of Psi4 ccsd.cc:1809; compute_C_tilde_batched
-            # is the legacy batched/cached implementation. Toggle via env
-            # for A/B comparison; default to Psi4-style.
-            _use_psi4_C = (os.environ.get('DLPNO_C_TILDE_LEGACY', '0') != '1')
+            # compute_C_tilde_psi4 is a line-by-line Psi4 reference port
+            # (slow Python, used for cross-validation against the upcoming
+            # C port). compute_C_tilde_batched is the production fast path.
+            # Default: batched. Opt into Psi4-Python via DLPNO_C_TILDE_PSI4=1.
+            _use_psi4_C = (os.environ.get('DLPNO_C_TILDE_PSI4', '0') == '1')
             if _use_psi4_C:
                 from pyscf.cc.dlpno_tccsd.residual import compute_C_tilde_psi4 as _cC_fn
             else:
@@ -2034,7 +2034,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _tj_C = _time.perf_counter() - _tj_c0
 
             _tj_d0 = _time.perf_counter()
-            _use_psi4_D = (os.environ.get('DLPNO_D_TILDE_LEGACY', '0') != '1')
+            _use_psi4_D = (os.environ.get('DLPNO_D_TILDE_PSI4', '0') == '1')
             if _use_psi4_D:
                 from pyscf.cc.dlpno_tccsd.residual import build_D_tilde_psi4 as _bD_fn
             else:
@@ -2072,7 +2072,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _jiang_J_oo_d = None
 
             _tj_g0 = _time.perf_counter()
-            _use_psi4_G = (os.environ.get('DLPNO_G_TILDE_LEGACY', '0') != '1')
+            _use_psi4_G = (os.environ.get('DLPNO_G_TILDE_PSI4', '0') == '1')
             if _use_psi4_G:
                 from pyscf.cc.dlpno_tccsd.residual import build_G_tilde_psi4 as _bG_fn
             else:
