@@ -1261,29 +1261,13 @@ def build_D_tilde_batched(
                 buf[slot] = v
         flat_out[n_ik] = buf
 
-    with _omp_threads_ctx(omp_threads):
-        # Term 3 — same kernel as C_tilde; D_tilde's sign and L-vs-K swap
-        # are absorbed into the plan's stacked K = L.T.
-        for bucket in plan['t3']:
-            t1i = np.ascontiguousarray(
-                np.array([t1_cache[key][l] for (key, l) in bucket['t1i_keys']]))
-            T1l = np.ascontiguousarray(
-                np.array([t1_cache[key][l] for (key, l) in bucket['T1l_keys']]))
-            _t3_kern(bucket['K'], bucket['S'], t1i, T1l,
-                     bucket['item_idx'], flat_out[bucket['n_ki']])
-
-        # Term 4 — stack u_il each cycle; kernel scale=+0.5 (D_tilde sign).
-        for bucket in plan['t4']:
-            u_arr = np.empty((len(bucket['u_sources']),
-                              bucket['n_li'], bucket['n_li']))
-            for n, (key_il, transpose) in enumerate(bucket['u_sources']):
-                t2_d = (t2_pno_all[key_il].T if transpose
-                        else t2_pno_all[key_il])
-                u_arr[n] = 2.0 * t2_d - t2_d.T
-            _t4_kern(bucket['S_ki_li'], u_arr, bucket['S_li_kl'],
-                     bucket['K'], bucket['S_kl_ki'],
-                     bucket['item_idx'], flat_out[bucket['n_ki']],
-                     0.5)
+    # Single-call batched path: ONE t3_kernel_batched + ONE t4_kernel_batched
+    # per cycle replaces the per-bucket loop. Plan view (built once) flattens
+    # all per-bucket K/S static tensors into single concatenated buffers and
+    # pre-computes per-item t1 absolute offsets into t1_cache._buffer.
+    bv = _get_or_build_t34_batched_view(plan, t1_cache)
+    _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
+                     t4_use_u=True, t4_scale=0.5)
 
     for n_ik, pairs in plan['pairs_by_n_ki'].items():
         buf = flat_out[n_ik]
@@ -2135,36 +2119,13 @@ def compute_C_tilde_batched(
 
     _pt['t3_gather'] = 0.0; _pt['t3_kern'] = 0.0
     _pt['t4_gather'] = 0.0; _pt['t4_kern'] = 0.0
-
-    with _omp_threads_ctx(omp_threads):
-        # ----- Term 3 via Cython kernel -----
-        for bucket in plan['t3']:
-            _tg = _time_dbg.perf_counter()
-            t1i = np.ascontiguousarray(
-                np.array([_t1_get(*key) for key in bucket['t1i_keys']]))
-            T1l = np.ascontiguousarray(
-                np.array([_t1_get(*key) for key in bucket['T1l_keys']]))
-            _pt['t3_gather'] += _time_dbg.perf_counter() - _tg
-
-            _tn = _time_dbg.perf_counter()
-            _t3_kern(bucket['K'], bucket['S'], t1i, T1l,
-                     bucket['item_idx'], flat_out[bucket['n_ki']])
-            _pt['t3_kern'] += _time_dbg.perf_counter() - _tn
-
-        # ----- Term 4 via Cython kernel -----
-        for bucket in plan['t4']:
-            _tg = _time_dbg.perf_counter()
-            t2_arr = np.ascontiguousarray(np.array([
-                (t2_pno_all[k_].T if tr else t2_pno_all[k_])
-                for (k_, tr) in bucket['t2_sources']
-            ]))
-            _pt['t4_gather'] += _time_dbg.perf_counter() - _tg
-
-            _tn = _time_dbg.perf_counter()
-            _t4_kern(bucket['S_ki_li'], t2_arr, bucket['S_li_kl'],
-                     bucket['K'], bucket['S_kl_ki'],
-                     bucket['item_idx'], flat_out[bucket['n_ki']])
-            _pt['t4_kern'] += _time_dbg.perf_counter() - _tn
+    # Single-call batched path: ONE t3+t4 prange call replaces the per-bucket
+    # loop. compute_C_tilde uses scale=-0.5 and t2 directly (not 2*t2-t2.T).
+    _tn_batch = _time_dbg.perf_counter()
+    bv = _get_or_build_t34_batched_view(plan, t1_cache)
+    _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
+                     t4_use_u=False, t4_scale=-0.5)
+    _pt['t4_kern'] = _time_dbg.perf_counter() - _tn_batch
 
     # Unpack flat_out back into C_tilde_all dict.
     _t_unpack = _time_dbg.perf_counter()
@@ -2899,6 +2860,257 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         'pairs_by_n_pno': pairs_by_n_pno,
         'pair_to_slot': pair_to_slot,
     }
+
+
+def _get_or_build_t34_batched_view(plan, t1_cache):
+    """Build (or fetch cached) flat per-item view across all t3/t4 buckets
+    in a compute_C_tilde / build_D_tilde Phase 2 plan.
+
+    Concatenates the per-bucket K/S static tensors into single flat
+    buffers; pre-computes per-item t1 absolute offsets into the
+    t1_cache._buffer (stable across CCSD iterations because pno_spaces
+    shapes don't change). Per-iter only ``t2`` and ``t1_cache._buffer``
+    pointers need refresh.
+    """
+    bv = plan.get('_t34_batched_view')
+    if bv is not None:
+        return bv
+
+    t1c_offsets = np.asarray(t1_cache._offsets)
+
+    def _t1_abs(key, l):
+        # Absolute offset of t1_cache[key][l] within t1_cache._buffer
+        # (each per-pair view is (nocc, n_pno) C-contig; row l starts at
+        # offset + l * n_pno).
+        canon = (min(key), max(key))
+        pidx = t1_cache._canon_to_idx[canon]
+        n_pno = int(t1_cache._shapes[pidx, 1])
+        return int(t1c_offsets[pidx]) + l * n_pno
+
+    # ---- t3 side ----
+    t3_n_kl_l, t3_n_ki_l = [], []
+    t3_K_off_l, t3_S_off_l = [], []
+    t3_t1i_off_l, t3_T1l_off_l = [], []
+    t3_target_slot_l = []   # (n_ki_bucket_key, slot)
+    t3_K_pieces, t3_S_pieces = [], []
+    t3_K_run = t3_S_run = 0
+    t3_tile_off = [0]
+
+    for bucket in plan['t3']:
+        n_ki = bucket['n_ki']
+        n_kl = bucket['n_kl']
+        N_b = len(bucket['t1i_keys'])
+        for nb in range(N_b):
+            t3_n_kl_l.append(n_kl)
+            t3_n_ki_l.append(n_ki)
+            t3_K_pieces.append(np.ascontiguousarray(
+                bucket['K'][nb]).ravel())
+            t3_S_pieces.append(np.ascontiguousarray(
+                bucket['S'][nb]).ravel())
+            t3_K_off_l.append(t3_K_run); t3_K_run += n_kl * n_kl
+            t3_S_off_l.append(t3_S_run); t3_S_run += n_ki * n_kl
+            key_t1i, l_t1i = bucket['t1i_keys'][nb]
+            key_T1l, l_T1l = bucket['T1l_keys'][nb]
+            t3_t1i_off_l.append(_t1_abs(key_t1i, l_t1i))
+            t3_T1l_off_l.append(_t1_abs(key_T1l, l_T1l))
+            t3_target_slot_l.append((n_ki, int(bucket['item_idx'][nb])))
+            t3_tile_off.append(t3_tile_off[-1] + n_ki * n_ki)
+
+    t3_N = len(t3_n_kl_l)
+
+    # ---- t4 side ----
+    t4_n_ki_l, t4_n_li_l, t4_n_kl_l = [], [], []
+    t4_S_ki_li_off_l, t4_S_li_kl_off_l = [], []
+    t4_K_off_l, t4_S_kl_ki_off_l = [], []
+    t4_t2_keys_l, t4_t2_trans_l = [], []
+    t4_target_slot_l = []
+    t4_S_ki_li_pieces, t4_S_li_kl_pieces = [], []
+    t4_K_pieces, t4_S_kl_ki_pieces = [], []
+    (t4_S_ki_li_run, t4_S_li_kl_run, t4_K_run,
+     t4_S_kl_ki_run) = 0, 0, 0, 0
+    t4_t2_size_l = []
+    t4_tile_off = [0]
+
+    for bucket in plan['t4']:
+        n_ki = bucket['n_ki']
+        n_li = bucket['n_li']
+        n_kl = bucket['n_kl']
+        # Source list of (canonical_t2_key, transpose_flag); compute_C uses
+        # 't2_sources', build_D uses 'u_sources' — same shape, same role.
+        sources = bucket.get('t2_sources') or bucket['u_sources']
+        N_b = len(sources)
+        for nb in range(N_b):
+            t4_n_ki_l.append(n_ki)
+            t4_n_li_l.append(n_li)
+            t4_n_kl_l.append(n_kl)
+            t4_S_ki_li_pieces.append(np.ascontiguousarray(
+                bucket['S_ki_li'][nb]).ravel())
+            t4_S_li_kl_pieces.append(np.ascontiguousarray(
+                bucket['S_li_kl'][nb]).ravel())
+            t4_K_pieces.append(np.ascontiguousarray(bucket['K'][nb]).ravel())
+            t4_S_kl_ki_pieces.append(np.ascontiguousarray(
+                bucket['S_kl_ki'][nb]).ravel())
+            t4_S_ki_li_off_l.append(t4_S_ki_li_run)
+            t4_S_ki_li_run += n_ki * n_li
+            t4_S_li_kl_off_l.append(t4_S_li_kl_run)
+            t4_S_li_kl_run += n_li * n_kl
+            t4_K_off_l.append(t4_K_run); t4_K_run += n_kl * n_kl
+            t4_S_kl_ki_off_l.append(t4_S_kl_ki_run)
+            t4_S_kl_ki_run += n_kl * n_ki
+            key, tr = sources[nb]
+            t4_t2_keys_l.append(key)
+            t4_t2_trans_l.append(bool(tr))
+            t4_t2_size_l.append(n_li * n_li)
+            t4_target_slot_l.append((n_ki, int(bucket['item_idx'][nb])))
+            t4_tile_off.append(t4_tile_off[-1] + n_ki * n_ki)
+
+    t4_N = len(t4_n_ki_l)
+
+    t4_t2_off = np.zeros(t4_N + 1, dtype=np.int64)
+    t4_t2_off[1:] = np.cumsum(t4_t2_size_l)
+
+    bv = {
+        # ---- t3 ----
+        't3_N': t3_N,
+        't3_n_kl': np.asarray(t3_n_kl_l, dtype=np.int32),
+        't3_n_ki': np.asarray(t3_n_ki_l, dtype=np.int32),
+        't3_K_off': np.asarray(t3_K_off_l, dtype=np.int64),
+        't3_S_off': np.asarray(t3_S_off_l, dtype=np.int64),
+        't3_t1i_off': np.asarray(t3_t1i_off_l, dtype=np.int64),
+        't3_T1l_off': np.asarray(t3_T1l_off_l, dtype=np.int64),
+        't3_K_flat': (np.concatenate(t3_K_pieces)
+                      if t3_K_pieces else np.zeros(0)),
+        't3_S_flat': (np.concatenate(t3_S_pieces)
+                      if t3_S_pieces else np.zeros(0)),
+        't3_target_slot': t3_target_slot_l,
+        't3_tile_off': np.asarray(t3_tile_off, dtype=np.int64),
+        # ---- t4 ----
+        't4_N': t4_N,
+        't4_n_ki': np.asarray(t4_n_ki_l, dtype=np.int32),
+        't4_n_li': np.asarray(t4_n_li_l, dtype=np.int32),
+        't4_n_kl': np.asarray(t4_n_kl_l, dtype=np.int32),
+        't4_S_ki_li_off': np.asarray(t4_S_ki_li_off_l, dtype=np.int64),
+        't4_S_li_kl_off': np.asarray(t4_S_li_kl_off_l, dtype=np.int64),
+        't4_K_off': np.asarray(t4_K_off_l, dtype=np.int64),
+        't4_S_kl_ki_off': np.asarray(t4_S_kl_ki_off_l, dtype=np.int64),
+        't4_S_ki_li_flat': (np.concatenate(t4_S_ki_li_pieces)
+                             if t4_S_ki_li_pieces else np.zeros(0)),
+        't4_S_li_kl_flat': (np.concatenate(t4_S_li_kl_pieces)
+                             if t4_S_li_kl_pieces else np.zeros(0)),
+        't4_K_flat': (np.concatenate(t4_K_pieces)
+                      if t4_K_pieces else np.zeros(0)),
+        't4_S_kl_ki_flat': (np.concatenate(t4_S_kl_ki_pieces)
+                             if t4_S_kl_ki_pieces else np.zeros(0)),
+        't4_t2_keys': t4_t2_keys_l,
+        't4_t2_trans': np.asarray(t4_t2_trans_l, dtype=bool),
+        't4_t2_off': t4_t2_off,
+        't4_target_slot': t4_target_slot_l,
+        't4_tile_off': np.asarray(t4_tile_off, dtype=np.int64),
+    }
+    plan['_t34_batched_view'] = bv
+    return bv
+
+
+def _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
+                     t4_use_u, t4_scale):
+    """Run batched t3 + t4 kernels and scatter into flat_out (per n_ki).
+
+    flat_out: dict {n_ki -> ndarray (n_pairs_n_ki, n_ki, n_ki)}.
+    t4_use_u: True for build_D_tilde (input is u = 2*t2 - t2.T),
+              False for compute_C_tilde (input is t2 directly).
+    t4_scale: -0.5 (C_tilde) or +0.5 (D_tilde).
+    """
+    from pyscf.cc.dlpno_tccsd._t34_batched_cy import (
+        t3_kernel_batched, t4_kernel_batched,
+    )
+    from threadpoolctl import threadpool_limits
+
+    # Flat views over per-n_ki output buffers (we update in-place via .ravel).
+    flat_views = {n_ki: buf.ravel() for n_ki, buf in flat_out.items()}
+
+    # ---- t3 ----
+    t3_N = bv['t3_N']
+    if t3_N > 0:
+        max_n_kl = int(bv['t3_n_kl'].max(initial=1))
+        max_n_ki = int(bv['t3_n_ki'].max(initial=1))
+        num_threads = min(64, t3_N)
+        Kt1 = np.empty((num_threads, max_n_kl))
+        Kt1_ki = np.empty((num_threads, max_n_ki))
+        t3_tiles = np.zeros(int(bv['t3_tile_off'][-1]))
+        with threadpool_limits(limits=1, user_api='blas'):
+            t3_kernel_batched(
+                t3_N, max_n_ki, max_n_kl,
+                bv['t3_n_kl'], bv['t3_n_ki'],
+                bv['t3_K_off'], bv['t3_S_off'],
+                bv['t3_t1i_off'], bv['t3_T1l_off'],
+                bv['t3_tile_off'],
+                bv['t3_K_flat'], bv['t3_S_flat'],
+                t1_cache._buffer,
+                Kt1, Kt1_ki,
+                t3_tiles, num_threads,
+            )
+        # Scatter contrib tiles into flat_out (-= for both C and D —
+        # the sign is absorbed into the kernel via the negative T1l).
+        # Reference scatters with `out[idx] += contrib`, kernel stores
+        # contrib = -T1l * Kt1_ki, so we use += here too.
+        t3_tile_off = bv['t3_tile_off']
+        t3_target = bv['t3_target_slot']
+        t3_n_ki = bv['t3_n_ki']
+        for n in range(t3_N):
+            n_ki, slot = t3_target[n]
+            tile_size = n_ki * n_ki
+            base = slot * tile_size
+            tile = t3_tiles[t3_tile_off[n]:t3_tile_off[n + 1]]
+            flat_views[n_ki][base:base + tile_size] += tile
+
+    # ---- t4 ----
+    t4_N = bv['t4_N']
+    if t4_N > 0:
+        # Per-cycle t2 flat buffer
+        t2_flat = np.empty(int(bv['t4_t2_off'][-1]))
+        t4_t2_keys = bv['t4_t2_keys']
+        t4_t2_trans = bv['t4_t2_trans']
+        t4_t2_off = bv['t4_t2_off']
+        t4_n_li = bv['t4_n_li']
+        for n in range(t4_N):
+            t2 = t2_pno_all[t4_t2_keys[n]]
+            t2_d = t2.T if t4_t2_trans[n] else t2
+            if t4_use_u:
+                t2_flat[t4_t2_off[n]:t4_t2_off[n + 1]] = (
+                    2.0 * t2_d - t2_d.T).ravel()
+            else:
+                t2_flat[t4_t2_off[n]:t4_t2_off[n + 1]] = t2_d.ravel()
+
+        max_n_ki = int(bv['t4_n_ki'].max(initial=1))
+        max_n_li = int(bv['t4_n_li'].max(initial=1))
+        max_n_kl = int(bv['t4_n_kl'].max(initial=1))
+        num_threads = min(64, t4_N)
+        tmp1 = np.empty((num_threads, max_n_ki * max_n_li))
+        tmp2 = np.empty((num_threads, max_n_ki * max_n_kl))
+        tmp3 = np.empty((num_threads, max_n_ki * max_n_kl))
+        t4_tiles = np.zeros(int(bv['t4_tile_off'][-1]))
+        with threadpool_limits(limits=1, user_api='blas'):
+            t4_kernel_batched(
+                t4_N, max_n_ki, max_n_li, max_n_kl,
+                bv['t4_n_ki'], bv['t4_n_li'], bv['t4_n_kl'],
+                bv['t4_S_ki_li_off'], bv['t4_t2_off'][:t4_N],
+                bv['t4_S_li_kl_off'], bv['t4_K_off'],
+                bv['t4_S_kl_ki_off'], bv['t4_tile_off'],
+                bv['t4_S_ki_li_flat'], bv['t4_S_li_kl_flat'],
+                bv['t4_K_flat'], bv['t4_S_kl_ki_flat'],
+                t2_flat,
+                tmp1, tmp2, tmp3,
+                t4_tiles, t4_scale, num_threads,
+            )
+        t4_tile_off = bv['t4_tile_off']
+        t4_target = bv['t4_target_slot']
+        t4_n_ki = bv['t4_n_ki']
+        for n in range(t4_N):
+            n_ki, slot = t4_target[n]
+            tile_size = n_ki * n_ki
+            base = slot * tile_size
+            tile = t4_tiles[t4_tile_off[n]:t4_tile_off[n + 1]]
+            flat_views[n_ki][base:base + tile_size] += tile
 
 
 def _get_or_build_cd_batched_view(plan, pno_spaces):
