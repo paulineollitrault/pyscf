@@ -654,6 +654,13 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             [_ctypes_cQ.c_int]
             + [_ctypes_cQ.c_void_p] * 13
             + [_ctypes_cQ.c_size_t] * 3)
+        _libcc_centerQ.DLPNOpartners_centerQ_step.restype = None
+        _libcc_centerQ.DLPNOpartners_centerQ_step.argtypes = (
+            [_ctypes_cQ.c_void_p] * 5            # proj, qia, local_Q, paos_dense, lmos_dense
+            + [_ctypes_cQ.c_int]                  # n_partners
+            + [_ctypes_cQ.c_void_p] * 8           # 8 flat partner arrays
+            + [_ctypes_cQ.c_size_t] * 7           # nQp..nocc
+            + [_ctypes_cQ.c_void_p] * 2)          # raw_cross_flat, raw_kv_flat
 
     # === DBG_CCINTS section timers (read DLPNO_CCINTS_DBG=1) ===
     import time as _ccints_time
@@ -717,6 +724,11 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         raw_jv = np.zeros((n_local, npno))
         raw_ab = np.zeros((n_local, npno, npno))
         raw_pair = np.zeros(n_local)
+        # When _use_centerQ_c, the per-partner raw_cross / raw_kv arrays
+        # live in flat buffers (built once per pair) so the C
+        # partners_centerQ kernel writes into them directly across centerQ
+        # iterations and the cross_partner kernel reads them without a
+        # dict→flat conversion. The Python fallback keeps dicts.
         raw_cross_kj = {k: np.zeros((n_local, npno, n_kj))
                         for k, _, n_kj in kj_partners}
         raw_kv_kj = {k: np.zeros((n_local, n_kj))
@@ -725,6 +737,65 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         for k, _, n_ki in ki_partners}
         raw_kv_ki = {k: np.zeros((n_local, n_ki))
                      for k, _, n_ki in ki_partners}
+
+        # Session: per-pair flat partner buffers for the C centerQ
+        # partners kernel.  Built once per pair (iteration-invariant since
+        # X_pno_kj / pair_paos_kj are static); the per-(centerQ, side)
+        # kernel call writes into raw_cross_kj_flat / raw_kv_kj_flat at
+        # absolute offsets.  After the centerQ loop ends, the contents are
+        # copied back into the per-k dicts (raw_cross_kj[k] etc.) for the
+        # downstream cross_partner kernel to consume.
+        if _use_centerQ_c:
+            def _build_partner_flat(partner_data, n_partners):
+                if n_partners == 0:
+                    return None
+                k_arr     = np.empty(n_partners, dtype=np.int64)
+                n_kj_arr  = np.empty(n_partners, dtype=np.int64)
+                pp_sizes  = np.empty(n_partners, dtype=np.int64)
+                for p, (k, _X, pp, n_kj) in enumerate(partner_data):
+                    k_arr[p]    = k
+                    n_kj_arr[p] = n_kj
+                    pp_sizes[p] = len(pp)
+                pp_off = np.empty(n_partners + 1, dtype=np.int64)
+                pp_off[0] = 0
+                pp_off[1:] = np.cumsum(pp_sizes)
+                X_sizes = pp_sizes * n_kj_arr
+                X_off = np.empty(n_partners + 1, dtype=np.int64)
+                X_off[0] = 0
+                X_off[1:] = np.cumsum(X_sizes)
+                cross_sizes = n_local * npno * n_kj_arr
+                cross_off = np.empty(n_partners + 1, dtype=np.int64)
+                cross_off[0] = 0
+                cross_off[1:] = np.cumsum(cross_sizes)
+                kv_sizes = n_local * n_kj_arr
+                kv_off = np.empty(n_partners + 1, dtype=np.int64)
+                kv_off[0] = 0
+                kv_off[1:] = np.cumsum(kv_sizes)
+
+                pp_flat = np.empty(int(pp_off[-1]), dtype=np.int64)
+                X_flat  = np.empty(int(X_off[-1]))
+                for p, (_k, X_p, pp_p, _n_kj) in enumerate(partner_data):
+                    pp_flat[pp_off[p]:pp_off[p + 1]] = (
+                        np.asarray(pp_p, dtype=np.int64))
+                    X_flat[X_off[p]:X_off[p + 1]] = X_p.ravel()
+                raw_cross_flat = np.zeros(int(cross_off[-1]))
+                raw_kv_flat    = np.zeros(int(kv_off[-1]))
+                return {
+                    'k_arr': k_arr, 'n_kj_arr': n_kj_arr,
+                    'pp_off': pp_off, 'pp_flat': pp_flat,
+                    'X_off': X_off, 'X_flat': X_flat,
+                    'cross_off': cross_off, 'kv_off': kv_off,
+                    'raw_cross_flat': raw_cross_flat,
+                    'raw_kv_flat': raw_kv_flat,
+                }
+            _kj_pdat = [(k, pno_spaces[key]['X_pno'],
+                         np.asarray(pno_spaces[key]['pair_paos']), n_kj)
+                        for k, key, n_kj in kj_partners]
+            _ki_pdat = [(k, pno_spaces[key]['X_pno'],
+                         np.asarray(pno_spaces[key]['pair_paos']), n_ki)
+                        for k, key, n_ki in ki_partners]
+            _kj_flat = _build_partner_flat(_kj_pdat, len(kj_partners))
+            _ki_flat = _build_partner_flat(_ki_pdat, len(ki_partners))
 
         pair_paos_ij = np.asarray(pair_paos_ij)
 
@@ -914,43 +985,126 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             do_proj = 1 if proj_ij is not None else 0
             _proj_arg = (proj_ij if proj_ij is not None
                          else np.empty((1, 1, 1)))
-            for k, X_kj, pp_kj, n_kj in kj_data:
-                k_s = int(riatom_to_lmos_ext_dense[centerQ, k])
-                kj_pao_pos = riatom_to_paos_ext_dense[centerQ, pp_kj]
-                kj_mask = kj_pao_pos >= 0
-                kj_u_in_pair = np.where(kj_mask)[0]
-                kj_u_in_Q = kj_pao_pos[kj_mask]
-                if len(kj_u_in_Q) == 0:
-                    continue
-                X_kj_slice = np.ascontiguousarray(X_kj[kj_u_in_pair])
-                kj_u_in_Q_long = np.ascontiguousarray(kj_u_in_Q, dtype=np.int64)
-                partner_apply(
-                    _proj_arg, qia_b, k_s,
-                    local_Q_long, kj_u_in_Q_long, X_kj_slice,
-                    raw_cross_kj[k], raw_kv_kj[k],
-                    do_proj,
-                )
 
-            for k, X_ki, pp_ki, n_ki in ki_data:
-                k_s = int(riatom_to_lmos_ext_dense[centerQ, k])
-                ki_pao_pos = riatom_to_paos_ext_dense[centerQ, pp_ki]
-                ki_mask = ki_pao_pos >= 0
-                ki_u_in_pair = np.where(ki_mask)[0]
-                ki_u_in_Q = ki_pao_pos[ki_mask]
-                if len(ki_u_in_Q) == 0:
-                    continue
-                X_ki_slice = np.ascontiguousarray(X_ki[ki_u_in_pair])
-                ki_u_in_Q_long = np.ascontiguousarray(ki_u_in_Q, dtype=np.int64)
-                partner_apply(
-                    _proj_arg, qia_b, k_s,
-                    local_Q_long, ki_u_in_Q_long, X_ki_slice,
-                    raw_cross_ji[k], raw_kv_ki[k],
-                    do_proj,
-                )
+            if _use_centerQ_c:
+                # Native-C path: one call per side processes all partners
+                # for this centerQ. Eliminates the per-partner Python prep
+                # loop (~120k iterations across CCSD setup on water-10).
+                _paos_dense_at = np.ascontiguousarray(
+                    riatom_to_paos_ext_dense[centerQ].astype(np.int64))
+                _lmos_dense_at = np.ascontiguousarray(
+                    riatom_to_lmos_ext_dense[centerQ].astype(np.int64))
+                _qia_b_c = np.ascontiguousarray(qia_b)
+                _proj_c = np.ascontiguousarray(_proj_arg)
+                _nQp = local_Q_long.shape[0]
+                _nl_at = qia_b.shape[1]
+                _np_full = qia_b.shape[2]
+                _nao_pao_total = riatom_to_paos_ext_dense.shape[1]
+
+                if _kj_flat is not None and do_proj:
+                    _libcc_centerQ.DLPNOpartners_centerQ_step(
+                        _proj_c.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _qia_b_c.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        local_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _paos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _lmos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        len(kj_partners),
+                        _kj_flat['k_arr'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _kj_flat['n_kj_arr'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _kj_flat['pp_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _kj_flat['pp_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _kj_flat['X_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _kj_flat['X_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _kj_flat['cross_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _kj_flat['kv_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _nQp, npno, _np_full, _nl_at,
+                        n_local, _nao_pao_total, nocc,
+                        _kj_flat['raw_cross_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _kj_flat['raw_kv_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                    )
+                if _ki_flat is not None and do_proj:
+                    _libcc_centerQ.DLPNOpartners_centerQ_step(
+                        _proj_c.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _qia_b_c.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        local_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _paos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _lmos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        len(ki_partners),
+                        _ki_flat['k_arr'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _ki_flat['n_kj_arr'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _ki_flat['pp_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _ki_flat['pp_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _ki_flat['X_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _ki_flat['X_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _ki_flat['cross_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _ki_flat['kv_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _nQp, npno, _np_full, _nl_at,
+                        n_local, _nao_pao_total, nocc,
+                        _ki_flat['raw_cross_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _ki_flat['raw_kv_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
+                    )
+            else:
+                for k, X_kj, pp_kj, n_kj in kj_data:
+                    k_s = int(riatom_to_lmos_ext_dense[centerQ, k])
+                    kj_pao_pos = riatom_to_paos_ext_dense[centerQ, pp_kj]
+                    kj_mask = kj_pao_pos >= 0
+                    kj_u_in_pair = np.where(kj_mask)[0]
+                    kj_u_in_Q = kj_pao_pos[kj_mask]
+                    if len(kj_u_in_Q) == 0:
+                        continue
+                    X_kj_slice = np.ascontiguousarray(X_kj[kj_u_in_pair])
+                    kj_u_in_Q_long = np.ascontiguousarray(kj_u_in_Q, dtype=np.int64)
+                    partner_apply(
+                        _proj_arg, qia_b, k_s,
+                        local_Q_long, kj_u_in_Q_long, X_kj_slice,
+                        raw_cross_kj[k], raw_kv_kj[k],
+                        do_proj,
+                    )
+
+                for k, X_ki, pp_ki, n_ki in ki_data:
+                    k_s = int(riatom_to_lmos_ext_dense[centerQ, k])
+                    ki_pao_pos = riatom_to_paos_ext_dense[centerQ, pp_ki]
+                    ki_mask = ki_pao_pos >= 0
+                    ki_u_in_pair = np.where(ki_mask)[0]
+                    ki_u_in_Q = ki_pao_pos[ki_mask]
+                    if len(ki_u_in_Q) == 0:
+                        continue
+                    X_ki_slice = np.ascontiguousarray(X_ki[ki_u_in_pair])
+                    ki_u_in_Q_long = np.ascontiguousarray(ki_u_in_Q, dtype=np.int64)
+                    partner_apply(
+                        _proj_arg, qia_b, k_s,
+                        local_Q_long, ki_u_in_Q_long, X_ki_slice,
+                        raw_cross_ji[k], raw_kv_ki[k],
+                        do_proj,
+                    )
 
         if _dbg_ccints:
             _dbg_add('centerQ_loop',
                      _ccints_time.perf_counter() - _t_centerQ_start)
+        # If we used the C partners_centerQ kernel, copy the per-pair flat
+        # raw_cross_*_flat / raw_kv_*_flat buffers back into the per-k
+        # dicts that the cross_partner phase consumes.  Cheap: O(npno*n_kj)
+        # per partner; partner counts are small.
+        if _use_centerQ_c and _kj_flat is not None:
+            cross_off = _kj_flat['cross_off']; kv_off = _kj_flat['kv_off']
+            cross_flat = _kj_flat['raw_cross_flat']; kv_flat = _kj_flat['raw_kv_flat']
+            for p, (k, _key, n_kj) in enumerate(kj_partners):
+                raw_cross_kj[k] = cross_flat[
+                    cross_off[p]:cross_off[p + 1]
+                ].reshape(n_local, npno, n_kj).copy()
+                raw_kv_kj[k] = kv_flat[
+                    kv_off[p]:kv_off[p + 1]
+                ].reshape(n_local, n_kj).copy()
+        if _use_centerQ_c and _ki_flat is not None:
+            cross_off = _ki_flat['cross_off']; kv_off = _ki_flat['kv_off']
+            cross_flat = _ki_flat['raw_cross_flat']; kv_flat = _ki_flat['raw_kv_flat']
+            for p, (k, _key, n_ki) in enumerate(ki_partners):
+                raw_cross_ji[k] = cross_flat[
+                    cross_off[p]:cross_off[p + 1]
+                ].reshape(n_local, npno, n_ki).copy()
+                raw_kv_ki[k] = kv_flat[
+                    kv_off[p]:kv_off[p + 1]
+                ].reshape(n_local, n_ki).copy()
         _t_jhi_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         # Apply local J^{-1/2}
         j2c_local = j2c[np.ix_(aux_idx, aux_idx)]
