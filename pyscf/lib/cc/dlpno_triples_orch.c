@@ -450,3 +450,551 @@ int DLPNOprocess_one_triple_phase1(
     free(X_tno_ijk); free(eps_tno);
     return 0;
 }
+
+/* ====================================================================
+ * Phase 3c-2/3: full single-call orchestrator (returns et_ijk).
+ *
+ * Does TNO + DF + U cache + t2_block + K_ab + K_ooov + K_*_for_V + W3
+ * all in one C entry point.  Replaces the entire post-screening body
+ * of `_process_one_triple` in Python.
+ * ==================================================================== */
+double DLPNOcompute_one_triple_E_T0(
+        /* triple */
+        const int i, const int j, const int k,
+        const int n_pao_ijk, const long *triple_paos,
+        const int n_dom, const long *triple_domain,
+        /* 3-pair (TNO) */
+        const int *pair_paos_n_3, const long *pair_paos_off_3,
+        const long *pair_paos_flat_3,
+        const int *n_pno_arr_3, const long *X_pno_off_3,
+        const double *X_pno_flat_3,
+        const long *T2_off_3, const double *T2_flat_3,
+        const int *same_lmo_3,
+        /* u_pks (X for U cache + T2 for w3 + t2_block) */
+        const int n_u_pks,
+        const int *u_pao_n, const int *u_pno_n,
+        const long *u_pp_off, const long *u_pp_flat,
+        const long *u_X_off, const double *u_X_flat,
+        const long *u_T2_off, const double *u_T2_flat,
+        /* t2_block 3x3 */
+        const int *t2_block_u_pk_idx,    /* (9,) — u_pk index or -1 */
+        const signed char *t2_block_transpose,  /* (9,) */
+        /* w3 task table (r, l) flat = r*m_dom + l */
+        const int *w3_u_pk_idx,          /* (3*m_dom,) — u_pk index or -1 */
+        const signed char *w3_transpose, /* (3*m_dom,) */
+        /* t1 path */
+        const int has_t1,
+        const long *t1_off, const double *t1_flat,
+        const int *t1_diag_u_pk_idx,     /* (3,) — diag (r,r) u_pk per r */
+        const long *t1_lmo_idx,          /* (3,) — global LMO indices [i,j,k] */
+        /* eps */
+        const double eps_i, const double eps_j, const double eps_k,
+        const int occ_denom,
+        /* PAO/aux globals */
+        const int nocc_lmo, const int n_pao_total, const int naux_total,
+        const double *F_pao_full, const double *S_pao_full,
+        const double *j2c_full,
+        const long *aux_atom_ids, const long *aux_pos_in_atom,
+        const long *qij_atom_off, const long *qia_atom_off,
+        const long *qab_atom_off,
+        const int  *qij_atom_n_aux, const int  *qij_atom_n_lmo,
+        const int  *qab_atom_n_pao,
+        const double *qij_atom_flat, const double *qia_atom_flat,
+        const double *qab_atom_flat,
+        const long *riatom_to_lmos_ext_dense,
+        const long *riatom_to_paos_ext_dense,
+        const long *lmo_aux_mask,
+        /* config */
+        const double T_CutTNO, const double S_cut_domain)
+{
+    if (n_pao_ijk == 0) return 0.0;
+    const char Nc = 'N', Tc = 'T';
+    const double one = 1.0, zero = 0.0;
+
+    /* === Phase 1: TNO + DF + U cache (re-implemented inline) === */
+    double *X_tno_ijk = NULL, *eps_tno = NULL, *X_pao_ijk = NULL;
+    int n_tno = 0, n_pao_can = 0;
+    int rc = DLPNObuild_triple_tno_full(
+        n_pao_ijk, n_pao_total, triple_paos,
+        F_pao_full, S_pao_full,
+        3, pair_paos_n_3, pair_paos_off_3, pair_paos_flat_3,
+        n_pno_arr_3, X_pno_off_3, X_pno_flat_3,
+        T2_off_3, T2_flat_3, same_lmo_3,
+        T_CutTNO, S_cut_domain,
+        &X_tno_ijk, &eps_tno, &X_pao_ijk,
+        &n_tno, &n_pao_can);
+    if (rc != 0 || n_tno == 0) {
+        if (X_tno_ijk) free(X_tno_ijk);
+        if (eps_tno)   free(eps_tno);
+        if (X_pao_ijk) free(X_pao_ijk);
+        return 0.0;
+    }
+    free(X_pao_ijk);
+    int n = n_tno;
+
+    /* aux_idx + jhi + groupby */
+    int naux_ijk = 0;
+    long *aux_idx = (long *)malloc(sizeof(long) * naux_total);
+    for (int q = 0; q < naux_total; q++) {
+        if (lmo_aux_mask[(size_t)i * naux_total + q]
+            || lmo_aux_mask[(size_t)j * naux_total + q]
+            || lmo_aux_mask[(size_t)k * naux_total + q]) {
+            aux_idx[naux_ijk++] = q;
+        }
+    }
+    if (naux_ijk == 0) {
+        free(aux_idx); free(X_tno_ijk); free(eps_tno);
+        return 0.0;
+    }
+    double *jhi = (double *)malloc(sizeof(double) * (size_t)naux_ijk * naux_ijk);
+    if (build_jhi(j2c_full, naux_total, aux_idx, naux_ijk, jhi) != 0) {
+        free(jhi); free(aux_idx); free(X_tno_ijk); free(eps_tno);
+        return 0.0;
+    }
+
+    long *local_Q_sorted = (long *)malloc(sizeof(long) * naux_ijk);
+    long *atom_pos_sorted = (long *)malloc(sizeof(long) * naux_ijk);
+    long *center_atoms = (long *)malloc(sizeof(long) * naux_ijk);
+    long *center_off = (long *)malloc(sizeof(long) * (naux_ijk + 1));
+    int n_centers = 0;
+    groupby_centers(aux_idx, naux_ijk, aux_atom_ids, aux_pos_in_atom,
+                    local_Q_sorted, atom_pos_sorted,
+                    center_atoms, center_off, &n_centers);
+    free(aux_idx);
+
+    double *ovL_sc = (double *)calloc((size_t)3 * n * naux_ijk, sizeof(double));
+    double *vvL_sc = (double *)calloc((size_t)n * n * naux_ijk, sizeof(double));
+    double *ooL_sc = (double *)calloc((size_t)3 * (size_t)n_dom * naux_ijk,
+                                      sizeof(double));
+    DLPNObuild_triple_local_DF(
+        i, j, k, n, n_dom, n_pao_ijk, naux_ijk, n_centers,
+        nocc_lmo, n_pao_total,
+        X_tno_ijk, triple_paos, triple_domain,
+        center_atoms, center_off, local_Q_sorted, atom_pos_sorted,
+        qij_atom_off, qia_atom_off, qab_atom_off,
+        qij_atom_n_aux, qij_atom_n_lmo, qab_atom_n_pao,
+        qij_atom_flat, qia_atom_flat, qab_atom_flat,
+        riatom_to_lmos_ext_dense, riatom_to_paos_ext_dense,
+        jhi, ovL_sc, vvL_sc, ooL_sc);
+    free(local_Q_sorted); free(atom_pos_sorted);
+    free(center_atoms); free(center_off); free(jhi);
+
+    /* W_pao_tno + U cache */
+    long *U_off_cache = NULL;
+    double *U_flat_cache = NULL;
+    if (n_u_pks > 0) {
+        double *S_slice = (double *)malloc(
+            sizeof(double) * (size_t)n_pao_total * n_pao_ijk);
+        for (int rr = 0; rr < n_pao_total; rr++) {
+            const double *src = S_pao_full + (size_t)rr * n_pao_total;
+            double *dst = S_slice + (size_t)rr * n_pao_ijk;
+            for (int cc = 0; cc < n_pao_ijk; cc++) {
+                dst[cc] = src[triple_paos[cc]];
+            }
+        }
+        double *W_pao_tno = (double *)malloc(
+            sizeof(double) * (size_t)n_pao_total * n);
+        int int_n = n, int_nao = n_pao_total, int_npi = n_pao_ijk;
+        dgemm_(&Nc, &Nc, &int_n, &int_nao, &int_npi,
+               &one, X_tno_ijk, &int_n,
+               S_slice, &int_npi,
+               &zero, W_pao_tno, &int_n);
+        free(S_slice);
+
+        U_off_cache = (long *)malloc(sizeof(long) * (n_u_pks + 1));
+        U_off_cache[0] = 0;
+        for (int p = 0; p < n_u_pks; p++) {
+            U_off_cache[p + 1] = U_off_cache[p] + (long)u_pno_n[p] * n;
+        }
+        U_flat_cache = (double *)malloc(
+            sizeof(double) * (size_t)U_off_cache[n_u_pks]);
+        DLPNObuild_U_for_triple(
+            n_u_pks, W_pao_tno, n, n_pao_total,
+            u_pao_n, u_pno_n,
+            u_pp_off, u_pp_flat, u_X_off, u_X_flat,
+            U_off_cache, U_flat_cache);
+        free(W_pao_tno);
+    }
+
+    /* === Phase 2: t2_block + K_ab + K_ooov + K_*_for_V + W3 === */
+    int int_n = n;
+    int int_nn = n * n;
+
+    /* t2_block (3, 3, n, n) row-major.
+     * For each (p, q) in 3x3:
+     *   pk_idx = t2_block_u_pk_idx[p*3 + q]; if -1, leave zero.
+     *   U_p = U_flat_cache + U_off_cache[pk_idx_for_p_diag]?  wait — need
+     *   careful: t2_block[p, q] = U_p.T @ T2_pq @ U_q where U_p is for
+     *   the pair (lmo_p, lmo_q) actually... no.
+     *
+     * Actually t2_block[p, q] is defined in Python as:
+     *   _proj_t2(lmo_triple[p], lmo_triple[q]) =
+     *     U_pk.T @ t2_for_T[pk] @ U_pk  with optional .T transpose
+     * where pk = (min, max) of the two LMOs.
+     *
+     * So both U's come from the SAME u_pk (the canonical pair of (lmo_p, lmo_q)).
+     * U_pk has shape (n_pno_pk, n_tno). So:
+     *   tmp = T2_pq @ U_pk  (n_pno × n_tno)
+     *   block = U_pk.T @ tmp  (n_tno × n_tno)
+     *   if lmo_p > lmo_q: transpose block.
+     */
+    double *t2_block = (double *)calloc((size_t)9 * n * n, sizeof(double));
+    {
+        /* Find max n_pno across t2_block u_pks for scratch sizing */
+        int max_npno_t2b = 0;
+        for (int pq = 0; pq < 9; pq++) {
+            int u_idx = t2_block_u_pk_idx[pq];
+            if (u_idx >= 0 && u_pno_n[u_idx] > max_npno_t2b) {
+                max_npno_t2b = u_pno_n[u_idx];
+            }
+        }
+        if (max_npno_t2b > 0) {
+            double *T2U_buf = (double *)malloc(
+                sizeof(double) * (size_t)max_npno_t2b * n);
+            double *block_tmp = (double *)malloc(sizeof(double) * (size_t)n * n);
+            for (int pq = 0; pq < 9; pq++) {
+                int u_idx = t2_block_u_pk_idx[pq];
+                if (u_idx < 0) continue;
+                int n_pno = u_pno_n[u_idx];
+                if (n_pno == 0) continue;
+                const double *U_pk = U_flat_cache + U_off_cache[u_idx];
+                const double *T2_pk = u_T2_flat + u_T2_off[u_idx];
+                int int_n_pno = n_pno;
+                /* T2U = T2 @ U : (n_pno, n_tno) = (n_pno, n_pno) @ (n_pno, n_tno)
+                 * Cython call:
+                 *   dgemm('N','N', n_tno, n_pno, n_pno,
+                 *         1, U, n_tno, T2, n_pno, 0, T2U, n_tno) */
+                dgemm_(&Nc, &Nc, &int_n, &int_n_pno, &int_n_pno,
+                       &one, U_pk, &int_n,
+                       T2_pk, &int_n_pno,
+                       &zero, T2U_buf, &int_n);
+                /* block = U.T @ T2U : (n_tno, n_tno)
+                 *   dgemm('N','T', n_tno, n_tno, n_pno,
+                 *         1, T2U, n_tno, U, n_tno, 0, block, n_tno)
+                 */
+                dgemm_(&Nc, &Tc, &int_n, &int_n, &int_n_pno,
+                       &one, T2U_buf, &int_n,
+                       U_pk, &int_n,
+                       &zero, block_tmp, &int_n);
+                /* Optional transpose if non-canonical */
+                double *dst = t2_block + (size_t)pq * n * n;
+                if (t2_block_transpose[pq]) {
+                    for (int a = 0; a < n; a++) {
+                        for (int b = 0; b < n; b++) {
+                            dst[(size_t)a*n + b] = block_tmp[(size_t)b*n + a];
+                        }
+                    }
+                } else {
+                    memcpy(dst, block_tmp, sizeof(double) * (size_t)n * n);
+                }
+            }
+            free(T2U_buf); free(block_tmp);
+        }
+    }
+
+    /* K_ab_cache (3, n, n, n): K_ab[ip, a, b, f] = sum_L ovL[ip, a, L] * vvL[b, f, L]
+     * Or equivalently K_ab[ip, a, b, f] = ovL[ip, a, :] @ vvL[b, f, :].T
+     *
+     * Computed Python-side as:
+     *   t = np.tensordot(ovL_sc[ip], vvL_sc, axes=([1], [2])).transpose(0, 2, 1)
+     *   shape (n, n, n) [a, b, f]
+     *
+     * For one ip:
+     *   Reshape ovL[ip] (n, naux) and vvL (n, n, naux).
+     *   tmp[a, b, f] = sum_q ovL[ip, a, q] * vvL[b, f, q]
+     *   Equivalently: K_tmp (n, n*n) = ovL[ip] (n, naux) @ vvL_resh (naux, n*n)
+     *     where vvL_resh[q, b*n + f] = vvL[b, f, q].
+     *   Then K_ab[ip, a, b, f] = K_tmp[a, b*n + f] reshaped.
+     *
+     * Wait — vvL_sc has shape (n, n, naux). Treating as (n*n, naux), the
+     * matmul is ovL[ip] (n, naux) @ vvL_T (naux, n*n) = (n, n*n).
+     *
+     * Row-major dgemm:
+     *   ovL_ip (n, naux) @ vvL.T (naux, n*n) — vvL is (n*n, naux), so .T = (naux, n*n).
+     *   Result (n, n*n) = ovL_ip @ vvL.T
+     *   row-major: out[a, bf] = sum_q ovL[a, q] * vvL_resh[bf, q]
+     *   where vvL_resh[bf, q] = vvL[b, f, q] (with bf = b*n + f).
+     *
+     *   So out[a, b*n + f] = sum_q ovL[ip, a, q] * vvL[b, f, q]
+     *     = K_ab[ip, a, b, f]?
+     *
+     * From Python:
+     *   t = np.tensordot(ovL_sc[ip], vvL_sc, axes=([1], [2]))
+     *     → t[a, b, f] = sum_L ovL_sc[ip, a, L] * vvL_sc[b, f, L]
+     *   Then K_ab_cache[ip] = t.transpose(0, 2, 1) → K_ab[ip, a, f, b]
+     *   But wait, the stored shape is (3, n, n, n) and Python comment says
+     *   "indexed [a, f, b]". Let me re-check.
+     *
+     * Actually in _w3_intermediate Python:
+     *   K_ab_cache[ip][a, b, f] = ?
+     *   The code:
+     *     t = np.tensordot(ovL_sc[ip], vvL_sc, axes=([1], [2]))
+     *     # shape (n, n, n) -- indexed [a, b, f]
+     *     K_ab_cache[ip] = t.transpose(0, 2, 1)  # → [a, f, b]
+     *
+     *   And the Cython kernel uses K_ab_cache[ip, a, b, f] in the dgemm
+     *   call as A_C (n*n, n) @ B_C (n, n) = base_buf (n*n, n).
+     *   So K_ab_cache[ip] is (n, n, n) read as (n*n, n).
+     *   The actual indices: K_ab_cache[ip, ?, ?, ?] = ovL[ip] @ vvL.T transposed how?
+     *
+     * Just match Python exactly. Python:
+     *   t = np.tensordot(ovL_sc[ip], vvL_sc, axes=([1], [2]))
+     *   K_ab_cache[ip] = t.transpose(0, 2, 1)
+     *
+     * Where ovL_sc[ip] is (n, naux), vvL_sc is (n, n, naux).
+     * t[a, b, f] = sum_L ovL_sc[ip, a, L] * vvL_sc[b, f, L]  (axes=[1] on ovL, [2] on vvL)
+     * Then transpose(0, 2, 1) gives K_ab_cache[ip, a, f, b] = t[a, b, f]
+     * → K_ab_cache[ip, a, X, Y] where X=f, Y=b.
+     *
+     * So the stored layout is [ip, a, f, b] with the trailing two indices
+     * "swapped" relative to what the math suggests.  We just need to
+     * compute and lay it out the same way Python does.
+     *
+     * Easiest: compute K_temp[ip, a, b, f] via matmul, then transpose
+     * trailing two axes when writing to K_ab_cache buffer.
+     *
+     * Or: compute directly: K_ab_cache[ip, a, f, b] = sum_L ovL[ip, a, L] * vvL[b, f, L].
+     * That's still sum_L ovL @ vvL.T reshape.
+     *
+     * Let me just do the straightforward computation matching Python:
+     *   t (n, n, n) = ovL[ip] @ vvL_resh.T   where vvL_resh[bf, L] = vvL[b, f, L]
+     *   K_ab_cache[ip] (n, n, n) = t.transpose(0, 2, 1) at [a, f, b]
+     */
+    double *K_ab_cache = (double *)malloc(sizeof(double) * (size_t)3 * n * n * n);
+    {
+        double *t_tmp = (double *)malloc(sizeof(double) * (size_t)n * n * n);
+        int int_naux = naux_ijk;
+        for (int ip = 0; ip < 3; ip++) {
+            const double *ovL_ip = ovL_sc + (size_t)ip * n * naux_ijk;
+            /* t (n, n*n) = ovL_ip (n, naux) @ vvL_T (naux, n*n)
+             * vvL is row-major (n*n, naux); .T treats it as (naux, n*n) col-major,
+             * which is the same memory.
+             *
+             * Row-major matmul rule for C(M, N) = A(M, K) @ B^T(N, K).T = A @ B^T:
+             *   dgemm('T','N', N, M, K, 1, B (LDB=K), A (LDA=K), 0, C (LDC=N))
+             * Verify: op(A_col)='T' on A (n, naux): A^T_col[i,k]=A_col[k,i]=A_row[i,k] ✓
+             *         op(B_col)='N' on vvL (n*n, naux): B_col[j,k]=vvL_col[j,k]=vvL_row[k,j]
+             *           ... but I want vvL_row[j, k] (treating bf as flattened).
+             *         Hmm. Actually vvL row-major is (n*n, naux): vvL[bf, q] =
+             *         vvL[b, f, q]. So vvL_row[j, k] = vvL[bf=j, q=k].
+             *         But B_col as col-major reads vvL_row transposed.
+             *
+             * Let me just use the row-major rule for C(M, N) = A(M, K) @ B(K, N):
+             *   dgemm('N','N', N, M, K, 1, B (LDB=N), A (LDA=K), 0, C (LDC=N))
+             * Here we want C(n, n*n) = ovL(n, naux) @ vvL_T(naux, n*n).
+             *   But vvL is stored as (n*n, naux) row-major. To use it as
+             *   (naux, n*n), I need to TRANSPOSE the storage interpretation.
+             *
+             * Alternative: dgemm with TRANSB='T' to transpose B.
+             *   row-major C(M, N) = A(M, K) @ B^T(N, K) (where B is stored (N, K))
+             *     dgemm('T','N', N, M, K, 1, B (LDB=K), A (LDA=K), 0, C (LDC=N))
+             * Here M=n, N=n*n, K=naux. A=ovL_ip (n, naux), B=vvL (n*n, naux).
+             *   ✓ matches the (M, N, K, A, B) pattern.
+             */
+            int int_n_sq = n * n;
+            dgemm_(&Tc, &Nc, &int_n_sq, &int_n, &int_naux,
+                   &one, vvL_sc, &int_naux,
+                   ovL_ip, &int_naux,
+                   &zero, t_tmp, &int_n_sq);
+            /* t_tmp now row-major (n, n*n) — t_tmp[a, bf] = sum_q ovL[a, q] * vvL[bf, q]
+             *   = sum_L ovL_sc[ip, a, L] * vvL_sc[b, f, L]
+             *   = t_python[a, b, f].
+             *
+             * Now write K_ab_cache[ip] = t.transpose(0, 2, 1) i.e. K[a, f, b] = t[a, b, f].
+             */
+            double *K_ip = K_ab_cache + (size_t)ip * n * n * n;
+            for (int a = 0; a < n; a++) {
+                for (int b = 0; b < n; b++) {
+                    for (int f = 0; f < n; f++) {
+                        K_ip[((size_t)a * n + f) * n + b]
+                            = t_tmp[((size_t)a * n * n) + b * n + f];
+                    }
+                }
+            }
+        }
+        free(t_tmp);
+    }
+
+    /* K_ooov (3, 3, n, m_dom): K_ooov[p, q, a, m] = sum_L ovL[p, a, L] * ooL[q, m, L]
+     * Python:
+     *   ov_flat (3*n, naux) = ovL_ijk.reshape(3*n, naux)
+     *   oo_flat (3*m_dom, naux) = ooL.reshape(3*m_dom, naux)
+     *   K_ooov_pre = ov_flat @ oo_flat.T  → (3*n, 3*m_dom)
+     *   K_ooov = K_ooov_pre.reshape(3, n, 3, m_dom).transpose(0, 2, 1, 3)
+     *   → K_ooov[p, q, a, m]
+     */
+    int m_dom_size = n_dom;
+    double *K_ooov = (double *)malloc(
+        sizeof(double) * (size_t)3 * 3 * n * m_dom_size);
+    if (m_dom_size > 0) {
+        int M = 3 * n, N = 3 * m_dom_size, K = naux_ijk;
+        double *K_pre = (double *)malloc(sizeof(double) * (size_t)M * N);
+        /* ov_flat (M, K) row-major @ oo_flat^T (K, N) row-major = (M, N).
+         * row-major C = A(M, K) @ B^T(N, K).T = A @ B^T:
+         *   dgemm('T','N', N, M, K, 1, B (LDB=K), A (LDA=K), 0, C (LDC=N))
+         */
+        dgemm_(&Tc, &Nc, &N, &M, &K,
+               &one, ooL_sc, &K,
+               ovL_sc, &K,
+               &zero, K_pre, &N);
+        /* Now K_pre (3*n, 3*m_dom) row-major. Reshape to (3, n, 3, m_dom):
+         *   K_pre[p*n + a, q*m_dom + m] → 4D[p, a, q, m]
+         * Then transpose(0, 2, 1, 3) → K_ooov[p, q, a, m] = 4D[p, a, q, m].
+         * So K_ooov[p, q, a, m] = K_pre[(p*n + a) * (3*m_dom) + q*m_dom + m].
+         */
+        for (int p = 0; p < 3; p++) {
+            for (int q = 0; q < 3; q++) {
+                for (int a = 0; a < n; a++) {
+                    for (int m = 0; m < m_dom_size; m++) {
+                        K_ooov[((((size_t)p * 3 + q) * n + a) * m_dom_size) + m]
+                            = K_pre[((size_t)p * n + a) * 3 * m_dom_size
+                                    + q * m_dom_size + m];
+                    }
+                }
+            }
+        }
+        free(K_pre);
+    }
+
+    /* K_jk, K_ik, K_ij (n, n) for V intermediate when has_t1.
+     * Python: K_jk = ovL[1] @ ovL[2].T, etc.
+     */
+    double *K_jk = (double *)calloc((size_t)n * n, sizeof(double));
+    double *K_ik = (double *)calloc((size_t)n * n, sizeof(double));
+    double *K_ij = (double *)calloc((size_t)n * n, sizeof(double));
+    if (has_t1) {
+        const double *ovL_0 = ovL_sc + 0 * (size_t)n * naux_ijk;
+        const double *ovL_1 = ovL_sc + 1 * (size_t)n * naux_ijk;
+        const double *ovL_2 = ovL_sc + 2 * (size_t)n * naux_ijk;
+        int int_naux = naux_ijk;
+        /* row-major C(n, n) = A(n, naux) @ B(n, naux)^T:
+         *   dgemm('T','N', n, n, naux, 1, B (LDB=naux), A (LDA=naux), 0, C (LDC=n))
+         */
+        dgemm_(&Tc, &Nc, &int_n, &int_n, &int_naux,
+               &one, ovL_2, &int_naux, ovL_1, &int_naux,
+               &zero, K_jk, &int_n);
+        dgemm_(&Tc, &Nc, &int_n, &int_n, &int_naux,
+               &one, ovL_2, &int_naux, ovL_0, &int_naux,
+               &zero, K_ik, &int_n);
+        dgemm_(&Tc, &Nc, &int_n, &int_n, &int_naux,
+               &one, ovL_1, &int_naux, ovL_0, &int_naux,
+               &zero, K_ij, &int_n);
+    }
+
+    /* t1_lmo (3, n) — project per-LMO t1 to TNO basis via diag pair U.
+     * t1_lmo[r] = U_diag_r.T @ t1_pno[lmo_r].
+     */
+    double *t1_lmo = (double *)calloc((size_t)3 * n, sizeof(double));
+    if (has_t1) {
+        for (int r = 0; r < 3; r++) {
+            int u_idx = t1_diag_u_pk_idx[r];
+            if (u_idx < 0) continue;
+            int n_pno = u_pno_n[u_idx];
+            long lmo_r = t1_lmo_idx[r];
+            const double *t1_r = t1_flat + t1_off[lmo_r];
+            const double *U_rr = U_flat_cache + U_off_cache[u_idx];
+            /* t1_lmo[r, a] = sum_p U_rr[p, a] * t1_r[p]
+             * row-major: out (n,) = U_rr.T (n, n_pno) @ t1_r (n_pno,)
+             * Use dgemv_ — simpler. */
+            int int_n_pno = n_pno;
+            extern void dgemv_(const char *, const int *, const int *,
+                                const double *, const double *, const int *,
+                                const double *, const int *,
+                                const double *, double *, const int *);
+            int one_inc = 1;
+            const char Tc_v = 'T';
+            dgemv_(&Tc_v, &int_n_pno, &int_n,
+                   &one, U_rr, &int_n_pno,
+                   t1_r, &one_inc,
+                   &zero, t1_lmo + (size_t)r * n, &one_inc);
+            /* Wait — dgemv computes y = α op(A) x + β y.  The row-major
+             * U_rr as col-major (n_tno, n_pno)? With LDA, etc., it's confusing.
+             *
+             * Simpler approach: hand-roll the matvec.
+             */
+            for (int a = 0; a < n; a++) {
+                double s = 0.0;
+                for (int p = 0; p < n_pno; p++) {
+                    s += U_rr[(size_t)p * n + a] * t1_r[p];
+                }
+                t1_lmo[(size_t)r * n + a] = s;
+            }
+        }
+    }
+
+    /* t2_T_all (3, 3, n, n) = t2_block.transpose(0, 1, 3, 2):
+     *   t2_T_all[ir, iq, c, f] = t2_block[ir, iq, f, c].
+     */
+    double *t2_T_all = (double *)malloc(
+        sizeof(double) * (size_t)9 * n * n);
+    for (int ir = 0; ir < 3; ir++) {
+        for (int iq = 0; iq < 3; iq++) {
+            const double *src = t2_block + (size_t)(ir * 3 + iq) * n * n;
+            double *dst = t2_T_all + (size_t)(ir * 3 + iq) * n * n;
+            for (int a = 0; a < n; a++) {
+                for (int b = 0; b < n; b++) {
+                    dst[(size_t)a * n + b] = src[(size_t)b * n + a];
+                }
+            }
+        }
+    }
+
+    /* Build per-task offsets into the existing U_flat_cache and u_T2_flat
+     * arrays — NO data copy.  W3 kernel reads U_flat_cache[w3_U_off[t]:...]
+     * and u_T2_flat[w3_T2_off[t]:...] directly.
+     *
+     * (Earlier version copied U/T2 into a per-task contiguous arena, which
+     * doubled memory traffic per triple and dominated the wall.)
+     */
+    long *w3_n_pno_arr = (long *)calloc(
+        (size_t)(3 * m_dom_size + 1), sizeof(long));
+    long *w3_U_off = (long *)calloc(
+        (size_t)(3 * m_dom_size + 1), sizeof(long));
+    long *w3_T2_off = (long *)calloc(
+        (size_t)(3 * m_dom_size + 1), sizeof(long));
+    signed char *w3_tflags = (signed char *)calloc(
+        (size_t)(3 * m_dom_size + 1), 1);
+    int n_pno_max_w3 = 0;
+    for (int t = 0; t < 3 * m_dom_size; t++) {
+        int u_idx = w3_u_pk_idx[t];
+        if (u_idx < 0) {
+            w3_n_pno_arr[t] = 0;
+            w3_U_off[t]  = 0;   /* unused when n_pno=0 */
+            w3_T2_off[t] = 0;
+        } else {
+            w3_n_pno_arr[t] = u_pno_n[u_idx];
+            w3_U_off[t]  = U_off_cache[u_idx];
+            w3_T2_off[t] = u_T2_off[u_idx];
+            if (u_pno_n[u_idx] > n_pno_max_w3) n_pno_max_w3 = u_pno_n[u_idx];
+        }
+        w3_tflags[t] = w3_transpose[t];
+    }
+
+    /* eps_occ */
+    double eps_occ_arr[3] = {eps_i, eps_j, eps_k};
+
+    /* Call W3.  Pass U_flat_cache and u_T2_flat directly with per-task
+     * offsets (w3_U_off / w3_T2_off index INTO those buffers). */
+    double et_ijk = DLPNOcompute_w3_energy(
+        K_ab_cache, t2_T_all,
+        K_jk, K_ik, K_ij, K_ooov,
+        U_flat_cache, w3_U_off, w3_n_pno_arr,
+        u_T2_flat,    w3_T2_off, w3_tflags,
+        eps_occ_arr, eps_tno,
+        t1_lmo,
+        has_t1, occ_denom,
+        n, m_dom_size, n_pno_max_w3);
+
+    /* Cleanup */
+    free(K_ab_cache); free(K_ooov);
+    free(K_jk); free(K_ik); free(K_ij);
+    free(t2_block); free(t2_T_all); free(t1_lmo);
+    free(w3_n_pno_arr); free(w3_U_off); free(w3_T2_off);
+    free(w3_tflags);
+    if (U_off_cache)  free(U_off_cache);
+    if (U_flat_cache) free(U_flat_cache);
+    free(ovL_sc); free(vvL_sc); free(ooL_sc);
+    free(X_tno_ijk); free(eps_tno);
+
+    return et_ijk;
+}
