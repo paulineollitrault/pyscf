@@ -195,6 +195,47 @@ double compute_one_triple(int i, int j, int k, /* arena */) {
 - Foundation for the parallel CCSD-as-single-kernel arc (separate
   multi-session effort).
 
+## ACTUAL OUTCOME (Phases 3c-1 through 3c-3)
+
+Phase 3c-1 + 3c-2/3 landed.  Validated correct (water-4
+E(T) = -0.0129209861 bit-perfect; water-10 E(T) = -0.0323130688
+within FP-summation noise).  But (T) wall on water-10 is **23s vs
+Phase 3a's 15.13s** — **slower, not faster**.
+
+Optimizations attempted:
+1. Cached globals (F_pao, S_pao, j2c, lmo_aux_mask) on the function
+   to avoid per-triple ascontiguousarray + bool→int64 copy.  No win.
+2. W3 task offsets aliased into U_flat_cache + u_T2_flat (no data
+   copy from cache to per-task arena).  Saved 2.77s (26 → 23).
+3. __thread-backed scratch arena: ~25 per-triple mallocs replaced
+   with grow-only persistent buffers.  No measurable win.
+4. Global per-CCSD pair arena (X_pno + T2 flat, indexed by pair_idx);
+   per-triple just looks up offsets.  No win.
+
+Cumulative: malloc churn, marshalling, global-array copies — none
+were the dominant cost.  The 8s gap to Phase 3a is somewhere else,
+likely:
+- Cache thrashing from oversized persistent scratch buffers
+  (vvL_sc grows to max naux_ijk ~250, kept across all triples even
+  when current triple uses ~175).
+- Different BLAS dispatch patterns vs numpy/Cython
+- Possibly GIL contention through ctypes (need to verify CDLL
+  releases GIL during the call).
+
+## Recommendation
+
+Phase 3c-2/3 (one C function per triple) is architecturally COMPLETE
+and CORRECT but does NOT outperform Phase 3a on water-10.  The end
+state the user requested (single C kernel mirroring Psi4) is in
+place; what remains for the perf win is **Phase 3c-4: OMP-over-
+triples in C with thread-pinned scratch**, which eliminates the
+ThreadPoolExecutor + GIL roundtrips entirely.  Estimated +500 lines
+C, 1 session.
+
+For now, default `DLPNO_TRIPLE_ORCH_FULL=0` (keep Phase 3a as the
+fast path).  The orch infrastructure stays in tree for Phase 3c-4 to
+build on.
+
 ## Known risks / pitfalls
 
 - **Per-thread BLAS oversubscription** when OMP loops over triples and
