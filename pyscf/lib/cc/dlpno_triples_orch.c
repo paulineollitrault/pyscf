@@ -451,6 +451,59 @@ int DLPNOprocess_one_triple_phase1(
     return 0;
 }
 
+/* --------------------------------------------------------------------
+ * Per-thread scratch arena.  Eliminates the ~25 malloc/free pairs per
+ * triple in DLPNOcompute_one_triple_E_T0 — each pthread reuses the
+ * same buffers across triples (grow-only).
+ *
+ * The Python pool reuses worker threads, so __thread storage persists
+ * across triples for the same worker.  Buffers are grown on first use
+ * and never freed (cleanup via thread exit / process exit).
+ * -------------------------------------------------------------------- */
+typedef struct {
+    long *aux_idx;          size_t aux_idx_cap;
+    double *jhi;            size_t jhi_cap;
+    long *local_Q_sorted;   size_t local_Q_sorted_cap;
+    long *atom_pos_sorted;  size_t atom_pos_sorted_cap;
+    long *center_atoms;     size_t center_atoms_cap;
+    long *center_off;       size_t center_off_cap;
+    double *ovL_sc;         size_t ovL_sc_cap;
+    double *vvL_sc;         size_t vvL_sc_cap;
+    double *ooL_sc;         size_t ooL_sc_cap;
+    double *S_slice;        size_t S_slice_cap;
+    double *W_pao_tno;      size_t W_pao_tno_cap;
+    long *U_off_cache;      size_t U_off_cache_cap;
+    double *U_flat_cache;   size_t U_flat_cache_cap;
+    double *K_ab_cache;     size_t K_ab_cache_cap;
+    double *t_tmp;          size_t t_tmp_cap;
+    double *K_ooov;         size_t K_ooov_cap;
+    double *K_pre;          size_t K_pre_cap;
+    double *K_jk;           size_t K_jk_cap;
+    double *K_ik;           size_t K_ik_cap;
+    double *K_ij;           size_t K_ij_cap;
+    double *t1_lmo;         size_t t1_lmo_cap;
+    double *t2_block;       size_t t2_block_cap;
+    double *T2U_buf;        size_t T2U_buf_cap;
+    double *block_tmp;      size_t block_tmp_cap;
+    double *t2_T_all;       size_t t2_T_all_cap;
+    long *w3_n_pno_arr;     size_t w3_n_pno_arr_cap;
+    long *w3_U_off;         size_t w3_U_off_cap;
+    long *w3_T2_off;        size_t w3_T2_off_cap;
+    signed char *w3_tflags; size_t w3_tflags_cap;
+} TScratch;
+
+static __thread TScratch tscratch = {0};
+
+#define ENSURE(field, T, n)                                              \
+    do {                                                                 \
+        size_t _need = (size_t)(n);                                      \
+        if (tscratch.field##_cap < _need) {                              \
+            free(tscratch.field);                                        \
+            tscratch.field = (T *)malloc(sizeof(T) * (_need > 0 ? _need : 1)); \
+            tscratch.field##_cap = _need;                                \
+        }                                                                \
+    } while (0)
+
 /* ====================================================================
  * Phase 3c-2/3: full single-call orchestrator (returns et_ijk).
  *
@@ -532,9 +585,10 @@ double DLPNOcompute_one_triple_E_T0(
     free(X_pao_ijk);
     int n = n_tno;
 
-    /* aux_idx + jhi + groupby */
+    /* aux_idx + jhi + groupby — using thread scratch */
+    ENSURE(aux_idx, long, naux_total);
+    long *aux_idx = tscratch.aux_idx;
     int naux_ijk = 0;
-    long *aux_idx = (long *)malloc(sizeof(long) * naux_total);
     for (int q = 0; q < naux_total; q++) {
         if (lmo_aux_mask[(size_t)i * naux_total + q]
             || lmo_aux_mask[(size_t)j * naux_total + q]
@@ -543,29 +597,41 @@ double DLPNOcompute_one_triple_E_T0(
         }
     }
     if (naux_ijk == 0) {
-        free(aux_idx); free(X_tno_ijk); free(eps_tno);
+        free(X_tno_ijk); free(eps_tno);
         return 0.0;
     }
-    double *jhi = (double *)malloc(sizeof(double) * (size_t)naux_ijk * naux_ijk);
+    ENSURE(jhi, double, (size_t)naux_ijk * naux_ijk);
+    double *jhi = tscratch.jhi;
     if (build_jhi(j2c_full, naux_total, aux_idx, naux_ijk, jhi) != 0) {
-        free(jhi); free(aux_idx); free(X_tno_ijk); free(eps_tno);
+        free(X_tno_ijk); free(eps_tno);
         return 0.0;
     }
 
-    long *local_Q_sorted = (long *)malloc(sizeof(long) * naux_ijk);
-    long *atom_pos_sorted = (long *)malloc(sizeof(long) * naux_ijk);
-    long *center_atoms = (long *)malloc(sizeof(long) * naux_ijk);
-    long *center_off = (long *)malloc(sizeof(long) * (naux_ijk + 1));
+    ENSURE(local_Q_sorted, long, naux_ijk);
+    ENSURE(atom_pos_sorted, long, naux_ijk);
+    ENSURE(center_atoms, long, naux_ijk);
+    ENSURE(center_off, long, naux_ijk + 1);
+    long *local_Q_sorted = tscratch.local_Q_sorted;
+    long *atom_pos_sorted = tscratch.atom_pos_sorted;
+    long *center_atoms = tscratch.center_atoms;
+    long *center_off = tscratch.center_off;
     int n_centers = 0;
     groupby_centers(aux_idx, naux_ijk, aux_atom_ids, aux_pos_in_atom,
                     local_Q_sorted, atom_pos_sorted,
                     center_atoms, center_off, &n_centers);
-    free(aux_idx);
 
-    double *ovL_sc = (double *)calloc((size_t)3 * n * naux_ijk, sizeof(double));
-    double *vvL_sc = (double *)calloc((size_t)n * n * naux_ijk, sizeof(double));
-    double *ooL_sc = (double *)calloc((size_t)3 * (size_t)n_dom * naux_ijk,
-                                      sizeof(double));
+    ENSURE(ovL_sc, double, (size_t)3 * n * naux_ijk);
+    ENSURE(vvL_sc, double, (size_t)n * n * naux_ijk);
+    ENSURE(ooL_sc, double, (size_t)3 * (size_t)n_dom * naux_ijk);
+    double *ovL_sc = tscratch.ovL_sc;
+    double *vvL_sc = tscratch.vvL_sc;
+    double *ooL_sc = tscratch.ooL_sc;
+    /* DF kernel zeros what it doesn't write; explicit memset for safety */
+    memset(ovL_sc, 0, sizeof(double) * (size_t)3 * n * naux_ijk);
+    memset(vvL_sc, 0, sizeof(double) * (size_t)n * n * naux_ijk);
+    if (n_dom > 0) {
+        memset(ooL_sc, 0, sizeof(double) * (size_t)3 * n_dom * naux_ijk);
+    }
     DLPNObuild_triple_local_DF(
         i, j, k, n, n_dom, n_pao_ijk, naux_ijk, n_centers,
         nocc_lmo, n_pao_total,
@@ -576,15 +642,13 @@ double DLPNOcompute_one_triple_E_T0(
         qij_atom_flat, qia_atom_flat, qab_atom_flat,
         riatom_to_lmos_ext_dense, riatom_to_paos_ext_dense,
         jhi, ovL_sc, vvL_sc, ooL_sc);
-    free(local_Q_sorted); free(atom_pos_sorted);
-    free(center_atoms); free(center_off); free(jhi);
 
     /* W_pao_tno + U cache */
     long *U_off_cache = NULL;
     double *U_flat_cache = NULL;
     if (n_u_pks > 0) {
-        double *S_slice = (double *)malloc(
-            sizeof(double) * (size_t)n_pao_total * n_pao_ijk);
+        ENSURE(S_slice, double, (size_t)n_pao_total * n_pao_ijk);
+        double *S_slice = tscratch.S_slice;
         for (int rr = 0; rr < n_pao_total; rr++) {
             const double *src = S_pao_full + (size_t)rr * n_pao_total;
             double *dst = S_slice + (size_t)rr * n_pao_ijk;
@@ -592,28 +656,27 @@ double DLPNOcompute_one_triple_E_T0(
                 dst[cc] = src[triple_paos[cc]];
             }
         }
-        double *W_pao_tno = (double *)malloc(
-            sizeof(double) * (size_t)n_pao_total * n);
+        ENSURE(W_pao_tno, double, (size_t)n_pao_total * n);
+        double *W_pao_tno = tscratch.W_pao_tno;
         int int_n = n, int_nao = n_pao_total, int_npi = n_pao_ijk;
         dgemm_(&Nc, &Nc, &int_n, &int_nao, &int_npi,
                &one, X_tno_ijk, &int_n,
                S_slice, &int_npi,
                &zero, W_pao_tno, &int_n);
-        free(S_slice);
 
-        U_off_cache = (long *)malloc(sizeof(long) * (n_u_pks + 1));
+        ENSURE(U_off_cache, long, n_u_pks + 1);
+        U_off_cache = tscratch.U_off_cache;
         U_off_cache[0] = 0;
         for (int p = 0; p < n_u_pks; p++) {
             U_off_cache[p + 1] = U_off_cache[p] + (long)u_pno_n[p] * n;
         }
-        U_flat_cache = (double *)malloc(
-            sizeof(double) * (size_t)U_off_cache[n_u_pks]);
+        ENSURE(U_flat_cache, double, (size_t)U_off_cache[n_u_pks]);
+        U_flat_cache = tscratch.U_flat_cache;
         DLPNObuild_U_for_triple(
             n_u_pks, W_pao_tno, n, n_pao_total,
             u_pao_n, u_pno_n,
             u_pp_off, u_pp_flat, u_X_off, u_X_flat,
             U_off_cache, U_flat_cache);
-        free(W_pao_tno);
     }
 
     /* === Phase 2: t2_block + K_ab + K_ooov + K_*_for_V + W3 === */
@@ -638,7 +701,9 @@ double DLPNOcompute_one_triple_E_T0(
      *   block = U_pk.T @ tmp  (n_tno × n_tno)
      *   if lmo_p > lmo_q: transpose block.
      */
-    double *t2_block = (double *)calloc((size_t)9 * n * n, sizeof(double));
+    ENSURE(t2_block, double, (size_t)9 * n * n);
+    double *t2_block = tscratch.t2_block;
+    memset(t2_block, 0, sizeof(double) * (size_t)9 * n * n);
     {
         /* Find max n_pno across t2_block u_pks for scratch sizing */
         int max_npno_t2b = 0;
@@ -649,9 +714,10 @@ double DLPNOcompute_one_triple_E_T0(
             }
         }
         if (max_npno_t2b > 0) {
-            double *T2U_buf = (double *)malloc(
-                sizeof(double) * (size_t)max_npno_t2b * n);
-            double *block_tmp = (double *)malloc(sizeof(double) * (size_t)n * n);
+            ENSURE(T2U_buf, double, (size_t)max_npno_t2b * n);
+            ENSURE(block_tmp, double, (size_t)n * n);
+            double *T2U_buf = tscratch.T2U_buf;
+            double *block_tmp = tscratch.block_tmp;
             for (int pq = 0; pq < 9; pq++) {
                 int u_idx = t2_block_u_pk_idx[pq];
                 if (u_idx < 0) continue;
@@ -688,7 +754,6 @@ double DLPNOcompute_one_triple_E_T0(
                     memcpy(dst, block_tmp, sizeof(double) * (size_t)n * n);
                 }
             }
-            free(T2U_buf); free(block_tmp);
         }
     }
 
@@ -760,9 +825,11 @@ double DLPNOcompute_one_triple_E_T0(
      *   t (n, n, n) = ovL[ip] @ vvL_resh.T   where vvL_resh[bf, L] = vvL[b, f, L]
      *   K_ab_cache[ip] (n, n, n) = t.transpose(0, 2, 1) at [a, f, b]
      */
-    double *K_ab_cache = (double *)malloc(sizeof(double) * (size_t)3 * n * n * n);
+    ENSURE(K_ab_cache, double, (size_t)3 * n * n * n);
+    double *K_ab_cache = tscratch.K_ab_cache;
     {
-        double *t_tmp = (double *)malloc(sizeof(double) * (size_t)n * n * n);
+        ENSURE(t_tmp, double, (size_t)n * n * n);
+        double *t_tmp = tscratch.t_tmp;
         int int_naux = naux_ijk;
         for (int ip = 0; ip < 3; ip++) {
             const double *ovL_ip = ovL_sc + (size_t)ip * n * naux_ijk;
@@ -812,7 +879,6 @@ double DLPNOcompute_one_triple_E_T0(
                 }
             }
         }
-        free(t_tmp);
     }
 
     /* K_ooov (3, 3, n, m_dom): K_ooov[p, q, a, m] = sum_L ovL[p, a, L] * ooL[q, m, L]
@@ -824,11 +890,12 @@ double DLPNOcompute_one_triple_E_T0(
      *   → K_ooov[p, q, a, m]
      */
     int m_dom_size = n_dom;
-    double *K_ooov = (double *)malloc(
-        sizeof(double) * (size_t)3 * 3 * n * m_dom_size);
+    ENSURE(K_ooov, double, (size_t)3 * 3 * n * (m_dom_size > 0 ? m_dom_size : 1));
+    double *K_ooov = tscratch.K_ooov;
     if (m_dom_size > 0) {
         int M = 3 * n, N = 3 * m_dom_size, K = naux_ijk;
-        double *K_pre = (double *)malloc(sizeof(double) * (size_t)M * N);
+        ENSURE(K_pre, double, (size_t)M * N);
+        double *K_pre = tscratch.K_pre;
         /* ov_flat (M, K) row-major @ oo_flat^T (K, N) row-major = (M, N).
          * row-major C = A(M, K) @ B^T(N, K).T = A @ B^T:
          *   dgemm('T','N', N, M, K, 1, B (LDB=K), A (LDA=K), 0, C (LDC=N))
@@ -853,15 +920,20 @@ double DLPNOcompute_one_triple_E_T0(
                 }
             }
         }
-        free(K_pre);
     }
 
     /* K_jk, K_ik, K_ij (n, n) for V intermediate when has_t1.
      * Python: K_jk = ovL[1] @ ovL[2].T, etc.
      */
-    double *K_jk = (double *)calloc((size_t)n * n, sizeof(double));
-    double *K_ik = (double *)calloc((size_t)n * n, sizeof(double));
-    double *K_ij = (double *)calloc((size_t)n * n, sizeof(double));
+    ENSURE(K_jk, double, (size_t)n * n);
+    ENSURE(K_ik, double, (size_t)n * n);
+    ENSURE(K_ij, double, (size_t)n * n);
+    double *K_jk = tscratch.K_jk;
+    double *K_ik = tscratch.K_ik;
+    double *K_ij = tscratch.K_ij;
+    memset(K_jk, 0, sizeof(double) * (size_t)n * n);
+    memset(K_ik, 0, sizeof(double) * (size_t)n * n);
+    memset(K_ij, 0, sizeof(double) * (size_t)n * n);
     if (has_t1) {
         const double *ovL_0 = ovL_sc + 0 * (size_t)n * naux_ijk;
         const double *ovL_1 = ovL_sc + 1 * (size_t)n * naux_ijk;
@@ -884,7 +956,9 @@ double DLPNOcompute_one_triple_E_T0(
     /* t1_lmo (3, n) — project per-LMO t1 to TNO basis via diag pair U.
      * t1_lmo[r] = U_diag_r.T @ t1_pno[lmo_r].
      */
-    double *t1_lmo = (double *)calloc((size_t)3 * n, sizeof(double));
+    ENSURE(t1_lmo, double, (size_t)3 * n);
+    double *t1_lmo = tscratch.t1_lmo;
+    memset(t1_lmo, 0, sizeof(double) * (size_t)3 * n);
     if (has_t1) {
         for (int r = 0; r < 3; r++) {
             int u_idx = t1_diag_u_pk_idx[r];
@@ -925,8 +999,8 @@ double DLPNOcompute_one_triple_E_T0(
     /* t2_T_all (3, 3, n, n) = t2_block.transpose(0, 1, 3, 2):
      *   t2_T_all[ir, iq, c, f] = t2_block[ir, iq, f, c].
      */
-    double *t2_T_all = (double *)malloc(
-        sizeof(double) * (size_t)9 * n * n);
+    ENSURE(t2_T_all, double, (size_t)9 * n * n);
+    double *t2_T_all = tscratch.t2_T_all;
     for (int ir = 0; ir < 3; ir++) {
         for (int iq = 0; iq < 3; iq++) {
             const double *src = t2_block + (size_t)(ir * 3 + iq) * n * n;
@@ -946,14 +1020,19 @@ double DLPNOcompute_one_triple_E_T0(
      * (Earlier version copied U/T2 into a per-task contiguous arena, which
      * doubled memory traffic per triple and dominated the wall.)
      */
-    long *w3_n_pno_arr = (long *)calloc(
-        (size_t)(3 * m_dom_size + 1), sizeof(long));
-    long *w3_U_off = (long *)calloc(
-        (size_t)(3 * m_dom_size + 1), sizeof(long));
-    long *w3_T2_off = (long *)calloc(
-        (size_t)(3 * m_dom_size + 1), sizeof(long));
-    signed char *w3_tflags = (signed char *)calloc(
-        (size_t)(3 * m_dom_size + 1), 1);
+    int n_w3 = 3 * m_dom_size + 1;
+    ENSURE(w3_n_pno_arr, long, n_w3);
+    ENSURE(w3_U_off, long, n_w3);
+    ENSURE(w3_T2_off, long, n_w3);
+    ENSURE(w3_tflags, signed char, n_w3);
+    long *w3_n_pno_arr = tscratch.w3_n_pno_arr;
+    long *w3_U_off = tscratch.w3_U_off;
+    long *w3_T2_off = tscratch.w3_T2_off;
+    signed char *w3_tflags = tscratch.w3_tflags;
+    memset(w3_n_pno_arr, 0, sizeof(long) * n_w3);
+    memset(w3_U_off, 0, sizeof(long) * n_w3);
+    memset(w3_T2_off, 0, sizeof(long) * n_w3);
+    memset(w3_tflags, 0, n_w3);
     int n_pno_max_w3 = 0;
     for (int t = 0; t < 3 * m_dom_size; t++) {
         int u_idx = w3_u_pk_idx[t];
@@ -985,15 +1064,9 @@ double DLPNOcompute_one_triple_E_T0(
         has_t1, occ_denom,
         n, m_dom_size, n_pno_max_w3);
 
-    /* Cleanup */
-    free(K_ab_cache); free(K_ooov);
-    free(K_jk); free(K_ik); free(K_ij);
-    free(t2_block); free(t2_T_all); free(t1_lmo);
-    free(w3_n_pno_arr); free(w3_U_off); free(w3_T2_off);
-    free(w3_tflags);
-    if (U_off_cache)  free(U_off_cache);
-    if (U_flat_cache) free(U_flat_cache);
-    free(ovL_sc); free(vvL_sc); free(ooL_sc);
+    /* All scratch buffers persist in __thread storage — no per-triple free.
+     * Only the heap-allocated TNO outputs get freed (those come from
+     * DLPNObuild_triple_tno_full's internal mallocs). */
     free(X_tno_ijk); free(eps_tno);
 
     return et_ijk;
