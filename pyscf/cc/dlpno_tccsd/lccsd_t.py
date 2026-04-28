@@ -1462,30 +1462,83 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
     if n_u_pks == 0:
         return 0.0
 
+    # Global pair arena — cached across triples within a CCSD run.
+    # Eliminates the per-triple ~2 MB X_pno/T2 marshalling that was the
+    # bottleneck (139 ms/call → expect <30 ms/call).  Per-triple offsets
+    # then point INTO the global flat arrays — no data copy.
+    _gak = (id(pno_spaces), id(t2_for_T))
+    gcache = getattr(_orch_full, '_pair_arena', None)
+    if gcache is None or gcache[0] != _gak:
+        all_pks = sorted(pno_spaces.keys())
+        pair_to_idx = {pk: idx for idx, pk in enumerate(all_pks)}
+        n_pairs = len(all_pks)
+        g_pao_n = np.zeros(n_pairs, dtype=np.int32)
+        g_pno_n = np.zeros(n_pairs, dtype=np.int32)
+        for p, pk in enumerate(all_pks):
+            pd = pno_spaces[pk]
+            pp_arr = pd.get('pair_paos')
+            xp_arr = pd.get('X_pno')
+            if pp_arr is not None:
+                g_pao_n[p] = int(np.asarray(pp_arr).size)
+            if xp_arr is not None:
+                g_pno_n[p] = int(xp_arr.shape[1])
+        g_pp_off = np.zeros(n_pairs + 1, dtype=np.int64)
+        g_pp_off[1:] = np.cumsum(g_pao_n.astype(np.int64))
+        g_X_off = np.zeros(n_pairs + 1, dtype=np.int64)
+        g_X_off[1:] = np.cumsum(
+            g_pao_n.astype(np.int64) * g_pno_n.astype(np.int64))
+        g_T2_off = np.zeros(n_pairs + 1, dtype=np.int64)
+        g_T2_off[1:] = np.cumsum(
+            g_pno_n.astype(np.int64) * g_pno_n.astype(np.int64))
+        g_pp_flat = np.empty(int(g_pp_off[-1]), dtype=np.int64)
+        g_X_flat  = np.empty(int(g_X_off[-1]), dtype=np.float64)
+        g_T2_flat = np.zeros(int(g_T2_off[-1]), dtype=np.float64)
+        for p, pk in enumerate(all_pks):
+            pd = pno_spaces[pk]
+            pp_arr = pd.get('pair_paos')
+            xp_arr = pd.get('X_pno')
+            if pp_arr is not None and g_pao_n[p] > 0:
+                g_pp_flat[g_pp_off[p]:g_pp_off[p + 1]] = np.asarray(
+                    pp_arr, dtype=np.int64)
+            if (xp_arr is not None and g_pao_n[p] > 0
+                    and g_pno_n[p] > 0):
+                g_X_flat[g_X_off[p]:g_X_off[p + 1]] = np.ascontiguousarray(
+                    xp_arr).ravel()
+            if pk in t2_for_T and g_pno_n[p] > 0:
+                g_T2_flat[g_T2_off[p]:g_T2_off[p + 1]] = np.ascontiguousarray(
+                    t2_for_T[pk]).ravel()
+        gcache = (_gak, pair_to_idx, g_pao_n, g_pno_n,
+                  g_pp_off, g_pp_flat, g_X_off, g_X_flat,
+                  g_T2_off, g_T2_flat)
+        _orch_full._pair_arena = gcache
+    (_, pair_to_idx,
+     g_pao_n, g_pno_n,
+     g_pp_off, g_pp_flat, g_X_off, g_X_flat,
+     g_T2_off, g_T2_flat) = gcache
+
+    # Per-triple: just look up offsets into the global arena.  No data copy.
     u_pao_n = np.empty(n_u_pks, dtype=np.int32)
     u_pno_n = np.empty(n_u_pks, dtype=np.int32)
+    u_pp_off = np.empty(n_u_pks + 1, dtype=np.int64)
+    u_X_off = np.empty(n_u_pks + 1, dtype=np.int64)
+    u_T2_off = np.empty(n_u_pks + 1, dtype=np.int64)
     for p, pk_ in enumerate(_u_pks):
-        pd = pno_spaces[pk_]
-        u_pao_n[p] = int(np.asarray(pd['pair_paos']).size)
-        u_pno_n[p] = int(pd['X_pno'].shape[1])
-    u_pp_off = np.empty(n_u_pks + 1, dtype=np.int64); u_pp_off[0] = 0
-    u_pp_off[1:] = np.cumsum(u_pao_n.astype(np.int64))
-    u_X_off = np.empty(n_u_pks + 1, dtype=np.int64); u_X_off[0] = 0
-    u_X_off[1:] = np.cumsum(
-        u_pao_n.astype(np.int64) * u_pno_n.astype(np.int64))
-    u_T2_off = np.empty(n_u_pks + 1, dtype=np.int64); u_T2_off[0] = 0
-    u_T2_off[1:] = np.cumsum(u_pno_n.astype(np.int64) * u_pno_n.astype(np.int64))
-    u_pp_flat = np.empty(int(u_pp_off[-1]), dtype=np.int64)
-    u_X_flat  = np.empty(int(u_X_off[-1]), dtype=np.float64)
-    u_T2_flat = np.empty(int(u_T2_off[-1]), dtype=np.float64)
-    for p, pk_ in enumerate(_u_pks):
-        pd = pno_spaces[pk_]
-        u_pp_flat[u_pp_off[p]:u_pp_off[p + 1]] = np.asarray(
-            pd['pair_paos'], dtype=np.int64)
-        u_X_flat[u_X_off[p]:u_X_off[p + 1]] = np.ascontiguousarray(
-            pd['X_pno']).ravel()
-        u_T2_flat[u_T2_off[p]:u_T2_off[p + 1]] = np.ascontiguousarray(
-            t2_for_T[pk_]).ravel()
+        idx = pair_to_idx[pk_]
+        u_pao_n[p] = g_pao_n[idx]
+        u_pno_n[p] = g_pno_n[idx]
+        u_pp_off[p] = g_pp_off[idx]
+        u_X_off[p]  = g_X_off[idx]
+        u_T2_off[p] = g_T2_off[idx]
+    # Last entry (for cumulative-bound checks in C — kernels read up to
+    # offsets[n_u_pks-1] + size, never offsets[n_u_pks]).  Keep matching
+    # patterns just in case.
+    u_pp_off[n_u_pks] = g_pp_off[-1]
+    u_X_off[n_u_pks]  = g_X_off[-1]
+    u_T2_off[n_u_pks] = g_T2_off[-1]
+    # Aliases (no copy) to global flat arrays.
+    u_pp_flat = g_pp_flat
+    u_X_flat  = g_X_flat
+    u_T2_flat = g_T2_flat
 
     # 5. Index tables for t2_block, w3, t1
     t2_block_idx = np.full(9, -1, dtype=np.int32)
