@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <alloca.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "vhf/fblas.h"
 
 double DLPNOcompute_w3_energy(
@@ -1071,3 +1075,209 @@ double DLPNOcompute_one_triple_E_T0(
 
     return et_ijk;
 }
+
+/* ====================================================================
+ * Phase 3c-4: OMP-over-triples driver.
+ *
+ * Single C entry point that iterates ALL triples in a `#pragma omp
+ * parallel for` loop, calling DLPNOcompute_one_triple_E_T0 per triple.
+ * Eliminates the Python ThreadPoolExecutor + GIL roundtrips that
+ * Phase 3a relied on for parallelism.
+ *
+ * Each OMP thread is a pthread, so the __thread scratch (TScratch)
+ * works correctly across the parallel region.
+ *
+ * Per-triple INPUTS are pre-marshalled Python-side into flat arrays
+ * with offset tables, indexed by triple index `t`:
+ *
+ *   ijk_list:      (n_triples, 3)
+ *   tp_off, tp_flat:    triple_paos (variable size per triple)
+ *   td_off, td_flat:    triple_domain (variable size per triple)
+ *   pair_idx_3:    (n_triples, 3)   — pair indices for ij, jk, ik
+ *   same_lmo_3:    (n_triples, 3)
+ *   t2b_idx:       (n_triples, 9)   — pair indices for t2_block
+ *   t2b_tflag:     (n_triples, 9)
+ *   upk_off, upk_idx:   per-triple u_pks lists (pair indices)
+ *   w3_off, w3_idx, w3_tflag:   per-triple W3 task tables
+ *                  (length 3*m_dom for each triple)
+ *   m_dom_arr:     (n_triples,)
+ *   t1d_idx:       (n_triples, 3)   — diag pair indices for t1
+ *   eps_ijk:       (n_triples, 3)
+ *   occ_denom_arr: (n_triples,)
+ *
+ * Global pair arena (shared across triples):
+ *   g_pao_n, g_pno_n, g_pp_off, g_pp_flat, g_X_off, g_X_flat,
+ *   g_T2_off, g_T2_flat
+ *
+ * Plus all the per-CCSD-run global args (F_pao, S_pao, j2c, etc.).
+ *
+ * Returns total E_T (sum over triples), populates et_per_triple.
+ * ==================================================================== */
+double DLPNOcompute_E_T0_omp(
+        const int n_triples,
+        const long *ijk_list,            /* (n_triples, 3) */
+        const long *tp_off,              /* (n_triples+1) */
+        const long *tp_flat,
+        const long *td_off,              /* (n_triples+1) */
+        const long *td_flat,
+        const int  *pair_idx_3,          /* (n_triples, 3) */
+        const signed char *same_lmo_3,   /* (n_triples, 3) */
+        const int  *t2b_idx,             /* (n_triples, 9) */
+        const signed char *t2b_tflag,    /* (n_triples, 9) */
+        const long *upk_off,             /* (n_triples+1) */
+        const int  *upk_idx_flat,        /* sum n_u_pks */
+        const long *w3_off,              /* (n_triples+1) — 3*m_dom each */
+        const int  *w3_idx_flat,
+        const signed char *w3_tflag_flat,
+        const int  *m_dom_arr,           /* (n_triples,) */
+        const int  *t1d_idx,             /* (n_triples, 3) */
+        const double *eps_ijk,           /* (n_triples, 3) */
+        const int  *occ_denom_arr,       /* (n_triples,) */
+        /* Global pair arena */
+        const int  n_pairs_total,
+        const int  *g_pao_n,             /* (n_pairs,) */
+        const int  *g_pno_n,
+        const long *g_pp_off,            /* (n_pairs+1) */
+        const long *g_pp_flat,
+        const long *g_X_off,
+        const double *g_X_flat,
+        const long *g_T2_off,
+        const double *g_T2_flat,
+        /* Other globals */
+        const int has_t1,
+        const long *t1_off, const double *t1_flat,
+        const int nocc_lmo, const int n_pao_total, const int naux_total,
+        const double *F_pao_full, const double *S_pao_full,
+        const double *j2c_full,
+        const long *aux_atom_ids, const long *aux_pos_in_atom,
+        const long *qij_atom_off, const long *qia_atom_off,
+        const long *qab_atom_off,
+        const int  *qij_atom_n_aux, const int  *qij_atom_n_lmo,
+        const int  *qab_atom_n_pao,
+        const double *qij_atom_flat, const double *qia_atom_flat,
+        const double *qab_atom_flat,
+        const long *riatom_to_lmos_ext_dense,
+        const long *riatom_to_paos_ext_dense,
+        const long *lmo_aux_mask,
+        const double T_CutTNO, const double S_cut_domain,
+        /* Output */
+        double *et_per_triple)
+{
+    double E_T = 0.0;
+    if (n_triples <= 0) return 0.0;
+
+#pragma omp parallel for schedule(dynamic) reduction(+:E_T)
+    for (int t = 0; t < n_triples; t++) {
+        const int i = (int)ijk_list[3 * t + 0];
+        const int j = (int)ijk_list[3 * t + 1];
+        const int k = (int)ijk_list[3 * t + 2];
+
+        const long *triple_paos_t = tp_flat + tp_off[t];
+        const int   n_pao_ijk_t   = (int)(tp_off[t + 1] - tp_off[t]);
+        const long *triple_dom_t  = td_flat + td_off[t];
+        const int   n_dom_t       = (int)(td_off[t + 1] - td_off[t]);
+
+        /* 3-pair view: build small offset arrays into the global arena.
+         * pair_paos_flat_3 = g_pp_flat (no copy — alias).
+         * pair_paos_off_3[kk] = g_pp_off[pair_idx_3[t, kk]]. */
+        const int *pi3 = pair_idx_3 + 3 * t;
+        int   p3_pao_n[3];
+        int   p3_pno_n[3];
+        long  p3_pp_off[4];
+        long  p3_X_off[4];
+        long  p3_T2_off[4];
+        int   p3_same_lmo[3];
+        for (int kk = 0; kk < 3; kk++) {
+            const int idx = pi3[kk];
+            p3_pao_n[kk] = (idx >= 0) ? g_pao_n[idx] : 0;
+            p3_pno_n[kk] = (idx >= 0) ? g_pno_n[idx] : 0;
+            p3_pp_off[kk] = (idx >= 0) ? g_pp_off[idx] : 0;
+            p3_X_off[kk]  = (idx >= 0) ? g_X_off[idx]  : 0;
+            p3_T2_off[kk] = (idx >= 0) ? g_T2_off[idx] : 0;
+            p3_same_lmo[kk] = same_lmo_3[3 * t + kk];
+        }
+        p3_pp_off[3] = (pi3[2] >= 0) ? g_pp_off[pi3[2] + 1] : 0;
+        p3_X_off[3]  = (pi3[2] >= 0) ? g_X_off[pi3[2]  + 1] : 0;
+        p3_T2_off[3] = (pi3[2] >= 0) ? g_T2_off[pi3[2] + 1] : 0;
+
+        /* u_pks view */
+        const int   n_u_pks_t = (int)(upk_off[t + 1] - upk_off[t]);
+        const int  *upk_t = upk_idx_flat + upk_off[t];
+        /* Build u_pao_n, u_pno_n, u_pp_off, u_X_off, u_T2_off as offset
+         * arrays into the global arena.  Use thread-scratch (small). */
+        int  *u_pao_n_t_i = (int *)alloca(sizeof(int) * (n_u_pks_t > 0 ? n_u_pks_t : 1));
+        int  *u_pno_n_t_i = (int *)alloca(sizeof(int) * (n_u_pks_t > 0 ? n_u_pks_t : 1));
+        long *u_pp_off_t  = (long *)alloca(sizeof(long) * (n_u_pks_t + 1));
+        long *u_X_off_t   = (long *)alloca(sizeof(long) * (n_u_pks_t + 1));
+        long *u_T2_off_t  = (long *)alloca(sizeof(long) * (n_u_pks_t + 1));
+        for (int p = 0; p < n_u_pks_t; p++) {
+            const int idx = upk_t[p];
+            u_pao_n_t_i[p] = g_pao_n[idx];
+            u_pno_n_t_i[p] = g_pno_n[idx];
+            u_pp_off_t[p]  = g_pp_off[idx];
+            u_X_off_t[p]   = g_X_off[idx];
+            u_T2_off_t[p]  = g_T2_off[idx];
+        }
+        /* Last entry — sentinel */
+        u_pp_off_t[n_u_pks_t]  = (n_u_pks_t > 0) ? g_pp_off[upk_t[n_u_pks_t - 1] + 1] : 0;
+        u_X_off_t[n_u_pks_t]   = (n_u_pks_t > 0) ? g_X_off[upk_t[n_u_pks_t - 1]  + 1] : 0;
+        u_T2_off_t[n_u_pks_t]  = (n_u_pks_t > 0) ? g_T2_off[upk_t[n_u_pks_t - 1] + 1] : 0;
+
+        /* Per-triple t2_block_idx, w3_idx, t1_diag_idx slices */
+        const int *t2b_idx_t   = t2b_idx + 9 * t;
+        const signed char *t2b_tflag_t = t2b_tflag + 9 * t;
+        const int *t1d_idx_t   = t1d_idx + 3 * t;
+        const long lmo_idx_t[3] = {ijk_list[3*t + 0], ijk_list[3*t + 1], ijk_list[3*t + 2]};
+
+        const int  *w3_idx_t   = w3_idx_flat + w3_off[t];
+        const signed char *w3_tflag_t = w3_tflag_flat + w3_off[t];
+        const int   m_dom_t = m_dom_arr[t];
+
+        const double eps_i = eps_ijk[3 * t + 0];
+        const double eps_j = eps_ijk[3 * t + 1];
+        const double eps_k = eps_ijk[3 * t + 2];
+
+        double et = DLPNOcompute_one_triple_E_T0(
+            i, j, k,
+            n_pao_ijk_t, triple_paos_t,
+            n_dom_t, triple_dom_t,
+            /* 3-pair (ij/jk/ik) — alias into global arena */
+            p3_pao_n, p3_pp_off, g_pp_flat,
+            p3_pno_n, p3_X_off, g_X_flat,
+            p3_T2_off, g_T2_flat,
+            p3_same_lmo,
+            /* u_pks — alias into global arena */
+            n_u_pks_t,
+            u_pao_n_t_i, u_pno_n_t_i,
+            u_pp_off_t, g_pp_flat,
+            u_X_off_t, g_X_flat,
+            u_T2_off_t, g_T2_flat,
+            /* indices */
+            t2b_idx_t, t2b_tflag_t,
+            w3_idx_t,  w3_tflag_t,
+            /* t1 */
+            has_t1,
+            t1_off, t1_flat,
+            t1d_idx_t,
+            lmo_idx_t,
+            /* eps + denom */
+            eps_i, eps_j, eps_k,
+            occ_denom_arr[t],
+            /* Globals */
+            nocc_lmo, n_pao_total, naux_total,
+            F_pao_full, S_pao_full, j2c_full,
+            aux_atom_ids, aux_pos_in_atom,
+            qij_atom_off, qia_atom_off, qab_atom_off,
+            qij_atom_n_aux, qij_atom_n_lmo, qab_atom_n_pao,
+            qij_atom_flat, qia_atom_flat, qab_atom_flat,
+            riatom_to_lmos_ext_dense, riatom_to_paos_ext_dense,
+            lmo_aux_mask,
+            T_CutTNO, S_cut_domain);
+
+        et_per_triple[t] = et;
+        E_T += et;
+    }
+
+    return E_T;
+}
+
