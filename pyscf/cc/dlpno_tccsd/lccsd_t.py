@@ -1413,6 +1413,50 @@ def _process_one_triple(i, j, k,
             dij = int(i == j); djk = int(j == k); dik = int(i == k)
             occ_denom = 1 + dij + djk + dik + 2 * dij * djk * dik
 
+            # Native-C W3 kernel (replaces Cython _w3_full_cy.w3_full_kernel).
+            # Same math, no GIL re-acquisition during BLAS calls.
+            if os.environ.get('DLPNO_W3_PYTHON', '0') != '1':
+                import ctypes as _ct
+                from pyscf import lib as _pl
+                _libcc_w3 = getattr(_process_one_triple, '_libcc_w3', None)
+                if _libcc_w3 is None:
+                    _libcc_w3 = _pl.load_library('libcc')
+                    _libcc_w3.DLPNOcompute_w3_energy.restype = _ct.c_double
+                    _libcc_w3.DLPNOcompute_w3_energy.argtypes = (
+                        [_ct.c_void_p] * 15       # 15 array/tensor pointers
+                        + [_ct.c_int] * 5         # has_t1, occ_denom, n, m_dom, n_pno_max
+                    )
+                    _process_one_triple._libcc_w3 = _libcc_w3
+                K_ab_cache_c = np.ascontiguousarray(K_ab_cache)
+                t2_T_all_c   = np.ascontiguousarray(t2_T_all)
+                K_jk_c       = np.ascontiguousarray(K_jk)
+                K_ik_c       = np.ascontiguousarray(K_ik)
+                K_ij_c       = np.ascontiguousarray(K_ij)
+                K_ooov_c     = np.ascontiguousarray(K_ooov)
+                eps_occ_c    = np.ascontiguousarray(eps_occ)
+                eps_tno_c    = np.ascontiguousarray(eps_tno_sc)
+                t1_c         = np.ascontiguousarray(t1_sc_arr)
+                tflags_c = transpose_flags.astype(np.int8, copy=False)
+                return _libcc_w3.DLPNOcompute_w3_energy(
+                    K_ab_cache_c.ctypes.data_as(_ct.c_void_p),
+                    t2_T_all_c.ctypes.data_as(_ct.c_void_p),
+                    K_jk_c.ctypes.data_as(_ct.c_void_p),
+                    K_ik_c.ctypes.data_as(_ct.c_void_p),
+                    K_ij_c.ctypes.data_as(_ct.c_void_p),
+                    K_ooov_c.ctypes.data_as(_ct.c_void_p),
+                    U_flat.ctypes.data_as(_ct.c_void_p),
+                    U_offsets.ctypes.data_as(_ct.c_void_p),
+                    n_pno_arr.ctypes.data_as(_ct.c_void_p),
+                    T2_flat.ctypes.data_as(_ct.c_void_p),
+                    T2_offsets.ctypes.data_as(_ct.c_void_p),
+                    tflags_c.ctypes.data_as(_ct.c_void_p),
+                    eps_occ_c.ctypes.data_as(_ct.c_void_p),
+                    eps_tno_c.ctypes.data_as(_ct.c_void_p),
+                    t1_c.ctypes.data_as(_ct.c_void_p),
+                    int(has_t1), int(occ_denom),
+                    int(n), int(m_dom), int(n_pno_max),
+                )
+
             return w3_full_kernel(
                 K_ab_cache, t2_T_all,
                 np.ascontiguousarray(K_jk),
