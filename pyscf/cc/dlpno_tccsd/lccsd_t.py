@@ -190,6 +190,122 @@ def _triple_pno_union_psi4(pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
         return np.zeros((nao, 0)), 0, None, None, None
     triple_paos = np.array(sorted(pao_set), dtype=np.int64)
 
+    # === Full-C TNO transform (Session 3 Phase 3a) ===
+    # One C call replaces orthogonalize_pao_domain + the entire body
+    # below (LAPACK eigh + dpstrf in C).  Returns X_tno_ijk + eps_tno
+    # directly.
+    if (os.environ.get('DLPNO_C_CYCLE', '0') == '1'
+            and os.environ.get('DLPNO_TRIPLE_TNO_FULL', '0') == '1'):
+        n_pao_ijk = int(triple_paos.size)
+        n_pao_total = int(F_pao_full.shape[0])
+
+        keys_list = [ij, jk, ik]
+        ij_lmos   = [(i, j), (j, k), (i, k)]
+        n_keys = 3
+        pair_paos_n = np.zeros(n_keys, dtype=np.int32)
+        n_pno_arr   = np.zeros(n_keys, dtype=np.int32)
+        same_lmo    = np.zeros(n_keys, dtype=np.int32)
+        pp_lists, Xpno_lists, T2_lists = [], [], []
+        for kk, (key, (ii_l, jj_l)) in enumerate(zip(keys_list, ij_lmos)):
+            X_pno_pair = pno_spaces[key].get('X_pno')
+            pp_pair = np.asarray(pno_spaces[key].get('pair_paos'))
+            T2_p = (t2_for_T[key] if (t2_for_T is not None and key in t2_for_T)
+                    else pno_spaces[key].get('T2_pno'))
+            if (X_pno_pair is None or X_pno_pair.shape[1] == 0
+                    or T2_p is None or T2_p.size == 0
+                    or pp_pair.size == 0):
+                pp_lists.append(np.empty(0, dtype=np.int64))
+                Xpno_lists.append(np.empty(0, dtype=np.float64))
+                T2_lists.append(np.empty(0, dtype=np.float64))
+                continue
+            pair_paos_n[kk] = pp_pair.size
+            n_pno_arr[kk]   = X_pno_pair.shape[1]
+            same_lmo[kk]    = 1 if ii_l == jj_l else 0
+            pp_lists.append(np.ascontiguousarray(pp_pair, dtype=np.int64))
+            Xpno_lists.append(
+                np.ascontiguousarray(X_pno_pair, dtype=np.float64).ravel())
+            T2_lists.append(
+                np.ascontiguousarray(T2_p, dtype=np.float64).ravel())
+        pair_paos_off = np.zeros(n_keys + 1, dtype=np.int64)
+        Xpno_off      = np.zeros(n_keys + 1, dtype=np.int64)
+        T2_off        = np.zeros(n_keys + 1, dtype=np.int64)
+        for kk in range(n_keys):
+            pair_paos_off[kk + 1] = pair_paos_off[kk] + pp_lists[kk].size
+            Xpno_off[kk + 1]      = Xpno_off[kk]      + Xpno_lists[kk].size
+            T2_off[kk + 1]        = T2_off[kk]        + T2_lists[kk].size
+        pair_paos_flat = (np.concatenate(pp_lists)
+                          if any(x.size for x in pp_lists)
+                          else np.empty(0, dtype=np.int64))
+        Xpno_flat = (np.concatenate(Xpno_lists)
+                     if any(x.size for x in Xpno_lists)
+                     else np.empty(0, dtype=np.float64))
+        T2_flat = (np.concatenate(T2_lists)
+                   if any(x.size for x in T2_lists)
+                   else np.empty(0, dtype=np.float64))
+
+        F_pao_c = np.ascontiguousarray(F_pao_full)
+        S_pao_c = np.ascontiguousarray(S_pao_full)
+        triple_paos_c = np.ascontiguousarray(triple_paos, dtype=np.int64)
+
+        # Output buffers — upper-bounded to (n_pao_ijk, n_pao_ijk) on each axis.
+        X_tno_buf = np.zeros((n_pao_ijk, n_pao_ijk), dtype=np.float64)
+        eps_buf   = np.zeros(n_pao_ijk, dtype=np.float64)
+        X_pao_buf = np.zeros((n_pao_ijk, n_pao_ijk), dtype=np.float64)
+        n_tno_arr     = np.zeros(1, dtype=np.int32)
+        n_pao_can_arr = np.zeros(1, dtype=np.int32)
+        info_arr      = np.zeros(1, dtype=np.int32)
+
+        import ctypes as _ct
+        from pyscf import lib as _pl
+        _libcc_full = getattr(_triple_pno_union_psi4, '_libcc_full', None)
+        if _libcc_full is None:
+            _libcc_full = _pl.load_library('libcc')
+            _libcc_full.DLPNObuild_triple_tno_full_py.restype = None
+            _libcc_full.DLPNObuild_triple_tno_full_py.argtypes = (
+                [_ct.c_int, _ct.c_int]              # n_pao_ijk, n_pao_total
+                + [_ct.c_void_p] * 3                # triple_paos, F, S
+                + [_ct.c_int]                       # n_keys
+                + [_ct.c_void_p] * 9                # all the per-key arrays
+                + [_ct.c_double, _ct.c_double]      # T_CutTNO, S_cut_domain
+                + [_ct.c_void_p] * 6                # outputs + n_tno + info
+            )
+            _triple_pno_union_psi4._libcc_full = _libcc_full
+
+        _libcc_full.DLPNObuild_triple_tno_full_py(
+            int(n_pao_ijk), int(n_pao_total),
+            triple_paos_c.ctypes.data_as(_ct.c_void_p),
+            F_pao_c.ctypes.data_as(_ct.c_void_p),
+            S_pao_c.ctypes.data_as(_ct.c_void_p),
+            int(n_keys),
+            pair_paos_n.ctypes.data_as(_ct.c_void_p),
+            pair_paos_off.ctypes.data_as(_ct.c_void_p),
+            pair_paos_flat.ctypes.data_as(_ct.c_void_p),
+            n_pno_arr.ctypes.data_as(_ct.c_void_p),
+            Xpno_off.ctypes.data_as(_ct.c_void_p),
+            Xpno_flat.ctypes.data_as(_ct.c_void_p),
+            T2_off.ctypes.data_as(_ct.c_void_p),
+            T2_flat.ctypes.data_as(_ct.c_void_p),
+            same_lmo.ctypes.data_as(_ct.c_void_p),
+            float(T_CutTNO), float(S_cut_domain),
+            X_tno_buf.ctypes.data_as(_ct.c_void_p),
+            eps_buf.ctypes.data_as(_ct.c_void_p),
+            X_pao_buf.ctypes.data_as(_ct.c_void_p),
+            n_tno_arr.ctypes.data_as(_ct.c_void_p),
+            n_pao_can_arr.ctypes.data_as(_ct.c_void_p),
+            info_arr.ctypes.data_as(_ct.c_void_p),
+        )
+        if int(info_arr[0]) != 0:
+            raise RuntimeError(
+                f'DLPNObuild_triple_tno_full LAPACK info={int(info_arr[0])} '
+                f'on triple ({i},{j},{k})')
+        n_tno = int(n_tno_arr[0])
+        if n_tno == 0:
+            return np.zeros((nao, 0)), 0, None, None, None
+        X_tno_ijk = X_tno_buf[:, :n_tno].copy()
+        eps_tno_sc = eps_buf[:n_tno].copy()
+        C_tno_sc = C_pao[:, triple_paos] @ X_tno_ijk
+        return C_tno_sc, n_tno, X_tno_ijk, triple_paos, eps_tno_sc
+
     # (2) Canonical orthogonalization of triple's PAO domain
     from pyscf.cc.dlpno_tccsd.local_orbs import orthogonalize_pao_domain
     C_orth_ijk, X_pao_ijk = orthogonalize_pao_domain(
@@ -199,41 +315,171 @@ def _triple_pno_union_psi4(pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
     if npao_can_ijk == 0:
         return np.zeros((nao, 0)), 0, None, None, None
 
-    # F_pao in orthogonalized triple basis
-    F_dom = F_pao_full[np.ix_(triple_paos, triple_paos)]
-    F_orth_ijk = X_pao_ijk.T @ F_dom @ X_pao_ijk
+    # F_orth_ijk and D_ijk: heavy-numerical body of the function.
+    # Single C kernel call (DLPNO_C_CYCLE=1) folds:
+    #   F_orth = X.T @ F_pao[trip,trip] @ X
+    #   D_ijk = (1/3) Σ_keys S.T @ D_pair @ S, with S, D_pair built per key
+    if (os.environ.get('DLPNO_C_CYCLE', '0') == '1'
+            and os.environ.get('DLPNO_TRIPLE_TNO_PYTHON', '0') != '1'):
+        # Pack 3-key data into flat buffers for the C kernel.
+        keys_list   = [ij, jk, ik]
+        ij_lmos     = [(i, j), (j, k), (i, k)]
+        n_keys      = 3
+        pair_paos_n = np.zeros(n_keys, dtype=np.int32)
+        n_pno_arr   = np.zeros(n_keys, dtype=np.int32)
+        same_lmo    = np.zeros(n_keys, dtype=np.int32)
+        pp_lists    = []
+        Xpno_lists  = []
+        T2_lists    = []
+        for kk, (key, (ii_l, jj_l)) in enumerate(zip(keys_list, ij_lmos)):
+            X_pno_pair = pno_spaces[key].get('X_pno')
+            pp_pair = np.asarray(pno_spaces[key].get('pair_paos'))
+            if t2_for_T is not None and key in t2_for_T:
+                T2_p = t2_for_T[key]
+            else:
+                T2_p = pno_spaces[key].get('T2_pno')
+            if (X_pno_pair is None or X_pno_pair.shape[1] == 0
+                    or T2_p is None or T2_p.size == 0
+                    or pp_pair.size == 0):
+                pp_lists.append(np.empty(0, dtype=np.int64))
+                Xpno_lists.append(np.empty(0, dtype=np.float64))
+                T2_lists.append(np.empty(0, dtype=np.float64))
+                continue
+            pair_paos_n[kk] = pp_pair.size
+            n_pno_arr[kk]   = X_pno_pair.shape[1]
+            same_lmo[kk]    = 1 if ii_l == jj_l else 0
+            pp_lists.append(np.ascontiguousarray(pp_pair, dtype=np.int64))
+            Xpno_lists.append(
+                np.ascontiguousarray(X_pno_pair, dtype=np.float64).ravel())
+            T2_lists.append(
+                np.ascontiguousarray(T2_p, dtype=np.float64).ravel())
 
-    # (3) Pair-PNO to triple-orth-PAO projections (S-weighted)
-    # S_proj[key] has shape (n_pno_pair, npao_can_ijk):
-    #   S_proj = X_pno[pair].T @ S_pao[pair_paos, triple_paos] @ X_pao_ijk
-    S_projs = {}
-    for key in (ij, jk, ik):
-        pp_pair = np.asarray(pno_spaces[key]['pair_paos'])
-        X_pno_pair = pno_spaces[key].get('X_pno')
-        if X_pno_pair is None or X_pno_pair.shape[1] == 0:
-            S_projs[key] = None
-            continue
-        S_pair_triple = S_pao_full[np.ix_(pp_pair, triple_paos)]
-        S_projs[key] = X_pno_pair.T @ S_pair_triple @ X_pao_ijk
+        pair_paos_off = np.zeros(n_keys + 1, dtype=np.int64)
+        Xpno_off      = np.zeros(n_keys + 1, dtype=np.int64)
+        T2_off        = np.zeros(n_keys + 1, dtype=np.int64)
+        for kk in range(n_keys):
+            pair_paos_off[kk + 1] = pair_paos_off[kk] + pp_lists[kk].size
+            Xpno_off[kk + 1]      = Xpno_off[kk]      + Xpno_lists[kk].size
+            T2_off[kk + 1]        = T2_off[kk]        + T2_lists[kk].size
+        pair_paos_flat = (np.concatenate(pp_lists)   if any(x.size for x in pp_lists)
+                          else np.empty(0, dtype=np.int64))
+        Xpno_flat      = (np.concatenate(Xpno_lists) if any(x.size for x in Xpno_lists)
+                          else np.empty(0, dtype=np.float64))
+        T2_flat        = (np.concatenate(T2_lists)   if any(x.size for x in T2_lists)
+                          else np.empty(0, dtype=np.float64))
 
-    # (4) Sum projected pair densities
-    D_ijk = np.zeros((npao_can_ijk, npao_can_ijk))
-    for key, ii_lmo, jj_lmo in [(ij, i, j), (jk, j, k), (ik, i, k)]:
-        S = S_projs[key]
-        if S is None:
-            continue
-        if t2_for_T is not None and key in t2_for_T:
-            T2_p = t2_for_T[key]
-        elif pno_spaces[key].get('T2_pno') is not None:
-            T2_p = pno_spaces[key]['T2_pno']
-        else:
-            continue
-        Tt_p = 2.0 * T2_p - T2_p.T
-        D_pair = Tt_p @ T2_p.T + Tt_p.T @ T2_p
-        if ii_lmo == jj_lmo:
-            D_pair *= 0.5
-        D_ijk += S.T @ D_pair @ S
-    D_ijk /= 3.0
+        F_orth_ijk = np.zeros((npao_can_ijk, npao_can_ijk), dtype=np.float64)
+        D_ijk      = np.zeros((npao_can_ijk, npao_can_ijk), dtype=np.float64)
+
+        triple_paos_c = np.ascontiguousarray(triple_paos, dtype=np.int64)
+        X_pao_ijk_c   = np.ascontiguousarray(X_pao_ijk)
+        F_pao_c       = np.ascontiguousarray(F_pao_full)
+        S_pao_c       = np.ascontiguousarray(S_pao_full)
+
+        import ctypes as _ct
+        from pyscf import lib as _pl
+        _libcc_t = getattr(_triple_pno_union_psi4, '_libcc', None)
+        if _libcc_t is None:
+            _libcc_t = _pl.load_library('libcc')
+            _libcc_t.DLPNObuild_triple_tno_body.restype = None
+            _libcc_t.DLPNObuild_triple_tno_body.argtypes = (
+                [_ct.c_int] * 3                # n_pao_ijk, n_pao_can, n_pao_total
+                + [_ct.c_void_p] * 4           # triple_paos, X_pao_ijk, F_pao, S_pao
+                + [_ct.c_int]                  # n_keys
+                + [_ct.c_void_p] * 9           # arrays + outputs
+            )
+            _triple_pno_union_psi4._libcc = _libcc_t
+
+        _libcc_t.DLPNObuild_triple_tno_body(
+            int(triple_paos.size), int(npao_can_ijk), int(F_pao_full.shape[0]),
+            triple_paos_c.ctypes.data_as(_ct.c_void_p),
+            X_pao_ijk_c.ctypes.data_as(_ct.c_void_p),
+            F_pao_c.ctypes.data_as(_ct.c_void_p),
+            S_pao_c.ctypes.data_as(_ct.c_void_p),
+            int(n_keys),
+            pair_paos_n.ctypes.data_as(_ct.c_void_p),
+            pair_paos_off.ctypes.data_as(_ct.c_void_p),
+            pair_paos_flat.ctypes.data_as(_ct.c_void_p),
+            n_pno_arr.ctypes.data_as(_ct.c_void_p),
+            Xpno_off.ctypes.data_as(_ct.c_void_p),
+            Xpno_flat.ctypes.data_as(_ct.c_void_p),
+            T2_off.ctypes.data_as(_ct.c_void_p),
+            T2_flat.ctypes.data_as(_ct.c_void_p),
+            same_lmo.ctypes.data_as(_ct.c_void_p),
+            F_orth_ijk.ctypes.data_as(_ct.c_void_p),
+            D_ijk.ctypes.data_as(_ct.c_void_p),
+        )
+        if os.environ.get('DLPNO_TRIPLE_TNO_DEBUG', '0') == '1':
+            # Recompute via Python and compare.
+            F_dom_py = F_pao_full[np.ix_(triple_paos, triple_paos)]
+            F_py = X_pao_ijk.T @ F_dom_py @ X_pao_ijk
+            S_projs_py = {}
+            for key in (ij, jk, ik):
+                pp_pair = np.asarray(pno_spaces[key]['pair_paos'])
+                X_pno_pair = pno_spaces[key].get('X_pno')
+                if X_pno_pair is None or X_pno_pair.shape[1] == 0:
+                    S_projs_py[key] = None
+                    continue
+                S_pair_triple = S_pao_full[np.ix_(pp_pair, triple_paos)]
+                S_projs_py[key] = X_pno_pair.T @ S_pair_triple @ X_pao_ijk
+            D_py = np.zeros((npao_can_ijk, npao_can_ijk))
+            for key, ii_l, jj_l in [(ij, i, j), (jk, j, k), (ik, i, k)]:
+                S = S_projs_py[key]
+                if S is None:
+                    continue
+                if t2_for_T is not None and key in t2_for_T:
+                    T2_p = t2_for_T[key]
+                else:
+                    T2_p = pno_spaces[key].get('T2_pno')
+                if T2_p is None or T2_p.size == 0:
+                    continue
+                Tt_p = 2.0 * T2_p - T2_p.T
+                Dp = Tt_p @ T2_p.T + Tt_p.T @ T2_p
+                if ii_l == jj_l:
+                    Dp *= 0.5
+                D_py += S.T @ Dp @ S
+            D_py /= 3.0
+            for nm, py, c in (('F_orth', F_py, F_orth_ijk),
+                              ('D_ijk', D_py, D_ijk)):
+                err = float(np.max(np.abs(py - c)))
+                mag = float(np.max(np.abs(py)))
+                rel = err / mag if mag > 0 else 0.0
+                if rel > 1e-8:
+                    raise AssertionError(
+                        f'_triple_pno_union_psi4 C/Python mismatch '
+                        f'(i,j,k)=({i},{j},{k}): {nm} max|Δ|={err:.3e} rel={rel:.3e}')
+    else:
+        # Python reference path.
+        F_dom = F_pao_full[np.ix_(triple_paos, triple_paos)]
+        F_orth_ijk = X_pao_ijk.T @ F_dom @ X_pao_ijk
+
+        S_projs = {}
+        for key in (ij, jk, ik):
+            pp_pair = np.asarray(pno_spaces[key]['pair_paos'])
+            X_pno_pair = pno_spaces[key].get('X_pno')
+            if X_pno_pair is None or X_pno_pair.shape[1] == 0:
+                S_projs[key] = None
+                continue
+            S_pair_triple = S_pao_full[np.ix_(pp_pair, triple_paos)]
+            S_projs[key] = X_pno_pair.T @ S_pair_triple @ X_pao_ijk
+
+        D_ijk = np.zeros((npao_can_ijk, npao_can_ijk))
+        for key, ii_lmo, jj_lmo in [(ij, i, j), (jk, j, k), (ik, i, k)]:
+            S = S_projs[key]
+            if S is None:
+                continue
+            if t2_for_T is not None and key in t2_for_T:
+                T2_p = t2_for_T[key]
+            elif pno_spaces[key].get('T2_pno') is not None:
+                T2_p = pno_spaces[key]['T2_pno']
+            else:
+                continue
+            Tt_p = 2.0 * T2_p - T2_p.T
+            D_pair = Tt_p @ T2_p.T + Tt_p.T @ T2_p
+            if ii_lmo == jj_lmo:
+                D_pair *= 0.5
+            D_ijk += S.T @ D_pair @ S
+        D_ijk /= 3.0
 
     # (5) Diagonalize, sort, truncate
     tno_occ, tno_vecs = np.linalg.eigh(D_ijk)
@@ -542,7 +788,7 @@ def _zero_cas_t2_amplitudes(t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir,
 
 def _build_triple_local_DF(i, j, k, X_tno_ijk, triple_paos, triple_domain,
                             sparse_df, screening, j2c_full,
-                            lmo_aux_mask):
+                            lmo_aux_mask, _force_python=False):
     """Psi4-style per-triple DF integrals on a local aux domain.
 
     Mirrors Psi4 DLPNOCCSD_T::compute_lccsd_t0 (triples.cc:667+). Aux Q's
@@ -591,6 +837,110 @@ def _build_triple_local_DF(i, j, k, X_tno_ijk, triple_paos, triple_domain,
         return (np.zeros((3, n_tno, 0)),
                 np.zeros((n_tno, n_tno, 0)),
                 np.zeros((3, n_domain, 0)))
+
+    if (not _force_python
+            and os.environ.get('DLPNO_C_CYCLE', '0') == '1'
+            and os.environ.get('DLPNO_TRIPLE_DF_PYTHON', '0') != '1'):
+        # Local J^{-1/2}: stays in NumPy (LAPACK eigh is already optimal).
+        j_loc = j2c_full[np.ix_(aux_idx, aux_idx)]
+        evals, evecs = np.linalg.eigh(j_loc)
+        keep_e = evals > 1e-14
+        jhi = (evecs[:, keep_e] * (1.0 / np.sqrt(evals[keep_e]))
+               ) @ evecs[:, keep_e].T
+        jhi_c = np.ascontiguousarray(jhi)
+
+        # Per-center metadata: group aux_idx by centerQ.
+        centers_of_aux = aux_atom_ids[aux_idx]                  # (naux_ijk,)
+        atom_pos_all = aux_pos_in_atom[aux_idx]                 # (naux_ijk,)
+        order = np.argsort(centers_of_aux, kind='stable')
+        centers_sorted = centers_of_aux[order]
+        local_Q_sorted = order.astype(np.int64)                 # positions in naux_ijk
+        atom_pos_sorted = atom_pos_all[order].astype(np.int64)
+        unique_centers, first_idx, counts = np.unique(
+            centers_sorted, return_index=True, return_counts=True)
+        center_atoms_arr = unique_centers.astype(np.int64)
+        center_off = np.empty(unique_centers.size + 1, dtype=np.int64)
+        center_off[0] = 0
+        center_off[1:] = np.cumsum(counts.astype(np.int64))
+
+        # Outputs (allocate row-major).
+        ovL_sc = np.zeros((3, n_tno, naux_ijk), dtype=np.float64)
+        vvL_sc = np.zeros((n_tno, n_tno, naux_ijk), dtype=np.float64)
+        ooL_sc = np.zeros((3, n_domain, naux_ijk), dtype=np.float64)
+
+        triple_paos_arr = np.ascontiguousarray(triple_paos, dtype=np.int64)
+        triple_domain_arr = np.ascontiguousarray(triple_domain, dtype=np.int64)
+        X_tno_c = np.ascontiguousarray(X_tno_ijk)
+
+        n_lmo_global = riatom_to_lmos_ext_dense.shape[1]
+        n_pao_global = riatom_to_paos_ext_dense.shape[1]
+        lmos_dense_c = np.ascontiguousarray(
+            riatom_to_lmos_ext_dense, dtype=np.int64)
+        paos_dense_c = np.ascontiguousarray(
+            riatom_to_paos_ext_dense, dtype=np.int64)
+
+        import ctypes as _ct
+        from pyscf import lib as _pl
+        _libcc_tdf = getattr(_build_triple_local_DF, '_libcc', None)
+        if _libcc_tdf is None:
+            _libcc_tdf = _pl.load_library('libcc')
+            _libcc_tdf.DLPNObuild_triple_local_DF.restype = None
+            _libcc_tdf.DLPNObuild_triple_local_DF.argtypes = (
+                [_ct.c_int] * 10                  # i,j,k,n_tno,n_domain,n_pao_ijk,naux_ijk,n_centers,n_lmo_g,n_pao_g
+                + [_ct.c_void_p] * 21
+            )
+            _build_triple_local_DF._libcc = _libcc_tdf
+
+        _libcc_tdf.DLPNObuild_triple_local_DF(
+            int(i), int(j), int(k),
+            int(n_tno), int(n_domain), int(triple_paos_arr.size),
+            int(naux_ijk), int(center_atoms_arr.size),
+            int(n_lmo_global), int(n_pao_global),
+            X_tno_c.ctypes.data_as(_ct.c_void_p),
+            triple_paos_arr.ctypes.data_as(_ct.c_void_p),
+            triple_domain_arr.ctypes.data_as(_ct.c_void_p),
+            center_atoms_arr.ctypes.data_as(_ct.c_void_p),
+            center_off.ctypes.data_as(_ct.c_void_p),
+            local_Q_sorted.ctypes.data_as(_ct.c_void_p),
+            atom_pos_sorted.ctypes.data_as(_ct.c_void_p),
+            sparse_df['qij_atom_off'].ctypes.data_as(_ct.c_void_p),
+            sparse_df['qia_atom_off'].ctypes.data_as(_ct.c_void_p),
+            sparse_df['qab_atom_off'].ctypes.data_as(_ct.c_void_p),
+            sparse_df['qij_atom_n_aux'].ctypes.data_as(_ct.c_void_p),
+            sparse_df['qij_atom_n_lmo'].ctypes.data_as(_ct.c_void_p),
+            sparse_df['qab_atom_n_pao'].ctypes.data_as(_ct.c_void_p),
+            sparse_df['qij_atom_flat'].ctypes.data_as(_ct.c_void_p),
+            sparse_df['qia_atom_flat'].ctypes.data_as(_ct.c_void_p),
+            sparse_df['qab_atom_flat'].ctypes.data_as(_ct.c_void_p),
+            lmos_dense_c.ctypes.data_as(_ct.c_void_p),
+            paos_dense_c.ctypes.data_as(_ct.c_void_p),
+            jhi_c.ctypes.data_as(_ct.c_void_p),
+            ovL_sc.ctypes.data_as(_ct.c_void_p),
+            vvL_sc.ctypes.data_as(_ct.c_void_p),
+            ooL_sc.ctypes.data_as(_ct.c_void_p),
+        )
+        if os.environ.get('DLPNO_TRIPLE_DF_DEBUG', '0') == '1':
+            # Side-by-side: thread-safe — just call back with _force_python=True.
+            py_ovL, py_vvL, py_ooL = _build_triple_local_DF(
+                i, j, k, X_tno_ijk, triple_paos, triple_domain,
+                sparse_df, screening, j2c_full, lmo_aux_mask,
+                _force_python=True)
+            for name, py, c in [('ovL', py_ovL, ovL_sc),
+                                ('vvL', py_vvL, vvL_sc),
+                                ('ooL', py_ooL, ooL_sc)]:
+                if not py.size:
+                    continue
+                err = float(np.max(np.abs(py - c)))
+                mag = float(np.max(np.abs(py)))
+                rel = err / mag if mag > 0 else 0.0
+                if err > 1e-8 and rel > 1e-9:
+                    print(f'  [TRIPLE_DF_DEBUG] (i,j,k)=({i},{j},{k}) {name} '
+                          f'mismatch max|Δ|={err:.3e} rel={rel:.3e} mag={mag:.3e}',
+                          flush=True)
+                    raise AssertionError(
+                        f'_build_triple_local_DF C/Python mismatch: '
+                        f'{name} max|Δ|={err:.3e} rel={rel:.3e}')
+        return ovL_sc, vvL_sc, ooL_sc
 
     dom_arr = np.asarray(triple_domain, dtype=np.int64)
     ijk_global = np.array([i, j, k], dtype=np.int64)
@@ -1538,6 +1888,57 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             sparse_df['aux_at_atom'] = aux_at_atom_list
             sparse_df['aux_pos_in_atom'] = aux_pos_in_atom
             sparse_df['aux_atom_ids'] = aux_atom_ids_arr
+
+            # Flat per-atom stacks for the C kernel (DLPNO_C_CYCLE=1 path).
+            # qij_atom[A]: (nQ_A, nl_A, nl_A); qia: (nQ_A, nl_A, np_A);
+            # qab: (nQ_A, np_A, np_A). We concat each per-atom block end-to-end
+            # and store offsets + dim hints so the C kernel can navigate them.
+            qij_off = np.zeros(_natm + 1, dtype=np.int64)
+            qia_off = np.zeros(_natm + 1, dtype=np.int64)
+            qab_off = np.zeros(_natm + 1, dtype=np.int64)
+            qij_n_aux = np.zeros(_natm, dtype=np.int32)
+            qij_n_lmo = np.zeros(_natm, dtype=np.int32)
+            qab_n_pao = np.zeros(_natm, dtype=np.int32)
+            for A in range(_natm):
+                if qij_stack[A] is not None:
+                    nQA, nlA, _ = qij_stack[A].shape
+                    qij_n_aux[A] = nQA
+                    qij_n_lmo[A] = nlA
+                    qij_off[A + 1] = qij_off[A] + qij_stack[A].size
+                else:
+                    qij_off[A + 1] = qij_off[A]
+                if qia_stack[A] is not None:
+                    qia_off[A + 1] = qia_off[A] + qia_stack[A].size
+                else:
+                    qia_off[A + 1] = qia_off[A]
+                if qab_stack[A] is not None:
+                    nQA2, npA, _ = qab_stack[A].shape
+                    qab_n_pao[A] = npA
+                    qab_off[A + 1] = qab_off[A] + qab_stack[A].size
+                else:
+                    qab_off[A + 1] = qab_off[A]
+            qij_flat = np.empty(int(qij_off[-1]), dtype=np.float64)
+            qia_flat = np.empty(int(qia_off[-1]), dtype=np.float64)
+            qab_flat = np.empty(int(qab_off[-1]), dtype=np.float64)
+            for A in range(_natm):
+                if qij_stack[A] is not None:
+                    qij_flat[qij_off[A]:qij_off[A + 1]] = (
+                        np.ascontiguousarray(qij_stack[A]).ravel())
+                if qia_stack[A] is not None:
+                    qia_flat[qia_off[A]:qia_off[A + 1]] = (
+                        np.ascontiguousarray(qia_stack[A]).ravel())
+                if qab_stack[A] is not None:
+                    qab_flat[qab_off[A]:qab_off[A + 1]] = (
+                        np.ascontiguousarray(qab_stack[A]).ravel())
+            sparse_df['qij_atom_flat'] = qij_flat
+            sparse_df['qia_atom_flat'] = qia_flat
+            sparse_df['qab_atom_flat'] = qab_flat
+            sparse_df['qij_atom_off'] = qij_off
+            sparse_df['qia_atom_off'] = qia_off
+            sparse_df['qab_atom_off'] = qab_off
+            sparse_df['qij_atom_n_aux'] = qij_n_aux
+            sparse_df['qij_atom_n_lmo'] = qij_n_lmo
+            sparse_df['qab_atom_n_pao'] = qab_n_pao
             return lmo_aux_mask, pao_domains, screening, sparse_df
 
         # Tight infrastructure (used for the final (T) pass on surviving triples).
