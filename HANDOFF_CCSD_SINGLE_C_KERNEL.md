@@ -103,3 +103,38 @@ End state targets:
   formulation). Psi4 may have different choices that give them
   inherent advantage. Stick to architectural optimization.
 - Full GPU port. Different effort entirely.
+
+## Session A retrospective (this session, partial)
+
+Discovered while writing the t1r OMP-over-i pilot:
+- **CCSD is already heavily optimized** — `compute_C_tilde_batched`,
+  `compute_B_E_batched_v2`, `compute_D_tilde_batched_v2`,
+  `compute_cd_term`, etc. all use plan-cached single-ctypes-call
+  architecture with internal OMP (DLPNObe_kernel_v2 takes
+  `omp_threads` param).
+- **Only t1_residual's per-i phase still uses pool.map**.  Per-cycle
+  wall = 0.23s, Python overhead estimate ~99ms.  Expected savings
+  from OMP-over-i: ~1.4s/CCSD run.  Modest.
+- **The real gap to Psi4 (38s vs 15s = 23s gap) is in pre-iter
+  setup and cycle 1 cache fills, not the steady-state cycle work.**
+
+Per-cycle steady-state breakdown is similar to estimated Psi4:
+  Ours 1.1s vs Psi4 ~0.7s — only 0.4s/cycle gap × 13 cycles = 5s.
+
+Pre-iter + cycle 1 gap:
+  Ours 16+8 = 24s vs Psi4 ~5+1 = 6s — 18s gap.
+  This is where the 23s total gap mostly lives.
+
+**Revised next-session targeting**:
+  Session B: PROFILE cc_ints DF (compute_cc_integrals_sparse, 11.9s)
+  to see what's eating 9s vs Psi4's likely ~3s.  Possible wins:
+   - Better atom-stack vectorization
+   - Batched eigh of j2c per atom-Q group
+   - Reduce per-pair Python orchestration in build_keys loop
+  Realistic save: 5-7s.
+
+  Session C: Move cycle-1 cache fills (jiang.G, jiang.C first-pass
+  intermediates) into pre-iter setup so they're amortized once.
+  Realistic save: 5s.
+
+  Session D+: per-cycle steady-state work, smaller wins.
