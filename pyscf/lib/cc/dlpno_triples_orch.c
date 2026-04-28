@@ -1251,6 +1251,29 @@ double DLPNOcompute_E_T0_omp(
     double E_T = 0.0;
     if (n_triples <= 0) return 0.0;
 
+    /* Tune OMP thread count: empirically OMP_NUM_THREADS=8-16 gives the
+     * fastest wall on a 64-physical-core box (tested water-10).  Higher
+     * thread counts oversubscribe and degrade wall (32 → 23s, 64 → 34s
+     * vs 8-16 → 15s).  Likely caused by BLAS/LAPACK internal threading
+     * + NUMA + HT effects that OPENBLAS_NUM_THREADS=1 alone doesn't
+     * suppress.  Override via DLPNO_TRIPLES_OMP_THREADS env var.
+     */
+#ifdef _OPENMP
+    {
+        const char *omp_env = getenv("DLPNO_TRIPLES_OMP_THREADS");
+        int desired_threads = 0;
+        if (omp_env) {
+            desired_threads = atoi(omp_env);
+        }
+        if (desired_threads <= 0) {
+            /* Auto: cap at 16, or to min(omp_max, hw_cores/4) heuristic. */
+            const int omp_max = omp_get_max_threads();
+            desired_threads = omp_max < 16 ? omp_max : 16;
+        }
+        omp_set_num_threads(desired_threads);
+    }
+#endif
+
     /* Profiler — enable via DLPNO_TRIPLE_PROF=1 */
     const char *_prof_env = getenv("DLPNO_TRIPLE_PROF");
     tpt_enabled = (_prof_env && _prof_env[0] == '1') ? 1 : 0;
