@@ -17,6 +17,8 @@
 #include <string.h>
 #include <math.h>
 #include <alloca.h>
+#include <stdio.h>
+#include <time.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -498,6 +500,36 @@ typedef struct {
 
 static __thread TScratch tscratch = {0};
 
+/* --------------------------------------------------------------------
+ * Per-phase profiler (Phase 3c-4 diagnostic).  Each phase accumulates
+ * wall time across triples in __thread storage; summed and printed
+ * after the OMP loop.
+ * -------------------------------------------------------------------- */
+typedef struct {
+    double tno;          /* TNO transform (when computed inline; 0 if precomputed) */
+    double aux_jhi;      /* aux_idx + jhi build */
+    double df;           /* groupby + local DF */
+    double u_cache;      /* W_pao_tno + U cache */
+    double t2_block;     /* 9 dgemms */
+    double K_ab;         /* 3 dgemms + transpose */
+    double K_ooov;       /* batched dgemm + reshape */
+    double K_for_V;      /* 3 dgemms */
+    double t1_lmo;       /* 3 matvecs */
+    double w3_marshal;   /* W3 offset arrays */
+    double w3_kernel;    /* DLPNOcompute_w3_energy */
+} TPhaseTime;
+static __thread TPhaseTime tpt = {0};
+static int tpt_enabled = 0;  /* gated by env var DLPNO_TRIPLE_PROF=1 */
+static TPhaseTime shared_tpt_sum = {0};
+
+static double _now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+#define TIC if (tpt_enabled) { _t_tic = _now_sec(); }
+#define TOC(field) if (tpt_enabled) { tpt.field += _now_sec() - _t_tic; }
+
 #define ENSURE(field, T, n)                                              \
     do {                                                                 \
         size_t _need = (size_t)(n);                                      \
@@ -573,8 +605,10 @@ double DLPNOcompute_one_triple_E_T0(
     if (n_pao_ijk == 0) return 0.0;
     const char Nc = 'N', Tc = 'T';
     const double one = 1.0, zero = 0.0;
+    double _t_tic = 0.0;
 
     /* === Phase 1: TNO transform (or use precomputed) === */
+    TIC;
     double *X_tno_ijk = NULL, *eps_tno = NULL;
     int n_tno = 0;
     int owns_tno = 0;  /* 1 if we malloc'd X_tno/eps and must free */
@@ -605,6 +639,10 @@ double DLPNOcompute_one_triple_E_T0(
         owns_tno = 1;
     }
     int n = n_tno;
+    TOC(tno);
+
+    /* aux_idx + jhi build */
+    TIC;
 
     /* aux_idx + jhi + groupby — using thread scratch */
     ENSURE(aux_idx, long, naux_total);
@@ -627,7 +665,10 @@ double DLPNOcompute_one_triple_E_T0(
         free(X_tno_ijk); free(eps_tno);
         return 0.0;
     }
+    TOC(aux_jhi);
 
+    /* groupby + local DF */
+    TIC;
     ENSURE(local_Q_sorted, long, naux_ijk);
     ENSURE(atom_pos_sorted, long, naux_ijk);
     ENSURE(center_atoms, long, naux_ijk);
@@ -663,8 +704,10 @@ double DLPNOcompute_one_triple_E_T0(
         qij_atom_flat, qia_atom_flat, qab_atom_flat,
         riatom_to_lmos_ext_dense, riatom_to_paos_ext_dense,
         jhi, ovL_sc, vvL_sc, ooL_sc);
+    TOC(df);
 
     /* W_pao_tno + U cache */
+    TIC;
     long *U_off_cache = NULL;
     double *U_flat_cache = NULL;
     if (n_u_pks > 0) {
@@ -699,8 +742,10 @@ double DLPNOcompute_one_triple_E_T0(
             u_pp_off, u_pp_flat, u_X_off, u_X_flat,
             U_off_cache, U_flat_cache);
     }
+    TOC(u_cache);
 
     /* === Phase 2: t2_block + K_ab + K_ooov + K_*_for_V + W3 === */
+    TIC;
     int int_n = n;
     int int_nn = n * n;
 
@@ -846,6 +891,10 @@ double DLPNOcompute_one_triple_E_T0(
      *   t (n, n, n) = ovL[ip] @ vvL_resh.T   where vvL_resh[bf, L] = vvL[b, f, L]
      *   K_ab_cache[ip] (n, n, n) = t.transpose(0, 2, 1) at [a, f, b]
      */
+    TOC(t2_block);
+
+    /* K_ab_cache */
+    TIC;
     ENSURE(K_ab_cache, double, (size_t)3 * n * n * n);
     double *K_ab_cache = tscratch.K_ab_cache;
     {
@@ -910,6 +959,10 @@ double DLPNOcompute_one_triple_E_T0(
      *   K_ooov = K_ooov_pre.reshape(3, n, 3, m_dom).transpose(0, 2, 1, 3)
      *   → K_ooov[p, q, a, m]
      */
+    TOC(K_ab);
+
+    /* K_ooov */
+    TIC;
     int m_dom_size = n_dom;
     ENSURE(K_ooov, double, (size_t)3 * 3 * n * (m_dom_size > 0 ? m_dom_size : 1));
     double *K_ooov = tscratch.K_ooov;
@@ -946,6 +999,10 @@ double DLPNOcompute_one_triple_E_T0(
     /* K_jk, K_ik, K_ij (n, n) for V intermediate when has_t1.
      * Python: K_jk = ovL[1] @ ovL[2].T, etc.
      */
+    TOC(K_ooov);
+
+    /* K_jk/ik/ij + t1_lmo */
+    TIC;
     ENSURE(K_jk, double, (size_t)n * n);
     ENSURE(K_ik, double, (size_t)n * n);
     ENSURE(K_ij, double, (size_t)n * n);
@@ -1020,6 +1077,10 @@ double DLPNOcompute_one_triple_E_T0(
     /* t2_T_all (3, 3, n, n) = t2_block.transpose(0, 1, 3, 2):
      *   t2_T_all[ir, iq, c, f] = t2_block[ir, iq, f, c].
      */
+    TOC(K_for_V);
+
+    /* t2_T_all + W3 marshalling */
+    TIC;
     ENSURE(t2_T_all, double, (size_t)9 * n * n);
     double *t2_T_all = tscratch.t2_T_all;
     for (int ir = 0; ir < 3; ir++) {
@@ -1073,6 +1134,10 @@ double DLPNOcompute_one_triple_E_T0(
     /* eps_occ */
     double eps_occ_arr[3] = {eps_i, eps_j, eps_k};
 
+    TOC(w3_marshal);
+
+    /* Call W3 */
+    TIC;
     /* Call W3.  Pass U_flat_cache and u_T2_flat directly with per-task
      * offsets (w3_U_off / w3_T2_off index INTO those buffers). */
     double et_ijk = DLPNOcompute_w3_energy(
@@ -1084,6 +1149,7 @@ double DLPNOcompute_one_triple_E_T0(
         t1_lmo,
         has_t1, occ_denom,
         n, m_dom_size, n_pno_max_w3);
+    TOC(w3_kernel);
 
     /* All scratch buffers persist in __thread storage — no per-triple free.
      * Only the heap-allocated TNO outputs get freed (those come from
@@ -1185,6 +1251,15 @@ double DLPNOcompute_E_T0_omp(
     double E_T = 0.0;
     if (n_triples <= 0) return 0.0;
 
+    /* Profiler — enable via DLPNO_TRIPLE_PROF=1 */
+    const char *_prof_env = getenv("DLPNO_TRIPLE_PROF");
+    tpt_enabled = (_prof_env && _prof_env[0] == '1') ? 1 : 0;
+    double _phase_a_t0 = 0.0, _phase_b_t0 = 0.0;
+    if (tpt_enabled) {
+        shared_tpt_sum = (TPhaseTime){0};
+        _phase_a_t0 = _now_sec();
+    }
+
     /* === Phase A: precompute TNO transform for all triples (Psi4-style) ===
      * Lifts the heaviest sub-kernel out of the main per-triple loop,
      * matching Psi4's compute_lccsd_t0 structure (TNO precomputed in
@@ -1241,6 +1316,13 @@ double DLPNOcompute_E_T0_omp(
         X_tno_per_triple[t] = X_tno;
         eps_per_triple[t]   = eps;
         n_tno_per_triple[t] = n_tno_t;
+    }
+
+    if (tpt_enabled) {
+        const double phase_a_wall = _now_sec() - _phase_a_t0;
+        printf("  [TRIPLE_PROF] Phase A (TNO precompute) wall: %.2f s\n",
+               phase_a_wall);
+        _phase_b_t0 = _now_sec();
     }
 
     /* === Phase B: main per-triple loop (uses precomputed TNO) === */
@@ -1364,6 +1446,86 @@ double DLPNOcompute_E_T0_omp(
 
         et_per_triple[t] = et;
         E_T += et;
+
+        /* Push thread-local tpt into shared_tpt_sum (atomic adds — only
+         * happens when profiling enabled, hot-path safe). */
+        if (tpt_enabled) {
+#pragma omp atomic
+            shared_tpt_sum.tno        += tpt.tno;
+#pragma omp atomic
+            shared_tpt_sum.aux_jhi    += tpt.aux_jhi;
+#pragma omp atomic
+            shared_tpt_sum.df         += tpt.df;
+#pragma omp atomic
+            shared_tpt_sum.u_cache    += tpt.u_cache;
+#pragma omp atomic
+            shared_tpt_sum.t2_block   += tpt.t2_block;
+#pragma omp atomic
+            shared_tpt_sum.K_ab       += tpt.K_ab;
+#pragma omp atomic
+            shared_tpt_sum.K_ooov     += tpt.K_ooov;
+#pragma omp atomic
+            shared_tpt_sum.K_for_V    += tpt.K_for_V;
+#pragma omp atomic
+            shared_tpt_sum.t1_lmo     += tpt.t1_lmo;
+#pragma omp atomic
+            shared_tpt_sum.w3_marshal += tpt.w3_marshal;
+#pragma omp atomic
+            shared_tpt_sum.w3_kernel  += tpt.w3_kernel;
+            tpt = (TPhaseTime){0};
+        }
+    }
+
+    if (tpt_enabled) {
+        const double phase_b_wall = _now_sec() - _phase_b_t0;
+        printf("  [TRIPLE_PROF] Phase B (per-triple body) wall: %.2f s\n",
+               phase_b_wall);
+        /* Per-thread tpts are stored in shared_tpts (filled inside the main
+         * OMP loop via TIC/TOC writing to thread-local tpt + a final
+         * atomic-write). */
+        const TPhaseTime sum = shared_tpt_sum;
+        const double total = sum.tno + sum.aux_jhi + sum.df + sum.u_cache
+                           + sum.t2_block + sum.K_ab + sum.K_ooov + sum.K_for_V
+                           + sum.t1_lmo + sum.w3_marshal + sum.w3_kernel;
+        printf("  [TRIPLE_PROF] Per-phase CPU sum (over all OMP threads):\n");
+        fflush(stdout);
+        printf("    [DEBUG] total=%g sum.tno=%g sum.df=%g sum.w3_kernel=%g\n",
+               total, sum.tno, sum.df, sum.w3_kernel);
+        fflush(stdout);
+        if (total > 0) {
+            printf("    [DEBUG2] entering if-branch, total=%g\n", total);
+            fflush(stdout);
+            printf("    TNO inline:     %7.2f s\n", sum.tno);
+            printf("    aux_jhi:        %7.2f s\n", sum.aux_jhi);
+            printf("    DF (ovL/vvL/ooL): %7.2f s\n", sum.df);
+            printf("    U cache:        %7.2f s\n", sum.u_cache);
+            printf("    t2_block (9):   %7.2f s\n", sum.t2_block);
+            printf("    K_ab_cache (3): %7.2f s\n", sum.K_ab);
+            printf("    K_ooov (1):     %7.2f s\n", sum.K_ooov);
+            printf("    K_*_for_V (3):  %7.2f s\n", sum.K_for_V);
+            printf("    t1_lmo:         %7.2f s\n", sum.t1_lmo);
+            printf("    W3 marshal:     %7.2f s\n", sum.w3_marshal);
+            printf("    W3 kernel:      %7.2f s\n", sum.w3_kernel);
+            printf("    TOTAL CPU:      %7.2f s\n", total);
+            fflush(stdout);
+            if (0) {
+            printf("    TNO inline:     %7.2f s  (%.1f%%)\n", sum.tno, 100*sum.tno/total);
+            printf("    aux_jhi:        %7.2f s  (%.1f%%)\n", sum.aux_jhi, 100*sum.aux_jhi/total);
+            printf("    DF (ovL/vvL/ooL): %7.2f s  (%.1f%%)\n", sum.df, 100*sum.df/total);
+            printf("    U cache:        %7.2f s  (%.1f%%)\n", sum.u_cache, 100*sum.u_cache/total);
+            printf("    t2_block (9):   %7.2f s  (%.1f%%)\n", sum.t2_block, 100*sum.t2_block/total);
+            printf("    K_ab_cache (3): %7.2f s  (%.1f%%)\n", sum.K_ab, 100*sum.K_ab/total);
+            printf("    K_ooov (1):     %7.2f s  (%.1f%%)\n", sum.K_ooov, 100*sum.K_ooov/total);
+            printf("    K_*_for_V (3):  %7.2f s  (%.1f%%)\n", sum.K_for_V, 100*sum.K_for_V/total);
+            printf("    t1_lmo:         %7.2f s  (%.1f%%)\n", sum.t1_lmo, 100*sum.t1_lmo/total);
+            printf("    W3 marshal:     %7.2f s  (%.1f%%)\n", sum.w3_marshal, 100*sum.w3_marshal/total);
+            printf("    W3 kernel:      %7.2f s  (%.1f%%)\n", sum.w3_kernel, 100*sum.w3_kernel/total);
+            printf("    TOTAL CPU:      %7.2f s\n", total);
+            } /* end if (0) */
+        } else {
+            printf("    (all zero — total=%.6e — profiling broken)\n", total);
+        }
+        fflush(stdout);
     }
 
     /* Cleanup precomputed TNO arena */

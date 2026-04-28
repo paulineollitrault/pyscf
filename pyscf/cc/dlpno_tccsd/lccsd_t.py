@@ -1721,6 +1721,9 @@ def _run_triples_omp(valid_triples,
     arrays, and calls DLPNOcompute_E_T0_omp ONCE to compute et_per_triple
     for the entire triples list.  Replaces pool.map dispatch.
     """
+    import time as _t
+    _prof = (os.environ.get('DLPNO_TRIPLE_PROF', '0') == '1')
+    _t_start = _t.perf_counter() if _prof else 0.0
     n_triples = len(valid_triples)
     if n_triples == 0:
         return np.zeros(0)
@@ -1778,6 +1781,9 @@ def _run_triples_omp(valid_triples,
      g_pp_off, g_pp_flat, g_X_off, g_X_flat,
      g_T2_off, g_T2_flat) = gcache
 
+    if _prof:
+        _t_arena = _t.perf_counter()
+        print(f'  [PYTHON_PROF] global pair arena build: {_t_arena - _t_start:.2f}s', flush=True)
     # Build per-triple arena.
     ijk_list = np.asarray(valid_triples, dtype=np.int64).reshape(n_triples, 3)
     tp_lists = []      # triple_paos for each triple
@@ -1917,6 +1923,9 @@ def _run_triples_omp(valid_triples,
         dij = int(i == j); djk = int(j == k); dik = int(i == k)
         occ_denom_arr[t] = 1 + dij + djk + dik + 2 * dij * djk * dik
 
+    if _prof:
+        _t_pertriple = _t.perf_counter()
+        print(f'  [PYTHON_PROF] per-triple arena build (loop): {_t_pertriple - _t_arena:.2f}s', flush=True)
     # Flatten variable-length per-triple data
     tp_off = np.zeros(n_triples + 1, dtype=np.int64)
     tp_off[1:] = np.cumsum([a.size for a in tp_lists])
@@ -2004,6 +2013,9 @@ def _run_triples_omp(valid_triples,
         )
         _run_triples_omp._libcc = _libcc
 
+    if _prof:
+        _t_flat = _t.perf_counter()
+        print(f'  [PYTHON_PROF] flatten + ctypes setup: {_t_flat - _t_pertriple:.2f}s', flush=True)
     et_per_triple = np.zeros(n_triples, dtype=np.float64)
     _libcc.DLPNOcompute_E_T0_omp(
         int(n_triples),
@@ -2058,6 +2070,10 @@ def _run_triples_omp(valid_triples,
         float(T_CutTNO), float(1e-8),
         et_per_triple.ctypes.data_as(_ct.c_void_p),
     )
+    if _prof:
+        _t_end = _t.perf_counter()
+        print(f'  [PYTHON_PROF] C call (DLPNOcompute_E_T0_omp): {_t_end - _t_flat:.2f}s', flush=True)
+        print(f'  [PYTHON_PROF] _run_triples_omp TOTAL: {_t_end - _t_start:.2f}s', flush=True)
     return et_per_triple
 
 
