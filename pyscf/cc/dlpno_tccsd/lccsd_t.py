@@ -1035,6 +1035,324 @@ def _build_triple_local_DF(i, j, k, X_tno_ijk, triple_paos, triple_domain,
     return ovL_sc, vvL_sc, ooL_sc
 
 
+def _orch_phase1(i, j, k, pno_spaces, t2_for_T,
+                  C_pao, S_pao_full, F_pao_full,
+                  sparse_df, screening, j2c_full, lmo_aux_mask,
+                  pao_domains_triple, nonneg_set, T_CutTNO):
+    """Phase 3c-1 helper: fused TNO + DF + U cache via single C orchestrator.
+
+    Replaces the chain
+        _triple_pno_union_psi4 → triple_domain build → _build_triple_local_DF
+        → W_pao_tno @ X_tno → DLPNObuild_U_for_triple
+    with one ctypes call to DLPNOprocess_one_triple_phase1.
+
+    Returns:
+        (n_tno, X_tno_ijk, eps_tno_sc, triple_paos, triple_domain,
+         ovL_ijk, vvL_sc, ooL_lmo_full, U_cache)
+        or (0, None, ...) if the triple should be skipped.
+    """
+    ij = (min(i, j), max(i, j))
+    ik = (min(i, k), max(i, k))
+    jk = (min(j, k), max(j, k))
+
+    if (ij not in pno_spaces or ik not in pno_spaces or jk not in pno_spaces):
+        return 0, None, None, None, None, None, None, None, None
+    if (ij not in t2_for_T or ik not in t2_for_T or jk not in t2_for_T):
+        return 0, None, None, None, None, None, None, None, None
+
+    # 1. triple_paos union (sorted)
+    if pao_domains_triple is not None:
+        pao_set = set()
+        for lmo in (i, j, k):
+            pao_set.update(int(x) for x in
+                           np.asarray(pao_domains_triple[lmo]).tolist())
+    else:
+        pao_set = set()
+        for key in (ij, jk, ik):
+            pp = pno_spaces[key].get('pair_paos')
+            if pp is not None:
+                pao_set.update(int(x) for x in np.asarray(pp).tolist())
+    if not pao_set:
+        return 0, None, None, None, None, None, None, None, None
+    triple_paos = np.array(sorted(pao_set), dtype=np.int64)
+    n_pao_ijk = int(triple_paos.size)
+    n_pao_total = int(F_pao_full.shape[0])
+
+    # 2. triple_domain
+    nocc_lmo = lmo_aux_mask.shape[0]
+    _domain_set = nonneg_set if nonneg_set is not None else set(t2_for_T.keys())
+    triple_domain = sorted(
+        m for m in range(nocc_lmo)
+        if (min(m, i), max(m, i)) in _domain_set
+        and (min(m, j), max(m, j)) in _domain_set
+        and (min(m, k), max(m, k)) in _domain_set)
+    triple_domain_arr = np.asarray(triple_domain, dtype=np.int64)
+    n_dom = int(triple_domain_arr.size)
+
+    # 3. Marshal 3-pair arena (ij, jk, ik)
+    keys_3 = [ij, jk, ik]
+    ij_lmos = [(i, j), (j, k), (i, k)]
+    pair_paos_n_3 = np.zeros(3, dtype=np.int32)
+    n_pno_arr_3   = np.zeros(3, dtype=np.int32)
+    same_lmo_3    = np.zeros(3, dtype=np.int32)
+    pp_lists, X_lists, T2_lists = [], [], []
+    for kk, (key, (ii_l, jj_l)) in enumerate(zip(keys_3, ij_lmos)):
+        Xp = pno_spaces[key].get('X_pno')
+        pp = np.asarray(pno_spaces[key].get('pair_paos'))
+        T2_p = t2_for_T[key]
+        if Xp is None or Xp.shape[1] == 0 or pp.size == 0 or T2_p.size == 0:
+            pp_lists.append(np.empty(0, dtype=np.int64))
+            X_lists.append(np.empty(0, dtype=np.float64))
+            T2_lists.append(np.empty(0, dtype=np.float64))
+            continue
+        pair_paos_n_3[kk] = pp.size
+        n_pno_arr_3[kk]   = Xp.shape[1]
+        same_lmo_3[kk]    = 1 if ii_l == jj_l else 0
+        pp_lists.append(np.ascontiguousarray(pp, dtype=np.int64))
+        X_lists.append(np.ascontiguousarray(Xp, dtype=np.float64).ravel())
+        T2_lists.append(np.ascontiguousarray(T2_p, dtype=np.float64).ravel())
+    pair_paos_off_3 = np.zeros(4, dtype=np.int64)
+    X_pno_off_3     = np.zeros(4, dtype=np.int64)
+    T2_off_3        = np.zeros(4, dtype=np.int64)
+    for kk in range(3):
+        pair_paos_off_3[kk + 1] = pair_paos_off_3[kk] + pp_lists[kk].size
+        X_pno_off_3[kk + 1]     = X_pno_off_3[kk]     + X_lists[kk].size
+        T2_off_3[kk + 1]        = T2_off_3[kk]        + T2_lists[kk].size
+    pair_paos_flat_3 = (np.concatenate(pp_lists) if any(x.size for x in pp_lists)
+                        else np.empty(0, dtype=np.int64))
+    X_pno_flat_3 = (np.concatenate(X_lists) if any(x.size for x in X_lists)
+                    else np.empty(0, dtype=np.float64))
+    T2_flat_3 = (np.concatenate(T2_lists) if any(x.size for x in T2_lists)
+                 else np.empty(0, dtype=np.float64))
+
+    # 4. Build u_pks list and marshal flat arrays
+    triple_lmo = [i, j, k]
+    _u_pks_seen = set()
+    _u_pks = []
+    for r_global in triple_lmo:
+        for m_global in triple_domain:
+            pk = (min(r_global, m_global), max(r_global, m_global))
+            if pk not in _u_pks_seen and pk in pno_spaces:
+                pd = pno_spaces[pk]
+                if (pd.get('X_pno') is not None and pd.get('pair_paos') is not None
+                        and pd['X_pno'].shape[1] > 0):
+                    _u_pks_seen.add(pk); _u_pks.append(pk)
+        pk = (r_global, r_global)
+        if pk not in _u_pks_seen and pk in pno_spaces:
+            pd = pno_spaces[pk]
+            if (pd.get('X_pno') is not None and pd.get('pair_paos') is not None
+                    and pd['X_pno'].shape[1] > 0):
+                _u_pks_seen.add(pk); _u_pks.append(pk)
+    for r_global in triple_lmo:
+        for r2_global in triple_lmo:
+            pk = (min(r_global, r2_global), max(r_global, r2_global))
+            if pk not in _u_pks_seen and pk in pno_spaces:
+                pd = pno_spaces[pk]
+                if (pd.get('X_pno') is not None and pd.get('pair_paos') is not None
+                        and pd['X_pno'].shape[1] > 0):
+                    _u_pks_seen.add(pk); _u_pks.append(pk)
+    n_u_pks = len(_u_pks)
+    if n_u_pks == 0:
+        u_pao_n = np.zeros(0, dtype=np.int32)
+        u_pno_n = np.zeros(0, dtype=np.int32)
+        u_pp_off = np.zeros(1, dtype=np.int64)
+        u_X_off  = np.zeros(1, dtype=np.int64)
+        u_pp_flat = np.empty(0, dtype=np.int64)
+        u_X_flat  = np.empty(0, dtype=np.float64)
+    else:
+        u_pao_n = np.empty(n_u_pks, dtype=np.int32)
+        u_pno_n = np.empty(n_u_pks, dtype=np.int32)
+        for p, pk_ in enumerate(_u_pks):
+            pd = pno_spaces[pk_]
+            u_pao_n[p] = int(np.asarray(pd['pair_paos']).size)
+            u_pno_n[p] = int(pd['X_pno'].shape[1])
+        u_pp_off = np.empty(n_u_pks + 1, dtype=np.int64); u_pp_off[0] = 0
+        u_pp_off[1:] = np.cumsum(u_pao_n.astype(np.int64))
+        u_X_off = np.empty(n_u_pks + 1, dtype=np.int64); u_X_off[0] = 0
+        u_X_off[1:] = np.cumsum(u_pao_n.astype(np.int64) * u_pno_n.astype(np.int64))
+        u_pp_flat = np.empty(int(u_pp_off[-1]), dtype=np.int64)
+        u_X_flat  = np.empty(int(u_X_off[-1]), dtype=np.float64)
+        for p, pk_ in enumerate(_u_pks):
+            pd = pno_spaces[pk_]
+            u_pp_flat[u_pp_off[p]:u_pp_off[p + 1]] = np.asarray(
+                pd['pair_paos'], dtype=np.int64)
+            u_X_flat[u_X_off[p]:u_X_off[p + 1]] = np.ascontiguousarray(
+                pd['X_pno']).ravel()
+
+    # 5. Output buffers (max-sized)
+    naux_total = int(j2c_full.shape[0])
+    X_tno_buf = np.zeros((n_pao_ijk, n_pao_ijk), dtype=np.float64)
+    eps_buf = np.zeros(n_pao_ijk, dtype=np.float64)
+    n_tno_max = n_pao_ijk
+    naux_max  = naux_total
+    ovL_buf = np.zeros((3, n_tno_max, naux_max), dtype=np.float64)
+    vvL_buf = np.zeros((n_tno_max, n_tno_max, naux_max), dtype=np.float64)
+    ooL_buf = np.zeros((3, max(n_dom, 1), naux_max), dtype=np.float64)
+    U_off_out = np.zeros(max(n_u_pks + 1, 1), dtype=np.int64)
+    U_flat_out = np.zeros(
+        int(np.sum(u_pno_n.astype(np.int64) * n_pao_ijk)) if n_u_pks > 0 else 1,
+        dtype=np.float64)
+    n_tno_arr     = np.zeros(1, dtype=np.int32)
+    naux_ijk_arr  = np.zeros(1, dtype=np.int32)
+
+    # 6. Other globals
+    # Globals — cached on the function across triples (within one CCSD run
+    # they don't change). astype/ascontiguousarray copies large arrays
+    # otherwise; doing it per-triple was a ~6s/water-10 hot spot.
+    # Cache key must disambiguate tight-pass vs prescreen-pass globals:
+    # j2c is shared but lmo_aux_mask/screening/sparse_df differ.
+    _ck = (id(j2c_full), id(F_pao_full), id(S_pao_full),
+           id(lmo_aux_mask), id(sparse_df), id(screening))
+    cached = getattr(_orch_phase1, '_globals_cache', None)
+    if cached is None or cached[0] != _ck:
+        cached = (_ck,
+                  np.ascontiguousarray(F_pao_full),
+                  np.ascontiguousarray(S_pao_full),
+                  np.ascontiguousarray(j2c_full),
+                  np.ascontiguousarray(sparse_df['aux_atom_ids'], dtype=np.int64),
+                  np.ascontiguousarray(sparse_df['aux_pos_in_atom'], dtype=np.int64),
+                  np.ascontiguousarray(
+                      screening['riatom_to_lmos_ext_dense'], dtype=np.int64),
+                  np.ascontiguousarray(
+                      screening['riatom_to_paos_ext_dense'], dtype=np.int64),
+                  np.ascontiguousarray(lmo_aux_mask.astype(np.int64)))
+        _orch_phase1._globals_cache = cached
+    (_, F_pao_c, S_pao_c, j2c_c, aux_atom_ids, aux_pos_in_atom,
+     lmo_dense_c, pao_dense_c, lmo_aux_mask_c) = cached
+    triple_paos_c = np.ascontiguousarray(triple_paos, dtype=np.int64)
+
+    import ctypes as _ct
+    from pyscf import lib as _pl
+    _libcc = getattr(_orch_phase1, '_libcc', None)
+    if _libcc is None:
+        _libcc = _pl.load_library('libcc')
+        _libcc.DLPNOprocess_one_triple_phase1.restype = _ct.c_int
+        _libcc.DLPNOprocess_one_triple_phase1.argtypes = (
+            [_ct.c_int] * 3                  # i, j, k
+            + [_ct.c_int]                    # n_pao_ijk
+            + [_ct.c_void_p]                 # triple_paos
+            + [_ct.c_int]                    # n_dom
+            + [_ct.c_void_p]                 # triple_domain
+            + [_ct.c_void_p] * 8             # 3-pair: pair_paos_n, off, flat, n_pno, X_off, X_flat, T2_off, T2_flat
+            + [_ct.c_void_p]                 # same_lmo_3
+            + [_ct.c_int]                    # n_u_pks
+            + [_ct.c_void_p] * 6             # u_pao_n, u_pno_n, u_pp_off, u_pp_flat, u_X_off, u_X_flat
+            + [_ct.c_int, _ct.c_int, _ct.c_int]   # nocc, n_pao_total, naux_total
+            + [_ct.c_void_p] * 14            # F_pao, S_pao, j2c, aux_atom_ids, aux_pos, qij_off, qia_off, qab_off, qij_n_aux, qij_n_lmo, qab_n_pao, qij_flat, qia_flat, qab_flat
+            + [_ct.c_void_p] * 3             # riatom_lmo_dense, riatom_pao_dense, lmo_aux_mask
+            + [_ct.c_double, _ct.c_double]   # T_CutTNO, S_cut_domain
+            + [_ct.c_int] * 3                # n_pao_ijk_stride, n_tno_max, naux_max
+            + [_ct.c_void_p] * 7             # output: X_tno, eps, ovL, vvL, ooL, U_off, U_flat
+            + [_ct.c_void_p] * 2             # n_tno_out, naux_ijk_out
+        )
+        _orch_phase1._libcc = _libcc
+
+    rc = _libcc.DLPNOprocess_one_triple_phase1(
+        int(i), int(j), int(k),
+        int(n_pao_ijk), triple_paos_c.ctypes.data_as(_ct.c_void_p),
+        int(n_dom), triple_domain_arr.ctypes.data_as(_ct.c_void_p),
+        pair_paos_n_3.ctypes.data_as(_ct.c_void_p),
+        pair_paos_off_3.ctypes.data_as(_ct.c_void_p),
+        pair_paos_flat_3.ctypes.data_as(_ct.c_void_p),
+        n_pno_arr_3.ctypes.data_as(_ct.c_void_p),
+        X_pno_off_3.ctypes.data_as(_ct.c_void_p),
+        X_pno_flat_3.ctypes.data_as(_ct.c_void_p),
+        T2_off_3.ctypes.data_as(_ct.c_void_p),
+        T2_flat_3.ctypes.data_as(_ct.c_void_p),
+        same_lmo_3.ctypes.data_as(_ct.c_void_p),
+        int(n_u_pks),
+        u_pao_n.ctypes.data_as(_ct.c_void_p),
+        u_pno_n.ctypes.data_as(_ct.c_void_p),
+        u_pp_off.ctypes.data_as(_ct.c_void_p),
+        u_pp_flat.ctypes.data_as(_ct.c_void_p),
+        u_X_off.ctypes.data_as(_ct.c_void_p),
+        u_X_flat.ctypes.data_as(_ct.c_void_p),
+        int(nocc_lmo), int(n_pao_total), int(naux_total),
+        F_pao_c.ctypes.data_as(_ct.c_void_p),
+        S_pao_c.ctypes.data_as(_ct.c_void_p),
+        j2c_c.ctypes.data_as(_ct.c_void_p),
+        aux_atom_ids.ctypes.data_as(_ct.c_void_p),
+        aux_pos_in_atom.ctypes.data_as(_ct.c_void_p),
+        sparse_df['qij_atom_off'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qia_atom_off'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qab_atom_off'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qij_atom_n_aux'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qij_atom_n_lmo'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qab_atom_n_pao'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qij_atom_flat'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qia_atom_flat'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qab_atom_flat'].ctypes.data_as(_ct.c_void_p),
+        lmo_dense_c.ctypes.data_as(_ct.c_void_p),
+        pao_dense_c.ctypes.data_as(_ct.c_void_p),
+        lmo_aux_mask_c.ctypes.data_as(_ct.c_void_p),
+        float(T_CutTNO), float(1e-8),
+        int(n_pao_ijk), int(n_tno_max), int(naux_max),
+        X_tno_buf.ctypes.data_as(_ct.c_void_p),
+        eps_buf.ctypes.data_as(_ct.c_void_p),
+        ovL_buf.ctypes.data_as(_ct.c_void_p),
+        vvL_buf.ctypes.data_as(_ct.c_void_p),
+        ooL_buf.ctypes.data_as(_ct.c_void_p),
+        U_off_out.ctypes.data_as(_ct.c_void_p),
+        U_flat_out.ctypes.data_as(_ct.c_void_p),
+        n_tno_arr.ctypes.data_as(_ct.c_void_p),
+        naux_ijk_arr.ctypes.data_as(_ct.c_void_p),
+    )
+    if rc != 0:
+        raise RuntimeError(f'orch phase1 LAPACK info={rc} on ({i},{j},{k})')
+    n_tno = int(n_tno_arr[0])
+    naux_ijk = int(naux_ijk_arr[0])
+    if n_tno == 0:
+        return 0, None, None, None, None, None, None, None, None
+
+    # Slice outputs to actual sizes.
+    X_tno_ijk = X_tno_buf[:, :n_tno].copy()
+    eps_tno_sc = eps_buf[:n_tno].copy()
+    ovL_ijk = ovL_buf[:, :n_tno, :naux_ijk].copy()
+    vvL_sc  = vvL_buf[:n_tno, :n_tno, :naux_ijk].copy()
+    ooL_lmo_full = (ooL_buf[:, :n_dom, :naux_ijk].copy() if n_dom > 0
+                    else np.zeros((3, 0, naux_ijk)))
+
+    # Reconstruct U_cache dict.
+    U_cache = {}
+    for p, pk_ in enumerate(_u_pks):
+        n_pno = int(u_pno_n[p])
+        if n_pno == 0:
+            U_cache[pk_] = None
+            continue
+        U_cache[pk_] = U_flat_out[
+            U_off_out[p]:U_off_out[p + 1]
+        ].reshape(n_pno, n_tno).copy()
+
+    if os.environ.get('DLPNO_ORCH_DEBUG', '0') == '1':
+        # Compare to reference path.
+        _saved = os.environ.pop('DLPNO_TRIPLE_ORCH', None)
+        try:
+            ref_C, ref_n_tno, ref_X_tno, ref_tp, ref_eps = _triple_pno_union_psi4(
+                pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
+                t2_for_T=t2_for_T, T_CutTNO=T_CutTNO,
+                pao_domains_triple=pao_domains_triple)
+            ref_ovL, ref_vvL, ref_ooL = _build_triple_local_DF(
+                i, j, k, ref_X_tno, ref_tp, triple_domain,
+                sparse_df, screening, j2c_full, lmo_aux_mask)
+        finally:
+            if _saved is not None:
+                os.environ['DLPNO_TRIPLE_ORCH'] = _saved
+        print(f'  [ORCH_DEBUG] (i,j,k)=({i},{j},{k})')
+        print(f'    n_tno: orch={n_tno}, ref={ref_n_tno}')
+        print(f'    eps_tno_diff sorted: max|Δ|={np.max(np.abs(np.sort(eps_tno_sc)-np.sort(ref_eps))):.3e}')
+        if ovL_ijk.shape == ref_ovL.shape:
+            print(f'    ovL  shape match. max|Δ|={np.max(np.abs(ovL_ijk-ref_ovL)):.3e}')
+        else:
+            print(f'    ovL  SHAPE MISMATCH C={ovL_ijk.shape} ref={ref_ovL.shape}')
+        if vvL_sc.shape == ref_vvL.shape:
+            print(f'    vvL  shape match. max|Δ|={np.max(np.abs(vvL_sc-ref_vvL)):.3e}')
+        if ooL_lmo_full.shape == ref_ooL.shape:
+            print(f'    ooL  shape match. max|Δ|={np.max(np.abs(ooL_lmo_full-ref_ooL)):.3e}')
+
+    return (n_tno, X_tno_ijk, eps_tno_sc, triple_paos, triple_domain,
+            ovL_ijk, vvL_sc, ooL_lmo_full, U_cache)
+
+
 def _process_one_triple(i, j, k,
                         pno_spaces, t2_for_T,
                         Lpq_full, C_lmo, fock_ao, F_lmo, s1e,
@@ -1068,7 +1386,30 @@ def _process_one_triple(i, j, k,
                      and j2c_full is not None and lmo_aux_mask is not None
                      and C_pao is not None
                      and S_pao_full is not None and F_pao_full is not None)
-    if _use_psi4_tno:
+
+    # === Phase 3c-1 path: fused TNO + DF + U cache via single C orchestrator ===
+    _orch_active = (_use_psi4_tno
+                    and os.environ.get('DLPNO_C_CYCLE', '0') == '1'
+                    and os.environ.get('DLPNO_TRIPLE_TNO_FULL', '0') == '1'
+                    and os.environ.get('DLPNO_TRIPLE_ORCH', '0') == '1')
+    _orch_data = None
+    if _orch_active:
+        _orch_res = _orch_phase1(
+            i, j, k, pno_spaces, t2_for_T,
+            C_pao, S_pao_full, F_pao_full,
+            sparse_df, screening, j2c_full, lmo_aux_mask,
+            pao_domains_triple, nonneg_set, T_CutTNO)
+        n_tno_orch, X_tno_orch, eps_tno_orch, tp_orch, td_orch, ovL_o, vvL_o, ooL_o, Uc_o = _orch_res
+        if n_tno_orch == 0:
+            return 0.0
+        # Stash for use after the standard TNO/DF block.
+        _orch_data = _orch_res
+        n_tno = n_tno_orch
+        X_tno_ijk = X_tno_orch
+        eps_tno_sc = eps_tno_orch
+        triple_paos = tp_orch
+        C_tno_sc = C_pao[:, triple_paos] @ X_tno_ijk
+    elif _use_psi4_tno:
         C_tno_sc, n_tno, X_tno_ijk, triple_paos, eps_tno_sc = \
             _triple_pno_union_psi4(
                 pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
@@ -1110,7 +1451,13 @@ def _process_one_triple(i, j, k,
     eps_occ = np.array([F_lmo[ii, ii] for ii in triple_lmo])
 
     # DF integrals: Psi4-style triple-local aux path when available.
-    if _use_psi4_tno and X_tno_ijk is not None:
+    if _orch_data is not None and os.environ.get('DLPNO_ORCH_PYTHON_DF', '0') != '1':
+        # Already built by the orch C call.
+        _, _, _, _, td_orch, ovL_ijk, vvL_sc, ooL_lmo_full, _ = _orch_data
+        triple_domain = td_orch
+        _m_pos = {m_global: m_local for m_local, m_global in enumerate(triple_domain)}
+        _sparse_path_prebuilt_rows = True
+    elif _use_psi4_tno and X_tno_ijk is not None:
         ovL_ijk, vvL_sc, ooL_lmo_full = _build_triple_local_DF(
             i, j, k, X_tno_ijk, triple_paos, triple_domain,
             sparse_df, screening, j2c_full, lmo_aux_mask)
@@ -1134,7 +1481,11 @@ def _process_one_triple(i, j, k,
         _W_pao_tno = S_pao_full[:, triple_paos] @ X_tno_ijk  # (nao_pao, n_tno)
     else:
         _W_pao_tno = None
-    _U_cache = {}
+    if _orch_data is not None and os.environ.get('DLPNO_ORCH_PYTHON_U', '0') != '1':
+        # Use the U cache from the orchestrator C call.
+        _U_cache = _orch_data[8]
+    else:
+        _U_cache = {}
 
     # === Pre-populate _U_cache via batched C kernel (DLPNO_C_CYCLE=1) ===
     # Per-triple work that used to dominate (T) wall (cProfile: 10.7s
@@ -1143,7 +1494,9 @@ def _process_one_triple(i, j, k,
     # ~60 unique pks needed for this triple, build U for each in C
     # via dgemm(W_sub @ X), populate the dict so subsequent _U_for
     # calls hit the cache.
-    if (_pao_basis and int(os.environ.get('DLPNO_C_CYCLE', '0'))):
+    if (_pao_basis and int(os.environ.get('DLPNO_C_CYCLE', '0'))
+            and (_orch_data is None
+                 or os.environ.get('DLPNO_ORCH_PYTHON_U', '0') == '1')):
         # Enumerate unique pks the rest of _process_one_triple will ask
         # for: (m, r) for m ∈ triple_domain ∪ triple_lmo, r ∈ triple_lmo,
         # plus diagonals (r, r) for the T1 path.

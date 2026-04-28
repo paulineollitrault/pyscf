@@ -23,7 +23,7 @@ add_library(cc SHARED
   dlpno_partners_centerQ.c dlpno_s_pno.c
   dlpno_u_for_triple.c dlpno_triple_local_df.c
   dlpno_triple_tno.c dlpno_triples_full.c
-  dlpno_w3_full.c)
+  dlpno_w3_full.c dlpno_triples_orch.c)
 add_dependencies(cc np_helper ao2mo)
 
 set_target_properties(cc PROPERTIES
