@@ -1647,6 +1647,8 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
                                            # qij_flat, qia_flat, qab_flat
             + [_ct.c_void_p] * 3           # lmo_dense, pao_dense, lmo_aux_mask
             + [_ct.c_double, _ct.c_double] # T_CutTNO, S_cut_domain
+            + [_ct.c_int]                  # pre_n_tno (0 = compute internally)
+            + [_ct.c_void_p] * 2           # pre_X_tno_ijk, pre_eps_tno (NULL)
         )
         _orch_full._libcc = _libcc
 
@@ -1702,6 +1704,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
         pao_dense_c.ctypes.data_as(_ct.c_void_p),
         lmo_aux_mask_c.ctypes.data_as(_ct.c_void_p),
         float(T_CutTNO), float(1e-8),
+        0, None, None,  # pre_n_tno=0 (compute TNO internally)
     )
     return float(et)
 

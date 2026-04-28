@@ -562,31 +562,48 @@ double DLPNOcompute_one_triple_E_T0(
         const long *riatom_to_paos_ext_dense,
         const long *lmo_aux_mask,
         /* config */
-        const double T_CutTNO, const double S_cut_domain)
+        const double T_CutTNO, const double S_cut_domain,
+        /* Optional precomputed TNO (Psi4-style separation): if
+         * pre_n_tno > 0, X_tno + eps are passed in instead of computed
+         * from scratch.  Caller owns the buffers; we don't free. */
+        const int pre_n_tno,
+        const double *pre_X_tno_ijk,
+        const double *pre_eps_tno)
 {
     if (n_pao_ijk == 0) return 0.0;
     const char Nc = 'N', Tc = 'T';
     const double one = 1.0, zero = 0.0;
 
-    /* === Phase 1: TNO + DF + U cache (re-implemented inline) === */
-    double *X_tno_ijk = NULL, *eps_tno = NULL, *X_pao_ijk = NULL;
-    int n_tno = 0, n_pao_can = 0;
-    int rc = DLPNObuild_triple_tno_full(
-        n_pao_ijk, n_pao_total, triple_paos,
-        F_pao_full, S_pao_full,
-        3, pair_paos_n_3, pair_paos_off_3, pair_paos_flat_3,
-        n_pno_arr_3, X_pno_off_3, X_pno_flat_3,
-        T2_off_3, T2_flat_3, same_lmo_3,
-        T_CutTNO, S_cut_domain,
-        &X_tno_ijk, &eps_tno, &X_pao_ijk,
-        &n_tno, &n_pao_can);
-    if (rc != 0 || n_tno == 0) {
-        if (X_tno_ijk) free(X_tno_ijk);
-        if (eps_tno)   free(eps_tno);
-        if (X_pao_ijk) free(X_pao_ijk);
-        return 0.0;
+    /* === Phase 1: TNO transform (or use precomputed) === */
+    double *X_tno_ijk = NULL, *eps_tno = NULL;
+    int n_tno = 0;
+    int owns_tno = 0;  /* 1 if we malloc'd X_tno/eps and must free */
+    if (pre_n_tno > 0 && pre_X_tno_ijk != NULL && pre_eps_tno != NULL) {
+        n_tno = pre_n_tno;
+        X_tno_ijk = (double *)pre_X_tno_ijk;
+        eps_tno   = (double *)pre_eps_tno;
+        owns_tno = 0;
+    } else {
+        double *X_pao_ijk = NULL;
+        int n_pao_can = 0;
+        int rc = DLPNObuild_triple_tno_full(
+            n_pao_ijk, n_pao_total, triple_paos,
+            F_pao_full, S_pao_full,
+            3, pair_paos_n_3, pair_paos_off_3, pair_paos_flat_3,
+            n_pno_arr_3, X_pno_off_3, X_pno_flat_3,
+            T2_off_3, T2_flat_3, same_lmo_3,
+            T_CutTNO, S_cut_domain,
+            &X_tno_ijk, &eps_tno, &X_pao_ijk,
+            &n_tno, &n_pao_can);
+        if (rc != 0 || n_tno == 0) {
+            if (X_tno_ijk) free(X_tno_ijk);
+            if (eps_tno)   free(eps_tno);
+            if (X_pao_ijk) free(X_pao_ijk);
+            return 0.0;
+        }
+        free(X_pao_ijk);
+        owns_tno = 1;
     }
-    free(X_pao_ijk);
     int n = n_tno;
 
     /* aux_idx + jhi + groupby — using thread scratch */
@@ -1071,7 +1088,9 @@ double DLPNOcompute_one_triple_E_T0(
     /* All scratch buffers persist in __thread storage — no per-triple free.
      * Only the heap-allocated TNO outputs get freed (those come from
      * DLPNObuild_triple_tno_full's internal mallocs). */
-    free(X_tno_ijk); free(eps_tno);
+    if (owns_tno) {
+        free(X_tno_ijk); free(eps_tno);
+    }
 
     return et_ijk;
 }
@@ -1166,6 +1185,65 @@ double DLPNOcompute_E_T0_omp(
     double E_T = 0.0;
     if (n_triples <= 0) return 0.0;
 
+    /* === Phase A: precompute TNO transform for all triples (Psi4-style) ===
+     * Lifts the heaviest sub-kernel out of the main per-triple loop,
+     * matching Psi4's compute_lccsd_t0 structure (TNO precomputed in
+     * DLPNOCCSD_T::tno_transform before the OMP loop). */
+    double **X_tno_per_triple = (double **)calloc(n_triples, sizeof(double *));
+    double **eps_per_triple   = (double **)calloc(n_triples, sizeof(double *));
+    int    *n_tno_per_triple  = (int *)calloc(n_triples, sizeof(int));
+
+#pragma omp parallel for schedule(dynamic)
+    for (int t = 0; t < n_triples; t++) {
+        const long *triple_paos_t = tp_flat + tp_off[t];
+        const int   n_pao_ijk_t   = (int)(tp_off[t + 1] - tp_off[t]);
+        if (n_pao_ijk_t == 0) continue;
+        const int *pi3 = pair_idx_3 + 3 * t;
+        if (pi3[0] < 0 || pi3[1] < 0 || pi3[2] < 0) continue;
+
+        int p3_pao_n[3];
+        int p3_pno_n[3];
+        long p3_pp_off[4];
+        long p3_X_off[4];
+        long p3_T2_off[4];
+        int p3_same_lmo[3];
+        for (int kk = 0; kk < 3; kk++) {
+            const int idx = pi3[kk];
+            p3_pao_n[kk] = g_pao_n[idx];
+            p3_pno_n[kk] = g_pno_n[idx];
+            p3_pp_off[kk] = g_pp_off[idx];
+            p3_X_off[kk]  = g_X_off[idx];
+            p3_T2_off[kk] = g_T2_off[idx];
+            p3_same_lmo[kk] = same_lmo_3[3 * t + kk];
+        }
+        p3_pp_off[3] = g_pp_off[pi3[2] + 1];
+        p3_X_off[3]  = g_X_off[pi3[2] + 1];
+        p3_T2_off[3] = g_T2_off[pi3[2] + 1];
+
+        double *X_tno = NULL, *eps = NULL, *X_pao = NULL;
+        int n_tno_t = 0, n_pao_can_t = 0;
+        int rc = DLPNObuild_triple_tno_full(
+            n_pao_ijk_t, n_pao_total, triple_paos_t,
+            F_pao_full, S_pao_full,
+            3, p3_pao_n, p3_pp_off, g_pp_flat,
+            p3_pno_n, p3_X_off, g_X_flat,
+            p3_T2_off, g_T2_flat,
+            p3_same_lmo,
+            T_CutTNO, S_cut_domain,
+            &X_tno, &eps, &X_pao,
+            &n_tno_t, &n_pao_can_t);
+        if (X_pao) free(X_pao);
+        if (rc != 0 || n_tno_t == 0) {
+            if (X_tno) free(X_tno);
+            if (eps)   free(eps);
+            continue;
+        }
+        X_tno_per_triple[t] = X_tno;
+        eps_per_triple[t]   = eps;
+        n_tno_per_triple[t] = n_tno_t;
+    }
+
+    /* === Phase B: main per-triple loop (uses precomputed TNO) === */
 #pragma omp parallel for schedule(dynamic) reduction(+:E_T)
     for (int t = 0; t < n_triples; t++) {
         const int i = (int)ijk_list[3 * t + 0];
@@ -1237,6 +1315,12 @@ double DLPNOcompute_E_T0_omp(
         const double eps_j = eps_ijk[3 * t + 1];
         const double eps_k = eps_ijk[3 * t + 2];
 
+        /* Skip if Phase A produced no TNO (n_tno=0 → triple drops out). */
+        if (n_tno_per_triple[t] == 0) {
+            et_per_triple[t] = 0.0;
+            continue;
+        }
+
         double et = DLPNOcompute_one_triple_E_T0(
             i, j, k,
             n_pao_ijk_t, triple_paos_t,
@@ -1272,11 +1356,24 @@ double DLPNOcompute_E_T0_omp(
             qij_atom_flat, qia_atom_flat, qab_atom_flat,
             riatom_to_lmos_ext_dense, riatom_to_paos_ext_dense,
             lmo_aux_mask,
-            T_CutTNO, S_cut_domain);
+            T_CutTNO, S_cut_domain,
+            /* Precomputed TNO from Phase A */
+            n_tno_per_triple[t],
+            X_tno_per_triple[t],
+            eps_per_triple[t]);
 
         et_per_triple[t] = et;
         E_T += et;
     }
+
+    /* Cleanup precomputed TNO arena */
+    for (int t = 0; t < n_triples; t++) {
+        if (X_tno_per_triple[t]) free(X_tno_per_triple[t]);
+        if (eps_per_triple[t])   free(eps_per_triple[t]);
+    }
+    free(X_tno_per_triple);
+    free(eps_per_triple);
+    free(n_tno_per_triple);
 
     return E_T;
 }
