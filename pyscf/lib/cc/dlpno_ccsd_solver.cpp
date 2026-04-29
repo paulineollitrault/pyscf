@@ -335,6 +335,21 @@ struct SolverInputs {
     //   inline build in run_phase_t1_residual_AC_init_into.  Built per Psi4
     //   ccsd.cc:1683-1692 with full LMO-domain scope (strong + weak).
     FlatPairStore Fkc_per_ordered;
+    // R2_external: precomputed R2 contributions externally (e.g. by
+    //   PySCF's full residual machinery).  Length t2_offsets[n_canon_pairs].
+    //   When non-null, run_one_cycle uses this *as* R2 (instead of K+A
+    //   skeleton).  Used during the R2 plan-extraction transition: lets
+    //   the class consume PySCF's full R2 to validate the orchestration +
+    //   update_amps + energy formula at machine precision.  Once all R2
+    //   plans (BE/CD/G_term/t3/t4) are extracted natively, this becomes
+    //   redundant.
+    const double *R2_external;
+    // is_strong_pair: byte flag per canonical pair (length n_canon_pairs).
+    //   1 = strong pair (counted in correlation energy formula);
+    //   0 = weak pair (T2 update applied but pair excluded from energy).
+    //   Mirrors PySCF's `strong_pairs` filter at line 2770 in lccsd.py.
+    //   When null, all pairs counted (legacy behavior).
+    const unsigned char *is_strong_pair;
 };
 
 // -- Output struct for the t1_ints phase (Step 2b) --------------------------
@@ -1262,15 +1277,23 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     // ------------------------------------------------------------------
     // R2 orchestration (skeleton): R2[p] += K[p] + A[p].
     // BE / CD / G_term / t3+t4 contributions skipped (plans=null).
+    // When R2_external is provided, use it AS-IS (Psi4-symmetrized R2
+    // computed by PySCF's full residual machinery — incremental
+    // transition while plan extraction lands).
     // ------------------------------------------------------------------
     std::vector<double> R2_buf((size_t)R2_total, 0.0);
-    for (int p = 0; p < N; ++p) {
-        const int npno = npno_arr[p];
-        if (npno == 0) continue;
-        const int64_t off = in_.t2_offsets[p];
-        const int64_t sz  = (int64_t)npno * npno;
-        for (int64_t e = 0; e < sz; ++e) {
-            R2_buf[off + e] = K_flat[off + e] + A_flat[off + e];
+    if (in_.R2_external != nullptr) {
+        std::memcpy(R2_buf.data(), in_.R2_external,
+                    (size_t)R2_total * sizeof(double));
+    } else {
+        for (int p = 0; p < N; ++p) {
+            const int npno = npno_arr[p];
+            if (npno == 0) continue;
+            const int64_t off = in_.t2_offsets[p];
+            const int64_t sz  = (int64_t)npno * npno;
+            for (int64_t e = 0; e < sz; ++e) {
+                R2_buf[off + e] = K_flat[off + e] + A_flat[off + e];
+            }
         }
     }
 
@@ -1769,41 +1792,106 @@ void DLPNOCCSDSolver::run_phase_update_amps_and_energy_into(
     // Energy: T2 contribution.
     //   tau = T2[p] + outer(t1_i_pno, t1_j_pno);  Tt = 2*tau - tau.T
     //   e_p = K_iajb[p] : Tt;  add (1 or 2)*e_p depending on diag.
+    //   Skip weak pairs when is_strong_pair[] is provided (Psi4/PySCF
+    //   correlation energy formula counts only strong pairs).
+    //
+    // T1_in_pair was built from PRE-UPDATE t1_pno; after the T1 update
+    // above it is STALE.  To form tau with NEW t1, project T1_flat[i]
+    // (in pair (i,i)'s PNO basis) into pair p's basis inline via
+    // S_PNO(p, (i,i)) — same projection that t1_cache encoded.
+    const int N_canon = in_.n_canon_pairs;
     double e_T2 = 0.0;
     #pragma omp parallel for reduction(+:e_T2) schedule(dynamic, 1)
     for (int p = 0; p < N; ++p) {
+        if (in_.is_strong_pair != nullptr && in_.is_strong_pair[p] == 0) continue;
         const int npno = in_.n_pno_per_pair[p];
         if (npno == 0) continue;
         const int i = in_.ij_to_i_j[2 * p];
         const int j = in_.ij_to_i_j[2 * p + 1];
-
-        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
-        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
-        const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
-
-        // i_in_p / j_in_p positions in pair_lmo_idx[p].
-        int i_in_p = -1, j_in_p = -1;
-        for (int k = 0; k < nlmo; ++k) {
-            if (lmo_list[k] == i) i_in_p = k;
-            if (lmo_list[k] == j) j_in_p = k;
-        }
-        if (i_in_p < 0 || j_in_p < 0) continue;
+        const int p_ii = in_.i_j_to_ij[(int64_t)i * nocc + i];
+        const int p_jj = in_.i_j_to_ij[(int64_t)j * nocc + j];
+        if (p_ii < 0 || p_jj < 0) continue;
+        const int npno_ii = in_.n_pno_per_pair[p_ii];
+        const int npno_jj = in_.n_pno_per_pair[p_jj];
 
         const double *T2_p =
             in_.T2_flat + in_.t2_offsets[p];
-        const double *T1_pair =
-            in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
-        const double *t1_i = T1_pair + (int64_t)i_in_p * npno;
-        const double *t1_j = T1_pair + (int64_t)j_in_p * npno;
         const double *K_p = in_.K_iajb.data + in_.K_iajb.offsets[p];
+
+        // Project T1_flat[i] from (i,i)'s PNO basis to pair p's PNO basis
+        // via S_PNO(p, (i,i)) which has shape (npno_p, npno_ii).  When
+        // S_pno_data is null and p != p_ii, fall back to the (stale)
+        // T1_in_pair view — preserves legacy behavior for tests that
+        // don't supply S_pno_cache.
+        std::vector<double> t1_i_in_p((size_t)npno, 0.0);
+        std::vector<double> t1_j_in_p((size_t)npno, 0.0);
+        if (in_.S_pno_data == nullptr || in_.S_pno_offsets == nullptr) {
+            // Legacy: read t1_i / t1_j from T1_in_pair via i_in_p / j_in_p.
+            const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
+            const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+            const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
+            int i_in_p = -1, j_in_p = -1;
+            for (int k = 0; k < nlmo; ++k) {
+                if (lmo_list[k] == i) i_in_p = k;
+                if (lmo_list[k] == j) j_in_p = k;
+            }
+            if (i_in_p < 0 || j_in_p < 0) continue;
+            const double *T1_pair = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+            for (int a = 0; a < npno; ++a) {
+                t1_i_in_p[a] = T1_pair[(int64_t)i_in_p * npno + a];
+                t1_j_in_p[a] = T1_pair[(int64_t)j_in_p * npno + a];
+            }
+        } else {
+            // S_pno-based projection (Psi4-faithful, uses NEW T1_flat).
+            if (p == p_ii) {
+                const double *T1_i_native = in_.T1_flat + in_.pno_offsets[i];
+                for (int a = 0; a < npno; ++a) t1_i_in_p[a] = T1_i_native[a];
+            } else {
+                const int64_t s_idx = (int64_t)p * N_canon + p_ii;
+                const int64_t s_off = in_.S_pno_offsets[s_idx];
+                const int64_t s_size = in_.S_pno_offsets[s_idx + 1] - s_off;
+                if (s_size == (int64_t)npno * npno_ii) {
+                    const double *S = in_.S_pno_data + s_off;
+                    const double *T1_i_native = in_.T1_flat + in_.pno_offsets[i];
+                    for (int a = 0; a < npno; ++a) {
+                        double s = 0.0;
+                        for (int b = 0; b < npno_ii; ++b) {
+                            s += S[a * npno_ii + b] * T1_i_native[b];
+                        }
+                        t1_i_in_p[a] = s;
+                    }
+                }
+            }
+            if (i == j) {
+                for (int a = 0; a < npno; ++a) t1_j_in_p[a] = t1_i_in_p[a];
+            } else if (p == p_jj) {
+                const double *T1_j_native = in_.T1_flat + in_.pno_offsets[j];
+                for (int a = 0; a < npno; ++a) t1_j_in_p[a] = T1_j_native[a];
+            } else {
+                const int64_t s_idx = (int64_t)p * N_canon + p_jj;
+                const int64_t s_off = in_.S_pno_offsets[s_idx];
+                const int64_t s_size = in_.S_pno_offsets[s_idx + 1] - s_off;
+                if (s_size == (int64_t)npno * npno_jj) {
+                    const double *S = in_.S_pno_data + s_off;
+                    const double *T1_j_native = in_.T1_flat + in_.pno_offsets[j];
+                    for (int a = 0; a < npno; ++a) {
+                        double s = 0.0;
+                        for (int b = 0; b < npno_jj; ++b) {
+                            s += S[a * npno_jj + b] * T1_j_native[b];
+                        }
+                        t1_j_in_p[a] = s;
+                    }
+                }
+            }
+        }
 
         // e_p = Σ_{a, b} K[a, b] * (2*tau[a, b] - tau[b, a])
         // with tau[a, b] = T2[a, b] + t1_i[a] * t1_j[b].
         double s = 0.0;
         for (int a = 0; a < npno; ++a) {
             for (int b = 0; b < npno; ++b) {
-                double tau_ab = T2_p[a * npno + b] + t1_i[a] * t1_j[b];
-                double tau_ba = T2_p[b * npno + a] + t1_i[b] * t1_j[a];
+                double tau_ab = T2_p[a * npno + b] + t1_i_in_p[a] * t1_j_in_p[b];
+                double tau_ba = T2_p[b * npno + a] + t1_i_in_p[b] * t1_j_in_p[a];
                 s += K_p[a * npno + b] * (2.0 * tau_ab - tau_ba);
             }
         }

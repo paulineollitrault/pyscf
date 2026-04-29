@@ -2097,6 +2097,81 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # ``_t1_cache[key][k]`` is the t1_k projection into pair key.
             _t1_cache = build_t1_cache(
                 t1_pno, _pair_index, S_pno_cache, pno_spaces)
+
+            # CCSD MONO real-data validation hook (env-gated; exits after).
+            if cycle == 0 and int(os.environ.get(
+                    'DLPNO_CCSD_MONO_TEST', '0')):
+                # Inject non-zero t1 so validators exercise t1-dependent
+                # terms (at cycle 0 t1=0 trivializes most dressing math).
+                if int(os.environ.get('DLPNO_CCSD_MONO_INJECT_T1', '1')):
+                    import numpy as _np_inj
+                    _rng_inj = _np_inj.random.default_rng(99999)
+                    for _ii in range(nocc):
+                        if _ii in t1_pno and t1_pno[_ii].size > 0:
+                            t1_pno[_ii] = _rng_inj.standard_normal(
+                                t1_pno[_ii].size) * 0.01
+                    # Rebuild t1_cache from the new t1_pno.
+                    _t1_cache = build_t1_cache(
+                        t1_pno, _pair_index, S_pno_cache, pno_spaces)
+                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+                    validate_t1_ints_real, validate_b_tilde_real,
+                    validate_update_amps_and_energy_real,
+                    validate_t1_fock_fia_bar_real, validate_t1_fock_real,
+                    validate_t1_fock_finalize_real, validate_d_tilde_ph1_real,
+                    validate_t1_residual_AC_init_real)
+                validate_t1_ints_real(
+                    _cc_ints, t1_pno, _t1_cache, pno_spaces, pair_lmo_idx,
+                    F_lmo, eps_lmo, fov_pno, nocc, keys_sorted, S_pno_cache)
+                validate_b_tilde_real(
+                    _cc_ints, t1_pno, _t1_cache, pno_spaces, pair_lmo_idx,
+                    F_lmo, eps_lmo, fov_pno, nocc, keys_sorted, S_pno_cache,
+                    t2_pno_all)
+                validate_update_amps_and_energy_real(
+                    _cc_ints, t1_pno, _t1_cache, pno_spaces, pair_lmo_idx,
+                    F_lmo, eps_lmo, fov_pno, nocc, keys_sorted, S_pno_cache,
+                    t2_pno_all, K_pno_cache=K_pno_cache)
+                validate_t1_fock_fia_bar_real(
+                    _cc_ints, t1_pno, _t1_cache, pno_spaces, pair_lmo_idx,
+                    F_lmo, eps_lmo, fov_pno, nocc, keys_sorted, S_pno_cache,
+                    t2_pno_all)
+                import numpy as _np_mono
+                _foo_zero = _np_mono.zeros((nocc, nocc), dtype=_np_mono.float64)
+                validate_t1_fock_real(
+                    _cc_ints, t1_pno, _t1_cache, pno_spaces, pair_lmo_idx,
+                    F_lmo, eps_lmo, fov_pno, nocc, keys_sorted, S_pno_cache,
+                    t2_pno_all, _foo_zero)
+                validate_t1_fock_finalize_real(
+                    _cc_ints, t1_pno, _t1_cache, pno_spaces, pair_lmo_idx,
+                    F_lmo, eps_lmo, fov_pno, nocc, keys_sorted, S_pno_cache,
+                    t2_pno_all, _foo_zero)
+                # phase_d_tilde_ph1 / phase_c_tilde_ph1 real-data validation
+                # deferred: build_D_tilde_batched / compute_C_tilde_batched
+                # return PH1 + PH2 combined; need separate PH1-only reference
+                # path (call _d_tilde_ph1_batched_cy / _c_tilde_ph1_batched_cy
+                # directly with the wrapper's internal plan).  Synthetic tests
+                # already cover PH1 math; real-data confirms only the packer
+                # for K_tilde_chem variants (covered by dump checksums above).
+                validate_t1_residual_AC_init_real(
+                    _cc_ints, t1_pno, _t1_cache, pno_spaces, pair_lmo_idx,
+                    F_lmo, eps_lmo, fov_pno, nocc, keys_sorted, S_pno_cache,
+                    t2_pno_all)
+                # c-collapse-1/2 orchestration parity test.
+                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+                    validate_run_one_cycle_real)
+                validate_run_one_cycle_real(
+                    _cc_ints, t1_pno, _t1_cache, pno_spaces, pair_lmo_idx,
+                    F_lmo, eps_lmo, fov_pno, nocc, keys_sorted, S_pno_cache,
+                    t2_pno_all)
+                # c-collapse-3 (per_kl wiring) — full R1 vs Python.
+                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+                    validate_run_one_cycle_with_per_kl)
+                validate_run_one_cycle_with_per_kl(
+                    _cc_ints, t1_pno, _t1_cache, pno_spaces, pair_lmo_idx,
+                    F_lmo, eps_lmo, fov_pno, nocc, keys_sorted, S_pno_cache,
+                    t2_pno_all, _cc_ints_flat, _pair_index, ovL_pno_cache)
+                import sys as _sys
+                _sys.exit(0)
+
             _t_cycle_start = _time.perf_counter()
             t2_new = {}
             t1_pno_old = {i: t1_pno[i].copy() for i in range(nocc)}
@@ -2284,11 +2359,21 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 compute_ladder as _cL_fn,
             )
             _bt_pool = _fine_pool or _pool
-            _t1_dressed_all = _t1_ints_all(
-                _cc_ints, t1_pno, pno_spaces, S_pno_cache,
-                keys_sorted, nocc,
-                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
-                _pool=_bt_pool)
+            if int(os.environ.get('DLPNO_CCSD_MONO_DROPIN_T1_INTS', '0')):
+                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+                    t1_ints_via_class)
+                _t1_dressed_all = t1_ints_via_class(
+                    _cc_ints, t1_pno, pno_spaces, S_pno_cache,
+                    keys_sorted, nocc,
+                    pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
+                    fov_pno=fov_pno, F_lmo=F_lmo, eps_lmo=eps_lmo,
+                    t2_pno_all=t2_pno_all)
+            else:
+                _t1_dressed_all = _t1_ints_all(
+                    _cc_ints, t1_pno, pno_spaces, S_pno_cache,
+                    keys_sorted, nocc,
+                    pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
+                    _pool=_bt_pool)
 
             # B_tilde uses the shared dressed dict (no recomputation).
             def _bt_one(_key):
@@ -2298,14 +2383,23 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                     pair_lmo_idx=pair_lmo_idx,
                                     t1_cache=_t1_cache)
             _t_bt0 = _time.perf_counter()
-            _B_tilde_per_ij = {}
-            if _bt_pool is not None:
-                for _k, _bt in _bt_pool.map(_bt_one, keys_sorted):
-                    _B_tilde_per_ij[_k] = _bt
+            if int(os.environ.get('DLPNO_CCSD_MONO_DROPIN_B_TILDE', '0')):
+                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+                    b_tilde_via_class)
+                _B_tilde_per_ij = b_tilde_via_class(
+                    _cc_ints, _t1_dressed_all, t2_pno_all, t1_pno,
+                    pno_spaces, S_pno_cache, keys_sorted, nocc,
+                    pair_lmo_idx, _t1_cache,
+                    F_lmo=F_lmo, eps_lmo=eps_lmo, fov_pno=fov_pno)
             else:
-                for _k in keys_sorted:
-                    _, _bt = _bt_one(_k)
-                    _B_tilde_per_ij[_k] = _bt
+                _B_tilde_per_ij = {}
+                if _bt_pool is not None:
+                    for _k, _bt in _bt_pool.map(_bt_one, keys_sorted):
+                        _B_tilde_per_ij[_k] = _bt
+                else:
+                    for _k in keys_sorted:
+                        _, _bt = _bt_one(_k)
+                        _B_tilde_per_ij[_k] = _bt
             _t_bt = _time.perf_counter() - _t_bt0
 
             # Hoist compute_ladder similarly: per-pair calls run via the
@@ -2606,6 +2700,24 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 t1_norm = np.sqrt(sum(np.dot(t1_pno[ii], t1_pno[ii])
                                       for ii in range(nocc) if t1_pno[ii].size > 0))
                 print(f'    [T1] |t1| = {t1_norm:.6f}', flush=True)
+
+            # CCSD MONO full-cycle validation hook (env-gated; exits after).
+            # Hook runs AFTER cycle 0's T1+T2 update but BEFORE DIIS.  At
+            # this point: r1_pno, r2_all, t1_pno (=t1_pno_new), t2_new,
+            # t1_pno_old all in scope.  t2_pno_all is still OLD (DIIS at
+            # line ~2750 hasn't run).
+            if cycle == 0 and int(os.environ.get(
+                    'DLPNO_CCSD_MONO_TEST_FULL', '0')):
+                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+                    validate_run_one_cycle_full_with_external_R2)
+                validate_run_one_cycle_full_with_external_R2(
+                    _cc_ints, t1_pno_old, t1_pno, t2_pno_all, t2_new,
+                    r1_pno, r2_all,
+                    pno_spaces, pair_lmo_idx, F_lmo, eps_lmo, fov_pno,
+                    nocc, keys_sorted, S_pno_cache, _cc_ints_flat,
+                    _pair_index, ovL_pno_cache, K_pno_cache)
+                import sys as _sys
+                _sys.exit(0)
 
             # ---- DIIS on external amplitudes only (Psi4-style R-based) ----
             def _mask_cas(t2_dict):

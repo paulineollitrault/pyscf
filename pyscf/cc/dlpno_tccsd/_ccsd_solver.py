@@ -122,6 +122,14 @@ class PySolverInputs(ctypes.Structure):
         # Set to NULL to disable (legacy strong-only paths apply).
         ('Fij_bar_full',           ctypes.c_void_p),
         ('Fkc_per_ordered',        PyFlatPairStore),
+        # External R2 (precomputed by PySCF's full residual machinery,
+        # used to validate orchestration + update_amps + energy formula
+        # while R2 plan extraction is incremental).  NULL = use K+A.
+        ('R2_external',            ctypes.c_void_p),
+        # is_strong_pair byte flag per canonical pair.  1 = strong (in
+        # correlation energy), 0 = weak (skip in energy formula).  NULL
+        # = all pairs counted.
+        ('is_strong_pair',         ctypes.c_void_p),
     ]
 
 
@@ -3250,23 +3258,48 @@ def _python_reference_update_amps_and_energy(aux, R1_flat, R2_flat,
         fov_i = fov_flat[t1_off:t1_off + npno_ii]
         e_T1 += float(np.dot(fov_i, T1_i))
 
+    # T2 contribution.  Mirrors the class: use NEW T1 (in pair-(i,i)'s
+    # PNO basis) projected to pair p's basis via S_PNO(p, (i,i)).
     e_T2 = 0.0
+    S_pno_data = aux.get('S_pno_data')
+    S_pno_offsets = aux.get('S_pno_offsets')
+    is_strong = aux.get('is_strong_pair')  # may be None
     for p in range(n_pairs):
+        if is_strong is not None and is_strong[p] == 0:
+            continue
         npno_p = int(npno[p])
         if npno_p == 0:
             continue
         i, j = aux['ij_pairs'][p]
-        lmo_list = np.asarray(pair_lmo_idx_list[p])
-        i_in_p_arr = np.where(lmo_list == i)[0]
-        j_in_p_arr = np.where(lmo_list == j)[0]
-        if i_in_p_arr.size == 0 or j_in_p_arr.size == 0:
+        p_ii = int(i_j_to_ij[i, i])
+        p_jj = int(i_j_to_ij[j, j])
+        if p_ii < 0 or p_jj < 0:
             continue
-        i_in_p = int(i_in_p_arr[0])
-        j_in_p = int(j_in_p_arr[0])
+        npno_ii = int(npno[p_ii])
+        npno_jj = int(npno[p_jj])
+
         T2_p = T2_out[t2_offsets[p]:t2_offsets[p+1]].reshape(npno_p, npno_p)
-        T1_pair = fps['T1_in_pair'][p]
-        t1_i = T1_pair[i_in_p]
-        t1_j = T1_pair[j_in_p]
+
+        def _project(p_target, p_native, n_target, n_native, occ_idx):
+            T1_native = T1_out[pno_offsets[occ_idx]
+                                :pno_offsets[occ_idx] + n_native]
+            if p_target == p_native:
+                return T1_native.copy()
+            if S_pno_data is None or S_pno_offsets is None:
+                return None
+            s_idx = p_target * n_pairs + p_native
+            s_off = int(S_pno_offsets[s_idx])
+            s_size = int(S_pno_offsets[s_idx + 1] - s_off)
+            if s_size != n_target * n_native:
+                return None
+            S = S_pno_data[s_off:s_off + s_size].reshape(n_target, n_native)
+            return S @ T1_native
+
+        t1_i = _project(p, p_ii, npno_p, npno_ii, i)
+        t1_j = (t1_i if i == j
+                else _project(p, p_jj, npno_p, npno_jj, j))
+        if t1_i is None or t1_j is None:
+            continue
         tau = T2_p + np.outer(t1_i, t1_j)
         Tt = 2.0 * tau - tau.T
         K_p = np.ascontiguousarray(fps['K_iajb'][p])
@@ -3315,15 +3348,21 @@ def parity_test_phase_update_amps_and_energy(verbose=True):
     d_T1 = float(np.max(np.abs(T1_class - T1_ref)))
     d_T2 = float(np.max(np.abs(T2_class - T2_ref)))
     d_E  = float(abs(e_class - e_ref))
-    max_abs = max(d_T1, d_T2, d_E)
+    # Energy is a sum over ~10 pairs × O(npno²) terms with random
+    # magnitudes ~10², so absolute energy is ~10⁴.  At this scale, FP
+    # noise floor is ~1e-11.  Use relative tolerance against |e_class|.
+    rel_E = d_E / max(abs(e_class), 1.0)
+    max_abs_amp = max(d_T1, d_T2)
 
     if verbose:
         print(f'[CCSD MONO] phase_update_amps_and_energy parity: '
               f'|dT1|={d_T1:.3e}  |dT2|={d_T2:.3e}  |dE|={d_E:.3e}  '
               f'(E_class={e_class:.6f})', flush=True)
-    if max_abs > 1e-12:
+    if max_abs_amp > 1e-12 or rel_E > 1e-12:
         raise AssertionError(
-            f'phase_update_amps_and_energy parity FAILED — {max_abs:.3e}')
+            f'phase_update_amps_and_energy parity FAILED — '
+            f'|dT1|={d_T1:.3e} |dT2|={d_T2:.3e} |dE|={d_E:.3e} rel_E={rel_E:.3e}')
+    max_abs = max(d_T1, d_T2, d_E)
     del ownership
     return max_abs
 
@@ -5001,6 +5040,196 @@ def validate_run_one_cycle_with_per_kl(
 
     del plan_own, ownership
     return d_R1
+
+
+def validate_run_one_cycle_full_with_external_R2(
+        cc_ints, t1_pno_old, t1_pno_new, t2_pno_all_old, t2_new_dict,
+        r1_pno, r2_all,
+        pno_spaces, pair_lmo_idx, F_lmo, eps_lmo, fov_pno, nocc,
+        keys_sorted, S_pno_cache, cc_ints_flat, pair_index, ovL_pno_cache,
+        K_pno_cache, verbose=True):
+    """End-to-end validator: compares class's run_one_cycle output to
+    PySCF's BEFORE-DIIS state.  Uses PySCF's r2_all as ``R2_external``
+    while the native plan extraction (BE/CD/G_term/t3/t4) is incremental.
+
+    Inputs (captured by the lccsd.py hook AFTER R1+T1 update +
+    R2+T2_new computation but BEFORE DIIS):
+      t1_pno_old: snapshot of t1_pno BEFORE this cycle's T1 update
+      t1_pno_new: t1_pno AFTER Psi4 increment (== t1_pno at hook point)
+      t2_pno_all_old: snapshot of t2_pno_all BEFORE this cycle's T2 update
+                     (still the input t2 since DIIS hasn't run yet)
+      t2_new_dict: dict of T2_new per pair (Psi4 increment applied)
+      r1_pno: dict of full R1 per occupied i
+      r2_all: dict of full R2 per pair (from compute_residual_v2)
+
+    Compares T1_new, T2_new, and energy against PySCF's reference.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+    from pyscf.cc.dlpno_tccsd.lccsd import _compute_t1_residual_psi4
+
+    # ---- Pre-flight: populate per_kl plan cache by calling PySCF R1. ----
+    if hasattr(_compute_t1_residual_psi4, '_per_kl_plan_cache'):
+        _compute_t1_residual_psi4._per_kl_plan_cache.clear()
+    _compute_t1_residual_psi4(
+        t1_pno_old, t2_pno_all_old, pno_spaces, fov_pno,
+        F_lmo, eps_lmo, nocc, S_pno_cache, cc_ints,
+        ovL_pno_cache=ovL_pno_cache,
+        pair_lmo_idx=pair_lmo_idx, t1_cache=None, _pool=None,
+        cc_ints_flat=cc_ints_flat, pair_index=pair_index)
+    plan_struct, plan_own = _extract_per_kl_plan(_compute_t1_residual_psi4)
+    if plan_struct is None:
+        print('[CCSD MONO] no per_kl plan; skipping full-cycle validation',
+              flush=True)
+        return None
+    plan_struct.t2_buffer       = t2_pno_all_old._buffer.ctypes.data
+    plan_struct.t1_cache_buffer = None  # populated below
+
+    # ---- Pack inputs (210 pairs) using OLD T1/T2 state. ----
+    from pyscf.cc.dlpno_tccsd.pair_index import build_t1_cache, PairIndex
+    _pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+    t1_cache = build_t1_cache(t1_pno_old, _pi, S_pno_cache, pno_spaces)
+    plan_struct.t1_cache_buffer = t1_cache._buffer.ctypes.data
+
+    _all_keys = sorted(t2_pno_all_old.keys())
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno_old, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, _all_keys,
+        t2_pno_all=t2_pno_all_old, S_pno_cache=S_pno_cache)
+
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    npno = aux['n_pno_per_pair']
+    pno_offsets = aux['pno_offsets']
+    t2_offsets = aux['t2_offsets']
+
+    # ---- Build R2_external from PySCF's r2_all (in our packed order). ----
+    R2_total = int(t2_offsets[n_pairs])
+    R2_external = np.zeros(R2_total, dtype=np.float64)
+    for p, key in enumerate(keys_reorder):
+        if key not in r2_all:
+            continue
+        npno_p = int(npno[p])
+        if npno_p == 0:
+            continue
+        R2_external[t2_offsets[p]:t2_offsets[p + 1]] = (
+            r2_all[key].ravel())
+    ownership.append(R2_external)
+    inputs.R2_external = R2_external.ctypes.data
+
+    # is_strong_pair: 1 if pair was in PySCF's r2_all (i.e. iterated as
+    # a strong pair), 0 otherwise.  Used to scope the energy formula.
+    is_strong_arr = np.zeros(n_pairs, dtype=np.uint8)
+    for p, key in enumerate(keys_reorder):
+        if key in r2_all:
+            is_strong_arr[p] = 1
+    ownership.append(is_strong_arr)
+    inputs.is_strong_pair = is_strong_arr.ctypes.data
+
+    # ---- Invoke run_one_cycle. ----
+    R1_size = sum(int(npno[i]) for i in range(nocc))
+    R1_class = np.zeros(R1_size, dtype=np.float64)
+    R2_class = np.zeros(R2_total, dtype=np.float64)
+    plans = PyRunCycleInputs()
+    for fname in ('g_tilde_plan', 'be_plan', 'c_term_plan',
+                  'd_term_plan', 'g_term_plan', 't3_plan', 't4_plan'):
+        setattr(plans, fname, None)
+    plans.per_kl_plan = ctypes.pointer(plan_struct)
+
+    out = PyRunCycleOutputs()
+    out.R1_flat = R1_class.ctypes.data
+    out.R2_flat = R2_class.ctypes.data
+    out.energy = 0.0
+    rc = _libcc.DLPNOcompute_lccsd_run_one_cycle(
+        ctypes.byref(inputs), ctypes.byref(plans), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'run_one_cycle rc={rc}')
+
+    # After run_one_cycle, T1/T2 in inputs (pointing at aux['T1_flat'] /
+    # aux['T2_flat']) have been updated in place.  T1_flat is sized for
+    # per-canonical-pair pno_offsets; the first sum_i(npno_ii) entries
+    # are the per-occupied t1 slab (diag-first invariant).
+    T1_class = aux['T1_flat'][:int(pno_offsets[nocc])].copy()
+    T2_class = aux['T2_flat'].copy()
+    energy_class = float(out.energy)
+
+    # ---- Compare R1. ----
+    R1_ref = np.zeros(R1_size, dtype=np.float64)
+    for i in range(nocc):
+        if i not in r1_pno:
+            continue
+        npno_ii = int(npno[i])
+        if npno_ii == 0:
+            continue
+        R1_ref[pno_offsets[i]:pno_offsets[i] + npno_ii] = r1_pno[i]
+    d_R1 = float(np.max(np.abs(R1_class - R1_ref)))
+
+    # ---- Compare T1_new. ----
+    T1_ref = np.zeros(R1_size, dtype=np.float64)
+    for i in range(nocc):
+        if i not in t1_pno_new:
+            continue
+        npno_ii = int(npno[i])
+        if npno_ii == 0:
+            continue
+        T1_ref[pno_offsets[i]:pno_offsets[i] + npno_ii] = t1_pno_new[i]
+    d_T1 = float(np.max(np.abs(T1_class - T1_ref)))
+
+    # ---- Compare T2_new. ----
+    # Strong pairs: from t2_new_dict (Psi4 increment applied).  Weak
+    # pairs: from t2_pno_all_old (unchanged — PySCF doesn't iterate
+    # weak; class also leaves them since R[weak] = 0).
+    T2_ref = np.zeros(R2_total, dtype=np.float64)
+    for p, key in enumerate(keys_reorder):
+        npno_p = int(npno[p])
+        if npno_p == 0:
+            continue
+        if key in t2_new_dict:
+            T2_ref[t2_offsets[p]:t2_offsets[p + 1]] = (
+                t2_new_dict[key].ravel())
+        elif key in t2_pno_all_old:
+            T2_ref[t2_offsets[p]:t2_offsets[p + 1]] = (
+                t2_pno_all_old[key].ravel())
+    d_T2 = float(np.max(np.abs(T2_class - T2_ref)))
+
+    # ---- Compare energy.  Rebuild t1_cache from t1_pno_new so the
+    # tau term uses the freshly-updated T1.  Energy formula matches
+    # the class's update_amps_and_energy phase line-by-line.
+    # Use cc_ints['K_iajb'] (same K as class consumes via in_.K_iajb)
+    # rather than K_pno_cache (which can differ slightly when built
+    # from different DF paths — global vs local DF).
+    t1_cache_new = build_t1_cache(t1_pno_new, _pi, S_pno_cache, pno_spaces)
+    e_ref = 0.0
+    for ii in range(nocc):
+        if t1_pno_new[ii].size > 0:
+            e_ref += float(np.dot(fov_pno[ii], t1_pno_new[ii]))
+    for key, T2_p in t2_new_dict.items():
+        if T2_p.size == 0:
+            continue
+        ci = cc_ints.get(key)
+        if ci is None or 'K_iajb' not in ci:
+            continue
+        K_p = ci['K_iajb']
+        i, j = key
+        t1_i_in_p = t1_cache_new[key][i]
+        t1_j_in_p = t1_cache_new[key][j]
+        tau_p = T2_p + np.outer(t1_i_in_p, t1_j_in_p)
+        contrib = float(np.sum(K_p * (2.0 * tau_p - tau_p.T)))
+        e_ref += (1.0 if i == j else 2.0) * contrib
+
+    d_E = float(abs(energy_class - e_ref))
+
+    if verbose:
+        print(f'[CCSD MONO] run_one_cycle FULL with R2_external '
+              f'(packed n_canon_pairs={n_pairs}):',
+              flush=True)
+        print(f'    |dR1| = {d_R1:.3e}', flush=True)
+        print(f'    |dT1| = {d_T1:.3e}', flush=True)
+        print(f'    |dT2| = {d_T2:.3e}', flush=True)
+        print(f'    |dE|  = {d_E:.3e}  (E_class={energy_class:.10f}  E_ref={e_ref:.10f})',
+              flush=True)
+
+    del plan_own, ownership
+    return d_R1, d_T1, d_T2, d_E
 
 
 def _extract_g_tilde_plan(key_to_p):

@@ -421,6 +421,8 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
     fkc_fps.data = None
     fkc_fps.offsets = None
     inputs.Fkc_per_ordered = fkc_fps
+    inputs.R2_external = None
+    inputs.is_strong_pair = None
 
     aux = {
         'keys_sorted': list(keys_sorted),
