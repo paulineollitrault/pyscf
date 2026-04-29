@@ -5281,8 +5281,229 @@ def validate_run_one_cycle_full_with_external_R2(
         print(f'    |dBE_B|    = {d_be_B:.3e}  |dBE_E| = {d_be_E:.3e}  '
               f'(per-pair BE build)', flush=True)
 
+    # ---- CD per-pair cross-check (if PySCF reference provided). ----
+    if (c_term_pyscf is not None and d_term_pyscf is not None
+            and jiang_C_pyscf is not None and jiang_D_pyscf is not None):
+        d_c_term, d_d_term = _validate_cd_native(
+            t2_pno_all_old, jiang_C_pyscf, jiang_D_pyscf,
+            pno_spaces, c_term_pyscf, d_term_pyscf)
+        print(f'    |dC_term|  = {d_c_term:.3e}  |dD_term| = {d_d_term:.3e}  '
+              f'(per-pair CD build)', flush=True)
+
     del plan_own, ownership
     return d_R1, d_T1, d_T2, d_E
+
+
+def _validate_cd_native(t2_pno_all, C_tilde_cache, D_tilde_cache,
+                          pno_spaces, C_term_ref, D_term_ref):
+    """Run C_term and D_term batched kernels via the class with
+    extracted plan + per-iter gathers; assemble per-pair C_term / D_term
+    and compare to PySCF references."""
+    from pyscf.cc.dlpno_tccsd.residual import (
+        compute_CD_terms_batched, _get_or_build_cd_batched_view)
+    from pyscf.cc.dlpno_tccsd._cd_gather_cy import (
+        gather_t2_with_transpose, gather_u_from_t2)
+    cache = getattr(compute_CD_terms_batched, '_plan_cache', None)
+    if not cache:
+        return float('nan'), float('nan')
+    plan = next(iter(cache.values()))
+    bv = _get_or_build_cd_batched_view(plan, pno_spaces, t2_pno_all)
+
+    pairs_by_n_pno = plan['pairs_by_n_pno']
+    n_pno_offsets = bv['n_pno_offsets']
+
+    # Allocate flat output buffers for C/D, ij/ji.
+    flat_C_ij = {n_pno: np.zeros((len(pairs), n_pno, n_pno))
+                 for n_pno, pairs in pairs_by_n_pno.items()}
+    flat_C_ji = {n_pno: np.zeros((len(pairs), n_pno, n_pno))
+                 for n_pno, pairs in pairs_by_n_pno.items()}
+    flat_D_ij = {n_pno: np.zeros((len(pairs), n_pno, n_pno))
+                 for n_pno, pairs in pairs_by_n_pno.items()}
+    flat_D_ji = {n_pno: np.zeros((len(pairs), n_pno, n_pno))
+                 for n_pno, pairs in pairs_by_n_pno.items()}
+
+    own_keep = []
+
+    # ---- C side. ----
+    c_N = bv['c_N']
+    if c_N > 0:
+        # Gather ct_flat from C_tilde_cache.
+        ct_flat = np.zeros(int(bv['c_ct_off'][-1]))
+        c_n_ct = bv['c_n_ct']
+        c_ct_keys = bv['c_ct_keys']
+        c_ct_off = bv['c_ct_off']
+        for n in range(c_N):
+            ct_val = (C_tilde_cache.get(c_ct_keys[n])
+                      if C_tilde_cache is not None else None)
+            if ct_val is not None and ct_val.shape[0] == int(c_n_ct[n]):
+                ct_flat[c_ct_off[n]:c_ct_off[n + 1]] = ct_val.ravel()
+
+        # Gather t2_flat.
+        t2_flat = np.empty(int(bv['c_t2_off'][-1]))
+        gather_t2_with_transpose(
+            c_N, bv['c_n_other'],
+            bv['c_t2_canon_off'], bv['c_t2_trans_arr'],
+            bv['c_t2_off'], t2_pno_all._buffer, t2_flat,
+            min(64, c_N),
+        )
+
+        max_n_pno = int(bv['c_n_pno'].max(initial=1))
+        max_n_ct = int(bv['c_n_ct'].max(initial=1))
+        max_n_other = int(bv['c_n_other'].max(initial=1))
+
+        plan_c = PyCTermInputs()
+        plan_c.N = int(c_N)
+        plan_c.n_pno_arr   = bv['c_n_pno'].ctypes.data
+        plan_c.n_ct_arr    = bv['c_n_ct'].ctypes.data
+        plan_c.n_other_arr = bv['c_n_other'].ctypes.data
+        plan_c.S_big_off   = bv['c_S_big_off'].ctypes.data
+        plan_c.ct_off      = bv['c_ct_off'].ctypes.data
+        plan_c.S_mid_off   = bv['c_S_mid_off'].ctypes.data
+        plan_c.J_bold_off  = bv['c_J_bold_off'].ctypes.data
+        plan_c.t2_off      = bv['c_t2_off'].ctypes.data
+        plan_c.S_outer_off = bv['c_S_outer_off'].ctypes.data
+        plan_c.tile_off    = bv['c_tile_off'].ctypes.data
+        plan_c.S_big_flat  = bv['c_S_big_flat'].ctypes.data
+        plan_c.S_mid_flat  = bv['c_S_mid_flat'].ctypes.data
+        plan_c.J_bold_flat = bv['c_J_bold_flat'].ctypes.data
+        plan_c.S_outer_flat= bv['c_S_outer_flat'].ctypes.data
+        plan_c.ct_flat     = ct_flat.ctypes.data
+        plan_c.t2_flat     = t2_flat.ctypes.data
+        plan_c.max_n_pno   = max_n_pno
+        plan_c.max_n_ct    = max_n_ct
+        plan_c.max_n_other = max_n_other
+
+        c_tiles = np.zeros(int(bv['c_tile_off'][-1]))
+        out_c = PyCTermOutputs()
+        out_c.tiles_flat = c_tiles.ctypes.data
+        rc = _libcc.DLPNOcompute_lccsd_phase_c_term(
+            ctypes.byref(PySolverInputs()),
+            ctypes.byref(plan_c), ctypes.byref(out_c))
+        if rc != 0:
+            raise RuntimeError(f'phase_c_term rc={rc}')
+        own_keep.extend([ct_flat, t2_flat, c_tiles])
+
+        # Scatter c_tiles -> flat_C_ij / flat_C_ji.  PySCF SUBTRACTS.
+        c_target_ij = bv['c_target_off_ij']
+        c_target_ji = bv['c_target_off_ji']
+        c_n_pno = bv['c_n_pno']
+        c_tile_off = bv['c_tile_off']
+        flat_C_ij_views = {n_pno: flat_C_ij[n_pno].ravel()
+                            for n_pno in pairs_by_n_pno}
+        flat_C_ji_views = {n_pno: flat_C_ji[n_pno].ravel()
+                            for n_pno in pairs_by_n_pno}
+        for n in range(c_N):
+            n_pno = int(c_n_pno[n])
+            tile_size = n_pno * n_pno
+            tile = c_tiles[c_tile_off[n]:c_tile_off[n + 1]]
+            if c_target_ij[n] >= 0:
+                base = c_target_ij[n] - n_pno_offsets[n_pno]
+                flat_C_ij_views[n_pno][base:base + tile_size] -= tile
+            else:
+                base = c_target_ji[n] - n_pno_offsets[n_pno]
+                flat_C_ji_views[n_pno][base:base + tile_size] -= tile
+
+    # ---- D side. ----
+    d_N = bv['d_N']
+    if d_N > 0:
+        # u = 2*t2 - t2.T (anti-sym).
+        u_flat = np.empty(int(bv['d_u_off'][-1]))
+        gather_u_from_t2(
+            d_N, bv['d_n_A'],
+            bv['d_t2_canon_off'], bv['d_t2_trans_arr'],
+            bv['d_u_off'], t2_pno_all._buffer, u_flat,
+            min(64, d_N),
+        )
+
+        # dt_flat from D_tilde_cache (per-item Python lookup).
+        dt_flat = np.zeros(int(bv['d_dt_off'][-1]))
+        d_dt_keys = bv['d_dt_keys']
+        d_dt_off = bv['d_dt_off']
+        for n in range(d_N):
+            dk = d_dt_keys[n]
+            dt_val = (D_tilde_cache.get(dk)
+                      if D_tilde_cache is not None else None)
+            if dt_val is not None:
+                dt_flat[d_dt_off[n]:d_dt_off[n + 1]] = dt_val.ravel()
+
+        max_n_pno = int(bv['d_n_pno'].max(initial=1))
+        max_n_A = int(bv['d_n_A'].max(initial=1))
+        max_n_B = int(bv['d_n_B'].max(initial=1))
+
+        plan_d = PyDTermInputs()
+        plan_d.N = int(d_N)
+        plan_d.n_pno_arr = bv['d_n_pno'].ctypes.data
+        plan_d.n_A_arr   = bv['d_n_A'].ctypes.data
+        plan_d.n_B_arr   = bv['d_n_B'].ctypes.data
+        plan_d.S_a_off   = bv['d_S_a_off'].ctypes.data
+        plan_d.u_off     = bv['d_u_off'].ctypes.data
+        plan_d.S_b_off   = bv['d_S_b_off'].ctypes.data
+        plan_d.S_c_off   = bv['d_S_c_off'].ctypes.data
+        plan_d.dt_off    = bv['d_dt_off'].ctypes.data
+        plan_d.KJ_off    = bv['d_KJ_off'].ctypes.data
+        plan_d.tile_off  = bv['d_tile_off'].ctypes.data
+        plan_d.S_a_flat  = bv['d_S_a_flat'].ctypes.data
+        plan_d.S_b_flat  = bv['d_S_b_flat'].ctypes.data
+        plan_d.S_c_flat  = bv['d_S_c_flat'].ctypes.data
+        plan_d.KJ_flat   = bv['d_KJ_flat'].ctypes.data
+        plan_d.u_flat    = u_flat.ctypes.data
+        plan_d.dt_flat   = dt_flat.ctypes.data
+        plan_d.max_n_pno = max_n_pno
+        plan_d.max_n_A   = max_n_A
+        plan_d.max_n_B   = max_n_B
+
+        d_tiles = np.zeros(int(bv['d_tile_off'][-1]))
+        out_d = PyDTermOutputs()
+        out_d.tiles_flat = d_tiles.ctypes.data
+        rc = _libcc.DLPNOcompute_lccsd_phase_d_term(
+            ctypes.byref(PySolverInputs()),
+            ctypes.byref(plan_d), ctypes.byref(out_d))
+        if rc != 0:
+            raise RuntimeError(f'phase_d_term rc={rc}')
+        own_keep.extend([u_flat, dt_flat, d_tiles])
+
+        # Scatter d_tiles -> flat_D_ij / flat_D_ji.  PySCF ADDS 0.5*tile
+        # (residual.py:4874 — different convention from C side).
+        d_target_ij = bv['d_target_off_ij']
+        d_target_ji = bv['d_target_off_ji']
+        d_n_pno = bv['d_n_pno']
+        d_tile_off = bv['d_tile_off']
+        flat_D_ij_views = {n_pno: flat_D_ij[n_pno].ravel()
+                            for n_pno in pairs_by_n_pno}
+        flat_D_ji_views = {n_pno: flat_D_ji[n_pno].ravel()
+                            for n_pno in pairs_by_n_pno}
+        for n in range(d_N):
+            n_pno = int(d_n_pno[n])
+            tile_size = n_pno * n_pno
+            tile = d_tiles[d_tile_off[n]:d_tile_off[n + 1]]
+            if d_target_ij[n] >= 0:
+                base = d_target_ij[n] - n_pno_offsets[n_pno]
+                flat_D_ij_views[n_pno][base:base + tile_size] += 0.5 * tile
+            else:
+                base = d_target_ji[n] - n_pno_offsets[n_pno]
+                flat_D_ji_views[n_pno][base:base + tile_size] += 0.5 * tile
+
+    # Assemble per-pair C_term, D_term and compare.
+    pair_to_slot = plan['pair_to_slot']
+    max_dC = 0.0
+    max_dD = 0.0
+    for key, slot in pair_to_slot.items():
+        n_pno = pno_spaces[key]['C_pno'].shape[1]
+        if n_pno == 0:
+            continue
+        Cij = flat_C_ij[n_pno][slot]
+        Cji = flat_C_ji[n_pno][slot]
+        Dij = flat_D_ij[n_pno][slot]
+        Dji = flat_D_ji[n_pno][slot]
+        C_class = 0.5 * Cij + Cij.T + 0.5 * Cji.T + Cji
+        D_class = Dij + Dji.T
+        if key in C_term_ref:
+            d = float(np.max(np.abs(C_class - C_term_ref[key])))
+            max_dC = max(max_dC, d)
+        if key in D_term_ref:
+            d = float(np.max(np.abs(D_class - D_term_ref[key])))
+            max_dD = max(max_dD, d)
+    return max_dC, max_dD
 
 
 def _validate_be_native(t2_pno_all, b_tilde_per_ij, pno_spaces,
