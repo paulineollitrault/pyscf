@@ -5048,7 +5048,10 @@ def validate_run_one_cycle_full_with_external_R2(
         r1_pno, r2_all,
         pno_spaces, pair_lmo_idx, F_lmo, eps_lmo, fov_pno, nocc,
         keys_sorted, S_pno_cache, cc_ints_flat, pair_index, ovL_pno_cache,
-        K_pno_cache, g_tilde_pyscf=None, verbose=True):
+        K_pno_cache, g_tilde_pyscf=None, g_term_pyscf=None,
+        be_pyscf=None, b_tilde_per_ij_pyscf=None,
+        c_term_pyscf=None, d_term_pyscf=None,
+        jiang_C_pyscf=None, jiang_D_pyscf=None, verbose=True):
     """End-to-end validator: compares class's run_one_cycle output to
     PySCF's BEFORE-DIIS state.  Uses PySCF's r2_all as ``R2_external``
     while the native plan extraction (BE/CD/G_term/t3/t4) is incremental.
@@ -5259,8 +5262,273 @@ def validate_run_one_cycle_full_with_external_R2(
               f'(class plan extracted from build_G_tilde._batched_plan)',
               flush=True)
 
+    # ---- G_term per-pair cross-check (if PySCF reference provided). ----
+    # Run the G_term batched kernel via the class with extracted plan,
+    # scatter tiles into flat_G_ij/flat_G_ji, build per-pair G_term,
+    # compare to PySCF's _G_term_all dict.
+    if g_term_pyscf is not None:
+        d_g_term = _validate_g_term_native(
+            t2_pno_all_old, key_to_p, keys_reorder, pno_spaces,
+            G_tilde_class, g_term_pyscf)
+        print(f'    |dG_term|  = {d_g_term:.3e}  (per-pair G_term build)',
+              flush=True)
+
+    # ---- BE per-pair cross-check (if PySCF reference provided). ----
+    if be_pyscf is not None and b_tilde_per_ij_pyscf is not None:
+        d_be_B, d_be_E = _validate_be_native(
+            t2_pno_all_old, b_tilde_per_ij_pyscf, pno_spaces,
+            be_pyscf['B'], be_pyscf['E'])
+        print(f'    |dBE_B|    = {d_be_B:.3e}  |dBE_E| = {d_be_E:.3e}  '
+              f'(per-pair BE build)', flush=True)
+
     del plan_own, ownership
     return d_R1, d_T1, d_T2, d_E
+
+
+def _validate_be_native(t2_pno_all, b_tilde_per_ij, pno_spaces,
+                          B_ref_dict, E_ref_dict):
+    """Run BE kernel via class per bucket; compare to PySCF's B/E dicts."""
+    from pyscf.cc.dlpno_tccsd.residual import compute_B_E_batched_v2
+    cache = getattr(compute_B_E_batched_v2, '_plan_cache', None)
+    if not cache:
+        return float('nan'), float('nan')
+    plan = next(iter(cache.values()))
+
+    pairs_by_n_ij = plan['pairs_by_n_ij']
+    pair_to_slot = plan['pair_to_slot']
+    flat_B = {n_ij: np.zeros((len(pairs), n_ij, n_ij))
+              for n_ij, pairs in pairs_by_n_ij.items()}
+    flat_E = {n_ij: np.zeros((len(pairs), n_ij, n_ij))
+              for n_ij, pairs in pairs_by_n_ij.items()}
+
+    ownership = []
+    for bucket in plan['buckets']:
+        n_ij = bucket['n_ij']
+        n_kl = bucket['n_kl']
+        N = len(bucket['kl_keys'])
+
+        # Per-iter T_arr build (mirror PySCF non-v2 path).
+        T_arr = np.empty((N, n_kl, n_kl))
+        beta_kl_arr = np.empty(N)
+        beta_lk_arr = np.empty(N)
+        for n in range(N):
+            T_arr[n] = t2_pno_all[bucket['kl_keys'][n]]
+            key_ij, k, l = bucket['beta_coords'][n]
+            B_tilde = b_tilde_per_ij[key_ij]
+            if isinstance(B_tilde, tuple):
+                B_local, p_dense = B_tilde
+                beta_kl_arr[n] = B_local[p_dense[k], p_dense[l]]
+                beta_lk_arr[n] = (
+                    0.0 if k == l
+                    else B_local[p_dense[l], p_dense[k]])
+            else:
+                beta_kl_arr[n] = B_tilde[k, l]
+                beta_lk_arr[n] = 0.0 if k == l else B_tilde[l, k]
+
+        plan_struct = PyBEInputs()
+        plan_struct.N = int(N)
+        plan_struct.n_ij = int(n_ij)
+        plan_struct.n_kl = int(n_kl)
+        plan_struct.n_slots = int(flat_B[n_ij].shape[0])
+        S_c = np.ascontiguousarray(bucket['S'])
+        T_c = np.ascontiguousarray(T_arr)
+        K_c = np.ascontiguousarray(bucket['K'])
+        same_c = np.ascontiguousarray(bucket['same']).astype(np.uint8, copy=False)
+        idx_c = np.ascontiguousarray(bucket['item_idx']).astype(np.int64, copy=False)
+        plan_struct.S       = S_c.ctypes.data
+        plan_struct.T       = T_c.ctypes.data
+        plan_struct.K       = K_c.ctypes.data
+        plan_struct.beta_kl = beta_kl_arr.ctypes.data
+        plan_struct.beta_lk = beta_lk_arr.ctypes.data
+        plan_struct.same    = same_c.ctypes.data
+        plan_struct.idx     = idx_c.ctypes.data
+
+        out = PyBEOutputs()
+        out.out_B = flat_B[n_ij].ctypes.data
+        out.out_E = flat_E[n_ij].ctypes.data
+        rc = _libcc.DLPNOcompute_lccsd_phase_be(
+            ctypes.byref(PySolverInputs()),
+            ctypes.byref(plan_struct),
+            ctypes.byref(out))
+        if rc != 0:
+            raise RuntimeError(f'phase_be rc={rc}')
+        ownership.extend([S_c, T_c, K_c, beta_kl_arr, beta_lk_arr,
+                          same_c, idx_c])
+
+    # Build B_all, E_all dicts and compare.
+    max_dB, max_dE = 0.0, 0.0
+    for key, slot in pair_to_slot.items():
+        n_ij = pno_spaces[key]['C_pno'].shape[1]
+        if n_ij == 0:
+            continue
+        B_class = flat_B[n_ij][slot]
+        E_class = flat_E[n_ij][slot]
+        if key in B_ref_dict:
+            d = float(np.max(np.abs(B_class - B_ref_dict[key])))
+            max_dB = max(max_dB, d)
+        if key in E_ref_dict:
+            d = float(np.max(np.abs(E_class - E_ref_dict[key])))
+            max_dE = max(max_dE, d)
+    return max_dB, max_dE
+
+
+def _validate_g_term_native(t2_pno_all, key_to_p, keys_reorder, pno_spaces,
+                              G_tilde, g_term_pyscf):
+    """Run G_term natively via class kernel + plan extraction; compare to
+    PySCF's _G_term_all dict.
+
+    Uses PySCF's `pairs_by_n_ij` / `pair_to_slot` from the cached plan
+    so the tile-scatter slot indexing matches what `target_slot` was
+    built against.
+    """
+    from pyscf.cc.dlpno_tccsd.residual import compute_G_term_batched
+    cache = getattr(compute_G_term_batched, '_plan_cache', None)
+    if not cache:
+        return float('nan')
+    plan = next(iter(cache.values()))
+    pairs_by_n_ij = plan['pairs_by_n_ij']
+    pair_to_slot_pyscf = plan['pair_to_slot']  # key → slot int
+    # Convert to (n_ij, slot) form keyed by key.
+    pair_to_slot = {}
+    for key, slot in pair_to_slot_pyscf.items():
+        n_ij = pno_spaces[key]['C_pno'].shape[1]
+        pair_to_slot[key] = (n_ij, slot)
+
+    flat_G_ij = {n_ij: np.zeros((len(pairs), n_ij, n_ij))
+                 for n_ij, pairs in pairs_by_n_ij.items()}
+    flat_G_ji = {n_ij: np.zeros((len(pairs), n_ij, n_ij))
+                 for n_ij, pairs in pairs_by_n_ij.items()}
+
+    G_tilde_c = np.ascontiguousarray(G_tilde)
+
+    for side, flat_out in [('ik', flat_G_ij), ('jk', flat_G_ji)]:
+        plan_struct, plan_own, target_slots, _ = _extract_g_term_plan(
+            t2_pno_all, key_to_p, side=side)
+        if plan_struct is None:
+            continue
+        plan_struct.G_tilde = G_tilde_c.ctypes.data
+        plan_struct.G_stride = int(G_tilde_c.shape[1])
+
+        # Allocate tiles.
+        # tile_off is (N+1,) but our struct stores it as ctypes pointer
+        # to the SAME numpy array — read it from ownership.
+        side_bv_t2_off = plan_own[3]      # t2_off
+        side_bv_tile_off = plan_own[4]    # tile_off
+        N = plan_struct.N
+        tiles_total = int(side_bv_tile_off[N])
+        tiles_flat = np.zeros(tiles_total, dtype=np.float64)
+
+        out = PyGTermOutputs()
+        out.tiles_flat = tiles_flat.ctypes.data
+        rc = _libcc.DLPNOcompute_lccsd_phase_g_term(
+            ctypes.byref(PySolverInputs()),  # SolverInputs unused by kernel
+            ctypes.byref(plan_struct),
+            ctypes.byref(out))
+        if rc != 0:
+            raise RuntimeError(f'phase_g_term rc={rc}')
+
+        # Scatter tiles into flat_out.  For item n: target_slots[n] = (n_ij, slot);
+        # tile is at tiles_flat[tile_off[n]:tile_off[n+1]] reshaped (n_ij, n_ij);
+        # PySCF SUBTRACTS the tile (residual.py:877).
+        for n in range(N):
+            n_ij_n, slot_n = target_slots[n]
+            tile = tiles_flat[side_bv_tile_off[n]:side_bv_tile_off[n + 1]]
+            flat_out[n_ij_n][slot_n] -= tile.reshape(n_ij_n, n_ij_n)
+        del plan_own
+
+    # Build G_term per pair: G_term[key] = flat_G_ij[slot] + flat_G_ji[slot].T.
+    max_diff = 0.0
+    for key, (n_ij, slot) in pair_to_slot.items():
+        G_class = flat_G_ij[n_ij][slot] + flat_G_ji[n_ij][slot].T
+        if key not in g_term_pyscf:
+            continue
+        G_ref = g_term_pyscf[key]
+        diff = float(np.max(np.abs(G_class - G_ref)))
+        if diff > max_diff:
+            max_diff = diff
+    return max_diff
+
+
+def _extract_g_term_plan(t2_pno_all, key_to_p, side='ik'):
+    """Extract one side ('ik' or 'jk') of the G_term plan from
+    PySCF's `compute_G_term_batched._plan_cache`.
+
+    Translates t2_canon_off (PySCF FlatTensorStore offsets into
+    `t2_pno_all._buffer`) to absolute offsets into our class's T2_flat.
+
+    Returns (plan_struct, ownership, target_slot_list, n_ij_to_n_pairs_in_bucket).
+    target_slot_list is a list of (n_ij, slot) pairs needed for tile
+    scatter post-kernel.
+    """
+    from pyscf.cc.dlpno_tccsd.residual import (
+        compute_G_term_batched, _get_or_build_g_term_batched_view,
+        _build_g_term_plan)
+    cache = getattr(compute_G_term_batched, '_plan_cache', None)
+    if not cache:
+        return None, [], [], {}
+    plan = next(iter(cache.values()))
+    bv = _get_or_build_g_term_batched_view(plan, t2_pno_all)
+    side_bv = bv[side]
+    N = side_bv['N']
+    if N == 0:
+        return None, [], [], {}
+
+    # PySCF's t2_canon_off is offset into t2_pno_all._buffer (in PySCF
+    # FTS canonical order).  Our class's T2_flat is in our diag-first
+    # canonical order — they're DIFFERENT.  PySCF's _canon_to_idx maps
+    # key → PySCF idx; our key_to_p maps key → our idx.  Since the BV
+    # already encodes absolute byte offsets through PySCF's FTS, we
+    # need to instead point directly at PySCF's t2_pno_all._buffer
+    # (not our T2_flat).  This still uses class's kernel + plan; just
+    # the T2 buffer comes from PySCF.  When we later sync T2 between
+    # PySCF and class, this will be a no-op.
+    pyscf_t2_buffer = t2_pno_all._buffer
+
+    # Build per-iter t2_flat by gather (mimics _run_g_term_batched).
+    from pyscf.cc.dlpno_tccsd._cd_gather_cy import gather_t2_with_transpose
+    t2_flat = np.empty(int(side_bv['t2_off'][-1]))
+    gather_t2_with_transpose(
+        N, side_bv['n_ik'],
+        side_bv['t2_canon_off'], side_bv['t2_trans_arr'],
+        side_bv['t2_off'], pyscf_t2_buffer, t2_flat,
+        min(64, N),
+    )
+
+    plan_struct = PyGTermInputs()
+    plan_struct.N           = int(N)
+    plan_struct.n_ij_arr    = side_bv['n_ij'].ctypes.data
+    plan_struct.n_ik_arr    = side_bv['n_ik'].ctypes.data
+    plan_struct.S_off       = side_bv['S_off'].ctypes.data
+    plan_struct.t2_off      = side_bv['t2_off'].ctypes.data
+    plan_struct.tile_off    = side_bv['tile_off'].ctypes.data
+    plan_struct.k_idx       = side_bv['k_idx'].ctypes.data
+    plan_struct.scalar_lmo  = side_bv['scalar_lmo'].ctypes.data
+    plan_struct.S_flat      = side_bv['S_flat'].ctypes.data
+    plan_struct.t2_flat     = t2_flat.ctypes.data
+    # G_tilde and G_stride are filled at run-time by the caller.
+    plan_struct.max_n_ij    = int(side_bv['n_ij'].max(initial=1))
+    plan_struct.max_n_ik    = int(side_bv['n_ik'].max(initial=1))
+
+    # target_slot_list: for tile scatter back to flat_G_ij[n_ij].
+    target_slots = list(plan['_g_batched_view'][side].get('target_slot', []))
+    if not target_slots:
+        # Reconstruct from buckets if not stored.
+        target_slots = []
+        for bucket in plan[f'{side}_buckets']:
+            n_ij = bucket['n_ij']
+            for slot in bucket['item_idx']:
+                target_slots.append((n_ij, int(slot)))
+
+    n_ij_to_n_pairs = {n_ij: len(pairs)
+                        for n_ij, pairs in plan['pairs_by_n_ij'].items()}
+
+    ownership = [
+        side_bv['n_ij'], side_bv['n_ik'], side_bv['S_off'],
+        side_bv['t2_off'], side_bv['tile_off'],
+        side_bv['k_idx'], side_bv['scalar_lmo'],
+        side_bv['S_flat'], t2_flat,
+    ]
+    return plan_struct, ownership, target_slots, n_ij_to_n_pairs
 
 
 def _extract_g_tilde_plan(key_to_p):

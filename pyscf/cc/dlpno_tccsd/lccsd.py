@@ -2716,7 +2716,14 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     pno_spaces, pair_lmo_idx, F_lmo, eps_lmo, fov_pno,
                     nocc, keys_sorted, S_pno_cache, _cc_ints_flat,
                     _pair_index, ovL_pno_cache, K_pno_cache,
-                    g_tilde_pyscf=_local_df_G)
+                    g_tilde_pyscf=_local_df_G,
+                    g_term_pyscf=_G_term_all,
+                    be_pyscf=_BE_all,
+                    b_tilde_per_ij_pyscf=_B_tilde_per_ij,
+                    c_term_pyscf=_C_term_all,
+                    d_term_pyscf=_D_term_all,
+                    jiang_C_pyscf=_jiang_C,
+                    jiang_D_pyscf=_jiang_D)
                 import sys as _sys
                 _sys.exit(0)
 
