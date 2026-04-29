@@ -4962,6 +4962,13 @@ def validate_run_one_cycle_with_per_kl(
         setattr(plans, fname, None)
     plans.per_kl_plan = ctypes.pointer(plan_struct)
 
+    # G_tilde plan extraction (the only plan currently extracted from
+    # PySCF's caches; the remaining R2 plans — BE/CD/G_term/t3/t4 — are
+    # still null, so R2 = K + ladder only).
+    g_plan_struct, g_plan_own = _extract_g_tilde_plan(key_to_p)
+    if g_plan_struct is not None:
+        plans.g_tilde_plan = ctypes.pointer(g_plan_struct)
+
     out_struct = PyRunCycleOutputs()
     out_struct.R1_flat = R1_class.ctypes.data
     out_struct.R2_flat = R2_class.ctypes.data
@@ -4994,6 +5001,57 @@ def validate_run_one_cycle_with_per_kl(
 
     del plan_own, ownership
     return d_R1
+
+
+def _extract_g_tilde_plan(key_to_p):
+    """Extract the G_tilde inner plan from PySCF's
+    `build_G_tilde._batched_plan` cache.  Translates
+    `triple_T2_pair_idx` from PySCF's canonical_pairs ordering to our
+    class's pair ordering via `key_to_p`.
+
+    Returns (plan_struct, ownership_arrays) — ownership keeps the numpy
+    arrays alive past the C call.  Returns (None, []) if no plan cached
+    or if the plan is empty.
+    """
+    from pyscf.cc.dlpno_tccsd.residual import build_G_tilde
+    bp = getattr(build_G_tilde, '_batched_plan', None)
+    if bp is None or bp.get('empty'):
+        return None, []
+
+    canonical_pairs = bp['canonical_pairs']
+    # Translate triple_T2_pair_idx from PySCF idx → our class idx.
+    pyscf_to_class = np.zeros(len(canonical_pairs), dtype=np.int64)
+    for pyscf_idx, key in enumerate(canonical_pairs):
+        cls_idx = key_to_p.get(key)
+        if cls_idx is None:
+            # Pair not in our class schema — should not happen if the
+            # validator passed all of t2_pno_all.keys() to the packer.
+            return None, []
+        pyscf_to_class[pyscf_idx] = cls_idx
+
+    triple_T2_pair_idx_class = pyscf_to_class[bp['triple_T2_pair_idx']]
+    triple_T2_pair_idx_class = np.ascontiguousarray(
+        triple_T2_pair_idx_class, dtype=np.int64)
+
+    plan = PyGTildeInputs()
+    plan.n_ij_slots         = int(bp['ij_i_arr'].shape[0])
+    plan.triple_eff_offset  = bp['triple_eff_offset'].ctypes.data
+    plan.triple_T2_pair_idx = triple_T2_pair_idx_class.ctypes.data
+    plan.triple_n_lj        = bp['triple_n_lj'].ctypes.data
+    plan.ij_triple_starts   = bp['ij_triple_starts'].ctypes.data
+    plan.ij_i_arr           = bp['ij_i_arr'].ctypes.data
+    plan.ij_j_arr           = bp['ij_j_arr'].ctypes.data
+    plan.effective_flat     = bp['effective_flat'].ctypes.data
+
+    ownership = [
+        triple_T2_pair_idx_class,
+        bp['triple_eff_offset'],
+        bp['triple_n_lj'],
+        bp['ij_triple_starts'],
+        bp['ij_i_arr'], bp['ij_j_arr'],
+        bp['effective_flat'],
+    ]
+    return plan, ownership
 
 
 def _extract_per_kl_plan(t1_residual_func):
