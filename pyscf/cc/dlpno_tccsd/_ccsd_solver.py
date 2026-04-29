@@ -1,0 +1,5095 @@
+"""DLPNO-CCSD monolithic solver — Python ctypes bridge.
+
+Step 2a: marshalling layer.
+
+Defines ``PyFlatPairStore`` and ``PySolverInputs`` ctypes Structures whose
+byte layout matches ``FlatPairStore`` / ``SolverInputs`` in
+``pyscf/lib/cc/dlpno_ccsd_solver.cpp``.  Provides ``build_synthetic_inputs``
+which constructs flat numpy buffers + offsets and populates a
+``PySolverInputs`` instance, plus ``parity_test_dump_inputs`` which calls
+the C++ ``DLPNOcompute_lccsd_dump_inputs`` and verifies the per-field
+checksums match Python's numpy-computed checksums on the same buffers.
+
+No CCSD math runs at this layer.  Step 2b adds the first real phase.
+"""
+
+import ctypes
+import math
+import os
+
+import numpy as np
+
+from pyscf import lib as _pyscf_lib
+
+
+_libcc = _pyscf_lib.load_library('libcc')
+
+
+# ----------------------------------------------------------------------------
+# ctypes structs — must match dlpno_ccsd_solver.cpp byte-for-byte.
+# ----------------------------------------------------------------------------
+
+class PyFlatPairStore(ctypes.Structure):
+    """Mirrors C++ ``pyscf_dlpno_ccsd::FlatPairStore``."""
+    _fields_ = [
+        ('data',    ctypes.c_void_p),     # const double *
+        ('offsets', ctypes.c_void_p),     # const int64_t *
+    ]
+
+
+class PySolverInputs(ctypes.Structure):
+    """Mirrors C++ ``pyscf_dlpno_ccsd::SolverInputs``.
+
+    Field order MUST match the C++ definition exactly — natural alignment
+    on both sides; ctypes inserts the same 4-byte padding after
+    ``n_cas_blocks``.
+    """
+    _fields_ = [
+        # sizes
+        ('nocc',                   ctypes.c_int),
+        ('nlmo',                   ctypes.c_int),
+        ('n_canon_pairs',          ctypes.c_int),
+        ('n_strong_pairs',         ctypes.c_int),
+        ('diis_max_vecs',          ctypes.c_int),
+        ('max_cycle',              ctypes.c_int),
+        ('e_conv',                 ctypes.c_double),
+        ('r_conv',                 ctypes.c_double),
+
+        # sparsity (read-only views)
+        ('i_j_to_ij',              ctypes.c_void_p),
+        ('ij_to_i_j',              ctypes.c_void_p),
+        ('ij_to_ji',               ctypes.c_void_p),
+        ('pair_lmo_idx_flat',      ctypes.c_void_p),
+        ('pair_lmo_idx_offsets',   ctypes.c_void_p),
+        ('n_pno_per_pair',         ctypes.c_void_p),
+        ('pno_offsets',            ctypes.c_void_p),
+        ('t2_offsets',             ctypes.c_void_p),
+
+        # orbital data (read-only views)
+        ('F_lmo',                  ctypes.c_void_p),
+        ('eps_lmo',                ctypes.c_void_p),
+        ('foo',                    ctypes.c_void_p),
+        ('fov_flat',               ctypes.c_void_p),
+        ('e_pno_flat',             ctypes.c_void_p),
+
+        # cc_ints (read-only views, pair_lmo_idx-axis)
+        ('Qma',                    PyFlatPairStore),
+        ('Qab',                    PyFlatPairStore),
+        ('i_Qk',                   PyFlatPairStore),
+        ('j_Qk',                   PyFlatPairStore),
+        ('i_Qa',                   PyFlatPairStore),
+        ('j_Qa',                   PyFlatPairStore),
+        ('K_iajb',                 PyFlatPairStore),
+        ('K_bar_ij',               PyFlatPairStore),
+        ('K_bar_chem',             PyFlatPairStore),
+        ('K_bar_ji',               PyFlatPairStore),
+        ('J_ij_kj',                PyFlatPairStore),
+        ('K_ij_kj',                PyFlatPairStore),
+        ('L_iajb',                 PyFlatPairStore),
+        ('L_bar',                  PyFlatPairStore),
+        ('K_tilde_chem_i',         PyFlatPairStore),
+        ('K_tilde_chem_j',         PyFlatPairStore),
+
+        # pno overlap cache
+        ('S_pno_data',             ctypes.c_void_p),
+        ('S_pno_offsets',          ctypes.c_void_p),
+        ('S_pno_index',            ctypes.c_void_p),
+
+        # amplitudes (READ-WRITE)
+        ('T1_flat',                ctypes.c_void_p),
+        ('T2_flat',                ctypes.c_void_p),
+
+        # T1 projected into each pair's PNO basis (per-pair (nlmo_p, npno_p))
+        ('T1_in_pair',             PyFlatPairStore),
+
+        # Full-nocc version (per-pair (nocc, npno_p)) — needed for Stage 4
+        # of the T1 residual (R1 -= Fij_bar @ T_n_full).
+        ('T1_in_pair_full',        PyFlatPairStore),
+
+        # Ordered-pair sparsity (Psi4 all_pairs)
+        ('n_ordered_pairs',        ctypes.c_int),
+        ('ordered_pair_i_idx',     ctypes.c_void_p),
+        ('ordered_pair_k_idx',     ctypes.c_void_p),
+
+        # CAS injection (optional)
+        ('n_cas_blocks',           ctypes.c_int),
+        ('cas_block_pair',         ctypes.c_void_p),
+        ('cas_block_offsets',      ctypes.c_void_p),
+        ('cas_block_data',         ctypes.c_void_p),
+        ('cas_block_slice',        ctypes.c_void_p),
+
+        # Optional Psi4-faithful overrides (full strong+weak scope).
+        # Set to NULL to disable (legacy strong-only paths apply).
+        ('Fij_bar_full',           ctypes.c_void_p),
+        ('Fkc_per_ordered',        PyFlatPairStore),
+    ]
+
+
+# ----------------------------------------------------------------------------
+# C entry-point declarations.
+# ----------------------------------------------------------------------------
+
+_libcc.DLPNOcompute_lccsd_solver_inputs_size.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_solver_inputs_size.argtypes = []
+
+_libcc.DLPNOcompute_lccsd_omp.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_omp.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(ctypes.c_double),
+]
+
+_libcc.DLPNOcompute_lccsd_dump_inputs.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_dump_inputs.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(ctypes.c_double),
+    ctypes.c_int,
+]
+
+_libcc.DLPNOcompute_lccsd_dump_n_fields.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_dump_n_fields.argtypes = []
+
+
+# Field-index mirror (must match enum DumpField in dlpno_ccsd_solver.cpp).
+DUMP_FIELDS = [
+    'nocc', 'nlmo', 'n_canon_pairs', 'n_strong_pairs',
+    'diis_max_vecs', 'max_cycle', 'e_conv', 'r_conv',
+    'F_lmo', 'eps_lmo', 'foo', 'fov_flat', 'e_pno_flat',
+    'T1_flat', 'T2_flat',
+    'pair_lmo_idx_flat', 'pair_lmo_idx_offsets_last',
+    'n_pno_per_pair', 'pno_offsets_last',
+    'Qma', 'Qab', 'i_Qk', 'j_Qk', 'i_Qa', 'j_Qa',
+    'K_iajb', 'K_bar_ij', 'K_bar_chem', 'J_ij_kj', 'K_ij_kj',
+    'L_iajb', 'L_bar',
+    'T1_in_pair',
+    't2_offsets_last',
+    'K_bar_ji',
+    'T1_in_pair_full',
+    'K_tilde_chem_i', 'K_tilde_chem_j',
+    'n_ordered_pairs',
+    'ordered_pair_i_idx', 'ordered_pair_k_idx',
+    'S_pno_data', 'S_pno_offsets_last',
+]
+
+
+# ----------------------------------------------------------------------------
+# Output struct for the t1_ints phase.
+# ----------------------------------------------------------------------------
+
+class PyWritablePairStore(ctypes.Structure):
+    _fields_ = [
+        ('data',    ctypes.c_void_p),
+        ('offsets', ctypes.c_void_p),
+    ]
+
+
+class PyT1IntsOutputs(ctypes.Structure):
+    _fields_ = [
+        ('i_Qa_t1', PyWritablePairStore),
+        ('j_Qa_t1', PyWritablePairStore),
+        ('i_Qk_t1', PyWritablePairStore),
+        ('j_Qk_t1', PyWritablePairStore),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_t1_ints.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_t1_ints.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyT1IntsOutputs),
+]
+
+
+class PyBTildeInputs(ctypes.Structure):
+    _fields_ = [
+        ('i_Qk_t1', PyFlatPairStore),
+        ('j_Qk_t1', PyFlatPairStore),
+    ]
+
+
+class PyBTildeOutputs(ctypes.Structure):
+    _fields_ = [
+        ('B_tilde', PyWritablePairStore),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_b_tilde.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_b_tilde.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyBTildeInputs),
+    ctypes.POINTER(PyBTildeOutputs),
+]
+
+
+_libcc.DLPNOcompute_B_tilde_pair.restype = None
+_libcc.DLPNOcompute_B_tilde_pair.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+]
+
+
+class PyT1FockOutputs(ctypes.Structure):
+    _fields_ = [
+        ('Fab',    PyWritablePairStore),
+        ('d_flat', ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_t1_fock.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_t1_fock.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyT1FockOutputs),
+]
+
+
+_libcc.DLPNOt1_fock_batched.restype = None
+_libcc.DLPNOt1_fock_batched.argtypes = (
+    [ctypes.c_void_p] * 18                                # 7 (ptr/off) + 4 shape arrays
+    + [ctypes.c_void_p, ctypes.c_size_t] * 6              # 6 scratch (ptr + stride)
+    + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, # d_flat, Fab, Fab_off
+       ctypes.c_size_t, ctypes.c_int])                    # N, num_threads
+
+
+class PyDTildeOutputs(ctypes.Structure):
+    _fields_ = [
+        ('D_tilde', PyWritablePairStore),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_d_tilde_ph1.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_d_tilde_ph1.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyDTildeOutputs),
+]
+
+
+_libcc.DLPNOcompute_D_tilde_ph1_batched.restype = None
+_libcc.DLPNOcompute_D_tilde_ph1_batched.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p,    # K_tilde_chem
+    ctypes.c_void_p, ctypes.c_void_p,    # M_static
+    ctypes.c_void_p, ctypes.c_void_p,    # t1
+    ctypes.c_void_p, ctypes.c_void_p,    # T1_rows
+    ctypes.c_void_p, ctypes.c_void_p,    # n_pno_arr, n_domain_arr
+    ctypes.c_void_p, ctypes.c_void_p,    # D_flat, D_offsets
+    ctypes.c_size_t,                      # N
+]
+
+
+class PyCTildeOutputs(ctypes.Structure):
+    _fields_ = [
+        ('C_tilde', PyWritablePairStore),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_c_tilde_ph1.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_c_tilde_ph1.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyCTildeOutputs),
+]
+
+
+_libcc.DLPNOcompute_C_tilde_ph1_batched.restype = None
+_libcc.DLPNOcompute_C_tilde_ph1_batched.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p,    # K_tilde_chem
+    ctypes.c_void_p, ctypes.c_void_p,    # K_bar_chem_slice
+    ctypes.c_void_p, ctypes.c_void_p,    # t1
+    ctypes.c_void_p, ctypes.c_void_p,    # T1_local
+    ctypes.c_void_p, ctypes.c_void_p,    # n_pno_arr, n_domain_arr
+    ctypes.c_void_p, ctypes.c_void_p,    # C_flat, C_offsets
+    ctypes.c_size_t,                      # N
+]
+
+
+class PyGTildeInputs(ctypes.Structure):
+    _fields_ = [
+        ('n_ij_slots',          ctypes.c_int),
+        ('triple_eff_offset',   ctypes.c_void_p),
+        ('triple_T2_pair_idx',  ctypes.c_void_p),
+        ('triple_n_lj',         ctypes.c_void_p),
+        ('ij_triple_starts',    ctypes.c_void_p),
+        ('ij_i_arr',            ctypes.c_void_p),
+        ('ij_j_arr',            ctypes.c_void_p),
+        ('effective_flat',      ctypes.c_void_p),
+    ]
+
+
+class PyGTildeOutputs(ctypes.Structure):
+    _fields_ = [
+        ('G_tilde', ctypes.c_void_p),     # (nocc, nocc) row-major
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_g_tilde_inner.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_g_tilde_inner.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyGTildeInputs),
+    ctypes.POINTER(PyGTildeOutputs),
+]
+
+
+_libcc.DLPNOcompute_G_tilde_inner.restype = None
+_libcc.DLPNOcompute_G_tilde_inner.argtypes = [
+    ctypes.c_void_p,        # triple_eff_offset
+    ctypes.c_void_p,        # triple_T2_pair_idx
+    ctypes.c_void_p,        # triple_n_lj
+    ctypes.c_void_p,        # ij_triple_starts
+    ctypes.c_void_p,        # ij_i_arr
+    ctypes.c_void_p,        # ij_j_arr
+    ctypes.c_void_p,        # effective_flat
+    ctypes.c_void_p,        # T2_flat
+    ctypes.c_void_p,        # T2_offsets
+    ctypes.c_void_p,        # G_addition
+    ctypes.c_size_t,        # n_ij_slots
+    ctypes.c_size_t,        # naocc
+]
+
+
+class PyT1FockExtraInputs(ctypes.Structure):
+    _fields_ = [
+        ('d_flat', ctypes.c_void_p),
+    ]
+
+
+class PyT1FockExtraOutputs(ctypes.Structure):
+    _fields_ = [
+        ('Fkj',              ctypes.c_void_p),
+        ('Fij_bar_snapshot', ctypes.c_void_p),
+        ('foo_t1',           ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_t1_fock_finalize.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_t1_fock_finalize.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyT1FockExtraInputs),
+    ctypes.POINTER(PyT1FockExtraOutputs),
+]
+
+
+class PyPerKlPlanInputs(ctypes.Structure):
+    _fields_ = [
+        ('n_tasks',           ctypes.c_int),
+        ('M',                 ctypes.c_int),
+        ('n_kl_arr',          ctypes.c_void_p),
+        ('t2_swap_kl',        ctypes.c_void_p),
+        ('K_iajb_kl_off',     ctypes.c_void_p),
+        ('K_bar_kl_off',      ctypes.c_void_p),
+        ('t2_kl_canon_off',   ctypes.c_void_p),
+        ('T_n_kl_off',        ctypes.c_void_p),
+        ('inner_off',         ctypes.c_void_p),
+        ('i_arr',             ctypes.c_void_p),
+        ('n_pno_ii_arr',      ctypes.c_void_p),
+        ('is_diag_kl_ii',     ctypes.c_void_p),
+        ('has_S_ii_kl',       ctypes.c_void_p),
+        ('S_ii_kl_off',       ctypes.c_void_p),
+        ('has_A2',            ctypes.c_void_p),
+        ('is_diag_kl_ki',     ctypes.c_void_p),
+        ('n_ki_arr',          ctypes.c_void_p),
+        ('t2_swap_ki',        ctypes.c_void_p),
+        ('t2_ki_canon_off',   ctypes.c_void_p),
+        ('S_kl_ki_off',       ctypes.c_void_p),
+        ('S_ki_kl_off',       ctypes.c_void_p),
+        ('T_n_l_ii_off',      ctypes.c_void_p),
+        ('contrib_off',       ctypes.c_void_p),
+        ('K_iajb_buffer',     ctypes.c_void_p),
+        ('K_bar_kl_static',   ctypes.c_void_p),
+        ('S_pno_buffer',      ctypes.c_void_p),
+        ('t2_buffer',         ctypes.c_void_p),
+        ('t1_cache_buffer',   ctypes.c_void_p),
+        ('max_n_kl',          ctypes.c_int),
+        ('max_n_ki',          ctypes.c_int),
+    ]
+
+
+class PyPerKlOutputs(ctypes.Structure):
+    _fields_ = [
+        ('contrib_flat', ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_t1_residual_per_kl.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_t1_residual_per_kl.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyPerKlPlanInputs),
+    ctypes.POINTER(PyPerKlOutputs),
+]
+
+
+_libcc.DLPNOper_kl_batched.restype = None
+_libcc.DLPNOper_kl_batched.argtypes = (
+    [ctypes.c_int, ctypes.c_int]
+    + [ctypes.c_void_p] * 21              # 7 per-task + 14 per-(task, inner_i)
+    + [ctypes.c_void_p] * 5               # 5 buffers
+    + [ctypes.c_void_p, ctypes.c_size_t] * 6   # 6 scratch (ptr, stride)
+    + [ctypes.c_void_p, ctypes.c_int])    # contrib_flat, num_threads
+
+
+class PyBEInputs(ctypes.Structure):
+    _fields_ = [
+        ('N',        ctypes.c_int),
+        ('n_ij',     ctypes.c_int),
+        ('n_kl',     ctypes.c_int),
+        ('n_slots',  ctypes.c_int),
+        ('S',        ctypes.c_void_p),
+        ('T',        ctypes.c_void_p),
+        ('K',        ctypes.c_void_p),
+        ('beta_kl',  ctypes.c_void_p),
+        ('beta_lk',  ctypes.c_void_p),
+        ('same',     ctypes.c_void_p),
+        ('idx',      ctypes.c_void_p),
+    ]
+
+
+class PyBEOutputs(ctypes.Structure):
+    _fields_ = [
+        ('out_B', ctypes.c_void_p),
+        ('out_E', ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_be.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_be.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyBEInputs),
+    ctypes.POINTER(PyBEOutputs),
+]
+
+
+_libcc.DLPNObe_kernel.restype = None
+_libcc.DLPNObe_kernel.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,    # S, T, K
+    ctypes.c_void_p, ctypes.c_void_p,                      # beta_kl, beta_lk
+    ctypes.c_void_p,                                       # same
+    ctypes.c_void_p,                                       # idx
+    ctypes.c_void_p, ctypes.c_void_p,                      # out_B, out_E
+    ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,    # N, n_ij, n_kl
+    ctypes.c_int,                                          # num_threads
+]
+
+
+class PyCTermInputs(ctypes.Structure):
+    _fields_ = [
+        ('N',             ctypes.c_int),
+        ('n_pno_arr',     ctypes.c_void_p),
+        ('n_ct_arr',      ctypes.c_void_p),
+        ('n_other_arr',   ctypes.c_void_p),
+        ('S_big_off',     ctypes.c_void_p),
+        ('ct_off',        ctypes.c_void_p),
+        ('S_mid_off',     ctypes.c_void_p),
+        ('J_bold_off',    ctypes.c_void_p),
+        ('t2_off',        ctypes.c_void_p),
+        ('S_outer_off',   ctypes.c_void_p),
+        ('tile_off',      ctypes.c_void_p),
+        ('S_big_flat',    ctypes.c_void_p),
+        ('S_mid_flat',    ctypes.c_void_p),
+        ('J_bold_flat',   ctypes.c_void_p),
+        ('S_outer_flat',  ctypes.c_void_p),
+        ('ct_flat',       ctypes.c_void_p),
+        ('t2_flat',       ctypes.c_void_p),
+        ('max_n_pno',     ctypes.c_int),
+        ('max_n_ct',      ctypes.c_int),
+        ('max_n_other',   ctypes.c_int),
+    ]
+
+
+class PyCTermOutputs(ctypes.Structure):
+    _fields_ = [
+        ('tiles_flat', ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_c_term.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_c_term.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyCTermInputs),
+    ctypes.POINTER(PyCTermOutputs),
+]
+
+
+_libcc.DLPNOc_term_batched.restype = None
+_libcc.DLPNOc_term_batched.argtypes = (
+    [ctypes.c_int]                            # N
+    + [ctypes.c_void_p] * 16                  # 3 shape + 7 offsets + 6 buffers
+    + [ctypes.c_void_p, ctypes.c_size_t] * 3  # 3 scratch (ptr, stride)
+    + [ctypes.c_void_p, ctypes.c_int])        # tiles_flat, num_threads
+
+
+class PyDTermInputs(ctypes.Structure):
+    _fields_ = [
+        ('N',           ctypes.c_int),
+        ('n_pno_arr',   ctypes.c_void_p),
+        ('n_A_arr',     ctypes.c_void_p),
+        ('n_B_arr',     ctypes.c_void_p),
+        ('S_a_off',     ctypes.c_void_p),
+        ('u_off',       ctypes.c_void_p),
+        ('S_b_off',     ctypes.c_void_p),
+        ('S_c_off',     ctypes.c_void_p),
+        ('dt_off',      ctypes.c_void_p),
+        ('KJ_off',      ctypes.c_void_p),
+        ('tile_off',    ctypes.c_void_p),
+        ('S_a_flat',    ctypes.c_void_p),
+        ('S_b_flat',    ctypes.c_void_p),
+        ('S_c_flat',    ctypes.c_void_p),
+        ('KJ_flat',     ctypes.c_void_p),
+        ('u_flat',      ctypes.c_void_p),
+        ('dt_flat',     ctypes.c_void_p),
+        ('max_n_pno',   ctypes.c_int),
+        ('max_n_A',     ctypes.c_int),
+        ('max_n_B',     ctypes.c_int),
+    ]
+
+
+class PyDTermOutputs(ctypes.Structure):
+    _fields_ = [
+        ('tiles_flat', ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_d_term.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_d_term.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyDTermInputs),
+    ctypes.POINTER(PyDTermOutputs),
+]
+
+
+_libcc.DLPNOd_term_batched.restype = None
+_libcc.DLPNOd_term_batched.argtypes = (
+    [ctypes.c_int]                            # N
+    + [ctypes.c_void_p] * 16                  # 3 shape + 7 offsets + 6 buffers
+    + [ctypes.c_void_p, ctypes.c_size_t] * 4  # 4 scratch (ptr, stride)
+    + [ctypes.c_void_p, ctypes.c_int])        # tiles_flat, num_threads
+
+
+class PyGTermInputs(ctypes.Structure):
+    _fields_ = [
+        ('N',           ctypes.c_int),
+        ('n_ij_arr',    ctypes.c_void_p),
+        ('n_ik_arr',    ctypes.c_void_p),
+        ('S_off',       ctypes.c_void_p),
+        ('t2_off',      ctypes.c_void_p),
+        ('tile_off',    ctypes.c_void_p),
+        ('k_idx',       ctypes.c_void_p),
+        ('scalar_lmo',  ctypes.c_void_p),
+        ('S_flat',      ctypes.c_void_p),
+        ('t2_flat',     ctypes.c_void_p),
+        ('G_tilde',     ctypes.c_void_p),
+        ('G_stride',    ctypes.c_int),
+        ('max_n_ij',    ctypes.c_int),
+        ('max_n_ik',    ctypes.c_int),
+    ]
+
+
+class PyGTermOutputs(ctypes.Structure):
+    _fields_ = [
+        ('tiles_flat', ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_g_term.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_g_term.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyGTermInputs),
+    ctypes.POINTER(PyGTermOutputs),
+]
+
+
+_libcc.DLPNOg_term_batched.restype = None
+_libcc.DLPNOg_term_batched.argtypes = (
+    [ctypes.c_int]                            # N
+    + [ctypes.c_void_p] * 9                   # 2 shape + 3 offsets + 2 idx + S_flat + t2_flat
+    + [ctypes.c_void_p, ctypes.c_size_t]      # G_tilde, G_stride
+    + [ctypes.c_void_p, ctypes.c_size_t]      # tmp scratch (ptr, stride)
+    + [ctypes.c_void_p, ctypes.c_int])        # tiles_flat, num_threads
+
+
+class PyT3Inputs(ctypes.Structure):
+    _fields_ = [
+        ('N',          ctypes.c_int),
+        ('n_kl_arr',   ctypes.c_void_p),
+        ('n_ki_arr',   ctypes.c_void_p),
+        ('K_off',      ctypes.c_void_p),
+        ('S_off',      ctypes.c_void_p),
+        ('t1i_off',    ctypes.c_void_p),
+        ('T1l_off',    ctypes.c_void_p),
+        ('tile_off',   ctypes.c_void_p),
+        ('K_flat',     ctypes.c_void_p),
+        ('S_flat',     ctypes.c_void_p),
+        ('t1_flat',    ctypes.c_void_p),
+        ('max_n_kl',   ctypes.c_int),
+        ('max_n_ki',   ctypes.c_int),
+    ]
+
+
+class PyT3Outputs(ctypes.Structure):
+    _fields_ = [
+        ('tiles_flat', ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_t3.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_t3.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyT3Inputs),
+    ctypes.POINTER(PyT3Outputs),
+]
+
+
+_libcc.DLPNOt3_kernel_batched.restype = None
+_libcc.DLPNOt3_kernel_batched.argtypes = (
+    [ctypes.c_int]                            # N
+    + [ctypes.c_void_p] * 10                  # 2 shape + 5 offsets + K_flat + S_flat + t1_flat
+    + [ctypes.c_void_p, ctypes.c_size_t] * 2  # 2 scratch
+    + [ctypes.c_void_p, ctypes.c_int])        # tiles_flat, num_threads
+
+
+class PyT4Inputs(ctypes.Structure):
+    _fields_ = [
+        ('N',              ctypes.c_int),
+        ('n_ki_arr',       ctypes.c_void_p),
+        ('n_li_arr',       ctypes.c_void_p),
+        ('n_kl_arr',       ctypes.c_void_p),
+        ('S_ki_li_off',    ctypes.c_void_p),
+        ('t2_off',         ctypes.c_void_p),
+        ('S_li_kl_off',    ctypes.c_void_p),
+        ('K_off',          ctypes.c_void_p),
+        ('S_kl_ki_off',    ctypes.c_void_p),
+        ('tile_off',       ctypes.c_void_p),
+        ('S_ki_li_flat',   ctypes.c_void_p),
+        ('S_li_kl_flat',   ctypes.c_void_p),
+        ('K_flat',         ctypes.c_void_p),
+        ('S_kl_ki_flat',   ctypes.c_void_p),
+        ('t2_flat',        ctypes.c_void_p),
+        ('scale',          ctypes.c_double),
+        ('max_n_ki',       ctypes.c_int),
+        ('max_n_li',       ctypes.c_int),
+        ('max_n_kl',       ctypes.c_int),
+    ]
+
+
+class PyT4Outputs(ctypes.Structure):
+    _fields_ = [
+        ('tiles_flat', ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_t4.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_t4.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyT4Inputs),
+    ctypes.POINTER(PyT4Outputs),
+]
+
+
+_libcc.DLPNOt4_kernel_batched.restype = None
+_libcc.DLPNOt4_kernel_batched.argtypes = (
+    [ctypes.c_int]                            # N
+    + [ctypes.c_void_p] * 14                  # 3 shape + 6 offsets + 5 buffers
+    + [ctypes.c_void_p, ctypes.c_size_t] * 3  # 3 scratch
+    + [ctypes.c_void_p, ctypes.c_double, ctypes.c_int])  # tiles_flat, scale, num_threads
+
+
+class PyKLadderInputs(ctypes.Structure):
+    _fields_ = [
+        ('i_Qa_t1', PyFlatPairStore),
+        ('j_Qa_t1', PyFlatPairStore),
+    ]
+
+
+class PyKLadderOutputs(ctypes.Structure):
+    _fields_ = [
+        ('K', PyWritablePairStore),
+        ('A', PyWritablePairStore),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_k_ladder.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_k_ladder.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyKLadderInputs),
+    ctypes.POINTER(PyKLadderOutputs),
+]
+
+
+class PyUpdateAmpsInputs(ctypes.Structure):
+    _fields_ = [
+        ('R1_flat', ctypes.c_void_p),
+        ('R2_flat', ctypes.c_void_p),
+    ]
+
+
+class PyUpdateAmpsOutputs(ctypes.Structure):
+    _fields_ = [
+        ('energy', ctypes.c_double),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_update_amps_and_energy.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_update_amps_and_energy.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyUpdateAmpsInputs),
+    ctypes.POINTER(PyUpdateAmpsOutputs),
+]
+
+
+class PyFiaBarOutputs(ctypes.Structure):
+    _fields_ = [
+        ('Fia_bar', PyWritablePairStore),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_t1_fock_fia_bar.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_t1_fock_fia_bar.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyFiaBarOutputs),
+]
+
+
+class PyR1AcInputs(ctypes.Structure):
+    _fields_ = [
+        ('Fia_bar', PyFlatPairStore),
+        ('do_init', ctypes.c_int),
+    ]
+
+
+class PyR1AcOutputs(ctypes.Structure):
+    _fields_ = [
+        ('R1_flat', ctypes.c_void_p),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_phase_t1_residual_AC_init.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_phase_t1_residual_AC_init.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyR1AcInputs),
+    ctypes.POINTER(PyR1AcOutputs),
+]
+
+
+# c-collapse-1: one-cycle entry.  Plan-cached phases are passed as nullable
+# struct pointers; null = skip phase (zero contribution).
+class PyRunCycleInputs(ctypes.Structure):
+    _fields_ = [
+        ('g_tilde_plan',  ctypes.POINTER(PyGTildeInputs)),
+        ('per_kl_plan',   ctypes.POINTER(PyPerKlPlanInputs)),
+        ('be_plan',       ctypes.POINTER(PyBEInputs)),
+        ('c_term_plan',   ctypes.POINTER(PyCTermInputs)),
+        ('d_term_plan',   ctypes.POINTER(PyDTermInputs)),
+        ('g_term_plan',   ctypes.POINTER(PyGTermInputs)),
+        ('t3_plan',       ctypes.POINTER(PyT3Inputs)),
+        ('t4_plan',       ctypes.POINTER(PyT4Inputs)),
+    ]
+
+
+class PyRunCycleOutputs(ctypes.Structure):
+    _fields_ = [
+        ('R1_flat', ctypes.c_void_p),
+        ('R2_flat', ctypes.c_void_p),
+        ('energy',  ctypes.c_double),
+    ]
+
+
+_libcc.DLPNOcompute_lccsd_run_one_cycle.restype = ctypes.c_int
+_libcc.DLPNOcompute_lccsd_run_one_cycle.argtypes = [
+    ctypes.POINTER(PySolverInputs),
+    ctypes.POINTER(PyRunCycleInputs),
+    ctypes.POINTER(PyRunCycleOutputs),
+]
+
+
+# Forward decl of the per-pair kernel; we call it directly from Python in
+# the parity reference path.  Existing wiring exists in local_df.py; we
+# repeat it here to keep this module self-contained.
+_libcc.DLPNOt1_ints_pair_side.restype = None
+_libcc.DLPNOt1_ints_pair_side.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+]
+
+
+# ----------------------------------------------------------------------------
+# Synthetic input builder.
+# ----------------------------------------------------------------------------
+
+def _ptr(arr):
+    """Pointer-as-int into a numpy array for ctypes c_void_p."""
+    if arr is None:
+        return None
+    return arr.ctypes.data
+
+
+def _build_flat_pair_store(per_pair_arrays, ownership):
+    """Coalesce a list of per-pair arrays into one flat buffer + offsets.
+
+    Returns (PyFlatPairStore, total_len). ``ownership`` is a list the caller
+    appends the flat numpy arrays to — the C side reads through their
+    pointers, so they must outlive the call.
+    """
+    n_pairs = len(per_pair_arrays)
+    offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    for p in range(n_pairs):
+        offsets[p + 1] = offsets[p] + per_pair_arrays[p].size
+    total = int(offsets[-1])
+    flat = np.empty(total, dtype=np.float64)
+    for p in range(n_pairs):
+        a = per_pair_arrays[p]
+        flat[offsets[p]:offsets[p + 1]] = a.ravel()
+    ownership.append(flat)
+    ownership.append(offsets)
+    fps = PyFlatPairStore()
+    fps.data = _ptr(flat)
+    fps.offsets = _ptr(offsets)
+    return fps, total, flat, offsets
+
+
+def build_synthetic_inputs(nocc=4, nlmo=4, n_canon_pairs=10,
+                            n_strong_pairs=8, npno_max=6, seed=1234):
+    """Construct a fully-populated PySolverInputs with random data.
+
+    The buffers are all real numpy arrays whose pointers go into the
+    Structure.  The returned ``ownership`` list MUST be kept alive across
+    any C call that reads the inputs.
+
+    Returns (inputs, ownership).
+    """
+    rng = np.random.default_rng(seed)
+
+    # Realistic ij_to_i_j: each canon pair gets a random (i, j) with i <= j.
+    # First nocc pairs are diagonals (i, i) so npno_per_pair[i] is well-defined
+    # for the per-i T1/fov layout.
+    ij_pairs = []
+    for ii in range(min(nocc, n_canon_pairs)):
+        ij_pairs.append((ii, ii))
+    seen = set(ij_pairs)
+    while len(ij_pairs) < n_canon_pairs:
+        i = int(rng.integers(0, nocc))
+        j = int(rng.integers(0, nocc))
+        if i > j:
+            i, j = j, i
+        if (i, j) in seen:
+            continue
+        seen.add((i, j))
+        ij_pairs.append((i, j))
+    ij_to_i_j = np.array(ij_pairs, dtype=np.int32).ravel()
+
+    # Sparsity: pair_lmo_idx[p] must contain pair p's own (i, j) (Phase III
+    # invariant).  Sample a random LMO subset of size between 2 and nlmo,
+    # then ensure i and j are in it.
+    pair_lmo_idx = []
+    n_pno_per_pair = np.empty(n_canon_pairs, dtype=np.int32)
+    for p in range(n_canon_pairs):
+        i, j = ij_pairs[p]
+        nlmo_p = int(rng.integers(2, max(3, nlmo + 1)))
+        chosen = set()
+        chosen.add(i)
+        chosen.add(j)
+        while len(chosen) < nlmo_p:
+            chosen.add(int(rng.integers(0, nlmo)))
+        # Order: deterministic but shuffled (so i_in_p / j_in_p aren't fixed)
+        idx = np.array(sorted(chosen), dtype=np.int32)
+        rng.shuffle(idx)
+        pair_lmo_idx.append(idx)
+        n_pno_per_pair[p] = int(rng.integers(1, npno_max + 1))
+
+    pair_lmo_idx_offsets = np.zeros(n_canon_pairs + 1, dtype=np.int64)
+    for p in range(n_canon_pairs):
+        pair_lmo_idx_offsets[p + 1] = pair_lmo_idx_offsets[p] + pair_lmo_idx[p].size
+    pair_lmo_idx_flat = np.empty(int(pair_lmo_idx_offsets[-1]), dtype=np.int32)
+    for p in range(n_canon_pairs):
+        pair_lmo_idx_flat[pair_lmo_idx_offsets[p]:pair_lmo_idx_offsets[p+1]] = pair_lmo_idx[p]
+
+    # pno_offsets: indexed by occupied i for the first ``nocc`` entries
+    # (so fov_flat[0:pno_offsets[nocc]] is the per-i fov stack); for p in
+    # [0, n_canon_pairs) it bounds e_pno_flat per pair.  Synthetic case:
+    # both regions use n_pno_per_pair[p] directly.  In real packing the
+    # diagonal pair (i, i) provides npno_ii.
+    pno_offsets = np.zeros(n_canon_pairs + 1, dtype=np.int64)
+    for p in range(n_canon_pairs):
+        pno_offsets[p + 1] = pno_offsets[p] + int(n_pno_per_pair[p])
+
+    t2_offsets = np.zeros(n_canon_pairs + 1, dtype=np.int64)
+    for p in range(n_canon_pairs):
+        t2_offsets[p + 1] = t2_offsets[p] + int(n_pno_per_pair[p]) ** 2
+
+    # T1: one (npno_ii) block per occupied i. The first ``nocc`` entries
+    # of n_pno_per_pair correspond to (i, i) pairs in this synthetic layout.
+    fov_total = int(pno_offsets[nocc])
+    e_pno_total = int(pno_offsets[n_canon_pairs])
+
+    F_lmo = rng.standard_normal((nocc, nocc))
+    F_lmo = (F_lmo + F_lmo.T) * 0.5
+    eps_lmo = rng.standard_normal(nocc)
+    foo = rng.standard_normal((nocc, nocc))
+    fov_flat = rng.standard_normal(fov_total)
+    e_pno_flat = rng.standard_normal(e_pno_total)
+
+    T1_flat = rng.standard_normal(fov_total)
+    t2_total = int(t2_offsets[-1])
+    T2_flat = rng.standard_normal(t2_total)
+
+    # i_j_to_ij: build from real ij_pairs so the kernel can locate (i,j) -> p.
+    i_j_to_ij_2d = -np.ones((nocc, nocc), dtype=np.int32)
+    for p, (i, j) in enumerate(ij_pairs):
+        i_j_to_ij_2d[i, j] = p
+        if i != j:
+            i_j_to_ij_2d[j, i] = p
+    i_j_to_ij = i_j_to_ij_2d.ravel().copy()
+    # ij_to_ji: in this synthetic setup, every canonical pair maps to itself
+    # (no separate ordered (j, i) entries); fine for the t1_ints phase which
+    # iterates canonical pairs and dresses both sides per call.
+    ij_to_ji = np.arange(n_canon_pairs, dtype=np.int32)
+
+    # FlatPairStores — synthesize one per cc_ints tensor with realistic
+    # per-pair shapes so checksums exercise the offsets path.
+    ownership = [
+        pair_lmo_idx_flat, pair_lmo_idx_offsets,
+        n_pno_per_pair, pno_offsets, t2_offsets,
+        F_lmo, eps_lmo, foo, fov_flat, e_pno_flat,
+        T1_flat, T2_flat,
+        i_j_to_ij, ij_to_i_j, ij_to_ji,
+    ]
+
+    # naux per pair must be the same across all per-pair tensors that share
+    # the auxiliary axis (Qma, Qab, i_Qa, j_Qa, i_Qk, j_Qk).  Pre-sample once.
+    naux_per_pair = rng.integers(2, 5, size=n_canon_pairs).astype(np.int32)
+
+    def _per_pair_shapes(kind):
+        arrs = []
+        for p in range(n_canon_pairs):
+            nlmo_p = int(pair_lmo_idx_offsets[p+1] - pair_lmo_idx_offsets[p])
+            npno_p = int(n_pno_per_pair[p])
+            naux_p = int(naux_per_pair[p])
+            if kind == 'Qma':
+                shape = (naux_p, nlmo_p, npno_p)
+            elif kind == 'Qab':
+                shape = (naux_p, npno_p, npno_p)
+            elif kind in ('i_Qk', 'j_Qk'):
+                shape = (naux_p, nlmo_p)
+            elif kind in ('i_Qa', 'j_Qa'):
+                shape = (naux_p, npno_p)
+            elif kind in ('K_iajb', 'L_iajb'):
+                shape = (npno_p, npno_p)
+            elif kind in ('K_bar_ij', 'K_bar_ji', 'L_bar'):
+                shape = (nlmo_p, npno_p)
+            elif kind == 'K_bar_chem':
+                shape = (nlmo_p, npno_p)
+            elif kind in ('J_ij_kj', 'K_ij_kj'):
+                shape = (nlmo_p, npno_p, npno_p)
+            elif kind in ('K_tilde_chem_i', 'K_tilde_chem_j'):
+                # Psi4 layout (npno, npno^2)
+                shape = (npno_p, npno_p * npno_p)
+            else:
+                shape = (1,)
+            arrs.append(rng.standard_normal(shape))
+        return arrs
+
+    inputs = PySolverInputs()
+    inputs.nocc = nocc
+    inputs.nlmo = nlmo
+    inputs.n_canon_pairs = n_canon_pairs
+    inputs.n_strong_pairs = n_strong_pairs
+    inputs.diis_max_vecs = 5
+    inputs.max_cycle = 50
+    inputs.e_conv = 1e-7
+    inputs.r_conv = 1e-6
+
+    inputs.i_j_to_ij           = _ptr(i_j_to_ij)
+    inputs.ij_to_i_j           = _ptr(ij_to_i_j)
+    inputs.ij_to_ji            = _ptr(ij_to_ji)
+    inputs.pair_lmo_idx_flat   = _ptr(pair_lmo_idx_flat)
+    inputs.pair_lmo_idx_offsets = _ptr(pair_lmo_idx_offsets)
+    inputs.n_pno_per_pair      = _ptr(n_pno_per_pair)
+    inputs.pno_offsets         = _ptr(pno_offsets)
+    inputs.t2_offsets          = _ptr(t2_offsets)
+
+    inputs.F_lmo      = _ptr(F_lmo)
+    inputs.eps_lmo    = _ptr(eps_lmo)
+    inputs.foo        = _ptr(foo)
+    inputs.fov_flat   = _ptr(fov_flat)
+    inputs.e_pno_flat = _ptr(e_pno_flat)
+
+    inputs.T1_flat = _ptr(T1_flat)
+    inputs.T2_flat = _ptr(T2_flat)
+
+    fps_arrays = {}   # keep each tensor's per-pair list for the parity test
+    for tname in ('Qma', 'Qab', 'i_Qk', 'j_Qk', 'i_Qa', 'j_Qa',
+                  'K_iajb', 'K_bar_ij', 'K_bar_chem',
+                  'J_ij_kj', 'K_ij_kj', 'L_iajb', 'L_bar',
+                  'K_bar_ji', 'K_tilde_chem_i', 'K_tilde_chem_j'):
+        per_pair = _per_pair_shapes(tname)
+        fps_arrays[tname] = per_pair
+        fps, _total, flat, offs = _build_flat_pair_store(per_pair, ownership)
+        setattr(inputs, tname, fps)
+
+    # T1_in_pair: per pair (nlmo_p, npno_p).  Row k holds t1_pno[lmo_list[k]]
+    # projected into pair p's PNO basis (synthetic: random doubles).
+    t1_in_pair_arrays = []
+    for p in range(n_canon_pairs):
+        nlmo_p = int(pair_lmo_idx_offsets[p+1] - pair_lmo_idx_offsets[p])
+        npno_p = int(n_pno_per_pair[p])
+        t1_in_pair_arrays.append(rng.standard_normal((nlmo_p, npno_p)))
+    fps_arrays['T1_in_pair'] = t1_in_pair_arrays
+    fps, _total, flat, offs = _build_flat_pair_store(t1_in_pair_arrays, ownership)
+    inputs.T1_in_pair = fps
+
+    # T1_in_pair_full: per-pair (nocc, npno_p).  Synthetic — random.
+    t1_in_pair_full_arrays = []
+    for p in range(n_canon_pairs):
+        npno_p = int(n_pno_per_pair[p])
+        t1_in_pair_full_arrays.append(rng.standard_normal((nocc, npno_p)))
+    fps_arrays['T1_in_pair_full'] = t1_in_pair_full_arrays
+    fps, _total, flat, offs = _build_flat_pair_store(
+        t1_in_pair_full_arrays, ownership)
+    inputs.T1_in_pair_full = fps
+
+    # Cross-canonical S_pno_cache (full-table layout, length n_canon^2).
+    # block[(p_a, p_b)] of shape (npno[p_a], npno[p_b]) — random doubles.
+    n_blocks = n_canon_pairs * n_canon_pairs
+    S_pno_offsets = np.zeros(n_blocks + 1, dtype=np.int64)
+    for p_a in range(n_canon_pairs):
+        for p_b in range(n_canon_pairs):
+            idx = p_a * n_canon_pairs + p_b
+            S_pno_offsets[idx + 1] = (
+                S_pno_offsets[idx]
+                + int(n_pno_per_pair[p_a]) * int(n_pno_per_pair[p_b]))
+    S_pno_data = rng.standard_normal(int(S_pno_offsets[-1]))
+    ownership.append(S_pno_data)
+    ownership.append(S_pno_offsets)
+    inputs.S_pno_data    = _ptr(S_pno_data)
+    inputs.S_pno_offsets = _ptr(S_pno_offsets)
+    inputs.S_pno_index   = None
+
+    # Ordered pairs (Psi4 all_pairs): (i, j) and (j, i) for each canonical
+    # off-diagonal; just (i, i) for diagonals.
+    ordered_i_list = []
+    ordered_k_list = []
+    for (a, b) in ij_pairs:
+        ordered_i_list.append(a)
+        ordered_k_list.append(b)
+        if a != b:
+            ordered_i_list.append(b)
+            ordered_k_list.append(a)
+    ordered_pair_i_idx = np.array(ordered_i_list, dtype=np.int32)
+    ordered_pair_k_idx = np.array(ordered_k_list, dtype=np.int32)
+    n_ordered_pairs = ordered_pair_i_idx.size
+    ownership.append(ordered_pair_i_idx)
+    ownership.append(ordered_pair_k_idx)
+    inputs.n_ordered_pairs = n_ordered_pairs
+    inputs.ordered_pair_i_idx = _ptr(ordered_pair_i_idx)
+    inputs.ordered_pair_k_idx = _ptr(ordered_pair_k_idx)
+
+    # CAS hooks unset → null pointers. Skipped in dump.
+    inputs.n_cas_blocks = 0
+    inputs.cas_block_pair = None
+    inputs.cas_block_offsets = None
+    inputs.cas_block_data = None
+    inputs.cas_block_slice = None
+
+    # Stash the raw arrays the dump test needs back, keyed by field name.
+    aux = {
+        'F_lmo': F_lmo, 'eps_lmo': eps_lmo, 'foo': foo,
+        'fov_flat': fov_flat, 'e_pno_flat': e_pno_flat,
+        'T1_flat': T1_flat, 'T2_flat': T2_flat,
+        'pair_lmo_idx_flat': pair_lmo_idx_flat,
+        'pair_lmo_idx_offsets': pair_lmo_idx_offsets,
+        'n_pno_per_pair': n_pno_per_pair,
+        'pno_offsets': pno_offsets,
+        't2_offsets': t2_offsets,
+        'naux_per_pair': naux_per_pair,
+        'ij_pairs': ij_pairs,
+        'pair_lmo_idx_list': pair_lmo_idx,
+        'fps_arrays': fps_arrays,
+        'ordered_pair_i_idx': ordered_pair_i_idx,
+        'ordered_pair_k_idx': ordered_pair_k_idx,
+        'i_j_to_ij': i_j_to_ij_2d,
+        'S_pno_data': S_pno_data,
+        'S_pno_offsets': S_pno_offsets,
+    }
+    return inputs, ownership, aux
+
+
+# ----------------------------------------------------------------------------
+# Parity test.
+# ----------------------------------------------------------------------------
+
+def _python_checksums(inputs, ownership, aux):
+    """Compute the same per-field sums that DLPNOcompute_lccsd_dump_inputs
+    computes on the C side.  Order MUST match enum DumpField in the .cpp.
+    """
+    n = len(DUMP_FIELDS)
+    out = np.full(n, np.nan, dtype=np.float64)
+    idx = {name: i for i, name in enumerate(DUMP_FIELDS)}
+
+    out[idx['nocc']]            = float(inputs.nocc)
+    out[idx['nlmo']]            = float(inputs.nlmo)
+    out[idx['n_canon_pairs']]   = float(inputs.n_canon_pairs)
+    out[idx['n_strong_pairs']]  = float(inputs.n_strong_pairs)
+    out[idx['diis_max_vecs']]   = float(inputs.diis_max_vecs)
+    out[idx['max_cycle']]       = float(inputs.max_cycle)
+    out[idx['e_conv']]          = inputs.e_conv
+    out[idx['r_conv']]          = inputs.r_conv
+
+    for name in ('F_lmo', 'eps_lmo', 'foo', 'fov_flat', 'e_pno_flat',
+                 'T1_flat', 'T2_flat'):
+        out[idx[name]] = float(aux[name].sum())
+
+    out[idx['pair_lmo_idx_flat']] = float(aux['pair_lmo_idx_flat'].sum())
+    out[idx['pair_lmo_idx_offsets_last']] = float(aux['pair_lmo_idx_offsets'][-1])
+    out[idx['n_pno_per_pair']] = float(aux['n_pno_per_pair'].sum())
+    out[idx['pno_offsets_last']] = float(aux['pno_offsets'][-1])
+
+    # FlatPairStore sums: ownership holds each (flat, offsets) pair in the
+    # exact order they were appended in build_synthetic_inputs.
+    fps_names = ('Qma', 'Qab', 'i_Qk', 'j_Qk', 'i_Qa', 'j_Qa',
+                 'K_iajb', 'K_bar_ij', 'K_bar_chem',
+                 'J_ij_kj', 'K_ij_kj', 'L_iajb', 'L_bar',
+                 'K_bar_ji', 'K_tilde_chem_i', 'K_tilde_chem_j',
+                 'T1_in_pair', 'T1_in_pair_full')
+    # The ownership list begins with the non-FPS arrays (count = 15), then
+    # each FPS appends (flat, offsets).
+    skip = 15
+    for j, name in enumerate(fps_names):
+        flat = ownership[skip + 2 * j]
+        out[idx[name]] = float(flat.sum())
+    out[idx['t2_offsets_last']] = float(aux['t2_offsets'][-1])
+    out[idx['n_ordered_pairs']] = float(aux['ordered_pair_i_idx'].size)
+    out[idx['ordered_pair_i_idx']] = float(aux['ordered_pair_i_idx'].sum())
+    out[idx['ordered_pair_k_idx']] = float(aux['ordered_pair_k_idx'].sum())
+    out[idx['S_pno_data']] = float(aux['S_pno_data'].sum())
+    out[idx['S_pno_offsets_last']] = float(aux['S_pno_offsets'][-1])
+    return out
+
+
+def parity_test_dump_inputs(verbose=True):
+    """Build synthetic inputs, dump from C, dump from numpy, compare."""
+    inputs, ownership, aux = build_synthetic_inputs()
+    n_fields_c = _libcc.DLPNOcompute_lccsd_dump_n_fields()
+    if n_fields_c != len(DUMP_FIELDS):
+        raise RuntimeError(
+            f'C n_fields={n_fields_c} != Python len(DUMP_FIELDS)={len(DUMP_FIELDS)}'
+            ' — enum DumpField in dlpno_ccsd_solver.cpp drifted from DUMP_FIELDS')
+
+    c_out = np.full(n_fields_c, np.nan, dtype=np.float64)
+    rc = _libcc.DLPNOcompute_lccsd_dump_inputs(
+        ctypes.byref(inputs),
+        c_out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+        ctypes.c_int(n_fields_c))
+    if rc != n_fields_c:
+        raise RuntimeError(f'dump_inputs returned rc={rc}, expected {n_fields_c}')
+
+    py_out = _python_checksums(inputs, ownership, aux)
+
+    rel_tol = 1e-12
+    abs_tol = 1e-10
+    failures = []
+    for i, name in enumerate(DUMP_FIELDS):
+        c_v, py_v = c_out[i], py_out[i]
+        if math.isnan(c_v) and math.isnan(py_v):
+            status = 'NaN both'
+        else:
+            scale = max(abs(c_v), abs(py_v), 1.0)
+            d = abs(c_v - py_v)
+            ok = d <= max(abs_tol, rel_tol * scale)
+            status = 'OK' if ok else 'FAIL'
+            if not ok:
+                failures.append((name, c_v, py_v, d))
+        if verbose:
+            print(f'  [{i:2d}] {name:32s} C={c_v: .12e}  py={py_v: .12e}  {status}',
+                  flush=True)
+
+    # Keep ownership alive past the call.
+    del ownership
+    if failures:
+        raise AssertionError(f'parity mismatch on {len(failures)} fields: {failures}')
+    print(f'[CCSD MONO] parity OK across {n_fields_c} fields', flush=True)
+    return True
+
+
+def _allocate_t1_ints_outputs(aux):
+    """Allocate flat output buffers + offsets for the 4 t1_ints output
+    tensors.  Returns (PyT1IntsOutputs, ownership-list).
+    """
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    naux = aux['naux_per_pair']
+    pair_lmo_offs = aux['pair_lmo_idx_offsets']
+
+    # Per-pair sizes
+    qa_sz = np.empty(n_pairs, dtype=np.int64)
+    qk_sz = np.empty(n_pairs, dtype=np.int64)
+    for p in range(n_pairs):
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        qa_sz[p] = int(naux[p]) * int(npno[p])
+        qk_sz[p] = int(naux[p]) * nlmo_p
+
+    qa_offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    qk_offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    qa_offsets[1:] = np.cumsum(qa_sz)
+    qk_offsets[1:] = np.cumsum(qk_sz)
+
+    own = []
+    bufs = {}
+    for name, total, off in (
+            ('i_Qa_t1', qa_offsets[-1], qa_offsets),
+            ('j_Qa_t1', qa_offsets[-1], qa_offsets),
+            ('i_Qk_t1', qk_offsets[-1], qk_offsets),
+            ('j_Qk_t1', qk_offsets[-1], qk_offsets)):
+        flat = np.full(int(total), np.nan, dtype=np.float64)
+        own.append(flat)
+        bufs[name] = (flat, off)
+    own.append(qa_offsets)
+    own.append(qk_offsets)
+
+    out = PyT1IntsOutputs()
+    for name, (flat, off) in bufs.items():
+        wps = PyWritablePairStore()
+        wps.data = flat.ctypes.data
+        wps.offsets = off.ctypes.data
+        setattr(out, name, wps)
+    return out, own, bufs
+
+
+def _python_reference_t1_ints(inputs, ownership, aux):
+    """Reference path: per pair, slice the same per-pair tensors that the
+    C++ class would slice (using ij_pairs / pair_lmo_idx / naux_per_pair
+    from aux), call DLPNOt1_ints_pair_side directly from Python, return
+    a flat dict of per-pair outputs.
+
+    The kernel is the same in both paths; the test verifies that the
+    class's per-pair slicing logic produces exactly the same inputs.
+    """
+    ij_pairs = aux['ij_pairs']
+    pair_lmo_idx_list = aux['pair_lmo_idx_list']
+    naux = aux['naux_per_pair']
+    npno = aux['n_pno_per_pair']
+    fps = aux['fps_arrays']
+
+    out_per_pair = []
+    for p, (i, j) in enumerate(ij_pairs):
+        lmo_list = pair_lmo_idx_list[p]
+        nlmo_p = len(lmo_list)
+        npno_p = int(npno[p])
+        n_local = int(naux[p])
+
+        i_in_p = int(np.where(lmo_list == i)[0][0])
+        j_in_p = int(np.where(lmo_list == j)[0][0])
+
+        T1_local = np.ascontiguousarray(fps['T1_in_pair'][p])
+        t1_lmo_i = np.ascontiguousarray(T1_local[i_in_p])
+        t1_lmo_j = np.ascontiguousarray(T1_local[j_in_p])
+        Qma = np.ascontiguousarray(fps['Qma'][p])
+        Qab = np.ascontiguousarray(fps['Qab'][p])
+        i_Qa = np.ascontiguousarray(fps['i_Qa'][p])
+        i_Qk = np.ascontiguousarray(fps['i_Qk'][p])
+        j_Qa = np.ascontiguousarray(fps['j_Qa'][p])
+        j_Qk = np.ascontiguousarray(fps['j_Qk'][p])
+
+        i_Qa_t1 = np.empty((n_local, npno_p), dtype=np.float64)
+        i_Qk_t1 = np.empty((n_local, nlmo_p), dtype=np.float64)
+        j_Qa_t1 = np.empty((n_local, npno_p), dtype=np.float64)
+        j_Qk_t1 = np.empty((n_local, nlmo_p), dtype=np.float64)
+
+        _libcc.DLPNOt1_ints_pair_side(
+            i_Qa_t1.ctypes.data, i_Qk_t1.ctypes.data,
+            i_Qa.ctypes.data, i_Qk.ctypes.data,
+            Qma.ctypes.data, Qab.ctypes.data,
+            t1_lmo_i.ctypes.data, T1_local.ctypes.data,
+            ctypes.c_size_t(n_local), ctypes.c_size_t(nlmo_p), ctypes.c_size_t(npno_p))
+        _libcc.DLPNOt1_ints_pair_side(
+            j_Qa_t1.ctypes.data, j_Qk_t1.ctypes.data,
+            j_Qa.ctypes.data, j_Qk.ctypes.data,
+            Qma.ctypes.data, Qab.ctypes.data,
+            t1_lmo_j.ctypes.data, T1_local.ctypes.data,
+            ctypes.c_size_t(n_local), ctypes.c_size_t(nlmo_p), ctypes.c_size_t(npno_p))
+
+        out_per_pair.append(dict(
+            i_Qa_t1=i_Qa_t1, j_Qa_t1=j_Qa_t1,
+            i_Qk_t1=i_Qk_t1, j_Qk_t1=j_Qk_t1))
+    return out_per_pair
+
+
+def parity_test_phase_t1_ints(verbose=True):
+    """Build synthetic inputs, run the new C++ phase + a Python reference
+    that invokes the same kernel directly, compare per-pair outputs."""
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    out_struct, out_own, bufs = _allocate_t1_ints_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_ints(
+        ctypes.byref(inputs), ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_ints returned rc={rc}')
+
+    ref = _python_reference_t1_ints(inputs, ownership, aux)
+
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    naux = aux['naux_per_pair']
+    pair_lmo_offs = aux['pair_lmo_idx_offsets']
+
+    qa_off = bufs['i_Qa_t1'][1]
+    qk_off = bufs['i_Qk_t1'][1]
+    i_Qa_t1_flat = bufs['i_Qa_t1'][0]
+    j_Qa_t1_flat = bufs['j_Qa_t1'][0]
+    i_Qk_t1_flat = bufs['i_Qk_t1'][0]
+    j_Qk_t1_flat = bufs['j_Qk_t1'][0]
+
+    max_abs = 0.0
+    failures = []
+    for p in range(n_pairs):
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        npno_p = int(npno[p])
+        n_local = int(naux[p])
+
+        c_iQa = i_Qa_t1_flat[qa_off[p]:qa_off[p+1]].reshape(n_local, npno_p)
+        c_jQa = j_Qa_t1_flat[qa_off[p]:qa_off[p+1]].reshape(n_local, npno_p)
+        c_iQk = i_Qk_t1_flat[qk_off[p]:qk_off[p+1]].reshape(n_local, nlmo_p)
+        c_jQk = j_Qk_t1_flat[qk_off[p]:qk_off[p+1]].reshape(n_local, nlmo_p)
+
+        for name, c_arr, py_arr in (
+                ('i_Qa_t1', c_iQa, ref[p]['i_Qa_t1']),
+                ('j_Qa_t1', c_jQa, ref[p]['j_Qa_t1']),
+                ('i_Qk_t1', c_iQk, ref[p]['i_Qk_t1']),
+                ('j_Qk_t1', c_jQk, ref[p]['j_Qk_t1'])):
+            d = float(np.max(np.abs(c_arr - py_arr)))
+            max_abs = max(max_abs, d)
+            if d > 1e-12:
+                failures.append((p, name, d))
+
+    if verbose:
+        print(f'[CCSD MONO] phase_t1_ints parity over {n_pairs} pairs: '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if failures:
+        sample = failures[:5]
+        raise AssertionError(
+            f'phase_t1_ints parity FAILED on {len(failures)} (pair, tensor) '
+            f'entries (showing first 5): {sample}')
+
+    # Keep buffers alive past the call
+    del out_own
+    del ownership
+    return max_abs
+
+
+def _allocate_b_tilde_outputs(aux):
+    """Per pair output: (nlmo_p, nlmo_p) doubles."""
+    n_pairs = len(aux['ij_pairs'])
+    pair_lmo_offs = aux['pair_lmo_idx_offsets']
+
+    sizes = np.empty(n_pairs, dtype=np.int64)
+    for p in range(n_pairs):
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        sizes[p] = nlmo_p * nlmo_p
+
+    offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(sizes)
+    flat = np.full(int(offsets[-1]), np.nan, dtype=np.float64)
+
+    out = PyBTildeOutputs()
+    wps = PyWritablePairStore()
+    wps.data = flat.ctypes.data
+    wps.offsets = offsets.ctypes.data
+    out.B_tilde = wps
+    return out, [flat, offsets], (flat, offsets)
+
+
+def _python_reference_b_tilde(inputs, aux, t1_ints_per_pair):
+    """Per-pair reference: call DLPNOcompute_B_tilde_pair directly with
+    inputs sliced from the aux dicts and the prior phase's outputs.
+    """
+    ij_pairs = aux['ij_pairs']
+    pair_lmo_idx_list = aux['pair_lmo_idx_list']
+    naux = aux['naux_per_pair']
+    npno = aux['n_pno_per_pair']
+    fps = aux['fps_arrays']
+    t2_offsets = aux['t2_offsets']
+    T2_flat = aux['T2_flat']
+
+    out_per_pair = []
+    for p, (i, j) in enumerate(ij_pairs):
+        nlmo_p = len(pair_lmo_idx_list[p])
+        npno_p = int(npno[p])
+        n_local = int(naux[p])
+
+        if npno_p == 0:
+            out_per_pair.append(np.zeros((nlmo_p, nlmo_p), dtype=np.float64))
+            continue
+
+        Qma = np.ascontiguousarray(fps['Qma'][p])
+        T2_p = np.ascontiguousarray(
+            T2_flat[t2_offsets[p]:t2_offsets[p+1]].reshape(npno_p, npno_p))
+        i_Qk_t1 = np.ascontiguousarray(t1_ints_per_pair[p]['i_Qk_t1'])
+        j_Qk_t1 = np.ascontiguousarray(t1_ints_per_pair[p]['j_Qk_t1'])
+
+        B_out = np.empty((nlmo_p, nlmo_p), dtype=np.float64)
+        _libcc.DLPNOcompute_B_tilde_pair(
+            B_out.ctypes.data,
+            i_Qk_t1.ctypes.data, j_Qk_t1.ctypes.data,
+            Qma.ctypes.data, T2_p.ctypes.data,
+            ctypes.c_size_t(n_local),
+            ctypes.c_size_t(nlmo_p),
+            ctypes.c_size_t(npno_p))
+        out_per_pair.append(B_out)
+    return out_per_pair
+
+
+def parity_test_phase_b_tilde(verbose=True):
+    """Build inputs, run phase_t1_ints to produce i_Qk_t1/j_Qk_t1, run
+    phase_b_tilde, compare against direct per-pair kernel calls."""
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    # Step 1: produce t1-dressed intermediates (used as inputs to b_tilde).
+    t1_out, t1_own, t1_bufs = _allocate_t1_ints_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_ints(
+        ctypes.byref(inputs), ctypes.byref(t1_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_ints rc={rc}')
+
+    # Wrap T1IntsOutputs i/j_Qk_t1 buffers as FlatPairStore inputs for b_tilde.
+    bt_inputs = PyBTildeInputs()
+    for name in ('i_Qk_t1', 'j_Qk_t1'):
+        wps = getattr(t1_out, name)
+        fps = PyFlatPairStore()
+        fps.data = wps.data
+        fps.offsets = wps.offsets
+        setattr(bt_inputs, name, fps)
+
+    # Step 2: run phase_b_tilde via the class.
+    bt_out, bt_own, (B_flat, B_offsets) = _allocate_b_tilde_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_b_tilde(
+        ctypes.byref(inputs), ctypes.byref(bt_inputs), ctypes.byref(bt_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_b_tilde rc={rc}')
+
+    # Step 3: build a per-pair list of t1_ints outputs for the reference.
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    naux_arr = aux['naux_per_pair']
+    pair_lmo_offs = aux['pair_lmo_idx_offsets']
+    qa_off = t1_bufs['i_Qa_t1'][1]
+    qk_off = t1_bufs['i_Qk_t1'][1]
+    iQk_flat = t1_bufs['i_Qk_t1'][0]
+    jQk_flat = t1_bufs['j_Qk_t1'][0]
+    t1_per_pair = []
+    for p in range(n_pairs):
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        n_local = int(naux_arr[p])
+        t1_per_pair.append({
+            'i_Qk_t1': iQk_flat[qk_off[p]:qk_off[p+1]].reshape(n_local, nlmo_p),
+            'j_Qk_t1': jQk_flat[qk_off[p]:qk_off[p+1]].reshape(n_local, nlmo_p),
+        })
+
+    # Step 4: reference + compare.
+    ref = _python_reference_b_tilde(inputs, aux, t1_per_pair)
+    max_abs = 0.0
+    failures = []
+    for p in range(n_pairs):
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        c_B = B_flat[B_offsets[p]:B_offsets[p+1]].reshape(nlmo_p, nlmo_p)
+        d = float(np.max(np.abs(c_B - ref[p])))
+        max_abs = max(max_abs, d)
+        if d > 1e-12:
+            failures.append((p, d))
+
+    if verbose:
+        print(f'[CCSD MONO] phase_b_tilde parity over {n_pairs} pairs: '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if failures:
+        raise AssertionError(
+            f'phase_b_tilde parity FAILED on {len(failures)} pairs: '
+            f'{failures[:5]}')
+
+    del t1_own, bt_own, ownership
+    return max_abs
+
+
+def _allocate_t1_fock_outputs(aux):
+    """Per-pair Fab (npno_p × npno_p) + flat d (N × 2)."""
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+
+    sizes = npno.astype(np.int64) ** 2
+    Fab_offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    Fab_offsets[1:] = np.cumsum(sizes)
+    Fab_flat = np.full(int(Fab_offsets[-1]), np.nan, dtype=np.float64)
+
+    # d_flat slot for d_ji is only written for off-diagonal pairs (i != j);
+    # initialize to 0 so the diagonal pairs' d_ji slot is well-defined and
+    # matches the reference path's zero-init.
+    d_flat = np.zeros(n_pairs * 2, dtype=np.float64)
+
+    out = PyT1FockOutputs()
+    wps = PyWritablePairStore()
+    wps.data = Fab_flat.ctypes.data
+    wps.offsets = Fab_offsets.ctypes.data
+    out.Fab = wps
+    out.d_flat = d_flat.ctypes.data
+    return out, [Fab_flat, Fab_offsets, d_flat], (Fab_flat, Fab_offsets, d_flat)
+
+
+def _python_reference_t1_fock(inputs, aux):
+    """Reference: pack the same flat-buffer plan the Python wrapper uses
+    and call DLPNOt1_fock_batched directly.  This validates that the
+    class produces identical output, including scratch arena handling.
+    """
+    ij_pairs = aux['ij_pairs']
+    pair_lmo_idx_list = aux['pair_lmo_idx_list']
+    naux = aux['naux_per_pair']
+    npno = aux['n_pno_per_pair']
+    fps = aux['fps_arrays']
+    e_pno_flat = aux['e_pno_flat']
+    pno_offsets = aux['pno_offsets']
+
+    N = len(ij_pairs)
+    nlmo_arr = np.array([len(pair_lmo_idx_list[p]) for p in range(N)],
+                        dtype=np.int32)
+    npno_arr = npno.astype(np.int32).copy()
+    n_local_arr = naux.astype(np.int32).copy()
+    need_dji_arr = np.array([1 if i != j else 0 for (i, j) in ij_pairs],
+                             dtype=np.int32)
+
+    def _flat(arrs):
+        sizes = np.array([a.size for a in arrs], dtype=np.int64)
+        offsets = np.zeros(len(arrs) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(sizes)
+        buf = np.empty(int(offsets[-1]))
+        for i, a in enumerate(arrs):
+            buf[offsets[i]:offsets[i+1]] = a.ravel()
+        return buf, offsets
+
+    K_chem_flat, K_chem_off = _flat(fps['K_bar_chem'])
+    K_ji_flat,   K_ji_off   = _flat(fps['K_bar_ji'])
+    K_ij_flat,   K_ij_off   = _flat(fps['K_bar_ij'])
+    Qma_flat,    Qma_off    = _flat(fps['Qma'])
+    Qab_flat,    Qab_off    = _flat(fps['Qab'])
+    T1_flat,     T1_off     = _flat(fps['T1_in_pair'])
+
+    # e_pno is per-pair (npno_p,) — pno_offsets indexes it directly.
+    e_pno_off = np.asarray(pno_offsets, dtype=np.int64).copy()
+
+    Fab_sizes = npno_arr.astype(np.int64) ** 2
+    Fab_off = np.zeros(N + 1, dtype=np.int64)
+    Fab_off[1:] = np.cumsum(Fab_sizes)
+    Fab_flat = np.zeros(int(Fab_off[-1]))
+    d_flat = np.zeros(N * 2)
+
+    max_n_local = int(n_local_arr.max())
+    max_nlmo = int(nlmo_arr.max())
+    max_npno = int(npno_arr.max())
+
+    import os as _os
+    num_threads = min(int(_os.environ.get('OMP_NUM_THREADS', '4')), 16)
+    if num_threads > N:
+        num_threads = max(N, 1)
+
+    sc_gamma = np.zeros((num_threads, max_n_local))
+    sc_Y     = np.zeros((num_threads, max_n_local * max_nlmo * max_npno))
+    sc_Y2    = np.zeros((num_threads, max_n_local * max_nlmo * max_npno))
+    sc_Fia   = np.zeros((num_threads, max_nlmo * max_npno))
+    sc_Z     = np.zeros((num_threads, max_n_local * max_nlmo * max_nlmo))
+    sc_Z2    = np.zeros((num_threads, max_n_local * max_nlmo * max_nlmo))
+
+    _libcc.DLPNOt1_fock_batched(
+        T1_flat.ctypes.data, T1_off.ctypes.data,
+        K_chem_flat.ctypes.data, K_chem_off.ctypes.data,
+        K_ji_flat.ctypes.data,   K_ji_off.ctypes.data,
+        K_ij_flat.ctypes.data,   K_ij_off.ctypes.data,
+        Qma_flat.ctypes.data,    Qma_off.ctypes.data,
+        Qab_flat.ctypes.data,    Qab_off.ctypes.data,
+        e_pno_flat.ctypes.data,  e_pno_off.ctypes.data,
+        nlmo_arr.ctypes.data, npno_arr.ctypes.data,
+        n_local_arr.ctypes.data, need_dji_arr.ctypes.data,
+        sc_gamma.ctypes.data, sc_gamma.shape[1],
+        sc_Y.ctypes.data,     sc_Y.shape[1],
+        sc_Y2.ctypes.data,    sc_Y2.shape[1],
+        sc_Fia.ctypes.data,   sc_Fia.shape[1],
+        sc_Z.ctypes.data,     sc_Z.shape[1],
+        sc_Z2.ctypes.data,    sc_Z2.shape[1],
+        d_flat.ctypes.data,
+        Fab_flat.ctypes.data, Fab_off.ctypes.data,
+        ctypes.c_size_t(N), ctypes.c_int(num_threads))
+    return Fab_flat, Fab_off, d_flat
+
+
+def parity_test_phase_t1_fock(verbose=True):
+    """Compare class run_phase_t1_fock_into vs direct kernel call."""
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    out, own, (c_Fab, c_Fab_off, c_d) = _allocate_t1_fock_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock(
+        ctypes.byref(inputs), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock rc={rc}')
+
+    ref_Fab, ref_Fab_off, ref_d = _python_reference_t1_fock(inputs, aux)
+
+    diff_Fab = float(np.max(np.abs(c_Fab - ref_Fab)))
+    diff_d   = float(np.max(np.abs(c_d - ref_d)))
+    max_abs  = max(diff_Fab, diff_d)
+
+    if verbose:
+        print(f'[CCSD MONO] phase_t1_fock parity: '
+              f'max |dFab|={diff_Fab:.3e}  max |dd|={diff_d:.3e}',
+              flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(
+            f'phase_t1_fock parity FAILED — Fab={diff_Fab:.3e}, d={diff_d:.3e}')
+    del own, ownership
+    return max_abs
+
+
+def _allocate_d_tilde_outputs(aux):
+    """Per ordered pair: D_tilde shape (npno_canonical, npno_canonical)."""
+    n_pairs = len(aux['ij_pairs'])
+    pair_lmo_offs = aux['pair_lmo_idx_offsets']
+    npno = aux['n_pno_per_pair']
+    i_j_to_ij = aux['i_j_to_ij']
+    o_i = aux['ordered_pair_i_idx']
+    o_k = aux['ordered_pair_k_idx']
+    N = o_i.size
+
+    sizes = np.empty(N, dtype=np.int64)
+    for o in range(N):
+        p = int(i_j_to_ij[int(o_i[o]), int(o_k[o])])
+        sizes[o] = int(npno[p]) ** 2
+    offsets = np.zeros(N + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(sizes)
+    flat = np.full(int(offsets[-1]), np.nan, dtype=np.float64)
+
+    out = PyDTildeOutputs()
+    wps = PyWritablePairStore()
+    wps.data = flat.ctypes.data
+    wps.offsets = offsets.ctypes.data
+    out.D_tilde = wps
+    return out, [flat, offsets], (flat, offsets)
+
+
+def _python_reference_d_tilde(aux):
+    """Reference: build the same flat-buffer plan the Python wrapper uses
+    and call DLPNOcompute_D_tilde_ph1_batched directly.
+    """
+    ij_pairs = aux['ij_pairs']
+    pair_lmo_idx_list = aux['pair_lmo_idx_list']
+    npno = aux['n_pno_per_pair']
+    fps = aux['fps_arrays']
+    i_j_to_ij = aux['i_j_to_ij']
+    o_i = aux['ordered_pair_i_idx']
+    o_k = aux['ordered_pair_k_idx']
+    N = o_i.size
+
+    n_pno_arr = np.empty(N, dtype=np.int32)
+    n_domain_arr = np.empty(N, dtype=np.int32)
+    K_tilde_chem_list = []
+    M_static_list = []
+    t1_list = []
+    T1_rows_list = []
+
+    for o in range(N):
+        i = int(o_i[o])
+        k = int(o_k[o])
+        p = int(i_j_to_ij[i, k])
+        a, b = ij_pairs[p]
+        nlmo_p = len(pair_lmo_idx_list[p])
+        npno_p = int(npno[p])
+
+        # K_tilde_chem orientation: i-variant if first canonical idx is k.
+        if a == k:
+            kt = fps['K_tilde_chem_i'][p]
+        else:
+            kt = fps['K_tilde_chem_j'][p]
+        # K_bar orientation: ij-variant if first canonical idx is i.
+        Kb = fps['K_bar_ij'][p] if a == i else fps['K_bar_ji'][p]
+        Kc = fps['K_bar_chem'][p]
+        M_static = 2.0 * Kb - Kc
+
+        # i_in_p
+        lmo_list = np.asarray(pair_lmo_idx_list[p])
+        i_in_p = int(np.where(lmo_list == i)[0][0])
+
+        T1_pair = fps['T1_in_pair'][p]
+        t1_i = T1_pair[i_in_p]
+        T1_rows = T1_pair
+
+        K_tilde_chem_list.append(np.ascontiguousarray(kt))
+        M_static_list.append(np.ascontiguousarray(M_static))
+        t1_list.append(np.ascontiguousarray(t1_i))
+        T1_rows_list.append(np.ascontiguousarray(T1_rows))
+        n_pno_arr[o] = npno_p
+        n_domain_arr[o] = nlmo_p
+
+    def _flat(arrs):
+        sizes = np.array([a.size for a in arrs], dtype=np.int64)
+        offsets = np.zeros(len(arrs) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(sizes)
+        buf = np.empty(int(offsets[-1]))
+        for i, a in enumerate(arrs):
+            buf[offsets[i]:offsets[i+1]] = a.ravel()
+        return buf, offsets
+
+    kt_flat, kt_off = _flat(K_tilde_chem_list)
+    M_flat,  M_off  = _flat(M_static_list)
+    t1_flat, t1_off = _flat(t1_list)
+    T1_rows_flat, T1_rows_off = _flat(T1_rows_list)
+
+    D_sizes = (n_pno_arr.astype(np.int64) ** 2)
+    D_off = np.zeros(N + 1, dtype=np.int64)
+    D_off[1:] = np.cumsum(D_sizes)
+    D_flat = np.zeros(int(D_off[-1]))
+
+    _libcc.DLPNOcompute_D_tilde_ph1_batched(
+        kt_flat.ctypes.data, kt_off.ctypes.data,
+        M_flat.ctypes.data,  M_off.ctypes.data,
+        t1_flat.ctypes.data, t1_off.ctypes.data,
+        T1_rows_flat.ctypes.data, T1_rows_off.ctypes.data,
+        n_pno_arr.ctypes.data, n_domain_arr.ctypes.data,
+        D_flat.ctypes.data, D_off.ctypes.data,
+        ctypes.c_size_t(N))
+    return D_flat, D_off
+
+
+def parity_test_phase_d_tilde_ph1(verbose=True):
+    """Run the class D_tilde Phase 1 vs direct kernel reference."""
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    out, own, (c_D, c_D_off) = _allocate_d_tilde_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_d_tilde_ph1(
+        ctypes.byref(inputs), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'phase_d_tilde_ph1 rc={rc}')
+
+    ref_D, ref_D_off = _python_reference_d_tilde(aux)
+    if not np.array_equal(c_D_off, ref_D_off):
+        raise AssertionError(
+            f'D_tilde offsets differ: c={c_D_off} ref={ref_D_off}')
+    max_abs = float(np.max(np.abs(c_D - ref_D)))
+
+    n_ord = aux['ordered_pair_i_idx'].size
+    if verbose:
+        print(f'[CCSD MONO] phase_d_tilde_ph1 parity over {n_ord} ordered '
+              f'pairs: max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(
+            f'phase_d_tilde_ph1 parity FAILED — max abs diff = {max_abs:.3e}')
+    del own, ownership
+    return max_abs
+
+
+def _allocate_c_tilde_outputs(aux):
+    """Per ordered pair: C_tilde shape (npno_canonical, npno_canonical).
+    Identical sizing to D_tilde — reuse the helper logic.
+    """
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    i_j_to_ij = aux['i_j_to_ij']
+    o_i = aux['ordered_pair_i_idx']
+    o_k = aux['ordered_pair_k_idx']
+    N = o_i.size
+
+    sizes = np.empty(N, dtype=np.int64)
+    for o in range(N):
+        p = int(i_j_to_ij[int(o_i[o]), int(o_k[o])])
+        sizes[o] = int(npno[p]) ** 2
+    offsets = np.zeros(N + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(sizes)
+    flat = np.full(int(offsets[-1]), np.nan, dtype=np.float64)
+
+    out = PyCTildeOutputs()
+    wps = PyWritablePairStore()
+    wps.data = flat.ctypes.data
+    wps.offsets = offsets.ctypes.data
+    out.C_tilde = wps
+    return out, [flat, offsets], (flat, offsets)
+
+
+def _python_reference_c_tilde(aux):
+    """C_tilde Phase 1 reference: build the same flat-buffer plan the
+    Python wrapper uses and call DLPNOcompute_C_tilde_ph1_batched.
+
+    Convention: our ordered_pair_i_idx[o] is treated as Psi4's "k" and
+    ordered_pair_k_idx[o] as Psi4's "i" (matching the (k, i) unpacking
+    in compute_C_tilde_batched).  K_tilde_chem orientation: pick "_i"
+    if canonical_first == "k" (= ordered_pair_i_idx[o]).  t1 source:
+    the "i" of the ordered pair (= ordered_pair_k_idx[o]).
+    """
+    ij_pairs = aux['ij_pairs']
+    pair_lmo_idx_list = aux['pair_lmo_idx_list']
+    npno = aux['n_pno_per_pair']
+    fps = aux['fps_arrays']
+    i_j_to_ij = aux['i_j_to_ij']
+    o_i = aux['ordered_pair_i_idx']
+    o_k = aux['ordered_pair_k_idx']
+    N = o_i.size
+
+    n_pno_arr = np.empty(N, dtype=np.int32)
+    n_domain_arr = np.empty(N, dtype=np.int32)
+    K_tilde_chem_list = []
+    K_bar_chem_slice_list = []
+    t1_list = []
+    T1_local_list = []
+
+    for o in range(N):
+        a = int(o_i[o])    # "k" in C_tilde nomenclature
+        b = int(o_k[o])    # "i"
+        p = int(i_j_to_ij[a, b])
+        ca = ij_pairs[p][0]
+        nlmo_p = len(pair_lmo_idx_list[p])
+        npno_p = int(npno[p])
+
+        # K_tilde_chem orientation: "_i" if canonical first == a (= "k").
+        if ca == a:
+            kt = fps['K_tilde_chem_i'][p]
+        else:
+            kt = fps['K_tilde_chem_j'][p]
+
+        # K_bar_chem_slice = ci['K_bar_chem'] (already pair_lmo_idx-restricted).
+        Kbc = fps['K_bar_chem'][p]
+
+        # t1 at "i" = b (second of ordered pair).
+        lmo_list = np.asarray(pair_lmo_idx_list[p])
+        i_in_p = int(np.where(lmo_list == b)[0][0])
+
+        T1_pair = fps['T1_in_pair'][p]
+        t1_i = T1_pair[i_in_p]
+        T1_local = T1_pair
+
+        K_tilde_chem_list.append(np.ascontiguousarray(kt))
+        K_bar_chem_slice_list.append(np.ascontiguousarray(Kbc))
+        t1_list.append(np.ascontiguousarray(t1_i))
+        T1_local_list.append(np.ascontiguousarray(T1_local))
+        n_pno_arr[o] = npno_p
+        n_domain_arr[o] = nlmo_p
+
+    def _flat(arrs):
+        sizes = np.array([a.size for a in arrs], dtype=np.int64)
+        offsets = np.zeros(len(arrs) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(sizes)
+        buf = np.empty(int(offsets[-1]))
+        for i, a in enumerate(arrs):
+            buf[offsets[i]:offsets[i+1]] = a.ravel()
+        return buf, offsets
+
+    kt_flat,  kt_off  = _flat(K_tilde_chem_list)
+    Kbc_flat, Kbc_off = _flat(K_bar_chem_slice_list)
+    t1_flat,  t1_off  = _flat(t1_list)
+    T1l_flat, T1l_off = _flat(T1_local_list)
+
+    C_sizes = (n_pno_arr.astype(np.int64) ** 2)
+    C_off = np.zeros(N + 1, dtype=np.int64)
+    C_off[1:] = np.cumsum(C_sizes)
+    C_flat = np.zeros(int(C_off[-1]))
+
+    _libcc.DLPNOcompute_C_tilde_ph1_batched(
+        kt_flat.ctypes.data,  kt_off.ctypes.data,
+        Kbc_flat.ctypes.data, Kbc_off.ctypes.data,
+        t1_flat.ctypes.data,  t1_off.ctypes.data,
+        T1l_flat.ctypes.data, T1l_off.ctypes.data,
+        n_pno_arr.ctypes.data, n_domain_arr.ctypes.data,
+        C_flat.ctypes.data, C_off.ctypes.data,
+        ctypes.c_size_t(N))
+    return C_flat, C_off
+
+
+def parity_test_phase_c_tilde_ph1(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    out, own, (c_C, c_C_off) = _allocate_c_tilde_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_c_tilde_ph1(
+        ctypes.byref(inputs), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'phase_c_tilde_ph1 rc={rc}')
+
+    ref_C, ref_C_off = _python_reference_c_tilde(aux)
+    if not np.array_equal(c_C_off, ref_C_off):
+        raise AssertionError(
+            f'C_tilde offsets differ: c={c_C_off} ref={ref_C_off}')
+    max_abs = float(np.max(np.abs(c_C - ref_C)))
+
+    n_ord = aux['ordered_pair_i_idx'].size
+    if verbose:
+        print(f'[CCSD MONO] phase_c_tilde_ph1 parity over {n_ord} ordered '
+              f'pairs: max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(
+            f'phase_c_tilde_ph1 parity FAILED — max abs diff = {max_abs:.3e}')
+    del own, ownership
+    return max_abs
+
+
+def _build_synthetic_g_tilde_plan(aux, seed=4321):
+    """Synthetic plan generator for the G_tilde inner kernel.
+
+    Each (i, j) slot has a random number of triples (1..3); each triple
+    points at a random canonical T2 pair and supplies an effective tensor
+    of shape (n_lj, n_lj) drawn from a fresh RNG.  The reference reduction
+    is computed in numpy from the same buffers.
+    """
+    rng = np.random.default_rng(seed)
+    nocc = int(aux['F_lmo'].shape[0])
+    n_canon = aux['n_pno_per_pair'].size
+    npno_arr = aux['n_pno_per_pair']
+
+    # Pick a subset of (i, j) slots with i, j in [0, nocc).
+    n_ij_slots = nocc * nocc      # use all slots; matches Psi4 enumeration
+    ij_i_arr = np.empty(n_ij_slots, dtype=np.int32)
+    ij_j_arr = np.empty(n_ij_slots, dtype=np.int32)
+    for s in range(n_ij_slots):
+        ij_i_arr[s] = s // nocc
+        ij_j_arr[s] = s %  nocc
+
+    # Random triples per slot.
+    per_slot = rng.integers(1, 4, size=n_ij_slots, dtype=np.int64)
+    ij_triple_starts = np.zeros(n_ij_slots + 1, dtype=np.int64)
+    ij_triple_starts[1:] = np.cumsum(per_slot)
+    n_triples = int(ij_triple_starts[-1])
+
+    # Per-triple data.
+    triple_T2_pair_idx = rng.integers(0, n_canon, size=n_triples, dtype=np.int64)
+    triple_n_lj = npno_arr[triple_T2_pair_idx].astype(np.int32)
+    triple_eff_size = (triple_n_lj.astype(np.int64) ** 2)
+    triple_eff_offset = np.zeros(n_triples + 1, dtype=np.int64)
+    triple_eff_offset[1:] = np.cumsum(triple_eff_size)
+    effective_flat = rng.standard_normal(int(triple_eff_offset[-1]))
+
+    # Strip the trailing offset entry so triple_eff_offset has length n_triples
+    # (kernel only reads triple_eff_offset[t] for t in [0, n_triples)).
+    plan_arrays = {
+        'triple_eff_offset':  triple_eff_offset[:-1].copy(),
+        'triple_T2_pair_idx': triple_T2_pair_idx,
+        'triple_n_lj':        triple_n_lj,
+        'ij_triple_starts':   ij_triple_starts,
+        'ij_i_arr':           ij_i_arr,
+        'ij_j_arr':           ij_j_arr,
+        'effective_flat':     effective_flat,
+        'n_triples':          n_triples,
+        'n_ij_slots':         n_ij_slots,
+    }
+    return plan_arrays
+
+
+def _python_reference_g_tilde_inner(plan_arrays, aux, G_init):
+    """Reference: directly call DLPNOcompute_G_tilde_inner with plan + T2."""
+    G_ref = G_init.copy()
+    _libcc.DLPNOcompute_G_tilde_inner(
+        plan_arrays['triple_eff_offset'].ctypes.data,
+        plan_arrays['triple_T2_pair_idx'].ctypes.data,
+        plan_arrays['triple_n_lj'].ctypes.data,
+        plan_arrays['ij_triple_starts'].ctypes.data,
+        plan_arrays['ij_i_arr'].ctypes.data,
+        plan_arrays['ij_j_arr'].ctypes.data,
+        plan_arrays['effective_flat'].ctypes.data,
+        aux['T2_flat'].ctypes.data,
+        aux['t2_offsets'].ctypes.data,
+        G_ref.ctypes.data,
+        ctypes.c_size_t(plan_arrays['n_ij_slots']),
+        ctypes.c_size_t(aux['F_lmo'].shape[0]))
+    return G_ref
+
+
+def parity_test_phase_g_tilde_inner(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+    plan_arrays = _build_synthetic_g_tilde_plan(aux)
+
+    # G initial = some Fkj-like nocc×nocc; here we just use foo as a stand-in.
+    nocc = int(aux['F_lmo'].shape[0])
+    G_init = aux['foo'].copy()
+
+    # Class path
+    G_class = G_init.copy()
+    plan_struct = PyGTildeInputs()
+    plan_struct.n_ij_slots = int(plan_arrays['n_ij_slots'])
+    plan_struct.triple_eff_offset  = plan_arrays['triple_eff_offset'].ctypes.data
+    plan_struct.triple_T2_pair_idx = plan_arrays['triple_T2_pair_idx'].ctypes.data
+    plan_struct.triple_n_lj        = plan_arrays['triple_n_lj'].ctypes.data
+    plan_struct.ij_triple_starts   = plan_arrays['ij_triple_starts'].ctypes.data
+    plan_struct.ij_i_arr           = plan_arrays['ij_i_arr'].ctypes.data
+    plan_struct.ij_j_arr           = plan_arrays['ij_j_arr'].ctypes.data
+    plan_struct.effective_flat     = plan_arrays['effective_flat'].ctypes.data
+    out_struct = PyGTildeOutputs()
+    out_struct.G_tilde = G_class.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_g_tilde_inner(
+        ctypes.byref(inputs), ctypes.byref(plan_struct), ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_g_tilde_inner rc={rc}')
+
+    # Reference
+    G_ref = _python_reference_g_tilde_inner(plan_arrays, aux, G_init)
+
+    max_abs = float(np.max(np.abs(G_class - G_ref)))
+    n_triples = plan_arrays['n_triples']
+    if verbose:
+        print(f'[CCSD MONO] phase_g_tilde_inner parity: '
+              f'{plan_arrays["n_ij_slots"]} slots, {n_triples} triples; '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(
+            f'phase_g_tilde_inner parity FAILED — max abs diff = {max_abs:.3e}')
+    del ownership
+    return max_abs
+
+
+def _python_reference_t1_fock_finalize(inputs, aux, d_flat):
+    """numpy reference for t1_fock finalize: Fkj scatter + Eq 94 + foo_t1."""
+    nocc = int(aux['F_lmo'].shape[0])
+    n_pairs = len(aux['ij_pairs'])
+    fps = aux['fps_arrays']
+    pair_lmo_idx_list = aux['pair_lmo_idx_list']
+    npno = aux['n_pno_per_pair']
+    naux = aux['naux_per_pair']
+
+    # Step A: Fkj = F_lmo + scatter(d_flat).
+    Fkj = aux['F_lmo'].copy()
+    for p in range(n_pairs):
+        i, j = aux['ij_pairs'][p]
+        Fkj[i, j] += d_flat[2 * p]
+        if i != j:
+            Fkj[j, i] += d_flat[2 * p + 1]
+
+    # Step B: snapshot.
+    Fij_bar_snapshot = Fkj.copy()
+
+    # Step C: Eq 94 per occupied j.
+    i_j_to_ij = aux['i_j_to_ij']
+    for j in range(nocc):
+        p_jj = int(i_j_to_ij[j, j])
+        if p_jj < 0:
+            continue
+        npno_p = int(npno[p_jj])
+        if npno_p == 0:
+            continue
+        n_local = int(naux[p_jj])
+        lmo_list = np.asarray(pair_lmo_idx_list[p_jj])
+        nlmo_p = lmo_list.size
+        Qma = np.ascontiguousarray(fps['Qma'][p_jj])               # (n_local, nlmo, npno)
+        T1_local = np.ascontiguousarray(fps['T1_in_pair'][p_jj])    # (nlmo, npno)
+
+        j_in_p = int(np.where(lmo_list == j)[0][0])
+        t1_j = T1_local[j_in_p]                                     # (npno,)
+
+        gamma = Qma.reshape(n_local, -1) @ T1_local.ravel()         # (n_local,)
+        Fia_bar = 2.0 * np.tensordot(gamma, Qma, axes=(0, 0))       # (nlmo, npno)
+        Z = T1_local @ Qma.transpose(0, 2, 1)                       # (n_local, nlmo, nlmo)
+        Fia_bar -= np.tensordot(Z, Qma, axes=((0, 1), (0, 1)))      # (nlmo, npno)
+
+        Fkj[lmo_list, j] += Fia_bar @ t1_j
+
+    foo_t1 = Fkj - aux['F_lmo']
+    return Fkj, Fij_bar_snapshot, foo_t1
+
+
+def parity_test_phase_t1_fock_finalize(verbose=True):
+    """Chains 2d (Fab + d_flat) → 2h (Fkj + Fij_bar + foo_t1) and compares
+    each output array against a numpy reference computed from aux.
+    """
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    # Run 2d to produce d_flat.
+    out_d, own_d, (_, _, d_flat) = _allocate_t1_fock_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock(
+        ctypes.byref(inputs), ctypes.byref(out_d))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock rc={rc}')
+
+    # Allocate 2h outputs (3 nocc×nocc matrices).
+    nocc = int(aux['F_lmo'].shape[0])
+    Fkj_buf = np.zeros((nocc, nocc), dtype=np.float64)
+    Fij_bar_buf = np.zeros((nocc, nocc), dtype=np.float64)
+    foo_t1_buf = np.zeros((nocc, nocc), dtype=np.float64)
+
+    extra_in = PyT1FockExtraInputs()
+    extra_in.d_flat = d_flat.ctypes.data
+    extra_out = PyT1FockExtraOutputs()
+    extra_out.Fkj = Fkj_buf.ctypes.data
+    extra_out.Fij_bar_snapshot = Fij_bar_buf.ctypes.data
+    extra_out.foo_t1 = foo_t1_buf.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock_finalize(
+        ctypes.byref(inputs), ctypes.byref(extra_in),
+        ctypes.byref(extra_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock_finalize rc={rc}')
+
+    ref_Fkj, ref_Fij, ref_foo = _python_reference_t1_fock_finalize(
+        inputs, aux, d_flat)
+
+    d_Fkj = float(np.max(np.abs(Fkj_buf - ref_Fkj)))
+    d_Fij = float(np.max(np.abs(Fij_bar_buf - ref_Fij)))
+    d_foo = float(np.max(np.abs(foo_t1_buf - ref_foo)))
+    max_abs = max(d_Fkj, d_Fij, d_foo)
+
+    if verbose:
+        print(f'[CCSD MONO] phase_t1_fock_finalize parity: '
+              f'|dFkj|={d_Fkj:.3e}  |dFij|={d_Fij:.3e}  '
+              f'|dfoo|={d_foo:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(
+            f'phase_t1_fock_finalize parity FAILED — max abs = {max_abs:.3e}')
+    del own_d, ownership
+    return max_abs
+
+
+def _build_synthetic_per_kl_plan(aux, seed=5678):
+    """Synthetic plan generator for the T1 residual per-(k, l) batched kernel.
+
+    The plan owns ALL buffers — K_iajb_buffer, K_bar_kl_static, S_pno_buffer,
+    t2_buffer, t1_cache_buffer.  Step 2m's plan-builder will reuse this
+    structure but bind t2_buffer / t1_cache_buffer to SolverInputs.T2_flat /
+    T1_in_pair (production layout).  For 2i parity, both class and reference
+    paths read the same buffers via the same offsets, so output is bit-clean.
+    """
+    rng = np.random.default_rng(seed)
+    M = int(aux['F_lmo'].shape[0])         # = nocc
+    n_tasks = 4
+
+    # Per-task: pick n_kl in {2, 3, 4}; t2_swap_kl random.
+    n_kl_arr = rng.integers(2, 5, size=n_tasks).astype(np.int32)
+    t2_swap_kl = rng.integers(0, 2, size=n_tasks).astype(np.int32)
+    max_n_kl = int(n_kl_arr.max())
+
+    # K_iajb_buffer: per task an (n_kl, n_kl) block, concatenated.
+    K_iajb_off = np.zeros(n_tasks, dtype=np.int64)
+    K_iajb_sizes = (n_kl_arr.astype(np.int64) ** 2)
+    K_iajb_off[1:] = np.cumsum(K_iajb_sizes[:-1])
+    K_iajb_buffer = rng.standard_normal(int(K_iajb_sizes.sum()))
+
+    # K_bar_kl_static: per task an (M, n_kl) block.
+    K_bar_off = np.zeros(n_tasks, dtype=np.int64)
+    K_bar_sizes = (M * n_kl_arr.astype(np.int64))
+    K_bar_off[1:] = np.cumsum(K_bar_sizes[:-1])
+    K_bar_kl_static = rng.standard_normal(int(K_bar_sizes.sum()))
+
+    # t1_cache_buffer: per task one (M, n_kl) block + per (task, inner_i)
+    # one (n_pno_ii,) tail block for T_n_l_ii.
+    T_n_kl_off = np.zeros(n_tasks, dtype=np.int64)
+    T_n_kl_sizes = K_bar_sizes.copy()       # same shape: (M, n_kl)
+    T_n_kl_off[1:] = np.cumsum(T_n_kl_sizes[:-1])
+    t1_block_total = int(T_n_kl_sizes.sum())
+
+    # Per-task t2_kl_canon_off: pick a random canonical pair whose npno >= n_kl
+    # and use its T2 block start; we'll just stuff a fresh n_kl² block into
+    # a dedicated synthetic t2_buffer.
+    t2_kl_canon_off_list = []
+    t2_buffer_chunks = []
+    t2_buffer_total = 0
+    for t in range(n_tasks):
+        sz = int(n_kl_arr[t]) ** 2
+        t2_kl_canon_off_list.append(t2_buffer_total)
+        t2_buffer_chunks.append(rng.standard_normal(sz))
+        t2_buffer_total += sz
+    t2_kl_canon_off = np.array(t2_kl_canon_off_list, dtype=np.int64)
+
+    # Inner per task: 2-3 inner_i entries.
+    inner_per_task = rng.integers(2, 4, size=n_tasks)
+    inner_off = np.zeros(n_tasks + 1, dtype=np.int64)
+    inner_off[1:] = np.cumsum(inner_per_task)
+    total_inner = int(inner_off[-1])
+
+    i_arr = rng.integers(0, M, size=total_inner).astype(np.int32)
+    n_pno_ii_arr = rng.integers(2, 5, size=total_inner).astype(np.int32)
+
+    is_diag_kl_ii = np.zeros(total_inner, dtype=np.int32)
+    has_S_ii_kl   = np.zeros(total_inner, dtype=np.int32)
+    has_A2        = np.zeros(total_inner, dtype=np.int32)
+    is_diag_kl_ki = np.zeros(total_inner, dtype=np.int32)
+    n_ki_arr      = np.zeros(total_inner, dtype=np.int32)
+    t2_swap_ki    = np.zeros(total_inner, dtype=np.int32)
+
+    S_ii_kl_off   = np.zeros(total_inner, dtype=np.int64)
+    S_kl_ki_off   = np.zeros(total_inner, dtype=np.int64)
+    S_ki_kl_off   = np.zeros(total_inner, dtype=np.int64)
+    T_n_l_ii_off  = np.zeros(total_inner, dtype=np.int64)
+    contrib_off   = np.zeros(total_inner, dtype=np.int64)
+    t2_ki_canon_off = np.zeros(total_inner, dtype=np.int64)
+
+    # Build S_pno_buffer + tail t1_cache_buffer per (task, inner_i).
+    s_pno_chunks = []
+    s_pno_total = 0
+    contrib_total = 0
+
+    # Tail of t1_cache_buffer: one (n_pno_ii,) per inner.
+    t1_tail_chunks = []
+    t1_tail_total = t1_block_total
+
+    for t in range(n_tasks):
+        n_kl = int(n_kl_arr[t])
+        ti_start = int(inner_off[t])
+        ti_end   = int(inner_off[t + 1])
+        for ti in range(ti_start, ti_end):
+            n_pno_ii = int(n_pno_ii_arr[ti])
+
+            # is_diag_kl_ii: equate sizes when set.
+            diag = (rng.integers(0, 2) == 1)
+            if diag:
+                n_pno_ii = n_kl
+                n_pno_ii_arr[ti] = n_pno_ii
+            is_diag_kl_ii[ti] = 1 if diag else 0
+
+            # has_S_ii_kl iff non-diag (kernel reads S only on this branch).
+            if not diag:
+                has_S_ii_kl[ti] = 1
+                S_ii_kl_off[ti] = s_pno_total
+                s_pno_chunks.append(rng.standard_normal(n_pno_ii * n_kl))
+                s_pno_total += n_pno_ii * n_kl
+
+            # has_A2 random; if true, decide A2 branch.
+            a2 = (rng.integers(0, 2) == 1)
+            has_A2[ti] = 1 if a2 else 0
+            if a2:
+                # Pick n_ki in {2, 3, 4}; force diag-ki when n_ki == n_kl.
+                n_ki = int(rng.integers(2, 5))
+                ki_diag = (n_ki == n_kl) and (rng.integers(0, 2) == 1)
+                if ki_diag:
+                    n_ki = n_kl
+                is_diag_kl_ki[ti] = 1 if ki_diag else 0
+                n_ki_arr[ti] = n_ki
+                t2_swap_ki[ti] = int(rng.integers(0, 2))
+                # t2_ki block: (n_ki, n_ki) doubles in t2_buffer.
+                t2_ki_canon_off[ti] = t2_buffer_total
+                t2_buffer_chunks.append(rng.standard_normal(n_ki * n_ki))
+                t2_buffer_total += n_ki * n_ki
+                if not ki_diag:
+                    # S_kl_ki: (n_kl, n_ki); S_ki_kl: (n_ki, n_kl).
+                    S_kl_ki_off[ti] = s_pno_total
+                    s_pno_chunks.append(rng.standard_normal(n_kl * n_ki))
+                    s_pno_total += n_kl * n_ki
+                    S_ki_kl_off[ti] = s_pno_total
+                    s_pno_chunks.append(rng.standard_normal(n_ki * n_kl))
+                    s_pno_total += n_ki * n_kl
+                # T_n_l_ii: (n_pno_ii,) tail entry into t1_cache_buffer.
+                T_n_l_ii_off[ti] = t1_tail_total
+                t1_tail_chunks.append(rng.standard_normal(n_pno_ii))
+                t1_tail_total += n_pno_ii
+
+            # contrib offset: one (n_pno_ii,) block per inner.
+            contrib_off[ti] = contrib_total
+            contrib_total += n_pno_ii
+
+    # Assemble flat buffers.
+    if t2_buffer_chunks:
+        t2_buffer = np.concatenate(t2_buffer_chunks)
+    else:
+        t2_buffer = np.zeros(0)
+    # t1_cache_buffer = per-task (M, n_kl) blocks first, then per-inner tails.
+    t1_blocks = []
+    for t in range(n_tasks):
+        sz = int(T_n_kl_sizes[t])
+        t1_blocks.append(rng.standard_normal(sz))
+    if t1_tail_chunks:
+        t1_cache_buffer = np.concatenate(t1_blocks + t1_tail_chunks)
+    else:
+        t1_cache_buffer = np.concatenate(t1_blocks) if t1_blocks else np.zeros(0)
+    if s_pno_chunks:
+        S_pno_buffer = np.concatenate(s_pno_chunks)
+    else:
+        S_pno_buffer = np.zeros(0)
+
+    max_n_ki = int(max(n_ki_arr.max(), 1))
+
+    plan_arrays = dict(
+        n_tasks=n_tasks, M=M,
+        n_kl_arr=n_kl_arr, t2_swap_kl=t2_swap_kl,
+        K_iajb_kl_off=K_iajb_off, K_bar_kl_off=K_bar_off,
+        t2_kl_canon_off=t2_kl_canon_off, T_n_kl_off=T_n_kl_off,
+        inner_off=inner_off,
+        i_arr=i_arr, n_pno_ii_arr=n_pno_ii_arr,
+        is_diag_kl_ii=is_diag_kl_ii, has_S_ii_kl=has_S_ii_kl,
+        S_ii_kl_off=S_ii_kl_off, has_A2=has_A2,
+        is_diag_kl_ki=is_diag_kl_ki, n_ki_arr=n_ki_arr,
+        t2_swap_ki=t2_swap_ki, t2_ki_canon_off=t2_ki_canon_off,
+        S_kl_ki_off=S_kl_ki_off, S_ki_kl_off=S_ki_kl_off,
+        T_n_l_ii_off=T_n_l_ii_off, contrib_off=contrib_off,
+        K_iajb_buffer=K_iajb_buffer, K_bar_kl_static=K_bar_kl_static,
+        S_pno_buffer=S_pno_buffer, t2_buffer=t2_buffer,
+        t1_cache_buffer=t1_cache_buffer,
+        max_n_kl=max_n_kl, max_n_ki=max_n_ki,
+        contrib_total=contrib_total, total_inner=total_inner,
+    )
+    return plan_arrays
+
+
+def _python_reference_per_kl(plan_arrays, contrib_flat):
+    """Reference: call DLPNOper_kl_batched directly with same plan +
+    fresh scratch buffers."""
+    a = plan_arrays
+    num_threads = max(1, min(int(os.environ.get('OMP_NUM_THREADS', '4')), 16))
+    if num_threads > a['n_tasks']:
+        num_threads = max(a['n_tasks'], 1)
+    M = a['M']
+    max_kl = a['max_n_kl']
+    max_ki = a['max_n_ki']
+    Tt_kl_stride  = max_kl * max_kl
+    K_kilc_stride = M * max_kl
+    B_ia_stride   = max_kl * M
+    Tt_ki_stride  = max_ki * max_ki
+    X_stride      = max_ki * max_kl
+    Z_stride      = max_ki * max_ki
+
+    Tt_kl_sc  = np.zeros(num_threads * Tt_kl_stride)
+    K_kilc_sc = np.zeros(num_threads * K_kilc_stride)
+    B_ia_sc   = np.zeros(num_threads * B_ia_stride)
+    Tt_ki_sc  = np.zeros(num_threads * Tt_ki_stride)
+    X_sc      = np.zeros(num_threads * X_stride)
+    Z_sc      = np.zeros(num_threads * Z_stride)
+
+    _libcc.DLPNOper_kl_batched(
+        ctypes.c_int(a['n_tasks']), ctypes.c_int(M),
+        a['n_kl_arr'].ctypes.data, a['t2_swap_kl'].ctypes.data,
+        a['K_iajb_kl_off'].ctypes.data, a['K_bar_kl_off'].ctypes.data,
+        a['t2_kl_canon_off'].ctypes.data, a['T_n_kl_off'].ctypes.data,
+        a['inner_off'].ctypes.data,
+        a['i_arr'].ctypes.data, a['n_pno_ii_arr'].ctypes.data,
+        a['is_diag_kl_ii'].ctypes.data, a['has_S_ii_kl'].ctypes.data,
+        a['S_ii_kl_off'].ctypes.data, a['has_A2'].ctypes.data,
+        a['is_diag_kl_ki'].ctypes.data, a['n_ki_arr'].ctypes.data,
+        a['t2_swap_ki'].ctypes.data, a['t2_ki_canon_off'].ctypes.data,
+        a['S_kl_ki_off'].ctypes.data, a['S_ki_kl_off'].ctypes.data,
+        a['T_n_l_ii_off'].ctypes.data, a['contrib_off'].ctypes.data,
+        a['K_iajb_buffer'].ctypes.data, a['K_bar_kl_static'].ctypes.data,
+        a['S_pno_buffer'].ctypes.data, a['t2_buffer'].ctypes.data,
+        a['t1_cache_buffer'].ctypes.data,
+        Tt_kl_sc.ctypes.data,  ctypes.c_size_t(Tt_kl_stride),
+        K_kilc_sc.ctypes.data, ctypes.c_size_t(K_kilc_stride),
+        B_ia_sc.ctypes.data,   ctypes.c_size_t(B_ia_stride),
+        Tt_ki_sc.ctypes.data,  ctypes.c_size_t(Tt_ki_stride),
+        X_sc.ctypes.data,      ctypes.c_size_t(X_stride),
+        Z_sc.ctypes.data,      ctypes.c_size_t(Z_stride),
+        contrib_flat.ctypes.data,
+        ctypes.c_int(num_threads))
+
+
+def parity_test_phase_t1_residual_per_kl(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+    plan = _build_synthetic_per_kl_plan(aux)
+
+    # Class path
+    contrib_class = np.full(plan['contrib_total'], np.nan, dtype=np.float64)
+    plan_struct = PyPerKlPlanInputs()
+    plan_struct.n_tasks = plan['n_tasks']
+    plan_struct.M       = plan['M']
+    plan_struct.max_n_kl = plan['max_n_kl']
+    plan_struct.max_n_ki = plan['max_n_ki']
+    for name in ('n_kl_arr', 't2_swap_kl', 'K_iajb_kl_off', 'K_bar_kl_off',
+                 't2_kl_canon_off', 'T_n_kl_off', 'inner_off',
+                 'i_arr', 'n_pno_ii_arr', 'is_diag_kl_ii', 'has_S_ii_kl',
+                 'S_ii_kl_off', 'has_A2', 'is_diag_kl_ki', 'n_ki_arr',
+                 't2_swap_ki', 't2_ki_canon_off',
+                 'S_kl_ki_off', 'S_ki_kl_off', 'T_n_l_ii_off', 'contrib_off',
+                 'K_iajb_buffer', 'K_bar_kl_static', 'S_pno_buffer',
+                 't2_buffer', 't1_cache_buffer'):
+        setattr(plan_struct, name, plan[name].ctypes.data)
+    out_struct = PyPerKlOutputs()
+    out_struct.contrib_flat = contrib_class.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_residual_per_kl(
+        ctypes.byref(inputs), ctypes.byref(plan_struct),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_residual_per_kl rc={rc}')
+
+    # Reference path — call the same kernel directly.
+    contrib_ref = np.full(plan['contrib_total'], np.nan, dtype=np.float64)
+    _python_reference_per_kl(plan, contrib_ref)
+
+    max_abs = float(np.max(np.abs(contrib_class - contrib_ref)))
+    if verbose:
+        print(f'[CCSD MONO] phase_t1_residual_per_kl parity: '
+              f'{plan["n_tasks"]} tasks, {plan["total_inner"]} inner-i; '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(
+            f'phase_t1_residual_per_kl parity FAILED — '
+            f'max abs diff = {max_abs:.3e}')
+    del ownership
+    return max_abs
+
+
+def _build_synthetic_be_bucket(seed=9012):
+    """Synthetic per-(n_ij, n_kl) bucket for the B+E kernel."""
+    rng = np.random.default_rng(seed)
+    N = 6           # items in this bucket
+    n_ij = 4
+    n_kl = 3
+    n_slots = 5     # output is (n_slots, n_ij, n_ij); idx[n] in [0, n_slots)
+
+    S = rng.standard_normal((N, n_ij, n_kl))
+    T = rng.standard_normal((N, n_kl, n_kl))
+    K = rng.standard_normal((N, n_kl, n_kl))
+    beta_kl = rng.standard_normal(N)
+    beta_lk = rng.standard_normal(N)
+    same = rng.integers(0, 2, size=N).astype(np.uint8)
+    idx = rng.integers(0, n_slots, size=N).astype(np.int64)
+
+    return dict(N=N, n_ij=n_ij, n_kl=n_kl, n_slots=n_slots,
+                S=np.ascontiguousarray(S), T=np.ascontiguousarray(T),
+                K=np.ascontiguousarray(K),
+                beta_kl=beta_kl, beta_lk=beta_lk, same=same, idx=idx)
+
+
+def _python_reference_be(bucket, out_B, out_E):
+    """Reference: call DLPNObe_kernel directly with same bucket inputs."""
+    num_threads = max(1, min(int(os.environ.get('OMP_NUM_THREADS', '4')), 16))
+    if num_threads > bucket['N']:
+        num_threads = max(bucket['N'], 1)
+    _libcc.DLPNObe_kernel(
+        bucket['S'].ctypes.data, bucket['T'].ctypes.data,
+        bucket['K'].ctypes.data,
+        bucket['beta_kl'].ctypes.data, bucket['beta_lk'].ctypes.data,
+        bucket['same'].ctypes.data, bucket['idx'].ctypes.data,
+        out_B.ctypes.data, out_E.ctypes.data,
+        ctypes.c_size_t(bucket['N']),
+        ctypes.c_size_t(bucket['n_ij']),
+        ctypes.c_size_t(bucket['n_kl']),
+        ctypes.c_int(num_threads))
+
+
+def parity_test_phase_be(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+    bucket = _build_synthetic_be_bucket()
+
+    # Class path
+    out_B_class = np.zeros((bucket['n_slots'], bucket['n_ij'], bucket['n_ij']))
+    out_E_class = np.zeros_like(out_B_class)
+    plan_struct = PyBEInputs()
+    plan_struct.N = bucket['N']
+    plan_struct.n_ij = bucket['n_ij']
+    plan_struct.n_kl = bucket['n_kl']
+    plan_struct.n_slots = bucket['n_slots']
+    plan_struct.S       = bucket['S'].ctypes.data
+    plan_struct.T       = bucket['T'].ctypes.data
+    plan_struct.K       = bucket['K'].ctypes.data
+    plan_struct.beta_kl = bucket['beta_kl'].ctypes.data
+    plan_struct.beta_lk = bucket['beta_lk'].ctypes.data
+    plan_struct.same    = bucket['same'].ctypes.data
+    plan_struct.idx     = bucket['idx'].ctypes.data
+    out_struct = PyBEOutputs()
+    out_struct.out_B = out_B_class.ctypes.data
+    out_struct.out_E = out_E_class.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_be(
+        ctypes.byref(inputs), ctypes.byref(plan_struct),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_be rc={rc}')
+
+    # Reference
+    out_B_ref = np.zeros_like(out_B_class)
+    out_E_ref = np.zeros_like(out_E_class)
+    _python_reference_be(bucket, out_B_ref, out_E_ref)
+
+    d_B = float(np.max(np.abs(out_B_class - out_B_ref)))
+    d_E = float(np.max(np.abs(out_E_class - out_E_ref)))
+    max_abs = max(d_B, d_E)
+
+    if verbose:
+        print(f'[CCSD MONO] phase_be parity: '
+              f'N={bucket["N"]} (n_ij={bucket["n_ij"]}, n_kl={bucket["n_kl"]}); '
+              f'|dB|={d_B:.3e}  |dE|={d_E:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(f'phase_be parity FAILED — max abs = {max_abs:.3e}')
+    del ownership
+    return max_abs
+
+
+def _build_synthetic_c_term_plan(seed=11111):
+    """Synthetic plan for DLPNOc_term_batched with N items of varying shape."""
+    rng = np.random.default_rng(seed)
+    N = 5
+    n_pno_arr   = rng.integers(2, 5, size=N).astype(np.int32)
+    n_ct_arr    = rng.integers(2, 5, size=N).astype(np.int32)
+    n_other_arr = rng.integers(2, 5, size=N).astype(np.int32)
+
+    def _alloc_offsets(sizes):
+        sizes64 = np.asarray(sizes, dtype=np.int64)
+        off = np.zeros(N + 1, dtype=np.int64)
+        off[1:] = np.cumsum(sizes64)
+        buf = rng.standard_normal(int(off[-1]))
+        return buf, off[:-1].copy(), int(off[-1])
+
+    S_big_sizes   = (n_pno_arr * n_ct_arr).astype(np.int64)
+    ct_sizes      = (n_ct_arr * n_ct_arr).astype(np.int64)
+    S_mid_sizes   = (n_ct_arr * n_other_arr).astype(np.int64)
+    J_bold_sizes  = (n_pno_arr * n_other_arr).astype(np.int64)
+    t2_sizes      = (n_other_arr * n_other_arr).astype(np.int64)
+    S_outer_sizes = (n_pno_arr * n_other_arr).astype(np.int64)
+    tile_sizes    = (n_pno_arr * n_pno_arr).astype(np.int64)
+
+    S_big_flat,   S_big_off,   _ = _alloc_offsets(S_big_sizes)
+    ct_flat,      ct_off,      _ = _alloc_offsets(ct_sizes)
+    S_mid_flat,   S_mid_off,   _ = _alloc_offsets(S_mid_sizes)
+    J_bold_flat,  J_bold_off,  _ = _alloc_offsets(J_bold_sizes)
+    t2_flat,      t2_off,      _ = _alloc_offsets(t2_sizes)
+    S_outer_flat, S_outer_off, _ = _alloc_offsets(S_outer_sizes)
+    tile_off = np.zeros(N + 1, dtype=np.int64)
+    tile_off[1:] = np.cumsum(tile_sizes)
+    tile_total = int(tile_off[-1])
+
+    return dict(N=N,
+                n_pno_arr=n_pno_arr, n_ct_arr=n_ct_arr, n_other_arr=n_other_arr,
+                S_big_off=S_big_off, ct_off=ct_off, S_mid_off=S_mid_off,
+                J_bold_off=J_bold_off, t2_off=t2_off, S_outer_off=S_outer_off,
+                tile_off=tile_off[:-1].copy(),
+                S_big_flat=S_big_flat, S_mid_flat=S_mid_flat,
+                J_bold_flat=J_bold_flat, S_outer_flat=S_outer_flat,
+                ct_flat=ct_flat, t2_flat=t2_flat,
+                max_n_pno=int(n_pno_arr.max()),
+                max_n_ct=int(n_ct_arr.max()),
+                max_n_other=int(n_other_arr.max()),
+                tile_total=tile_total)
+
+
+def _python_reference_c_term(plan, tiles_flat):
+    num_threads = max(1, min(int(os.environ.get('OMP_NUM_THREADS', '4')), 16))
+    if num_threads > plan['N']:
+        num_threads = max(plan['N'], 1)
+    STB_stride   = plan['max_n_pno'] * plan['max_n_ct']
+    GAMMA_stride = plan['max_n_pno'] * plan['max_n_other']
+    GT_stride    = plan['max_n_pno'] * plan['max_n_other']
+    STB_sc   = np.zeros(num_threads * STB_stride)
+    GAMMA_sc = np.zeros(num_threads * GAMMA_stride)
+    GT_sc    = np.zeros(num_threads * GT_stride)
+    _libcc.DLPNOc_term_batched(
+        ctypes.c_int(plan['N']),
+        plan['n_pno_arr'].ctypes.data,
+        plan['n_ct_arr'].ctypes.data,
+        plan['n_other_arr'].ctypes.data,
+        plan['S_big_off'].ctypes.data,
+        plan['ct_off'].ctypes.data,
+        plan['S_mid_off'].ctypes.data,
+        plan['J_bold_off'].ctypes.data,
+        plan['t2_off'].ctypes.data,
+        plan['S_outer_off'].ctypes.data,
+        plan['tile_off'].ctypes.data,
+        plan['S_big_flat'].ctypes.data,
+        plan['S_mid_flat'].ctypes.data,
+        plan['J_bold_flat'].ctypes.data,
+        plan['S_outer_flat'].ctypes.data,
+        plan['ct_flat'].ctypes.data,
+        plan['t2_flat'].ctypes.data,
+        STB_sc.ctypes.data, ctypes.c_size_t(STB_stride),
+        GAMMA_sc.ctypes.data, ctypes.c_size_t(GAMMA_stride),
+        GT_sc.ctypes.data, ctypes.c_size_t(GT_stride),
+        tiles_flat.ctypes.data,
+        ctypes.c_int(num_threads))
+
+
+def parity_test_phase_c_term(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+    plan = _build_synthetic_c_term_plan()
+
+    tiles_class = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    plan_struct = PyCTermInputs()
+    plan_struct.N = plan['N']
+    plan_struct.max_n_pno = plan['max_n_pno']
+    plan_struct.max_n_ct = plan['max_n_ct']
+    plan_struct.max_n_other = plan['max_n_other']
+    for name in ('n_pno_arr', 'n_ct_arr', 'n_other_arr',
+                 'S_big_off', 'ct_off', 'S_mid_off',
+                 'J_bold_off', 't2_off', 'S_outer_off', 'tile_off',
+                 'S_big_flat', 'S_mid_flat', 'J_bold_flat', 'S_outer_flat',
+                 'ct_flat', 't2_flat'):
+        setattr(plan_struct, name, plan[name].ctypes.data)
+    out_struct = PyCTermOutputs()
+    out_struct.tiles_flat = tiles_class.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_c_term(
+        ctypes.byref(inputs), ctypes.byref(plan_struct),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_c_term rc={rc}')
+
+    tiles_ref = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    _python_reference_c_term(plan, tiles_ref)
+
+    max_abs = float(np.max(np.abs(tiles_class - tiles_ref)))
+    if verbose:
+        print(f'[CCSD MONO] phase_c_term parity: N={plan["N"]}; '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(f'phase_c_term parity FAILED — {max_abs:.3e}')
+    del ownership
+    return max_abs
+
+
+def _build_synthetic_d_term_plan(seed=22222):
+    """Synthetic plan for DLPNOd_term_batched with N items."""
+    rng = np.random.default_rng(seed)
+    N = 5
+    n_pno_arr = rng.integers(2, 5, size=N).astype(np.int32)
+    n_A_arr   = rng.integers(2, 5, size=N).astype(np.int32)
+    n_B_arr   = rng.integers(2, 5, size=N).astype(np.int32)
+
+    def _alloc_offsets(sizes):
+        sizes64 = np.asarray(sizes, dtype=np.int64)
+        off = np.zeros(N + 1, dtype=np.int64)
+        off[1:] = np.cumsum(sizes64)
+        buf = rng.standard_normal(int(off[-1]))
+        return buf, off[:-1].copy()
+
+    S_a_sizes = (n_pno_arr * n_A_arr).astype(np.int64)
+    u_sizes   = (n_A_arr * n_A_arr).astype(np.int64)
+    S_b_sizes = (n_A_arr * n_B_arr).astype(np.int64)
+    S_c_sizes = (n_pno_arr * n_B_arr).astype(np.int64)
+    dt_sizes  = (n_B_arr * n_B_arr).astype(np.int64)
+    KJ_sizes  = (n_pno_arr * n_A_arr).astype(np.int64)
+    tile_sizes = (n_pno_arr * n_pno_arr).astype(np.int64)
+
+    S_a_flat, S_a_off = _alloc_offsets(S_a_sizes)
+    u_flat,   u_off   = _alloc_offsets(u_sizes)
+    S_b_flat, S_b_off = _alloc_offsets(S_b_sizes)
+    S_c_flat, S_c_off = _alloc_offsets(S_c_sizes)
+    dt_flat,  dt_off  = _alloc_offsets(dt_sizes)
+    KJ_flat,  KJ_off  = _alloc_offsets(KJ_sizes)
+    tile_off = np.zeros(N + 1, dtype=np.int64)
+    tile_off[1:] = np.cumsum(tile_sizes)
+    tile_total = int(tile_off[-1])
+
+    return dict(N=N,
+                n_pno_arr=n_pno_arr, n_A_arr=n_A_arr, n_B_arr=n_B_arr,
+                S_a_off=S_a_off, u_off=u_off, S_b_off=S_b_off,
+                S_c_off=S_c_off, dt_off=dt_off, KJ_off=KJ_off,
+                tile_off=tile_off[:-1].copy(),
+                S_a_flat=S_a_flat, S_b_flat=S_b_flat, S_c_flat=S_c_flat,
+                KJ_flat=KJ_flat, u_flat=u_flat, dt_flat=dt_flat,
+                max_n_pno=int(n_pno_arr.max()),
+                max_n_A=int(n_A_arr.max()),
+                max_n_B=int(n_B_arr.max()),
+                tile_total=tile_total)
+
+
+def _python_reference_d_term(plan, tiles_flat):
+    num_threads = max(1, min(int(os.environ.get('OMP_NUM_THREADS', '4')), 16))
+    if num_threads > plan['N']:
+        num_threads = max(plan['N'], 1)
+    SU_stride   = plan['max_n_pno'] * plan['max_n_A']
+    UP_stride   = plan['max_n_pno'] * plan['max_n_B']
+    SCD_stride  = plan['max_n_pno'] * plan['max_n_B']
+    Bint_stride = plan['max_n_pno'] * plan['max_n_A']
+    SU_sc   = np.zeros(num_threads * SU_stride)
+    UP_sc   = np.zeros(num_threads * UP_stride)
+    SCD_sc  = np.zeros(num_threads * SCD_stride)
+    Bint_sc = np.zeros(num_threads * Bint_stride)
+    _libcc.DLPNOd_term_batched(
+        ctypes.c_int(plan['N']),
+        plan['n_pno_arr'].ctypes.data,
+        plan['n_A_arr'].ctypes.data,
+        plan['n_B_arr'].ctypes.data,
+        plan['S_a_off'].ctypes.data,
+        plan['u_off'].ctypes.data,
+        plan['S_b_off'].ctypes.data,
+        plan['S_c_off'].ctypes.data,
+        plan['dt_off'].ctypes.data,
+        plan['KJ_off'].ctypes.data,
+        plan['tile_off'].ctypes.data,
+        plan['S_a_flat'].ctypes.data,
+        plan['S_b_flat'].ctypes.data,
+        plan['S_c_flat'].ctypes.data,
+        plan['KJ_flat'].ctypes.data,
+        plan['u_flat'].ctypes.data,
+        plan['dt_flat'].ctypes.data,
+        SU_sc.ctypes.data,   ctypes.c_size_t(SU_stride),
+        UP_sc.ctypes.data,   ctypes.c_size_t(UP_stride),
+        SCD_sc.ctypes.data,  ctypes.c_size_t(SCD_stride),
+        Bint_sc.ctypes.data, ctypes.c_size_t(Bint_stride),
+        tiles_flat.ctypes.data,
+        ctypes.c_int(num_threads))
+
+
+def parity_test_phase_d_term(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+    plan = _build_synthetic_d_term_plan()
+
+    tiles_class = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    plan_struct = PyDTermInputs()
+    plan_struct.N = plan['N']
+    plan_struct.max_n_pno = plan['max_n_pno']
+    plan_struct.max_n_A = plan['max_n_A']
+    plan_struct.max_n_B = plan['max_n_B']
+    for name in ('n_pno_arr', 'n_A_arr', 'n_B_arr',
+                 'S_a_off', 'u_off', 'S_b_off', 'S_c_off',
+                 'dt_off', 'KJ_off', 'tile_off',
+                 'S_a_flat', 'S_b_flat', 'S_c_flat',
+                 'KJ_flat', 'u_flat', 'dt_flat'):
+        setattr(plan_struct, name, plan[name].ctypes.data)
+    out_struct = PyDTermOutputs()
+    out_struct.tiles_flat = tiles_class.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_d_term(
+        ctypes.byref(inputs), ctypes.byref(plan_struct),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_d_term rc={rc}')
+
+    tiles_ref = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    _python_reference_d_term(plan, tiles_ref)
+
+    max_abs = float(np.max(np.abs(tiles_class - tiles_ref)))
+    if verbose:
+        print(f'[CCSD MONO] phase_d_term parity: N={plan["N"]}; '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(f'phase_d_term parity FAILED — {max_abs:.3e}')
+    del ownership
+    return max_abs
+
+
+def _build_synthetic_g_term_plan(seed=33333):
+    """Synthetic plan for DLPNOg_term_batched with N items of varying shape.
+
+    Per item: scalar = G_tilde[k_idx, scalar_lmo]; tmp = S @ t2;
+    Cc = scalar * tmp @ S.T.
+    """
+    rng = np.random.default_rng(seed)
+    N = 6
+    nocc = 5     # G_tilde dimension; arbitrary
+
+    n_ij_arr = rng.integers(2, 5, size=N).astype(np.int32)
+    n_ik_arr = rng.integers(2, 5, size=N).astype(np.int32)
+
+    def _alloc_offsets(sizes):
+        sizes64 = np.asarray(sizes, dtype=np.int64)
+        off = np.zeros(N + 1, dtype=np.int64)
+        off[1:] = np.cumsum(sizes64)
+        buf = rng.standard_normal(int(off[-1]))
+        return buf, off[:-1].copy()
+
+    S_sizes  = (n_ij_arr * n_ik_arr).astype(np.int64)
+    t2_sizes = (n_ik_arr * n_ik_arr).astype(np.int64)
+    tile_sizes = (n_ij_arr * n_ij_arr).astype(np.int64)
+
+    S_flat,  S_off  = _alloc_offsets(S_sizes)
+    t2_flat, t2_off = _alloc_offsets(t2_sizes)
+    tile_off = np.zeros(N + 1, dtype=np.int64)
+    tile_off[1:] = np.cumsum(tile_sizes)
+    tile_total = int(tile_off[-1])
+
+    G_tilde = rng.standard_normal((nocc, nocc))
+    k_idx      = rng.integers(0, nocc, size=N).astype(np.int64)
+    scalar_lmo = rng.integers(0, nocc, size=N).astype(np.int64)
+
+    return dict(N=N, nocc=nocc,
+                n_ij_arr=n_ij_arr, n_ik_arr=n_ik_arr,
+                S_off=S_off, t2_off=t2_off, tile_off=tile_off[:-1].copy(),
+                k_idx=k_idx, scalar_lmo=scalar_lmo,
+                S_flat=S_flat, t2_flat=t2_flat,
+                G_tilde=np.ascontiguousarray(G_tilde),
+                max_n_ij=int(n_ij_arr.max()),
+                max_n_ik=int(n_ik_arr.max()),
+                tile_total=tile_total)
+
+
+def _python_reference_g_term(plan, tiles_flat):
+    num_threads = max(1, min(int(os.environ.get('OMP_NUM_THREADS', '4')), 16))
+    if num_threads > plan['N']:
+        num_threads = max(plan['N'], 1)
+    tmp_stride = plan['max_n_ij'] * plan['max_n_ik']
+    tmp_sc = np.zeros(num_threads * tmp_stride)
+    _libcc.DLPNOg_term_batched(
+        ctypes.c_int(plan['N']),
+        plan['n_ij_arr'].ctypes.data,
+        plan['n_ik_arr'].ctypes.data,
+        plan['S_off'].ctypes.data,
+        plan['t2_off'].ctypes.data,
+        plan['tile_off'].ctypes.data,
+        plan['k_idx'].ctypes.data,
+        plan['scalar_lmo'].ctypes.data,
+        plan['S_flat'].ctypes.data,
+        plan['t2_flat'].ctypes.data,
+        plan['G_tilde'].ctypes.data, ctypes.c_size_t(plan['nocc']),
+        tmp_sc.ctypes.data, ctypes.c_size_t(tmp_stride),
+        tiles_flat.ctypes.data,
+        ctypes.c_int(num_threads))
+
+
+def parity_test_phase_g_term(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+    plan = _build_synthetic_g_term_plan()
+
+    tiles_class = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    plan_struct = PyGTermInputs()
+    plan_struct.N = plan['N']
+    plan_struct.G_stride = plan['nocc']
+    plan_struct.max_n_ij = plan['max_n_ij']
+    plan_struct.max_n_ik = plan['max_n_ik']
+    for name in ('n_ij_arr', 'n_ik_arr', 'S_off', 't2_off', 'tile_off',
+                 'k_idx', 'scalar_lmo', 'S_flat', 't2_flat', 'G_tilde'):
+        setattr(plan_struct, name, plan[name].ctypes.data)
+    out_struct = PyGTermOutputs()
+    out_struct.tiles_flat = tiles_class.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_g_term(
+        ctypes.byref(inputs), ctypes.byref(plan_struct),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_g_term rc={rc}')
+
+    tiles_ref = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    _python_reference_g_term(plan, tiles_ref)
+
+    max_abs = float(np.max(np.abs(tiles_class - tiles_ref)))
+    if verbose:
+        print(f'[CCSD MONO] phase_g_term parity: N={plan["N"]}; '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(f'phase_g_term parity FAILED — {max_abs:.3e}')
+    del ownership
+    return max_abs
+
+
+def _build_synthetic_t3_plan(seed=44444):
+    """Synthetic plan for DLPNOt3_kernel_batched.  t3 uses one shared
+    t1_flat buffer with TWO offset arrays (t1i_off, T1l_off)."""
+    rng = np.random.default_rng(seed)
+    N = 5
+    n_kl_arr = rng.integers(2, 5, size=N).astype(np.int32)
+    n_ki_arr = rng.integers(2, 5, size=N).astype(np.int32)
+
+    def _alloc(sizes):
+        s64 = np.asarray(sizes, dtype=np.int64)
+        off = np.zeros(N + 1, dtype=np.int64)
+        off[1:] = np.cumsum(s64)
+        buf = rng.standard_normal(int(off[-1]))
+        return buf, off[:-1].copy()
+
+    K_sizes = (n_kl_arr * n_kl_arr).astype(np.int64)
+    S_sizes = (n_ki_arr * n_kl_arr).astype(np.int64)
+    tile_sizes = (n_ki_arr * n_ki_arr).astype(np.int64)
+
+    K_flat, K_off = _alloc(K_sizes)
+    S_flat, S_off = _alloc(S_sizes)
+
+    # t1_flat: per-item t1i (n_kl,) and T1l (n_ki,) appended.
+    t1_chunks = []
+    t1i_off_list = []
+    T1l_off_list = []
+    cursor = 0
+    for n in range(N):
+        t1i_off_list.append(cursor)
+        t1_chunks.append(rng.standard_normal(int(n_kl_arr[n])))
+        cursor += int(n_kl_arr[n])
+        T1l_off_list.append(cursor)
+        t1_chunks.append(rng.standard_normal(int(n_ki_arr[n])))
+        cursor += int(n_ki_arr[n])
+    t1_flat = np.concatenate(t1_chunks) if t1_chunks else np.zeros(0)
+    t1i_off = np.array(t1i_off_list, dtype=np.int64)
+    T1l_off = np.array(T1l_off_list, dtype=np.int64)
+
+    tile_off = np.zeros(N + 1, dtype=np.int64)
+    tile_off[1:] = np.cumsum(tile_sizes)
+    tile_total = int(tile_off[-1])
+
+    return dict(N=N,
+                n_kl_arr=n_kl_arr, n_ki_arr=n_ki_arr,
+                K_off=K_off, S_off=S_off,
+                t1i_off=t1i_off, T1l_off=T1l_off,
+                tile_off=tile_off[:-1].copy(),
+                K_flat=K_flat, S_flat=S_flat, t1_flat=t1_flat,
+                max_n_kl=int(n_kl_arr.max()),
+                max_n_ki=int(n_ki_arr.max()),
+                tile_total=tile_total)
+
+
+def _python_reference_t3(plan, tiles_flat):
+    num_threads = max(1, min(int(os.environ.get('OMP_NUM_THREADS', '4')), 16))
+    if num_threads > plan['N']:
+        num_threads = max(plan['N'], 1)
+    Kt1_stride    = plan['max_n_kl']
+    Kt1_ki_stride = plan['max_n_ki']
+    Kt1_sc    = np.zeros(num_threads * Kt1_stride)
+    Kt1_ki_sc = np.zeros(num_threads * Kt1_ki_stride)
+    _libcc.DLPNOt3_kernel_batched(
+        ctypes.c_int(plan['N']),
+        plan['n_kl_arr'].ctypes.data, plan['n_ki_arr'].ctypes.data,
+        plan['K_off'].ctypes.data, plan['S_off'].ctypes.data,
+        plan['t1i_off'].ctypes.data, plan['T1l_off'].ctypes.data,
+        plan['tile_off'].ctypes.data,
+        plan['K_flat'].ctypes.data, plan['S_flat'].ctypes.data,
+        plan['t1_flat'].ctypes.data,
+        Kt1_sc.ctypes.data,    ctypes.c_size_t(Kt1_stride),
+        Kt1_ki_sc.ctypes.data, ctypes.c_size_t(Kt1_ki_stride),
+        tiles_flat.ctypes.data,
+        ctypes.c_int(num_threads))
+
+
+def parity_test_phase_t3(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+    plan = _build_synthetic_t3_plan()
+
+    tiles_class = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    plan_struct = PyT3Inputs()
+    plan_struct.N = plan['N']
+    plan_struct.max_n_kl = plan['max_n_kl']
+    plan_struct.max_n_ki = plan['max_n_ki']
+    for name in ('n_kl_arr', 'n_ki_arr', 'K_off', 'S_off',
+                 't1i_off', 'T1l_off', 'tile_off',
+                 'K_flat', 'S_flat', 't1_flat'):
+        setattr(plan_struct, name, plan[name].ctypes.data)
+    out_struct = PyT3Outputs()
+    out_struct.tiles_flat = tiles_class.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_t3(
+        ctypes.byref(inputs), ctypes.byref(plan_struct),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_t3 rc={rc}')
+
+    tiles_ref = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    _python_reference_t3(plan, tiles_ref)
+
+    max_abs = float(np.max(np.abs(tiles_class - tiles_ref)))
+    if verbose:
+        print(f'[CCSD MONO] phase_t3 parity: N={plan["N"]}; '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(f'phase_t3 parity FAILED — {max_abs:.3e}')
+    del ownership
+    return max_abs
+
+
+def _build_synthetic_t4_plan(seed=55555):
+    """Synthetic plan for DLPNOt4_kernel_batched (4 chained matmuls)."""
+    rng = np.random.default_rng(seed)
+    N = 5
+    n_ki_arr = rng.integers(2, 5, size=N).astype(np.int32)
+    n_li_arr = rng.integers(2, 5, size=N).astype(np.int32)
+    n_kl_arr = rng.integers(2, 5, size=N).astype(np.int32)
+
+    def _alloc(sizes):
+        s64 = np.asarray(sizes, dtype=np.int64)
+        off = np.zeros(N + 1, dtype=np.int64)
+        off[1:] = np.cumsum(s64)
+        buf = rng.standard_normal(int(off[-1]))
+        return buf, off[:-1].copy()
+
+    S_ki_li_sizes = (n_ki_arr * n_li_arr).astype(np.int64)
+    t2_sizes      = (n_li_arr * n_li_arr).astype(np.int64)
+    S_li_kl_sizes = (n_li_arr * n_kl_arr).astype(np.int64)
+    K_sizes       = (n_kl_arr * n_kl_arr).astype(np.int64)
+    S_kl_ki_sizes = (n_kl_arr * n_ki_arr).astype(np.int64)
+    tile_sizes    = (n_ki_arr * n_ki_arr).astype(np.int64)
+
+    S_ki_li_flat, S_ki_li_off = _alloc(S_ki_li_sizes)
+    t2_flat,      t2_off      = _alloc(t2_sizes)
+    S_li_kl_flat, S_li_kl_off = _alloc(S_li_kl_sizes)
+    K_flat,       K_off       = _alloc(K_sizes)
+    S_kl_ki_flat, S_kl_ki_off = _alloc(S_kl_ki_sizes)
+    tile_off = np.zeros(N + 1, dtype=np.int64)
+    tile_off[1:] = np.cumsum(tile_sizes)
+    tile_total = int(tile_off[-1])
+
+    return dict(N=N,
+                n_ki_arr=n_ki_arr, n_li_arr=n_li_arr, n_kl_arr=n_kl_arr,
+                S_ki_li_off=S_ki_li_off, t2_off=t2_off, S_li_kl_off=S_li_kl_off,
+                K_off=K_off, S_kl_ki_off=S_kl_ki_off,
+                tile_off=tile_off[:-1].copy(),
+                S_ki_li_flat=S_ki_li_flat, S_li_kl_flat=S_li_kl_flat,
+                K_flat=K_flat, S_kl_ki_flat=S_kl_ki_flat, t2_flat=t2_flat,
+                scale=0.5,                          # arbitrary non-trivial
+                max_n_ki=int(n_ki_arr.max()),
+                max_n_li=int(n_li_arr.max()),
+                max_n_kl=int(n_kl_arr.max()),
+                tile_total=tile_total)
+
+
+def _python_reference_t4(plan, tiles_flat):
+    num_threads = max(1, min(int(os.environ.get('OMP_NUM_THREADS', '4')), 16))
+    if num_threads > plan['N']:
+        num_threads = max(plan['N'], 1)
+    tmp1_stride = plan['max_n_ki'] * plan['max_n_li']
+    tmp2_stride = plan['max_n_ki'] * plan['max_n_kl']
+    tmp3_stride = plan['max_n_ki'] * plan['max_n_kl']
+    tmp1_sc = np.zeros(num_threads * tmp1_stride)
+    tmp2_sc = np.zeros(num_threads * tmp2_stride)
+    tmp3_sc = np.zeros(num_threads * tmp3_stride)
+    _libcc.DLPNOt4_kernel_batched(
+        ctypes.c_int(plan['N']),
+        plan['n_ki_arr'].ctypes.data, plan['n_li_arr'].ctypes.data,
+        plan['n_kl_arr'].ctypes.data,
+        plan['S_ki_li_off'].ctypes.data, plan['t2_off'].ctypes.data,
+        plan['S_li_kl_off'].ctypes.data, plan['K_off'].ctypes.data,
+        plan['S_kl_ki_off'].ctypes.data, plan['tile_off'].ctypes.data,
+        plan['S_ki_li_flat'].ctypes.data, plan['S_li_kl_flat'].ctypes.data,
+        plan['K_flat'].ctypes.data, plan['S_kl_ki_flat'].ctypes.data,
+        plan['t2_flat'].ctypes.data,
+        tmp1_sc.ctypes.data, ctypes.c_size_t(tmp1_stride),
+        tmp2_sc.ctypes.data, ctypes.c_size_t(tmp2_stride),
+        tmp3_sc.ctypes.data, ctypes.c_size_t(tmp3_stride),
+        tiles_flat.ctypes.data,
+        ctypes.c_double(plan['scale']),
+        ctypes.c_int(num_threads))
+
+
+def parity_test_phase_t4(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+    plan = _build_synthetic_t4_plan()
+
+    tiles_class = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    plan_struct = PyT4Inputs()
+    plan_struct.N = plan['N']
+    plan_struct.scale = plan['scale']
+    plan_struct.max_n_ki = plan['max_n_ki']
+    plan_struct.max_n_li = plan['max_n_li']
+    plan_struct.max_n_kl = plan['max_n_kl']
+    for name in ('n_ki_arr', 'n_li_arr', 'n_kl_arr',
+                 'S_ki_li_off', 't2_off', 'S_li_kl_off', 'K_off',
+                 'S_kl_ki_off', 'tile_off',
+                 'S_ki_li_flat', 'S_li_kl_flat', 'K_flat',
+                 'S_kl_ki_flat', 't2_flat'):
+        setattr(plan_struct, name, plan[name].ctypes.data)
+    out_struct = PyT4Outputs()
+    out_struct.tiles_flat = tiles_class.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_t4(
+        ctypes.byref(inputs), ctypes.byref(plan_struct),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_t4 rc={rc}')
+
+    tiles_ref = np.full(plan['tile_total'], np.nan, dtype=np.float64)
+    _python_reference_t4(plan, tiles_ref)
+
+    max_abs = float(np.max(np.abs(tiles_class - tiles_ref)))
+    if verbose:
+        print(f'[CCSD MONO] phase_t4 parity: N={plan["N"]} scale={plan["scale"]}; '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(f'phase_t4 parity FAILED — {max_abs:.3e}')
+    del ownership
+    return max_abs
+
+
+def _allocate_k_ladder_outputs(aux):
+    """Per pair K and A, both (npno_p, npno_p) — share t2_offsets layout."""
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    sizes = (npno.astype(np.int64) ** 2)
+    offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(sizes)
+    K_flat = np.full(int(offsets[-1]), np.nan, dtype=np.float64)
+    A_flat = np.full(int(offsets[-1]), np.nan, dtype=np.float64)
+
+    out = PyKLadderOutputs()
+    K_wps = PyWritablePairStore()
+    K_wps.data = K_flat.ctypes.data
+    K_wps.offsets = offsets.ctypes.data
+    out.K = K_wps
+    A_wps = PyWritablePairStore()
+    A_wps.data = A_flat.ctypes.data
+    A_wps.offsets = offsets.ctypes.data
+    out.A = A_wps
+    return out, [K_flat, A_flat, offsets], (K_flat, A_flat, offsets)
+
+
+def _python_reference_k_ladder(inputs, aux, t1_dressed_per_pair):
+    """numpy reference for K + ladder, computing the same math directly
+    on per-pair sliced inputs.
+
+    `t1_dressed_per_pair` is the per-pair dict from
+    _python_reference_t1_ints (already returns i_Qa_t1 / j_Qa_t1 etc).
+    """
+    n_pairs = len(aux['ij_pairs'])
+    fps = aux['fps_arrays']
+    npno = aux['n_pno_per_pair']
+    naux = aux['naux_per_pair']
+    t2_offsets = aux['t2_offsets']
+    T2_flat = aux['T2_flat']
+
+    K_per_pair = []
+    A_per_pair = []
+    for p in range(n_pairs):
+        npno_p = int(npno[p])
+        if npno_p == 0:
+            K_per_pair.append(np.zeros((0, 0)))
+            A_per_pair.append(np.zeros((0, 0)))
+            continue
+        n_local = int(naux[p])
+        Qma = np.ascontiguousarray(fps['Qma'][p])              # (n_local, nlmo, npno)
+        Qab = np.ascontiguousarray(fps['Qab'][p])              # (n_local, npno, npno)
+        T1l = np.ascontiguousarray(fps['T1_in_pair'][p])       # (nlmo, npno)
+        T2_p = T2_flat[t2_offsets[p]:t2_offsets[p+1]].reshape(npno_p, npno_p)
+        i_Qa_t1 = np.ascontiguousarray(t1_dressed_per_pair[p]['i_Qa_t1'])
+        j_Qa_t1 = np.ascontiguousarray(t1_dressed_per_pair[p]['j_Qa_t1'])
+
+        # K = i_Qa_t1.T @ j_Qa_t1
+        K = i_Qa_t1.T @ j_Qa_t1
+
+        # A = Σ_Q (Qab[Q] - T1l.T @ Qma[Q]) @ T2 @ (Qab[Q] - T1l.T @ Qma[Q]).T
+        A = np.zeros((npno_p, npno_p))
+        for Q in range(n_local):
+            Qab_t1 = Qab[Q] - T1l.T @ Qma[Q]
+            A += Qab_t1 @ T2_p @ Qab_t1.T
+
+        K_per_pair.append(K)
+        A_per_pair.append(A)
+    return K_per_pair, A_per_pair
+
+
+def parity_test_phase_k_ladder(verbose=True):
+    """Chains 2b (t1_ints output) → 2j-e (K + ladder), compares vs numpy ref."""
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    # Run 2b to produce i_Qa_t1 / j_Qa_t1.
+    t1_out, t1_own, t1_bufs = _allocate_t1_ints_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_ints(
+        ctypes.byref(inputs), ctypes.byref(t1_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_ints rc={rc}')
+
+    # Wrap as KLadderInputs (FlatPairStore views over the writable buffers).
+    kl_inputs = PyKLadderInputs()
+    for name in ('i_Qa_t1', 'j_Qa_t1'):
+        wps = getattr(t1_out, name)
+        fps = PyFlatPairStore()
+        fps.data = wps.data
+        fps.offsets = wps.offsets
+        setattr(kl_inputs, name, fps)
+
+    # Class path
+    kl_out, kl_own, (K_flat, A_flat, K_off) = _allocate_k_ladder_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_k_ladder(
+        ctypes.byref(inputs), ctypes.byref(kl_inputs), ctypes.byref(kl_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_k_ladder rc={rc}')
+
+    # Reference: rebuild the per-pair t1_ints dict and compute math in numpy.
+    t1_per_pair = _python_reference_t1_ints(inputs, ownership, aux)
+    K_ref, A_ref = _python_reference_k_ladder(inputs, aux, t1_per_pair)
+
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    max_K = 0.0
+    max_A = 0.0
+    for p in range(n_pairs):
+        npno_p = int(npno[p])
+        if npno_p == 0:
+            continue
+        K_class = K_flat[K_off[p]:K_off[p+1]].reshape(npno_p, npno_p)
+        A_class = A_flat[K_off[p]:K_off[p+1]].reshape(npno_p, npno_p)
+        max_K = max(max_K, float(np.max(np.abs(K_class - K_ref[p]))))
+        max_A = max(max_A, float(np.max(np.abs(A_class - A_ref[p]))))
+    max_abs = max(max_K, max_A)
+
+    if verbose:
+        print(f'[CCSD MONO] phase_k_ladder parity over {n_pairs} pairs: '
+              f'|dK|={max_K:.3e}  |dA|={max_A:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(f'phase_k_ladder parity FAILED — {max_abs:.3e}')
+    del kl_own, t1_own, ownership
+    return max_abs
+
+
+def _python_reference_update_amps_and_energy(aux, R1_flat, R2_flat,
+                                                T1_in, T2_in):
+    """numpy reference for update_amps + energy.  Returns (T1_out, T2_out, energy).
+
+    T1_in / T2_in are NOT mutated; we copy them so the C++ in-place mutation
+    can be cross-checked against the reference's output.
+    """
+    nocc = int(aux['F_lmo'].shape[0])
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    pno_offsets = aux['pno_offsets']
+    t2_offsets = aux['t2_offsets']
+    F_lmo = aux['F_lmo']
+    e_pno_flat = aux['e_pno_flat']
+    fov_flat = aux['fov_flat']
+    pair_lmo_idx_list = aux['pair_lmo_idx_list']
+    fps = aux['fps_arrays']
+    i_j_to_ij = aux['i_j_to_ij']
+    DENOM_FLOOR = 1e-12
+
+    T1_out = T1_in.copy()
+    T2_out = T2_in.copy()
+
+    # T1 update.
+    for i in range(nocc):
+        p_ii = int(i_j_to_ij[i, i])
+        if p_ii < 0:
+            continue
+        npno_ii = int(npno[p_ii])
+        if npno_ii == 0:
+            continue
+        t1_off = int(pno_offsets[i])
+        epno_off = int(pno_offsets[p_ii])
+        F_ii = F_lmo[i, i]
+        T1_i = T1_out[t1_off:t1_off + npno_ii]
+        R1_i = R1_flat[t1_off:t1_off + npno_ii]
+        e_p = e_pno_flat[epno_off:epno_off + npno_ii]
+        denom = e_p - F_ii
+        denom = np.where(np.abs(denom) > DENOM_FLOOR, denom, DENOM_FLOOR)
+        T1_out[t1_off:t1_off + npno_ii] = T1_i - R1_i / denom
+
+    # T2 update.
+    for p in range(n_pairs):
+        npno_p = int(npno[p])
+        if npno_p == 0:
+            continue
+        i, j = aux['ij_pairs'][p]
+        F_ii = F_lmo[i, i]
+        F_jj = F_lmo[j, j]
+        e_p = e_pno_flat[pno_offsets[p]:pno_offsets[p+1]]
+        denom = (e_p[:, None] + e_p[None, :] - F_ii - F_jj)
+        denom = np.where(np.abs(denom) > DENOM_FLOOR, denom, DENOM_FLOOR)
+        sl = slice(t2_offsets[p], t2_offsets[p+1])
+        T2_p = T2_out[sl].reshape(npno_p, npno_p)
+        R2_p = R2_flat[sl].reshape(npno_p, npno_p)
+        T2_out[sl] = (T2_p - R2_p / denom).ravel()
+
+    # Energy.
+    e_T1 = 0.0
+    for i in range(nocc):
+        p_ii = int(i_j_to_ij[i, i])
+        if p_ii < 0:
+            continue
+        npno_ii = int(npno[p_ii])
+        if npno_ii == 0:
+            continue
+        t1_off = int(pno_offsets[i])
+        T1_i  = T1_out[t1_off:t1_off + npno_ii]
+        fov_i = fov_flat[t1_off:t1_off + npno_ii]
+        e_T1 += float(np.dot(fov_i, T1_i))
+
+    e_T2 = 0.0
+    for p in range(n_pairs):
+        npno_p = int(npno[p])
+        if npno_p == 0:
+            continue
+        i, j = aux['ij_pairs'][p]
+        lmo_list = np.asarray(pair_lmo_idx_list[p])
+        i_in_p_arr = np.where(lmo_list == i)[0]
+        j_in_p_arr = np.where(lmo_list == j)[0]
+        if i_in_p_arr.size == 0 or j_in_p_arr.size == 0:
+            continue
+        i_in_p = int(i_in_p_arr[0])
+        j_in_p = int(j_in_p_arr[0])
+        T2_p = T2_out[t2_offsets[p]:t2_offsets[p+1]].reshape(npno_p, npno_p)
+        T1_pair = fps['T1_in_pair'][p]
+        t1_i = T1_pair[i_in_p]
+        t1_j = T1_pair[j_in_p]
+        tau = T2_p + np.outer(t1_i, t1_j)
+        Tt = 2.0 * tau - tau.T
+        K_p = np.ascontiguousarray(fps['K_iajb'][p])
+        e_p = float(np.einsum('ab,ab->', K_p, Tt))
+        e_T2 += e_p if i == j else 2.0 * e_p
+
+    return T1_out, T2_out, e_T1 + e_T2
+
+
+def parity_test_phase_update_amps_and_energy(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    nocc = int(aux['F_lmo'].shape[0])
+    pno_offsets = aux['pno_offsets']
+    t2_offsets = aux['t2_offsets']
+
+    rng = np.random.default_rng(77777)
+    R1_flat = rng.standard_normal(int(pno_offsets[nocc]))
+    R2_flat = rng.standard_normal(int(t2_offsets[-1]))
+
+    # Snapshot T1 / T2 BEFORE the C++ phase mutates them.
+    T1_before = aux['T1_flat'].copy()
+    T2_before = aux['T2_flat'].copy()
+
+    # Class path (mutates T1_flat / T2_flat in place).
+    resid_struct = PyUpdateAmpsInputs()
+    resid_struct.R1_flat = R1_flat.ctypes.data
+    resid_struct.R2_flat = R2_flat.ctypes.data
+    out_struct = PyUpdateAmpsOutputs()
+    out_struct.energy = 0.0
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_update_amps_and_energy(
+        ctypes.byref(inputs), ctypes.byref(resid_struct),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_update_amps rc={rc}')
+
+    T1_class = aux['T1_flat'].copy()    # post-mutation
+    T2_class = aux['T2_flat'].copy()
+    e_class  = float(out_struct.energy)
+
+    # Reference.
+    T1_ref, T2_ref, e_ref = _python_reference_update_amps_and_energy(
+        aux, R1_flat, R2_flat, T1_before, T2_before)
+
+    d_T1 = float(np.max(np.abs(T1_class - T1_ref)))
+    d_T2 = float(np.max(np.abs(T2_class - T2_ref)))
+    d_E  = float(abs(e_class - e_ref))
+    max_abs = max(d_T1, d_T2, d_E)
+
+    if verbose:
+        print(f'[CCSD MONO] phase_update_amps_and_energy parity: '
+              f'|dT1|={d_T1:.3e}  |dT2|={d_T2:.3e}  |dE|={d_E:.3e}  '
+              f'(E_class={e_class:.6f})', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(
+            f'phase_update_amps_and_energy parity FAILED — {max_abs:.3e}')
+    del ownership
+    return max_abs
+
+
+def _allocate_fia_bar_outputs(aux):
+    """Per-pair Fia_bar of shape (nlmo_p, npno_p)."""
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    pair_lmo_offs = aux['pair_lmo_idx_offsets']
+    sizes = np.empty(n_pairs, dtype=np.int64)
+    for p in range(n_pairs):
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        sizes[p] = nlmo_p * int(npno[p])
+    offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(sizes)
+    flat = np.full(int(offsets[-1]), np.nan, dtype=np.float64)
+    out = PyFiaBarOutputs()
+    wps = PyWritablePairStore()
+    wps.data = flat.ctypes.data
+    wps.offsets = offsets.ctypes.data
+    out.Fia_bar = wps
+    return out, [flat, offsets], (flat, offsets)
+
+
+def _python_reference_fia_bar(aux):
+    """numpy reference for Fia_bar per canonical pair (Eq 94 inner math)."""
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    naux = aux['naux_per_pair']
+    pair_lmo_offs = aux['pair_lmo_idx_offsets']
+    fps = aux['fps_arrays']
+
+    out_per_pair = []
+    for p in range(n_pairs):
+        npno_p = int(npno[p])
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        if npno_p == 0 or nlmo_p == 0:
+            out_per_pair.append(np.zeros((nlmo_p, npno_p)))
+            continue
+        n_local = int(naux[p])
+        Qma = np.ascontiguousarray(fps['Qma'][p])               # (n_local, nlmo, npno)
+        T1l = np.ascontiguousarray(fps['T1_in_pair'][p])         # (nlmo, npno)
+        gamma = Qma.reshape(n_local, -1) @ T1l.ravel()
+        Z = T1l @ Qma.transpose(0, 2, 1)                         # (n_local, nlmo, nlmo)
+        Fia_bar = 2.0 * np.tensordot(gamma, Qma, axes=(0, 0))    # (nlmo, npno)
+        Fia_bar -= np.tensordot(Z, Qma, axes=((0, 1), (0, 1)))   # (nlmo, npno)
+        out_per_pair.append(Fia_bar)
+    return out_per_pair
+
+
+def parity_test_phase_t1_fock_fia_bar(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    out, own, (flat, offsets) = _allocate_fia_bar_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock_fia_bar(
+        ctypes.byref(inputs), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock_fia_bar rc={rc}')
+
+    ref = _python_reference_fia_bar(aux)
+
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    pair_lmo_offs = aux['pair_lmo_idx_offsets']
+    max_abs = 0.0
+    for p in range(n_pairs):
+        npno_p = int(npno[p])
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        if npno_p == 0 or nlmo_p == 0:
+            continue
+        c_block = flat[offsets[p]:offsets[p+1]].reshape(nlmo_p, npno_p)
+        d = float(np.max(np.abs(c_block - ref[p])))
+        max_abs = max(max_abs, d)
+
+    if verbose:
+        print(f'[CCSD MONO] phase_t1_fock_fia_bar parity over {n_pairs} pairs: '
+              f'max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(
+            f'phase_t1_fock_fia_bar parity FAILED — {max_abs:.3e}')
+    del own, ownership
+    return max_abs
+
+
+def _python_reference_t1_residual_AC_init(aux, Fia_bar_per_pair,
+                                            do_init=True):
+    """numpy reference for R1 init + A + C per ordered pair, matching the
+    POST-fix C++ class math (LT1-chain C term, Psi4-faithful).
+
+    - Init (gated by do_init): R1[i] += Fai[i] = Fia_bar[(i,i)][i_in_p, :].
+    - A: per ordered pair, Tt_ki K_tilde_chem chain.
+    - C: per ordered pair, Tt_ik @ fkc_dress where
+         fkc_dress = Σ_m S_PNO((k,i), (i,m)) @ LT1[(i,m)].
+    """
+    nocc = int(aux['F_lmo'].shape[0])
+    n_pairs = len(aux['ij_pairs'])
+    npno = aux['n_pno_per_pair']
+    pno_offsets = aux['pno_offsets']
+    pair_lmo_idx_list = aux['pair_lmo_idx_list']
+    fps = aux['fps_arrays']
+    i_j_to_ij = aux['i_j_to_ij']
+    ij_pairs = aux['ij_pairs']
+    o_i = aux['ordered_pair_i_idx']
+    o_k = aux['ordered_pair_k_idx']
+    t2_offsets = aux['t2_offsets']
+    T2_flat = aux['T2_flat']
+    S_pno_data = aux['S_pno_data']
+    S_pno_offsets = aux['S_pno_offsets']
+
+    R1_flat = np.zeros(int(pno_offsets[nocc]))
+
+    # Init: R1[i] += Fai[i] (gated by do_init).
+    if do_init:
+        for i in range(nocc):
+            p_ii = int(i_j_to_ij[i, i])
+            if p_ii < 0:
+                continue
+            npno_ii = int(npno[p_ii])
+            if npno_ii == 0:
+                continue
+            lmo_list_ii = np.asarray(pair_lmo_idx_list[p_ii])
+            i_in_p_arr = np.where(lmo_list_ii == i)[0]
+            if i_in_p_arr.size == 0:
+                continue
+            i_in_p = int(i_in_p_arr[0])
+            Fai = Fia_bar_per_pair[p_ii][i_in_p]
+            R1_flat[pno_offsets[i]:pno_offsets[i] + npno_ii] += Fai
+
+    # Precompute LT1[(i, m)] per ordered pair (matching new C++ math).
+    # LT1[o] = (2·K_iajb[canon(i,m)] - K_iajb[canon(i,m)]ᵀ) @ t1_m_in_im
+    # where t1_m_in_im = T1_in_pair_full[canon(i,m)][m, :].
+    K_iajb_per_pair = aux['fps_arrays'].get('K_iajb', None)
+    T1_full_per_pair = aux['fps_arrays'].get('T1_in_pair_full', None)
+    LT1_per_o = []
+    for o_idx in range(o_i.size):
+        a_ord = int(o_i[o_idx])
+        b_ord = int(o_k[o_idx])
+        p_im = int(i_j_to_ij[a_ord, b_ord])
+        if p_im < 0 or K_iajb_per_pair is None or T1_full_per_pair is None:
+            LT1_per_o.append(np.zeros(0))
+            continue
+        npno_im = int(npno[p_im])
+        if npno_im == 0:
+            LT1_per_o.append(np.zeros(0))
+            continue
+        K = K_iajb_per_pair[p_im]
+        T_full = T1_full_per_pair[p_im]
+        t1_m = T_full[b_ord]
+        L = 2.0 * K - K.T
+        LT1_per_o.append(L @ t1_m)
+
+    ord_idx_lookup = {(int(o_i[oo]), int(o_k[oo])): oo for oo in range(o_i.size)}
+
+    # A + C contributions per ordered pair.
+    for o_idx in range(o_i.size):
+        a_ord = int(o_i[o_idx])
+        b_ord = int(o_k[o_idx])
+        p_canon = int(i_j_to_ij[a_ord, b_ord])
+        if p_canon < 0:
+            continue
+        npno_p = int(npno[p_canon])
+        if npno_p == 0:
+            continue
+        p_ii = int(i_j_to_ij[a_ord, a_ord])
+        if p_ii < 0:
+            continue
+        npno_ii = int(npno[p_ii])
+        if npno_ii == 0:
+            continue
+
+        can_first = ij_pairs[p_canon][0]
+
+        # S_pno_cache lookup.
+        s_idx = p_canon * n_pairs + p_ii
+        s_off = int(S_pno_offsets[s_idx])
+        s_size = int(S_pno_offsets[s_idx + 1] - s_off)
+        if s_size != npno_p * npno_ii:
+            continue
+        S_p = S_pno_data[s_off:s_off + s_size].reshape(npno_p, npno_ii)
+
+        T2_p = T2_flat[t2_offsets[p_canon]:t2_offsets[p_canon+1]] \
+            .reshape(npno_p, npno_p)
+
+        # A term: K_chem variant + Tt_ki + S_p.T @ Y.
+        if can_first == b_ord:
+            K_chem_ki = fps['K_tilde_chem_i'][p_canon]
+        else:
+            K_chem_ki = fps['K_tilde_chem_j'][p_canon]
+        K_chem_ki = np.ascontiguousarray(K_chem_ki)         # (npno_p, npno_p²)
+
+        swap_ki = (can_first != b_ord)
+        T2_ki = T2_p.T if swap_ki else T2_p
+        Tt_ki = 2.0 * T2_ki - T2_ki.T
+
+        # Y[c] = Σ_R K_chem_ki.reshape(npno_p², npno_p)[R, c] * Tt_ki.flat[R]
+        K_R = K_chem_ki.reshape(npno_p * npno_p, npno_p)
+        Y = K_R.T @ Tt_ki.ravel()                            # (npno_p,)
+
+        A_contrib = S_p.T @ Y                                # (npno_ii,)
+        R1_flat[pno_offsets[a_ord]:pno_offsets[a_ord] + npno_ii] += A_contrib
+
+        # C term.
+        swap_ik = (can_first != a_ord)
+        T2_ik = T2_p.T if swap_ik else T2_p
+        Tt_ik = 2.0 * T2_ik - T2_ik.T
+
+        # Build fkc_dress = Σ_m S_PNO((k,i), (i,m)) @ LT1[(i, m)].
+        fkc_dress = np.zeros(npno_p)
+        for m_ in range(nocc):
+            o_im = ord_idx_lookup.get((a_ord, m_))
+            if o_im is None:
+                continue
+            p_im = int(i_j_to_ij[a_ord, m_])
+            if p_im < 0:
+                continue
+            npno_im = int(npno[p_im])
+            if npno_im == 0:
+                continue
+            lt1_im = LT1_per_o[o_im]
+            if lt1_im.size != npno_im:
+                continue
+            if p_canon == p_im:
+                fkc_dress += lt1_im
+            else:
+                s_idx_im = p_canon * n_pairs + p_im
+                s_off_im = int(S_pno_offsets[s_idx_im])
+                s_size_im = int(S_pno_offsets[s_idx_im + 1] - s_off_im)
+                if s_size_im != npno_p * npno_im:
+                    continue
+                S_pi = S_pno_data[s_off_im:s_off_im + s_size_im].reshape(
+                    npno_p, npno_im)
+                fkc_dress += S_pi @ lt1_im
+
+        contrib_C = Tt_ik @ fkc_dress                            # (npno_p,)
+        if p_canon == p_ii:
+            R1_flat[pno_offsets[a_ord]:pno_offsets[a_ord] + npno_p] += contrib_C
+        else:
+            s_idx2 = p_ii * n_pairs + p_canon
+            s_off2 = int(S_pno_offsets[s_idx2])
+            s_size2 = int(S_pno_offsets[s_idx2 + 1] - s_off2)
+            if s_size2 == npno_ii * npno_p:
+                S_ii_ki = S_pno_data[s_off2:s_off2 + s_size2].reshape(
+                    npno_ii, npno_p)
+                R1_flat[pno_offsets[a_ord]:pno_offsets[a_ord] + npno_ii] += (
+                    S_ii_ki @ contrib_C)
+
+    return R1_flat
+
+
+def parity_test_phase_t1_residual_AC_init(verbose=True):
+    inputs, ownership, aux = build_synthetic_inputs()
+
+    # Run 2l-b to produce Fia_bar.
+    fia_out, fia_own, (fia_flat, fia_offsets) = _allocate_fia_bar_outputs(aux)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock_fia_bar(
+        ctypes.byref(inputs), ctypes.byref(fia_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock_fia_bar rc={rc}')
+
+    # Wrap as R1AcInputs (FlatPairStore view over the writable buffer).
+    r1ac_in = PyR1AcInputs()
+    fps = PyFlatPairStore()
+    fps.data = fia_out.Fia_bar.data
+    fps.offsets = fia_out.Fia_bar.offsets
+    r1ac_in.Fia_bar = fps
+    r1ac_in.do_init = 1
+
+    # Class path
+    nocc = int(aux['F_lmo'].shape[0])
+    R1_class = np.full(int(aux['pno_offsets'][nocc]), np.nan, dtype=np.float64)
+    out_struct = PyR1AcOutputs()
+    out_struct.R1_flat = R1_class.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_residual_AC_init(
+        ctypes.byref(inputs), ctypes.byref(r1ac_in),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_residual_AC_init rc={rc}')
+
+    # Reference: same Fia_bar (recompute via numpy reference for cleanliness),
+    # then run the AC+init reference.
+    Fia_bar_ref = _python_reference_fia_bar(aux)
+    R1_ref = _python_reference_t1_residual_AC_init(aux, Fia_bar_ref)
+
+    max_abs = float(np.max(np.abs(R1_class - R1_ref)))
+    n_ord = aux['ordered_pair_i_idx'].size
+    if verbose:
+        print(f'[CCSD MONO] phase_t1_residual_AC_init parity over {n_ord} '
+              f'ordered pairs: max abs diff = {max_abs:.3e}', flush=True)
+    if max_abs > 1e-12:
+        raise AssertionError(
+            f'phase_t1_residual_AC_init parity FAILED — {max_abs:.3e}')
+    del fia_own, ownership
+    return max_abs
+
+
+def validate_t1_ints_real(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+                           F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+                           S_pno_cache, verbose=True):
+    """Real-data validation of phase_t1_ints against the existing
+    Python `t1_ints(...)` wrapper.  Called from a hook in lccsd.py at
+    cycle 0 (after t1_cache is built).  Compares per-pair output dicts.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+    from pyscf.cc.dlpno_tccsd.local_df import t1_ints as _ref_t1_ints
+
+    # Reference path (existing Python wrapper).
+    ref_dict = _ref_t1_ints(
+        cc_ints, t1_pno, pno_spaces, S_pno_cache, list(keys_sorted), nocc,
+        pair_lmo_idx=pair_lmo_idx, t1_cache=t1_cache, _pool=None)
+
+    # Pack SolverInputs.
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted))
+
+    # Allocate outputs.
+    keys_reorder = aux['keys_sorted']
+    out, own, bufs = _allocate_t1_ints_outputs({
+        'ij_pairs': keys_reorder,
+        'pair_lmo_idx_offsets': np.cumsum(
+            np.concatenate(([0],
+                np.array([pl.size for pl in aux['pair_lmo_lists']], dtype=np.int64)))),
+        'n_pno_per_pair': aux['n_pno_per_pair'],
+        'naux_per_pair': np.array([
+            aux['Qma_list'][p].shape[0] for p in range(len(keys_reorder))
+        ], dtype=np.int32),
+    })
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_ints(
+        ctypes.byref(inputs), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_ints rc={rc}')
+
+    # Compare per-pair outputs.
+    qa_off = bufs['i_Qa_t1'][1]
+    qk_off = bufs['i_Qk_t1'][1]
+    iQa_flat = bufs['i_Qa_t1'][0]
+    jQa_flat = bufs['j_Qa_t1'][0]
+    iQk_flat = bufs['i_Qk_t1'][0]
+    jQk_flat = bufs['j_Qk_t1'][0]
+
+    n_compared = 0
+    n_skipped = 0
+    max_iQa = max_jQa = max_iQk = max_jQk = 0.0
+    failures = []
+
+    for key in keys_sorted:
+        if key not in ref_dict:
+            n_skipped += 1
+            continue
+        if key not in key_to_p:
+            n_skipped += 1
+            continue
+        p = key_to_p[key]
+        ref = ref_dict[key]
+        nlmo_p = aux['pair_lmo_lists'][p].size
+        npno_p = int(aux['n_pno_per_pair'][p])
+        n_local = aux['Qma_list'][p].shape[0]
+
+        c_iQa = iQa_flat[qa_off[p]:qa_off[p + 1]].reshape(n_local, npno_p)
+        c_jQa = jQa_flat[qa_off[p]:qa_off[p + 1]].reshape(n_local, npno_p)
+        c_iQk = iQk_flat[qk_off[p]:qk_off[p + 1]].reshape(n_local, nlmo_p)
+        c_jQk = jQk_flat[qk_off[p]:qk_off[p + 1]].reshape(n_local, nlmo_p)
+
+        d_iQa = float(np.max(np.abs(c_iQa - ref['i_Qa_t1'])))
+        d_jQa = float(np.max(np.abs(c_jQa - ref['j_Qa_t1'])))
+        d_iQk = float(np.max(np.abs(c_iQk - ref['i_Qk_t1'])))
+        d_jQk = float(np.max(np.abs(c_jQk - ref['j_Qk_t1'])))
+        max_iQa = max(max_iQa, d_iQa)
+        max_jQa = max(max_jQa, d_jQa)
+        max_iQk = max(max_iQk, d_iQk)
+        max_jQk = max(max_jQk, d_jQk)
+        if max(d_iQa, d_jQa, d_iQk, d_jQk) > 1e-10:
+            failures.append((p, key, d_iQa, d_jQa, d_iQk, d_jQk))
+        n_compared += 1
+    _ = n_compared  # silence unused-warning if any
+
+    print(f'[CCSD MONO] phase_t1_ints REAL-DATA parity over {n_compared} '
+          f'pairs (skipped {n_skipped}):', flush=True)
+    print(f'  max |di_Qa_t1| = {max_iQa:.3e}', flush=True)
+    print(f'  max |dj_Qa_t1| = {max_jQa:.3e}', flush=True)
+    print(f'  max |di_Qk_t1| = {max_iQk:.3e}', flush=True)
+    print(f'  max |dj_Qk_t1| = {max_jQk:.3e}', flush=True)
+    if failures:
+        print(f'  FAILURES on {len(failures)} pairs (showing first 5):', flush=True)
+        for f in failures[:5]:
+            print(f'    pair p={f[0]} key={f[1]}: '
+                  f'iQa={f[2]:.3e} jQa={f[3]:.3e} '
+                  f'iQk={f[4]:.3e} jQk={f[5]:.3e}', flush=True)
+    del own, ownership
+    return max(max_iQa, max_jQa, max_iQk, max_jQk)
+
+
+def validate_b_tilde_real(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+                           F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+                           S_pno_cache, t2_pno_all, verbose=True):
+    """Real-data validation of phase_b_tilde.  Chains C++ phase_t1_ints
+    output → phase_b_tilde, compares to existing PySCF compute_B_tilde.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+    from pyscf.cc.dlpno_tccsd.local_df import (
+        t1_ints as _ref_t1_ints, compute_B_tilde as _ref_compute_B_tilde)
+
+    # Reference path: existing dressed dict → compute_B_tilde per pair.
+    ref_dressed = _ref_t1_ints(
+        cc_ints, t1_pno, pno_spaces, S_pno_cache, list(keys_sorted), nocc,
+        pair_lmo_idx=pair_lmo_idx, t1_cache=t1_cache, _pool=None)
+    ref_B_per_key = {}
+    for key in keys_sorted:
+        if key not in cc_ints or cc_ints[key] is None:
+            continue
+        bt = _ref_compute_B_tilde(
+            cc_ints, ref_dressed, t2_pno_all, t1_pno,
+            pno_spaces, S_pno_cache, key, nocc,
+            pair_lmo_idx=pair_lmo_idx, t1_cache=t1_cache)
+        if bt is None:
+            continue
+        # compute_B_tilde returns (B_local, p_lmos_dense) — take B_local.
+        ref_B_per_key[key] = bt[0]
+
+    # Pack SolverInputs (with real T2_pno_all).
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted),
+        t2_pno_all=t2_pno_all)
+
+    # Run phase_t1_ints to produce dressed Qa/Qk.
+    keys_reorder = aux['keys_sorted']
+    aux_for_alloc = {
+        'ij_pairs': keys_reorder,
+        'pair_lmo_idx_offsets': np.cumsum(
+            np.concatenate(([0],
+                np.array([pl.size for pl in aux['pair_lmo_lists']], dtype=np.int64)))),
+        'n_pno_per_pair': aux['n_pno_per_pair'],
+        'naux_per_pair': np.array([
+            aux['Qma_list'][p].shape[0] for p in range(len(keys_reorder))
+        ], dtype=np.int32),
+    }
+    t1_out, t1_own, t1_bufs = _allocate_t1_ints_outputs(aux_for_alloc)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_ints(
+        ctypes.byref(inputs), ctypes.byref(t1_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_ints rc={rc}')
+
+    # Wrap dressed outputs as BTildeInputs (FlatPairStore views).
+    bt_in = PyBTildeInputs()
+    for name in ('i_Qk_t1', 'j_Qk_t1'):
+        wps = getattr(t1_out, name)
+        fps = PyFlatPairStore()
+        fps.data = wps.data
+        fps.offsets = wps.offsets
+        setattr(bt_in, name, fps)
+
+    # Allocate B_tilde outputs (per pair (nlmo_p, nlmo_p)).
+    bt_out, bt_own, (B_flat, B_offsets) = _allocate_b_tilde_outputs(aux_for_alloc)
+    rc = _libcc.DLPNOcompute_lccsd_phase_b_tilde(
+        ctypes.byref(inputs), ctypes.byref(bt_in), ctypes.byref(bt_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_b_tilde rc={rc}')
+
+    # Compare per-pair B_local against reference.
+    n_compared = 0
+    n_skipped = 0
+    max_abs = 0.0
+    failures = []
+    for key in keys_sorted:
+        if key not in ref_B_per_key:
+            n_skipped += 1
+            continue
+        if key not in key_to_p:
+            n_skipped += 1
+            continue
+        p = key_to_p[key]
+        nlmo_p = aux['pair_lmo_lists'][p].size
+        c_B = B_flat[B_offsets[p]:B_offsets[p + 1]].reshape(nlmo_p, nlmo_p)
+        ref_B = ref_B_per_key[key]
+        d = float(np.max(np.abs(c_B - ref_B)))
+        max_abs = max(max_abs, d)
+        if d > 1e-10:
+            failures.append((p, key, d))
+        n_compared += 1
+
+    print(f'[CCSD MONO] phase_b_tilde REAL-DATA parity over {n_compared} '
+          f'pairs (skipped {n_skipped}): max abs diff = {max_abs:.3e}', flush=True)
+    if failures:
+        print(f'  FAILURES on {len(failures)} pairs (first 5):', flush=True)
+        for f in failures[:5]:
+            print(f'    p={f[0]} key={f[1]}: max abs = {f[2]:.3e}',
+                  flush=True)
+    del t1_own, bt_own, ownership
+    return max_abs
+
+
+def validate_update_amps_and_energy_real(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+        S_pno_cache, t2_pno_all, K_pno_cache=None, verbose=True):
+    """Real-data validation of update_amps_and_energy with R1 = R2 = 0.
+
+    With zero residuals, T1/T2 mutation is a no-op (T -= 0/D = T).  We
+    just compare the cycle correlation energy against a numpy reference
+    formed from the same state.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+
+    # Pack SolverInputs.
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted),
+        t2_pno_all=t2_pno_all)
+
+    # Snapshot T1/T2 BEFORE the call (to verify they don't change with
+    # zero residual).
+    pno_offsets = aux.get('pno_offsets')
+    t2_offsets = aux.get('t2_offsets')
+    # T1_flat / T2_flat live in `ownership` — find them by exact identity.
+    # Easier: re-derive from inputs pointers via a temporary numpy view.
+    # The packer keeps them in ownership; simplest is to read via the
+    # SolverInputs pointers (caller-allocated arrays still in ownership).
+    keys_reorder = aux['keys_sorted']
+
+    # Build R1 = R2 = 0.
+    R1_size = sum(int(aux['n_pno_per_pair'][i]) for i in range(nocc))
+    R2_size = sum(int(aux['n_pno_per_pair'][p]) ** 2
+                  for p in range(len(keys_reorder)))
+    R1_zero = np.zeros(R1_size, dtype=np.float64)
+    R2_zero = np.zeros(R2_size, dtype=np.float64)
+
+    resid_struct = PyUpdateAmpsInputs()
+    resid_struct.R1_flat = R1_zero.ctypes.data
+    resid_struct.R2_flat = R2_zero.ctypes.data
+    out_struct = PyUpdateAmpsOutputs()
+    out_struct.energy = 0.0
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_update_amps_and_energy(
+        ctypes.byref(inputs), ctypes.byref(resid_struct),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_update_amps_and_energy rc={rc}')
+    e_class = float(out_struct.energy)
+
+    # Reference: numpy reproduction of the same energy formula on the
+    # original Python state.  E = Σ_i fov[i]·t1[i] +
+    #                           Σ_p (1 or 2) K_iajb[p]:(2τ - τᵀ) with
+    #                           τ = T2[p] + t1_i ⊗ t1_j (in pair PNO basis).
+    e_ref_T1 = 0.0
+    for i in range(nocc):
+        if i not in t1_pno or t1_pno[i].size == 0:
+            continue
+        if i not in fov_pno or fov_pno[i].size == 0:
+            continue
+        e_ref_T1 += float(np.dot(fov_pno[i], t1_pno[i]))
+
+    e_ref_T2 = 0.0
+    for key in keys_sorted:
+        if key not in t2_pno_all:
+            continue
+        T2_p = t2_pno_all[key]
+        if T2_p.shape[0] == 0:
+            continue
+        i, j = key
+        # K_iajb: prefer cc_ints['K_iajb']; else K_pno_cache; else
+        # pno_spaces[key].get('K_pno').
+        K_p = None
+        if cc_ints.get(key) is not None and 'K_iajb' in cc_ints[key]:
+            K_p = cc_ints[key]['K_iajb']
+        elif K_pno_cache is not None and key in K_pno_cache:
+            K_p = K_pno_cache[key]
+        elif key in pno_spaces and 'K_pno' in pno_spaces[key]:
+            K_p = pno_spaces[key]['K_pno']
+        if K_p is None:
+            continue
+        # t1_i / t1_j projected into pair (i, j) PNO basis = t1_cache row.
+        t1_i_pno = t1_cache[key][i]
+        t1_j_pno = t1_cache[key][j]
+        tau = T2_p + np.outer(t1_i_pno, t1_j_pno)
+        Tt = 2.0 * tau - tau.T
+        e_p = float(np.einsum('ab,ab->', K_p, Tt))
+        e_ref_T2 += e_p if i == j else 2.0 * e_p
+
+    e_ref = e_ref_T1 + e_ref_T2
+    diff = abs(e_class - e_ref)
+    print(f'[CCSD MONO] phase_update_amps_and_energy REAL-DATA energy: '
+          f'class={e_class:.10f}  ref={e_ref:.10f}  '
+          f'|d|={diff:.3e}', flush=True)
+    del ownership
+    return diff
+
+
+def validate_t1_fock_fia_bar_real(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+        S_pno_cache, t2_pno_all, verbose=True):
+    """Real-data validation of phase_t1_fock_fia_bar.  No existing Python
+    counterpart for this exact tensor — reference is computed inline via
+    numpy from the same Qma + T1_in_pair the packer feeds the C++ class.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted),
+        t2_pno_all=t2_pno_all)
+
+    # Allocate Fia_bar outputs (per pair (nlmo_p, npno_p) doubles).
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    pair_lmo_offs = np.cumsum(np.concatenate(([0],
+        np.array([pl.size for pl in aux['pair_lmo_lists']],
+                 dtype=np.int64))))
+    npno = aux['n_pno_per_pair']
+    sizes = np.empty(n_pairs, dtype=np.int64)
+    for p in range(n_pairs):
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        sizes[p] = nlmo_p * int(npno[p])
+    offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(sizes)
+    flat = np.full(int(offsets[-1]), np.nan, dtype=np.float64)
+
+    out_struct = PyFiaBarOutputs()
+    wps = PyWritablePairStore()
+    wps.data = flat.ctypes.data
+    wps.offsets = offsets.ctypes.data
+    out_struct.Fia_bar = wps
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock_fia_bar(
+        ctypes.byref(inputs), ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock_fia_bar rc={rc}')
+
+    # Reference: per canonical pair, compute Fia_bar with numpy.
+    n_compared = 0
+    n_skipped = 0
+    max_abs = 0.0
+    failures = []
+    for p in range(n_pairs):
+        npno_p = int(aux['n_pno_per_pair'][p])
+        nlmo_p = int(aux['pair_lmo_lists'][p].size)
+        if npno_p == 0 or nlmo_p == 0:
+            n_skipped += 1
+            continue
+        Qma = aux['Qma_list'][p]                              # (n_local, nlmo_p, npno_p)
+        T1l = aux['T1_in_pair_list'][p]                       # (nlmo_p, npno_p)
+        n_local = Qma.shape[0]
+        gamma = Qma.reshape(n_local, -1) @ T1l.ravel()        # (n_local,)
+        Z = T1l @ Qma.transpose(0, 2, 1)                      # (n_local, nlmo_p, nlmo_p)
+        Fia_bar_ref = 2.0 * np.tensordot(gamma, Qma, axes=(0, 0))
+        Fia_bar_ref -= np.tensordot(Z, Qma, axes=((0, 1), (0, 1)))
+
+        c_block = flat[offsets[p]:offsets[p + 1]].reshape(nlmo_p, npno_p)
+        d = float(np.max(np.abs(c_block - Fia_bar_ref)))
+        max_abs = max(max_abs, d)
+        if d > 1e-10:
+            failures.append((p, d))
+        n_compared += 1
+
+    print(f'[CCSD MONO] phase_t1_fock_fia_bar REAL-DATA parity over {n_compared} '
+          f'pairs (skipped {n_skipped}): max abs diff = {max_abs:.3e}',
+          flush=True)
+    if failures:
+        print(f'  FAILURES on {len(failures)} pairs (first 5):', flush=True)
+        for f in failures[:5]:
+            print(f'    p={f[0]}: max abs = {f[1]:.3e}', flush=True)
+    del ownership
+    return max_abs
+
+
+def validate_t1_fock_real(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+        S_pno_cache, t2_pno_all, foo_total, verbose=True):
+    """Real-data validation of phase_t1_fock (Fab + d_ij/d_ji).  Compares
+    per-pair Fab against the existing Python `t1_fock(...)` wrapper.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+    from pyscf.cc.dlpno_tccsd.local_df import t1_fock as _ref_t1_fock
+
+    # Reference: existing Python t1_fock returns (Fkj, Fab_all, foo_t1, Fij_bar).
+    Fkj_ref, Fab_ref, foo_t1_ref, Fij_bar_ref = _ref_t1_fock(
+        cc_ints, None, t1_pno, fov_pno, pno_spaces, S_pno_cache,
+        F_lmo, eps_lmo, foo_total, list(keys_sorted), nocc,
+        pair_lmo_idx=pair_lmo_idx, t1_cache=t1_cache, _pool=None)
+
+    # Pack SolverInputs.
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted),
+        t2_pno_all=t2_pno_all)
+
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    npno = aux['n_pno_per_pair']
+
+    # Allocate Fab + d outputs.
+    sizes = (npno.astype(np.int64) ** 2)
+    Fab_offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    Fab_offsets[1:] = np.cumsum(sizes)
+    Fab_flat = np.full(int(Fab_offsets[-1]), np.nan, dtype=np.float64)
+    d_flat   = np.zeros(n_pairs * 2, dtype=np.float64)
+
+    out = PyT1FockOutputs()
+    wps = PyWritablePairStore()
+    wps.data    = Fab_flat.ctypes.data
+    wps.offsets = Fab_offsets.ctypes.data
+    out.Fab    = wps
+    out.d_flat = d_flat.ctypes.data
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock(
+        ctypes.byref(inputs), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock rc={rc}')
+
+    # Compare per-pair Fab against reference.
+    n_compared = 0
+    n_skipped = 0
+    max_Fab = 0.0
+    failures = []
+    for key in keys_sorted:
+        if key not in Fab_ref:
+            n_skipped += 1
+            continue
+        if key not in key_to_p:
+            n_skipped += 1
+            continue
+        p = key_to_p[key]
+        npno_p = int(npno[p])
+        c_Fab = Fab_flat[Fab_offsets[p]:Fab_offsets[p + 1]].reshape(npno_p, npno_p)
+        d = float(np.max(np.abs(c_Fab - Fab_ref[key])))
+        max_Fab = max(max_Fab, d)
+        if d > 1e-10:
+            failures.append((p, key, d))
+        n_compared += 1
+
+    print(f'[CCSD MONO] phase_t1_fock REAL-DATA Fab parity over {n_compared} '
+          f'pairs (skipped {n_skipped}): max abs diff = {max_Fab:.3e}',
+          flush=True)
+    if failures:
+        print(f'  FAILURES on {len(failures)} pairs (first 5):', flush=True)
+        for f in failures[:5]:
+            print(f'    p={f[0]} key={f[1]}: {f[2]:.3e}', flush=True)
+    del ownership
+    return max_Fab
+
+
+def validate_t1_fock_finalize_real(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+        S_pno_cache, t2_pno_all, foo_total, verbose=True):
+    """Real-data validation of phase_t1_fock_finalize: chains 2d → 2h
+    and compares Fkj / Fij_bar / foo_t1 against existing Python t1_fock.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+    from pyscf.cc.dlpno_tccsd.local_df import t1_fock as _ref_t1_fock
+
+    Fkj_ref, Fab_ref, foo_t1_ref, Fij_bar_ref = _ref_t1_fock(
+        cc_ints, None, t1_pno, fov_pno, pno_spaces, S_pno_cache,
+        F_lmo, eps_lmo, foo_total, list(keys_sorted), nocc,
+        pair_lmo_idx=pair_lmo_idx, t1_cache=t1_cache, _pool=None)
+
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted),
+        t2_pno_all=t2_pno_all)
+
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    npno = aux['n_pno_per_pair']
+
+    # Run 2d to produce d_flat.
+    sizes = (npno.astype(np.int64) ** 2)
+    Fab_offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    Fab_offsets[1:] = np.cumsum(sizes)
+    Fab_flat = np.full(int(Fab_offsets[-1]), np.nan, dtype=np.float64)
+    d_flat   = np.zeros(n_pairs * 2, dtype=np.float64)
+    out_d = PyT1FockOutputs()
+    wps = PyWritablePairStore()
+    wps.data    = Fab_flat.ctypes.data
+    wps.offsets = Fab_offsets.ctypes.data
+    out_d.Fab    = wps
+    out_d.d_flat = d_flat.ctypes.data
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock(
+        ctypes.byref(inputs), ctypes.byref(out_d))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock rc={rc}')
+
+    # Run 2h to produce Fkj / Fij_bar / foo_t1.
+    Fkj_class       = np.zeros((nocc, nocc), dtype=np.float64)
+    Fij_bar_class   = np.zeros((nocc, nocc), dtype=np.float64)
+    foo_t1_class    = np.zeros((nocc, nocc), dtype=np.float64)
+    extra_in = PyT1FockExtraInputs()
+    extra_in.d_flat = d_flat.ctypes.data
+    extra_out = PyT1FockExtraOutputs()
+    extra_out.Fkj              = Fkj_class.ctypes.data
+    extra_out.Fij_bar_snapshot = Fij_bar_class.ctypes.data
+    extra_out.foo_t1           = foo_t1_class.ctypes.data
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock_finalize(
+        ctypes.byref(inputs), ctypes.byref(extra_in),
+        ctypes.byref(extra_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock_finalize rc={rc}')
+
+    d_Fkj  = float(np.max(np.abs(Fkj_class       - Fkj_ref)))
+    d_Fij  = float(np.max(np.abs(Fij_bar_class   - Fij_bar_ref)))
+    d_foo  = float(np.max(np.abs(foo_t1_class    - foo_t1_ref)))
+    print(f'[CCSD MONO] phase_t1_fock_finalize REAL-DATA: '
+          f'|dFkj|={d_Fkj:.3e}  |dFij|={d_Fij:.3e}  |dfoo|={d_foo:.3e}',
+          flush=True)
+    del ownership
+    return max(d_Fkj, d_Fij, d_foo)
+
+
+def validate_d_tilde_ph1_real(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+        S_pno_cache, t2_pno_all, ovL_pno_cache=None, ooL_3idx=None,
+        with_df=None, S_pao_full=None, s1e=None, K_coul_cache=None,
+        verbose=True):
+    """Real-data validation of phase_d_tilde_ph1 (ordered-pair).
+
+    Reference: existing Python build_D_tilde_batched (Phase 1 portion).
+    The reference returns a per-ordered-pair dict keyed by (i, k) → (n_pno_ki, n_pno_ki) D tile.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+    from pyscf.cc.dlpno_tccsd.residual import build_D_tilde_batched
+
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted),
+        t2_pno_all=t2_pno_all)
+
+    # Reference path.  build_D_tilde_batched needs a list of ordered pairs;
+    # the function builds (a, b) and (b, a) internally as `all_pairs`.
+    ref = build_D_tilde_batched(
+        t1_pno, t2_pno_all, pno_spaces, nocc,
+        ovL_pno_cache, ooL_3idx, S_pno_cache, with_df,
+        cc_ints=cc_ints,
+        pair_lmo_idx=pair_lmo_idx, _pool=None,
+        S_pao_full=S_pao_full, s1e=s1e, t1_cache=t1_cache,
+        omp_threads=1)
+
+    # Allocate D_tilde outputs (per ordered pair, (npno_p, npno_p)).
+    n_ord = inputs.n_ordered_pairs
+    keys_reorder = aux['keys_sorted']
+    npno = aux['n_pno_per_pair']
+    o_i = np.frombuffer(
+        (ctypes.c_int * n_ord).from_address(inputs.ordered_pair_i_idx),
+        dtype=np.int32, count=n_ord)
+    o_k = np.frombuffer(
+        (ctypes.c_int * n_ord).from_address(inputs.ordered_pair_k_idx),
+        dtype=np.int32, count=n_ord)
+
+    sizes = np.empty(n_ord, dtype=np.int64)
+    for o in range(n_ord):
+        i_, k_ = int(o_i[o]), int(o_k[o])
+        p_canon = key_to_p[(min(i_, k_), max(i_, k_))]
+        sizes[o] = int(npno[p_canon]) ** 2
+    offsets = np.zeros(n_ord + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(sizes)
+    D_flat = np.full(int(offsets[-1]), np.nan, dtype=np.float64)
+
+    out = PyDTildeOutputs()
+    wps = PyWritablePairStore()
+    wps.data = D_flat.ctypes.data
+    wps.offsets = offsets.ctypes.data
+    out.D_tilde = wps
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_d_tilde_ph1(
+        ctypes.byref(inputs), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'phase_d_tilde_ph1 rc={rc}')
+
+    # Compare per-ordered-pair: ref[(i, k)] vs our flat output.
+    n_compared = 0
+    n_skipped = 0
+    max_abs = 0.0
+    for o in range(n_ord):
+        i_, k_ = int(o_i[o]), int(o_k[o])
+        ref_key = (i_, k_)
+        if ref_key not in ref:
+            n_skipped += 1
+            continue
+        p_canon = key_to_p[(min(i_, k_), max(i_, k_))]
+        npno_p = int(npno[p_canon])
+        c_D = D_flat[offsets[o]:offsets[o + 1]].reshape(npno_p, npno_p)
+        d = float(np.max(np.abs(c_D - ref[ref_key])))
+        max_abs = max(max_abs, d)
+        n_compared += 1
+
+    print(f'[CCSD MONO] phase_d_tilde_ph1 REAL-DATA parity over {n_compared} '
+          f'ordered pairs (skipped {n_skipped}): max abs diff = {max_abs:.3e}',
+          flush=True)
+    del ownership
+    return max_abs
+
+
+def validate_t1_residual_AC_init_real(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+        S_pno_cache, t2_pno_all, verbose=True):
+    """Real-data validation of phase_t1_residual_AC_init.  Reference is
+    a numpy reproduction of the same math (init + A + C per ordered pair),
+    using the same packed-from-real-data state.  Validates the cross-
+    canonical S_pno_cache packer + the R1 init/A/C math on real data.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+
+    # Pack with S_pno_cache.
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted),
+        t2_pno_all=t2_pno_all, S_pno_cache=S_pno_cache)
+
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    npno = aux['n_pno_per_pair']
+
+    # Run 2l-b to get Fia_bar per pair.
+    pair_lmo_offs = np.cumsum(np.concatenate(([0],
+        np.array([pl.size for pl in aux['pair_lmo_lists']], dtype=np.int64))))
+    sizes = np.empty(n_pairs, dtype=np.int64)
+    for p in range(n_pairs):
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        sizes[p] = nlmo_p * int(npno[p])
+    fia_offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    fia_offsets[1:] = np.cumsum(sizes)
+    fia_flat = np.full(int(fia_offsets[-1]), np.nan, dtype=np.float64)
+    fia_out = PyFiaBarOutputs()
+    wps = PyWritablePairStore()
+    wps.data    = fia_flat.ctypes.data
+    wps.offsets = fia_offsets.ctypes.data
+    fia_out.Fia_bar = wps
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock_fia_bar(
+        ctypes.byref(inputs), ctypes.byref(fia_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_fock_fia_bar rc={rc}')
+
+    # Wrap as R1AcInputs (FlatPairStore over the writable buffer).
+    r1ac_in = PyR1AcInputs()
+    fps = PyFlatPairStore()
+    fps.data    = fia_out.Fia_bar.data
+    fps.offsets = fia_out.Fia_bar.offsets
+    r1ac_in.Fia_bar = fps
+    r1ac_in.do_init = 1
+
+    # Run 2l-c.
+    R1_size = sum(int(npno[i]) for i in range(nocc))
+    R1_class = np.full(R1_size, np.nan, dtype=np.float64)
+    out_struct = PyR1AcOutputs()
+    out_struct.R1_flat = R1_class.ctypes.data
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_residual_AC_init(
+        ctypes.byref(inputs), ctypes.byref(r1ac_in),
+        ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_residual_AC_init rc={rc}')
+
+    # Reference: numpy reproduction of init + A + C using the SAME packed
+    # state.  We reuse aux fields directly.
+    pno_offsets = aux['pno_offsets']
+    t2_offsets = aux['t2_offsets']
+    T2_flat = aux['T2_flat']
+    fps_arr = aux  # has Qma_list, T1_in_pair_list, pair_lmo_lists, etc.
+
+    # First compute per-pair Fia_bar reference (numpy).
+    Fia_bar_ref_list = []
+    for p in range(n_pairs):
+        nlmo_p = int(aux['pair_lmo_lists'][p].size)
+        npno_p = int(npno[p])
+        if nlmo_p == 0 or npno_p == 0:
+            Fia_bar_ref_list.append(np.zeros((nlmo_p, npno_p)))
+            continue
+        Qma = aux['Qma_list'][p]
+        T1l = aux['T1_in_pair_list'][p]
+        n_local = Qma.shape[0]
+        gamma = Qma.reshape(n_local, -1) @ T1l.ravel()
+        Z = T1l @ Qma.transpose(0, 2, 1)
+        F = 2.0 * np.tensordot(gamma, Qma, axes=(0, 0))
+        F -= np.tensordot(Z, Qma, axes=((0, 1), (0, 1)))
+        Fia_bar_ref_list.append(F)
+
+    # Now build R1 reference.
+    R1_ref = np.zeros(R1_size, dtype=np.float64)
+
+    # Init: R1[i] += Fia_bar[(i,i)][i_in_p, :]  (diag-first: p_ii = i)
+    for i in range(nocc):
+        if i >= n_pairs:
+            continue
+        npno_ii = int(npno[i])
+        if npno_ii == 0:
+            continue
+        lmo_list_ii = aux['pair_lmo_lists'][i]
+        i_in_p_arr = np.where(lmo_list_ii == i)[0]
+        if i_in_p_arr.size == 0:
+            continue
+        i_in_p = int(i_in_p_arr[0])
+        Fai = Fia_bar_ref_list[i][i_in_p]
+        R1_ref[pno_offsets[i]:pno_offsets[i] + npno_ii] += Fai
+
+    # A + C per ordered pair.  Read S_pno from the packed flat buffer
+    # we stored in ownership (so we test the SAME data the C++ reads).
+    n_ord = inputs.n_ordered_pairs
+    o_i = np.frombuffer(
+        (ctypes.c_int * n_ord).from_address(inputs.ordered_pair_i_idx),
+        dtype=np.int32, count=n_ord)
+    o_k = np.frombuffer(
+        (ctypes.c_int * n_ord).from_address(inputs.ordered_pair_k_idx),
+        dtype=np.int32, count=n_ord)
+    # S_pno_data + S_pno_offsets pointers from inputs.
+    S_pno_offsets_arr = None
+    S_pno_data_arr = None
+    for arr in ownership:
+        if (isinstance(arr, np.ndarray)
+                and arr.dtype == np.int64
+                and arr.size == n_pairs * n_pairs + 1
+                and arr.ctypes.data == inputs.S_pno_offsets):
+            S_pno_offsets_arr = arr
+        elif (isinstance(arr, np.ndarray)
+                and arr.dtype == np.float64
+                and arr.ctypes.data == inputs.S_pno_data):
+            S_pno_data_arr = arr
+
+    i_j_to_ij_2d = np.frombuffer(
+        (ctypes.c_int * (nocc * nocc)).from_address(inputs.i_j_to_ij),
+        dtype=np.int32, count=nocc * nocc).reshape(nocc, nocc).copy()
+
+    for o_idx in range(n_ord):
+        a_ord = int(o_i[o_idx])
+        b_ord = int(o_k[o_idx])
+        p_canon = int(i_j_to_ij_2d[a_ord, b_ord])
+        if p_canon < 0:
+            continue
+        npno_p = int(npno[p_canon])
+        p_ii = int(i_j_to_ij_2d[a_ord, a_ord])
+        if p_ii < 0:
+            continue
+        npno_ii = int(npno[p_ii])
+        if npno_p == 0 or npno_ii == 0:
+            continue
+
+        can_first = keys_reorder[p_canon][0]
+
+        s_idx = p_canon * n_pairs + p_ii
+        s_off = int(S_pno_offsets_arr[s_idx])
+        s_size = int(S_pno_offsets_arr[s_idx + 1] - s_off)
+        if s_size != npno_p * npno_ii:
+            continue
+        S_p = S_pno_data_arr[s_off:s_off + s_size].reshape(npno_p, npno_ii)
+
+        T2_p = T2_flat[t2_offsets[p_canon]:t2_offsets[p_canon+1]] \
+            .reshape(npno_p, npno_p)
+
+        # A term.
+        # Get K_tilde_chem variant from cc_ints (we didn't expose it via
+        # aux explicitly).  For ordered (b_ord, a_ord), pick "_i" if
+        # can_first == b_ord else "_j".
+        ci = cc_ints.get(keys_reorder[p_canon])
+        if ci is None:
+            continue
+        if can_first == b_ord:
+            K_chem_ki = np.ascontiguousarray(ci['K_tilde_chem_i'])
+        else:
+            K_chem_ki = np.ascontiguousarray(ci['K_tilde_chem_j'])
+
+        swap_ki = (can_first != b_ord)
+        T2_ki = T2_p.T if swap_ki else T2_p
+        Tt_ki = 2.0 * T2_ki - T2_ki.T
+
+        K_R = K_chem_ki.reshape(npno_p * npno_p, npno_p)
+        Y = K_R.T @ Tt_ki.ravel()
+        A_contrib = S_p.T @ Y
+        R1_ref[pno_offsets[a_ord]:pno_offsets[a_ord] + npno_ii] += A_contrib
+
+        # C term.
+        swap_ik = (can_first != a_ord)
+        T2_ik = T2_p.T if swap_ik else T2_p
+        Tt_ik = 2.0 * T2_ik - T2_ik.T
+
+        lmo_list_p = aux['pair_lmo_lists'][p_canon]
+        k_in_p_arr = np.where(lmo_list_p == b_ord)[0]
+        if k_in_p_arr.size == 0:
+            continue
+        k_in_p = int(k_in_p_arr[0])
+        Fkc_ki = Fia_bar_ref_list[p_canon][k_in_p]
+        C_contrib = S_p.T @ (Tt_ik @ Fkc_ki)
+        R1_ref[pno_offsets[a_ord]:pno_offsets[a_ord] + npno_ii] += C_contrib
+
+    max_abs = float(np.max(np.abs(R1_class - R1_ref)))
+    print(f'[CCSD MONO] phase_t1_residual_AC_init REAL-DATA parity over '
+          f'{n_ord} ordered pairs: max abs diff = {max_abs:.3e}',
+          flush=True)
+    del ownership
+    return max_abs
+
+
+def t1_ints_via_class(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
+                       pair_lmo_idx=None, t1_cache=None, _pool=None,
+                       fov_pno=None, F_lmo=None, eps_lmo=None,
+                       t2_pno_all=None):
+    """Drop-in replacement for `local_df.t1_ints`.  Runs phase_t1_ints
+    via the C++ class on real data and returns a dict matching the
+    existing wrapper's output shape:
+        dressed[(i, j)] = {'i_Qa_t1', 'j_Qa_t1', 'i_Qk_t1', 'j_Qk_t1'}.
+    Caller passes additional args (fov_pno, F_lmo, eps_lmo, t2_pno_all)
+    that the existing t1_ints doesn't need but our packer does — they
+    can default to None and the packer will fill with zeros.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+
+    if fov_pno is None:
+        fov_pno = {i: np.zeros(0) for i in range(nocc)}
+    if F_lmo is None:
+        F_lmo = np.zeros((nocc, nocc))
+    if eps_lmo is None:
+        eps_lmo = np.zeros(nocc)
+
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys),
+        t2_pno_all=t2_pno_all)
+
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    npno = aux['n_pno_per_pair']
+    pair_lmo_offs = np.cumsum(np.concatenate(([0],
+        np.array([pl.size for pl in aux['pair_lmo_lists']],
+                 dtype=np.int64))))
+
+    aux_for_alloc = {
+        'ij_pairs': keys_reorder,
+        'pair_lmo_idx_offsets': pair_lmo_offs,
+        'n_pno_per_pair': npno,
+        'naux_per_pair': np.array([
+            aux['Qma_list'][p].shape[0] for p in range(n_pairs)
+        ], dtype=np.int32),
+    }
+    out, own, bufs = _allocate_t1_ints_outputs(aux_for_alloc)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_ints(
+        ctypes.byref(inputs), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'phase_t1_ints rc={rc}')
+
+    qa_off = bufs['i_Qa_t1'][1]
+    qk_off = bufs['i_Qk_t1'][1]
+    iQa = bufs['i_Qa_t1'][0]
+    jQa = bufs['j_Qa_t1'][0]
+    iQk = bufs['i_Qk_t1'][0]
+    jQk = bufs['j_Qk_t1'][0]
+
+    dressed = {}
+    for p, key in enumerate(keys_reorder):
+        if cc_ints.get(key) is None:
+            continue
+        nlmo_p = int(pair_lmo_offs[p+1] - pair_lmo_offs[p])
+        npno_p = int(npno[p])
+        n_local = aux['Qma_list'][p].shape[0]
+        if npno_p == 0:
+            continue
+        dressed[key] = {
+            'i_Qa_t1': iQa[qa_off[p]:qa_off[p+1]].reshape(n_local, npno_p).copy(),
+            'j_Qa_t1': jQa[qa_off[p]:qa_off[p+1]].reshape(n_local, npno_p).copy(),
+            'i_Qk_t1': iQk[qk_off[p]:qk_off[p+1]].reshape(n_local, nlmo_p).copy(),
+            'j_Qk_t1': jQk[qk_off[p]:qk_off[p+1]].reshape(n_local, nlmo_p).copy(),
+        }
+    # The .copy() above is essential — once we return, `ownership` and
+    # the output buffers will be GC'd (unless caller keeps them).  By
+    # copying into per-pair numpy arrays in the returned dict, we
+    # decouple from the flat buffers.
+    del out, own, bufs, ownership
+    return dressed
+
+
+def b_tilde_via_class(cc_ints, dressed_dict, t2_pno_all, t1_pno,
+                       pno_spaces, S_pno_cache, keys, nocc,
+                       pair_lmo_idx, t1_cache,
+                       F_lmo=None, eps_lmo=None, fov_pno=None):
+    """Drop-in replacement for the per-pair `compute_B_tilde` loop.
+    Returns dict[key] -> (B_local, p_lmos_dense) matching the existing
+    Python wrapper's output shape.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import (
+        pack_for_t1_ints, _build_flat_from_per_pair)
+
+    if fov_pno is None:
+        fov_pno = {i: np.zeros(0) for i in range(nocc)}
+    if F_lmo is None:
+        F_lmo = np.zeros((nocc, nocc))
+    if eps_lmo is None:
+        eps_lmo = np.zeros(nocc)
+
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys),
+        t2_pno_all=t2_pno_all)
+
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+
+    # Pack dressed_dict's i_Qk_t1 / j_Qk_t1 into FlatPairStore form.
+    iQk_per_pair = []
+    jQk_per_pair = []
+    for p in range(n_pairs):
+        key = keys_reorder[p]
+        if key in dressed_dict:
+            iQk_per_pair.append(np.ascontiguousarray(
+                dressed_dict[key]['i_Qk_t1'], dtype=np.float64))
+            jQk_per_pair.append(np.ascontiguousarray(
+                dressed_dict[key]['j_Qk_t1'], dtype=np.float64))
+        else:
+            n_local = aux['Qma_list'][p].shape[0]
+            nlmo_p = aux['pair_lmo_lists'][p].size
+            iQk_per_pair.append(np.zeros((n_local, nlmo_p), dtype=np.float64))
+            jQk_per_pair.append(np.zeros((n_local, nlmo_p), dtype=np.float64))
+
+    iQk_fps, _, _ = _build_flat_from_per_pair(iQk_per_pair, ownership)
+    jQk_fps, _, _ = _build_flat_from_per_pair(jQk_per_pair, ownership)
+
+    bt_in = PyBTildeInputs()
+    bt_in.i_Qk_t1 = iQk_fps
+    bt_in.j_Qk_t1 = jQk_fps
+
+    pair_lmo_offs = np.cumsum(np.concatenate(([0],
+        np.array([pl.size for pl in aux['pair_lmo_lists']],
+                 dtype=np.int64))))
+    aux_for_alloc = {
+        'ij_pairs': keys_reorder,
+        'pair_lmo_idx_offsets': pair_lmo_offs,
+        'n_pno_per_pair': aux['n_pno_per_pair'],
+        'naux_per_pair': np.array([
+            aux['Qma_list'][p].shape[0] for p in range(n_pairs)
+        ], dtype=np.int32),
+    }
+    bt_out, bt_own, (B_flat, B_offsets) = _allocate_b_tilde_outputs(aux_for_alloc)
+
+    rc = _libcc.DLPNOcompute_lccsd_phase_b_tilde(
+        ctypes.byref(inputs), ctypes.byref(bt_in), ctypes.byref(bt_out))
+    if rc != 0:
+        raise RuntimeError(f'phase_b_tilde rc={rc}')
+
+    out = {}
+    for p, key in enumerate(keys_reorder):
+        ci = cc_ints.get(key)
+        if ci is None:
+            continue
+        nlmo_p = aux['pair_lmo_lists'][p].size
+        npno_p = int(aux['n_pno_per_pair'][p])
+        if npno_p == 0:
+            continue
+        B_local = B_flat[B_offsets[p]:B_offsets[p + 1]].reshape(
+            nlmo_p, nlmo_p).copy()
+        p_lmos_dense = ci.get('p_lmos_dense')
+        out[key] = (B_local, p_lmos_dense)
+
+    del bt_own, ownership
+    return out
+
+
+def run_one_cycle_via_class(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+        S_pno_cache, t2_pno_all):
+    """c-collapse-1 driver: pack SolverInputs, call DLPNOcompute_lccsd_run_one_cycle
+    (currently a no-op skeleton), return (R1_flat, R2_flat, energy).
+
+    Walking-skeleton scope: plan-cached phase inputs are all NULL, so the
+    C++ method zeros R1/R2 and returns 0 energy.  Subsequent pushes fill
+    in plans + phase calls inside C++.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted),
+        t2_pno_all=t2_pno_all, S_pno_cache=S_pno_cache)
+
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    npno = aux['n_pno_per_pair']
+
+    # Allocate output buffers.
+    R1_size = sum(int(npno[i]) for i in range(nocc))
+    R2_size = sum(int(npno[p]) ** 2 for p in range(n_pairs))
+    R1_flat = np.zeros(R1_size, dtype=np.float64)
+    R2_flat = np.zeros(R2_size, dtype=np.float64)
+
+    # Walking-skeleton: all plans null.
+    plans = PyRunCycleInputs()
+    plans.g_tilde_plan = None
+    plans.per_kl_plan  = None
+    plans.be_plan      = None
+    plans.c_term_plan  = None
+    plans.d_term_plan  = None
+    plans.g_term_plan  = None
+    plans.t3_plan      = None
+    plans.t4_plan      = None
+
+    out = PyRunCycleOutputs()
+    out.R1_flat = R1_flat.ctypes.data
+    out.R2_flat = R2_flat.ctypes.data
+    out.energy  = 0.0
+
+    rc = _libcc.DLPNOcompute_lccsd_run_one_cycle(
+        ctypes.byref(inputs), ctypes.byref(plans), ctypes.byref(out))
+    if rc != 0:
+        raise RuntimeError(f'run_one_cycle rc={rc}')
+
+    energy = float(out.energy)
+    del ownership
+    return R1_flat, R2_flat, energy
+
+
+def validate_run_one_cycle_real(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+        S_pno_cache, t2_pno_all, verbose=True):
+    """Real-data validation of run_one_cycle's orchestration.
+
+    Strategy: run_one_cycle calls a known sequence of phases inside C++.
+    Reference: call the SAME phases via individual ctypes wrappers from
+    Python, assemble R1 / R2 the same way, run update_amps_and_energy
+    independently.  Bit-for-bit comparison validates the orchestration
+    glue (since each phase is already validated separately).
+
+    Skeleton-mode caveat: only K+A contribute to R2 (plans absent for
+    BE/CD/G_term/t3/t4); only init+A+C contribute to R1 (per_kl plan
+    absent).  Reference path mirrors this subset exactly.
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, list(keys_sorted),
+        t2_pno_all=t2_pno_all, S_pno_cache=S_pno_cache)
+
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    npno = aux['n_pno_per_pair']
+
+    # Snapshot T1 / T2 before mutation (run_one_cycle mutates in place).
+    T1_flat_arr = aux['T1_flat']
+    T2_flat_arr = aux['T2_flat']
+    T1_snapshot = T1_flat_arr.copy()
+    T2_snapshot = T2_flat_arr.copy()
+
+    R1_size = sum(int(npno[i]) for i in range(nocc))
+    R2_size = sum(int(npno[p]) ** 2 for p in range(n_pairs))
+
+    # ---- Path A: run_one_cycle ----
+    R1_class = np.zeros(R1_size, dtype=np.float64)
+    R2_class = np.zeros(R2_size, dtype=np.float64)
+    plans = PyRunCycleInputs()
+    for fname in ('g_tilde_plan', 'per_kl_plan', 'be_plan', 'c_term_plan',
+                  'd_term_plan', 'g_term_plan', 't3_plan', 't4_plan'):
+        setattr(plans, fname, None)
+    out_struct = PyRunCycleOutputs()
+    out_struct.R1_flat = R1_class.ctypes.data
+    out_struct.R2_flat = R2_class.ctypes.data
+    out_struct.energy  = 0.0
+    rc = _libcc.DLPNOcompute_lccsd_run_one_cycle(
+        ctypes.byref(inputs), ctypes.byref(plans), ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'run_one_cycle rc={rc}')
+    e_class = float(out_struct.energy)
+
+    # Restore T1/T2 to snapshot before path B.
+    T1_flat_arr[:] = T1_snapshot
+    T2_flat_arr[:] = T2_snapshot
+
+    # ---- Path B: same phases via individual ctypes calls ----
+    pair_lmo_offs = np.cumsum(np.concatenate(([0],
+        np.array([pl.size for pl in aux['pair_lmo_lists']],
+                 dtype=np.int64))))
+    aux_for_alloc = {
+        'ij_pairs': keys_reorder,
+        'pair_lmo_idx_offsets': pair_lmo_offs,
+        'n_pno_per_pair': npno,
+        'naux_per_pair': np.array([
+            aux['Qma_list'][p].shape[0] for p in range(n_pairs)
+        ], dtype=np.int32),
+    }
+
+    # Phase 1: t1_ints.
+    t1_out, t1_own, t1_bufs = _allocate_t1_ints_outputs(aux_for_alloc)
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_ints(
+        ctypes.byref(inputs), ctypes.byref(t1_out))
+    assert rc == 0
+
+    # Phase 2: t1_fock (Fab + d).
+    t2_offsets = aux['t2_offsets']
+    Fab_flat = np.zeros(int(t2_offsets[-1]), dtype=np.float64)
+    d_flat   = np.zeros(n_pairs * 2, dtype=np.float64)
+    t1f_out = PyT1FockOutputs()
+    wps = PyWritablePairStore()
+    wps.data    = Fab_flat.ctypes.data
+    wps.offsets = t2_offsets.ctypes.data
+    t1f_out.Fab    = wps
+    t1f_out.d_flat = d_flat.ctypes.data
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock(
+        ctypes.byref(inputs), ctypes.byref(t1f_out))
+    assert rc == 0
+
+    # Phase 3: Fia_bar.
+    fia_sizes = np.array([
+        int(pair_lmo_offs[p+1] - pair_lmo_offs[p]) * int(npno[p])
+        for p in range(n_pairs)], dtype=np.int64)
+    fia_offsets = np.zeros(n_pairs + 1, dtype=np.int64)
+    fia_offsets[1:] = np.cumsum(fia_sizes)
+    fia_flat = np.zeros(int(fia_offsets[-1]), dtype=np.float64)
+    fia_out = PyFiaBarOutputs()
+    fia_wps = PyWritablePairStore()
+    fia_wps.data    = fia_flat.ctypes.data
+    fia_wps.offsets = fia_offsets.ctypes.data
+    fia_out.Fia_bar = fia_wps
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_fock_fia_bar(
+        ctypes.byref(inputs), ctypes.byref(fia_out))
+    assert rc == 0
+
+    # Phase 4: K + ladder (consumes dressed Qa).
+    kl_in = PyKLadderInputs()
+    for name in ('i_Qa_t1', 'j_Qa_t1'):
+        wps = getattr(t1_out, name)
+        fps = PyFlatPairStore()
+        fps.data    = wps.data
+        fps.offsets = wps.offsets
+        setattr(kl_in, name, fps)
+    K_flat = np.zeros(int(t2_offsets[-1]), dtype=np.float64)
+    A_flat = np.zeros(int(t2_offsets[-1]), dtype=np.float64)
+    kl_out = PyKLadderOutputs()
+    K_wps = PyWritablePairStore()
+    K_wps.data = K_flat.ctypes.data; K_wps.offsets = t2_offsets.ctypes.data
+    kl_out.K = K_wps
+    A_wps = PyWritablePairStore()
+    A_wps.data = A_flat.ctypes.data; A_wps.offsets = t2_offsets.ctypes.data
+    kl_out.A = A_wps
+    rc = _libcc.DLPNOcompute_lccsd_phase_k_ladder(
+        ctypes.byref(inputs), ctypes.byref(kl_in), ctypes.byref(kl_out))
+    assert rc == 0
+
+    # Phase 5: R1 init + A + C (uses Fia_bar).
+    r1ac_in = PyR1AcInputs()
+    fps = PyFlatPairStore()
+    fps.data    = fia_out.Fia_bar.data
+    fps.offsets = fia_out.Fia_bar.offsets
+    r1ac_in.Fia_bar = fps
+    r1ac_in.do_init = 1
+    R1_ref = np.zeros(R1_size, dtype=np.float64)
+    r1ac_out = PyR1AcOutputs()
+    r1ac_out.R1_flat = R1_ref.ctypes.data
+    rc = _libcc.DLPNOcompute_lccsd_phase_t1_residual_AC_init(
+        ctypes.byref(inputs), ctypes.byref(r1ac_in), ctypes.byref(r1ac_out))
+    assert rc == 0
+
+    # Phase 6: R2 = K + A per canonical pair.
+    R2_ref = np.zeros(R2_size, dtype=np.float64)
+    for p in range(n_pairs):
+        npno_p = int(npno[p])
+        if npno_p == 0:
+            continue
+        sl = slice(int(t2_offsets[p]), int(t2_offsets[p+1]))
+        R2_ref[sl] = K_flat[sl] + A_flat[sl]
+
+    # Phase 7: update_amps_and_energy.
+    resid = PyUpdateAmpsInputs()
+    resid.R1_flat = R1_ref.ctypes.data
+    resid.R2_flat = R2_ref.ctypes.data
+    upd_out = PyUpdateAmpsOutputs()
+    upd_out.energy = 0.0
+    rc = _libcc.DLPNOcompute_lccsd_phase_update_amps_and_energy(
+        ctypes.byref(inputs), ctypes.byref(resid), ctypes.byref(upd_out))
+    assert rc == 0
+    e_ref = float(upd_out.energy)
+
+    d_R1 = float(np.max(np.abs(R1_class - R1_ref)))
+    d_R2 = float(np.max(np.abs(R2_class - R2_ref)))
+    d_e  = float(abs(e_class - e_ref))
+    print(f'[CCSD MONO] run_one_cycle orchestration parity: '
+          f'|dR1|={d_R1:.3e}  |dR2|={d_R2:.3e}  |dE|={d_e:.3e}  '
+          f'(class energy = {e_class:.6e})', flush=True)
+
+    del t1_own, ownership
+    return max(d_R1, d_R2, d_e)
+
+
+def _build_Fij_bar_full(F_lmo, t2_pno_all, cc_ints, pno_spaces,
+                         t1_cache, pair_lmo_idx, nocc):
+    """Mirror PySCF _compute_t1_residual_psi4's Fij_bar dressing (lines
+    681-709).  Builds the FULL T1-dressed F_oo (strong + weak pair
+    contributions).  Returns a (nocc, nocc) numpy array.
+    """
+    Fij_bar = np.ascontiguousarray(F_lmo, dtype=np.float64).copy()
+    for key_ij, _T2 in t2_pno_all.items():
+        ci_ij = cc_ints.get(key_ij)
+        if ci_ij is None:
+            continue
+        i0, j0 = key_ij
+        if pno_spaces[key_ij]['C_pno'].shape[1] == 0:
+            continue
+        T_n_ij_mat = t1_cache[key_ij]
+        T_n_red = T_n_ij_mat[ci_ij['p_lmos']]
+        Fij_bar[i0, j0] += (
+            2.0 * np.sum(T_n_red * ci_ij['K_bar_chem'])
+            - np.sum(T_n_red * ci_ij['K_bar_ji']))
+        if i0 != j0:
+            Fij_bar[j0, i0] += (
+                2.0 * np.sum(T_n_red * ci_ij['K_bar_chem'])
+                - np.sum(T_n_red * ci_ij['K_bar_ij']))
+    return np.ascontiguousarray(Fij_bar)
+
+
+def _build_Fkc_per_ordered(cc_ints, t1_pno, t1_cache, S_pno_cache,
+                            pno_spaces, keys_sorted,
+                            ordered_pair_i_idx, ordered_pair_k_idx,
+                            n_pno_per_pair, i_j_to_ij_2d, nocc):
+    """Build Fkc per ORDERED pair (a_ord=i, b_ord=k), mirroring PySCF's
+    fkc_dress inner sum in `_compute_t1_residual_psi4` C term:
+        Fkc[(i, k)] = sum_m S(canon(k,i), canon(i,m)) @ L_iajb[canon(i,m)]
+                              @ t1[m]_in_(i,m)
+    where i is the R1 owner, k is the partner.  Length npno[canon(k,i)].
+    Returns (Fkc_flat, Fkc_offsets) with offsets[o+1] - offsets[o] =
+    npno[canon(k,i)] of ordered pair o.
+    """
+    n_ord = ordered_pair_i_idx.size
+    # Precompute LT1[(i, m)] = (key_im, L_im @ t1_m_in_im) for all valid (i, m).
+    _LT1_cache = {}
+    for m in range(nocc):
+        t1_m = t1_pno.get(m)
+        if t1_m is None or t1_m.size == 0:
+            continue
+        if np.max(np.abs(t1_m)) < 1e-15:
+            continue
+        for i_out in range(nocc):
+            key_im = (min(i_out, m), max(i_out, m))
+            if key_im not in pno_spaces:
+                continue
+            if pno_spaces[key_im]['C_pno'].shape[1] == 0:
+                continue
+            ci_im = cc_ints.get(key_im)
+            if ci_im is None:
+                continue
+            K_im = ci_im['K_iajb']
+            L_im = 2.0 * K_im - K_im.T
+            t1_m_in_im = t1_cache[key_im][m]
+            _LT1_cache[(i_out, m)] = (key_im, L_im @ t1_m_in_im)
+
+    # Build per-ordered-pair Fkc.
+    Fkc_offsets = np.zeros(n_ord + 1, dtype=np.int64)
+    Fkc_blocks = []
+    for o in range(n_ord):
+        a_ord = int(ordered_pair_i_idx[o])  # i (R1 owner)
+        b_ord = int(ordered_pair_k_idx[o])  # k (partner)
+        p_canon = int(i_j_to_ij_2d[b_ord, a_ord])  # canon(k, i) == canon(i, k)
+        if p_canon < 0:
+            Fkc_offsets[o + 1] = Fkc_offsets[o]
+            continue
+        npno_p = int(n_pno_per_pair[p_canon])
+        if npno_p == 0:
+            Fkc_offsets[o + 1] = Fkc_offsets[o]
+            continue
+        key_ki = keys_sorted[p_canon]
+        Fkc = np.zeros(npno_p, dtype=np.float64)
+        for m in range(nocc):
+            entry = _LT1_cache.get((a_ord, m))
+            if entry is None:
+                continue
+            key_im, LT1 = entry
+            if key_ki == key_im:
+                Fkc += LT1
+            else:
+                S_ki_im = S_pno_cache.get((key_ki, key_im))
+                if S_ki_im is not None:
+                    Fkc += S_ki_im @ LT1
+        Fkc_blocks.append(Fkc)
+        Fkc_offsets[o + 1] = Fkc_offsets[o] + npno_p
+    Fkc_flat = (np.concatenate(Fkc_blocks)
+                if Fkc_blocks else np.zeros(0, dtype=np.float64))
+    return np.ascontiguousarray(Fkc_flat), Fkc_offsets
+
+
+def validate_run_one_cycle_with_per_kl(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
+        S_pno_cache, t2_pno_all, cc_ints_flat, pair_index, ovL_pno_cache,
+        verbose=True):
+    """Validate run_one_cycle with the per_kl plan extracted from
+    `_compute_t1_residual_psi4`'s cache.  R1 should equal the Python
+    wrapper's R1 (init + A + C + B + A2).  Skeleton mode for R2 (only
+    K + A) — energy not compared (incomplete R2 → wrong T2 update).
+    """
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+    from pyscf.cc.dlpno_tccsd.lccsd import _compute_t1_residual_psi4
+
+    # ---- Reference: full Python R1 computation. ----
+    # This populates _compute_t1_residual_psi4._per_kl_plan_cache.
+    r1_pno_ref = _compute_t1_residual_psi4(
+        t1_pno, t2_pno_all, pno_spaces, fov_pno, F_lmo, eps_lmo, nocc,
+        S_pno_cache, cc_ints, ovL_pno_cache=ovL_pno_cache,
+        pair_lmo_idx=pair_lmo_idx, t1_cache=t1_cache, _pool=None,
+        cc_ints_flat=cc_ints_flat, pair_index=pair_index)
+
+    # Extract plan from cache.
+    plan_struct, plan_own = _extract_per_kl_plan(_compute_t1_residual_psi4)
+    if plan_struct is None:
+        print('[CCSD MONO] no per_kl plan cached; skipping', flush=True)
+        return None
+    # Wire t2_buffer / t1_cache_buffer to the FlatTensorStore _buffer arrays.
+    plan_struct.t2_buffer       = t2_pno_all._buffer.ctypes.data
+    plan_struct.t1_cache_buffer = t1_cache._buffer.ctypes.data
+
+    # ---- Pack SolverInputs and call run_one_cycle. ----
+    # Use ALL surviving pairs (strong + weak) so AC iteration spans every
+    # partner k, not just strong ones.  PySCF's _compute_t1_residual_psi4
+    # iterates over t2_pno_all (210 pairs) — we must match.
+    _all_keys = sorted(t2_pno_all.keys())
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, _all_keys,
+        t2_pno_all=t2_pno_all, S_pno_cache=S_pno_cache)
+
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    npno = aux['n_pno_per_pair']
+
+
+
+    # Snapshot T1/T2 (run_one_cycle mutates).
+    T1_snapshot = aux['T1_flat'].copy()
+    T2_snapshot = aux['T2_flat'].copy()
+
+    R1_size = sum(int(npno[i]) for i in range(nocc))
+    R2_size = sum(int(npno[p]) ** 2 for p in range(n_pairs))
+    R1_class = np.zeros(R1_size, dtype=np.float64)
+    R2_class = np.zeros(R2_size, dtype=np.float64)
+
+    plans = PyRunCycleInputs()
+    for fname in ('g_tilde_plan', 'be_plan', 'c_term_plan',
+                  'd_term_plan', 'g_term_plan', 't3_plan', 't4_plan'):
+        setattr(plans, fname, None)
+    plans.per_kl_plan = ctypes.pointer(plan_struct)
+
+    out_struct = PyRunCycleOutputs()
+    out_struct.R1_flat = R1_class.ctypes.data
+    out_struct.R2_flat = R2_class.ctypes.data
+    out_struct.energy  = 0.0
+    rc = _libcc.DLPNOcompute_lccsd_run_one_cycle(
+        ctypes.byref(inputs), ctypes.byref(plans), ctypes.byref(out_struct))
+    if rc != 0:
+        raise RuntimeError(f'run_one_cycle rc={rc}')
+
+    # Restore T1/T2 (so subsequent validators see clean state).
+    aux['T1_flat'][:] = T1_snapshot
+    aux['T2_flat'][:] = T2_snapshot
+
+    # ---- Compare R1: flatten r1_pno_ref to per-occupied layout. ----
+    pno_offsets = aux['pno_offsets']
+    R1_ref = np.zeros(R1_size, dtype=np.float64)
+    for i in range(nocc):
+        if i not in r1_pno_ref:
+            continue
+        npno_ii = int(npno[i])
+        if npno_ii == 0:
+            continue
+        R1_ref[pno_offsets[i]:pno_offsets[i] + npno_ii] = r1_pno_ref[i]
+
+    d_R1 = float(np.max(np.abs(R1_class - R1_ref)))
+    print(f'[CCSD MONO] run_one_cycle WITH per_kl plan: '
+          f'|dR1| = {d_R1:.3e} vs Python full R1 ref '
+          f'(packed n_canon_pairs={n_pairs})',
+          flush=True)
+
+    del plan_own, ownership
+    return d_R1
+
+
+def _extract_per_kl_plan(t1_residual_func):
+    """Extract a PyPerKlPlanInputs from the cached `_batched_plan` in
+    `_compute_t1_residual_psi4`.  Caller must have already invoked the
+    function once (so the cache is populated).  Returns (plan_struct,
+    ownership) — ownership keeps the cached numpy arrays alive.
+    """
+    cache = getattr(t1_residual_func, '_per_kl_plan_cache', None)
+    if cache is None or not cache:
+        return None, []
+    # Take the first (and typically only) cached plan.
+    pkl_plan = next(iter(cache.values()))
+    bp = pkl_plan.get('_batched_plan')
+    if bp is None or bp.get('n_tasks', 0) == 0:
+        return None, []
+
+    # The cached plan's static buffers (K_iajb_static, K_bar_static,
+    # S_consolidated) are contiguous numpy arrays kept alive in the
+    # cache; t2_buffer / t1_cache_buffer are FlatTensorStore _buffer
+    # arrays held by t2_pno_all and t1_cache (also alive through the
+    # caller's scope).
+    plan = PyPerKlPlanInputs()
+    plan.n_tasks  = int(bp['n_tasks'])
+    plan.M        = int(bp['M'])
+    plan.max_n_kl = int(bp['max_n_kl'])
+    plan.max_n_ki = int(bp['max_n_ki'])
+    for name in ('n_kl_arr', 't2_swap_kl', 'inner_off',
+                 'i_arr', 'n_pno_ii_arr',
+                 'is_diag_kl_ii', 'has_S_ii_kl', 'has_A2',
+                 'is_diag_kl_ki', 'n_ki_arr', 't2_swap_ki',
+                 'S_ii_kl_off', 'S_kl_ki_off', 'S_ki_kl_off',
+                 'T_n_l_ii_off', 'contrib_off',
+                 't2_kl_canon_off', 'T_n_kl_off',
+                 't2_ki_canon_off'):
+        # Map cached-name to our struct-name (most match exactly).
+        struct_name = name
+        cache_name = name
+        # Special: K_iajb_off / K_bar_off in cache → K_iajb_kl_off / K_bar_kl_off in struct.
+        setattr(plan, struct_name, bp[cache_name].ctypes.data)
+    plan.K_iajb_kl_off = bp['K_iajb_off'].ctypes.data
+    plan.K_bar_kl_off  = bp['K_bar_off'].ctypes.data
+    plan.K_iajb_buffer    = bp['K_iajb_static'].ctypes.data
+    plan.K_bar_kl_static  = bp['K_bar_static'].ctypes.data
+    plan.S_pno_buffer     = bp['S_consolidated'].ctypes.data
+    # t2_buffer / t1_cache_buffer are filled in by caller from
+    # t2_pno_all._buffer / t1_cache._buffer (FlatTensorStore).
+    plan.t2_buffer       = 0
+    plan.t1_cache_buffer = 0
+    # Ownership references all the numpy arrays we depend on.
+    own = list(bp.values())
+    return plan, own
+
+
+def smoke_test():
+    """Verify the library loaded and the entry points are callable."""
+    n = _libcc.DLPNOcompute_lccsd_solver_inputs_size()
+    py_n = ctypes.sizeof(PySolverInputs)
+    if n != py_n:
+        raise RuntimeError(
+            f'sizeof(SolverInputs): C={n} vs Python={py_n} — struct layouts disagree')
+    print(f'[CCSD MONO] sizeof(SolverInputs) = {n} bytes (C and Python agree)',
+          flush=True)
+
+    e_out = ctypes.c_double(0.0)
+    rc = _libcc.DLPNOcompute_lccsd_omp(None, ctypes.byref(e_out))
+    if rc != -2:
+        raise RuntimeError(f'expected -2 for NULL inputs, got {rc}')
+    print(f'[CCSD MONO] NULL-inputs guard returned rc={rc} (expected -2)',
+          flush=True)
+    return n
+
+
+def is_enabled():
+    """Whether the new monolithic path is requested via env."""
+    return bool(int(os.environ.get('DLPNO_CCSD_MONO', '0')))
+
+
+if __name__ == '__main__':
+    smoke_test()
+    parity_test_dump_inputs(verbose=False)
+    parity_test_phase_t1_ints()
+    parity_test_phase_b_tilde()
+    parity_test_phase_t1_fock()
+    parity_test_phase_d_tilde_ph1()
+    parity_test_phase_c_tilde_ph1()
+    parity_test_phase_g_tilde_inner()
+    parity_test_phase_t1_fock_finalize()
+    parity_test_phase_t1_residual_per_kl()
+    parity_test_phase_be()
+    parity_test_phase_c_term()
+    parity_test_phase_d_term()
+    parity_test_phase_g_term()
+    parity_test_phase_t3()
+    parity_test_phase_t4()
+    parity_test_phase_k_ladder()
+    parity_test_phase_update_amps_and_energy()
+    parity_test_phase_t1_fock_fia_bar()
+    parity_test_phase_t1_residual_AC_init()

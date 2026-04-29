@@ -1,0 +1,2933 @@
+/*
+ * DLPNO-CCSD monolithic C++ solver — skeleton (Step 1 / 7).
+ *
+ * Mission: a single C++ class that owns all CCSD state and runs the entire
+ * cycle loop in C++, mirroring Psi4's DLPNOCCSD::lccsd_iterations
+ * (psi4_jiang/psi4/src/psi4/dlpno/ccsd.cc:2134).  Eliminates the per-phase
+ * Python/C ping-pong that bounded our piecemeal kernel ports at ~38s on
+ * water-10.
+ *
+ * This file is the SKELETON only — phase methods are empty.  Built and loaded
+ * to validate ctypes wiring before any behavioral code lands.  See
+ * HANDOFF_CCSD_C_CLASS.md for the full plan.
+ *
+ * Single Python entry point: DLPNOcompute_lccsd_omp.  Returns -1 (sentinel
+ * for "skeleton; not converged") so callers fall back to the legacy path.
+ */
+
+#include <cstddef>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cmath>
+#include <algorithm>
+#include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+// Forward decls of per-pair kernels implemented in dlpno_*.c (compiled as C;
+// declared here as extern "C" to suppress C++ mangling).
+extern "C" void DLPNOt1_ints_pair_side(
+    double *Qa_t1_out, double *Qk_t1_out,
+    const double *Qa_full, const double *Qk_local,
+    const double *Qma, const double *Qab,
+    const double *t1_lmo, const double *T1_local,
+    size_t n_local, size_t nlmo, size_t npno);
+
+extern "C" void DLPNOcompute_B_tilde_pair(
+    double *B_out,
+    const double *i_Qk_t1, const double *j_Qk_t1,
+    const double *Qma, const double *T2,
+    size_t n_local, size_t nlmo, size_t npno);
+
+extern "C" void DLPNOper_i_stages123(
+    double *r1_inout,
+    const double *Qma, const double *Qab,
+    const double *Qia, const double *Qik,
+    const double *T_n, const double *t1_i,
+    const double *e_pno,
+    int do_stage_23,
+    size_t L, size_t M, size_t A);
+
+extern "C" void DLPNOcompute_D_tilde_ph1_batched(
+    const double *K_tilde_chem_flat, const long *K_tilde_chem_offsets,
+    const double *M_static_flat,     const long *M_static_offsets,
+    const double *t1_flat,           const long *t1_offsets,
+    const double *T1_rows_flat,      const long *T1_rows_offsets,
+    const int    *n_pno_arr,
+    const int    *n_domain_arr,
+    double       *D_flat,            const long *D_offsets,
+    size_t        N);
+
+extern "C" void DLPNOcompute_C_tilde_ph1_batched(
+    const double *K_tilde_chem_flat,       const long *K_tilde_chem_offsets,
+    const double *K_bar_chem_slice_flat,   const long *K_bar_chem_slice_offsets,
+    const double *t1_ki_flat,              const long *t1_ki_offsets,
+    const double *T1_local_flat,           const long *T1_local_offsets,
+    const int    *n_pno_arr,
+    const int    *n_domain_arr,
+    double       *C_flat,                  const long *C_offsets,
+    size_t        N);
+
+extern "C" void DLPNOcompute_G_tilde_inner(
+    const long *triple_eff_offset,
+    const long *triple_T2_pair_idx,
+    const int  *triple_n_lj,
+    const long *ij_triple_starts,
+    const int  *ij_i_arr,
+    const int  *ij_j_arr,
+    const double *effective_flat,
+    const double *T2_flat,
+    const long  *T2_offsets,
+    double      *G_addition,
+    size_t n_ij_slots,
+    size_t naocc);
+
+extern "C" void DLPNObe_kernel(
+    const double *S, const double *T, const double *K,
+    const double *beta_kl, const double *beta_lk,
+    const unsigned char *same,
+    const long *idx,
+    double *out_B, double *out_E,
+    size_t N, size_t n_ij, size_t n_kl,
+    int num_threads);
+
+extern "C" void DLPNOc_term_batched(
+    int N,
+    const int  *n_pno_arr, const int *n_ct_arr, const int *n_other_arr,
+    const long *S_big_off, const long *ct_off, const long *S_mid_off,
+    const long *J_bold_off, const long *t2_off, const long *S_outer_off,
+    const long *tile_off,
+    const double *S_big_flat, const double *S_mid_flat,
+    const double *J_bold_flat, const double *S_outer_flat,
+    const double *ct_flat, const double *t2_flat,
+    double *STB_scratch,   size_t STB_stride,
+    double *GAMMA_scratch, size_t GAMMA_stride,
+    double *GT_scratch,    size_t GT_stride,
+    double *tiles_flat,
+    int num_threads);
+
+extern "C" void DLPNOt3_kernel_batched(
+    int N,
+    const int  *n_kl_arr, const int *n_ki_arr,
+    const long *K_off, const long *S_off,
+    const long *t1i_off, const long *T1l_off, const long *tile_off,
+    const double *K_flat, const double *S_flat, const double *t1_flat,
+    double *Kt1_scratch,    size_t Kt1_stride,
+    double *Kt1_ki_scratch, size_t Kt1_ki_stride,
+    double *tiles_flat,
+    int num_threads);
+
+extern "C" void DLPNOt4_kernel_batched(
+    int N,
+    const int  *n_ki_arr, const int *n_li_arr, const int *n_kl_arr,
+    const long *S_ki_li_off, const long *t2_off, const long *S_li_kl_off,
+    const long *K_off, const long *S_kl_ki_off, const long *tile_off,
+    const double *S_ki_li_flat, const double *S_li_kl_flat,
+    const double *K_flat, const double *S_kl_ki_flat,
+    const double *t2_flat,
+    double *tmp1_scratch, size_t tmp1_stride,
+    double *tmp2_scratch, size_t tmp2_stride,
+    double *tmp3_scratch, size_t tmp3_stride,
+    double *tiles_flat,
+    double scale,
+    int num_threads);
+
+extern "C" void DLPNOg_term_batched(
+    int N,
+    const int  *n_ij_arr, const int *n_ik_arr,
+    const long *S_off, const long *t2_off, const long *tile_off,
+    const long *k_idx, const long *scalar_lmo,
+    const double *S_flat, const double *t2_flat,
+    const double *G_tilde, size_t G_stride,
+    double *tmp_scratch, size_t tmp_stride,
+    double *tiles_flat,
+    int num_threads);
+
+extern "C" void DLPNOd_term_batched(
+    int N,
+    const int  *n_pno_arr, const int *n_A_arr, const int *n_B_arr,
+    const long *S_a_off, const long *u_off, const long *S_b_off,
+    const long *S_c_off, const long *dt_off, const long *KJ_off,
+    const long *tile_off,
+    const double *S_a_flat, const double *S_b_flat, const double *S_c_flat,
+    const double *KJ_flat, const double *u_flat, const double *dt_flat,
+    double *SU_scratch,   size_t SU_stride,
+    double *UP_scratch,   size_t UP_stride,
+    double *SCD_scratch,  size_t SCD_stride,
+    double *Bint_scratch, size_t Bint_stride,
+    double *tiles_flat,
+    int num_threads);
+
+extern "C" void DLPNOper_kl_batched(
+    int n_tasks, int M,
+    const int  *n_kl_arr,
+    const int  *t2_swap_kl,
+    const long *K_iajb_kl_off,
+    const long *K_bar_kl_off,
+    const long *t2_kl_canon_off,
+    const long *T_n_kl_off,
+    const long *inner_off,
+    const int  *i_arr,
+    const int  *n_pno_ii_arr,
+    const int  *is_diag_kl_ii,
+    const int  *has_S_ii_kl,
+    const long *S_ii_kl_off,
+    const int  *has_A2,
+    const int  *is_diag_kl_ki,
+    const int  *n_ki_arr,
+    const int  *t2_swap_ki,
+    const long *t2_ki_canon_off,
+    const long *S_kl_ki_off,
+    const long *S_ki_kl_off,
+    const long *T_n_l_ii_off,
+    const long *contrib_off,
+    const double *K_iajb_buffer,
+    const double *K_bar_kl_static,
+    const double *S_pno_buffer,
+    const double *t2_buffer,
+    const double *t1_cache_buffer,
+    double *Tt_kl_scratch,    size_t Tt_kl_stride,
+    double *K_kilc_scratch,   size_t K_kilc_stride,
+    double *B_ia_scratch,     size_t B_ia_stride,
+    double *Tt_ki_scratch,    size_t Tt_ki_stride,
+    double *X_scratch,        size_t X_stride,
+    double *Z_scratch,        size_t Z_stride,
+    double *contrib_flat,
+    int num_threads);
+
+extern "C" void DLPNOt1_fock_batched(
+    const double *T1_flat,        const long *T1_offsets,
+    const double *K_chem_flat,    const long *K_chem_offsets,
+    const double *K_ji_flat,      const long *K_ji_offsets,
+    const double *K_ij_flat,      const long *K_ij_offsets,
+    const double *Qma_flat,       const long *Qma_offsets,
+    const double *Qab_flat,       const long *Qab_offsets,
+    const double *e_pno_flat,     const long *e_pno_offsets,
+    const int    *nlmo_arr,
+    const int    *npno_arr,
+    const int    *n_local_arr,
+    const int    *need_dji_arr,
+    double       *gamma_scratch,    size_t gamma_sc_stride,
+    double       *Y_trans_scratch,  size_t Y_trans_sc_stride,
+    double       *Y_alt_scratch,    size_t Y_alt_sc_stride,
+    double       *Fia_scratch,      size_t Fia_sc_stride,
+    double       *Z_stacked_scratch, size_t Z_stacked_sc_stride,
+    double       *Z_xxx_scratch,    size_t Z_xxx_sc_stride,
+    double       *d_flat,
+    double       *Fab_flat,         const long *Fab_offsets,
+    size_t        N,
+    int           num_threads);
+
+namespace pyscf_dlpno_ccsd {
+
+// -- Pair-axis flat tensor view (non-owning) ---------------------------------
+//
+// Mirrors the layout introduced in the cc_ints storage refactor + Phase III
+// (project_psi4_port_phase3_done.md): one contiguous data buffer plus an
+// offsets array of length n_pairs+1 such that pair `p` lives at
+// data[offsets[p] : offsets[p+1]].  Strides are encoded by the kernel — we
+// just hand the kernel the pointer and let it interpret the per-pair shape
+// using n_pno_per_pair / pair_lmo_idx_offsets.
+struct FlatPairStore {
+    const double *data;      // contiguous storage for all pairs
+    const int64_t *offsets;  // length n_pairs + 1
+};
+
+// -- Inputs from Python (read-only views unless noted) -----------------------
+struct SolverInputs {
+    // sizes
+    int nocc;
+    int nlmo;
+    int n_canon_pairs;
+    int n_strong_pairs;
+    int diis_max_vecs;
+    int max_cycle;
+    double e_conv;
+    double r_conv;
+
+    // sparsity (read-only views)
+    const int *i_j_to_ij;            // nocc * nocc; -1 if not significant
+    const int *ij_to_i_j;             // 2 * n_canon_pairs (i, j packed)
+    const int *ij_to_ji;              // n_canon_pairs
+    const int *pair_lmo_idx_flat;     // pair-domain LMO indices, flattened
+    const int64_t *pair_lmo_idx_offsets;  // length n_canon_pairs + 1
+    const int *n_pno_per_pair;        // length n_canon_pairs
+    const int64_t *pno_offsets;       // length n_canon_pairs + 1 (T1/fov axis)
+    const int64_t *t2_offsets;        // length n_canon_pairs + 1; per-pair npno_p^2
+
+    // orbital data (read-only views)
+    const double *F_lmo;              // nocc * nocc
+    const double *eps_lmo;            // nocc
+    const double *foo;                // nocc * nocc (T2-dressed)
+    const double *fov_flat;           // pno_offsets[nocc] doubles (per-i)
+    const double *e_pno_flat;         // pno_offsets[n_canon_pairs] doubles
+
+    // cc_ints (read-only views, pair_lmo_idx-axis)
+    FlatPairStore Qma, Qab;
+    FlatPairStore i_Qk, j_Qk, i_Qa, j_Qa;
+    FlatPairStore K_iajb, K_bar_ij, K_bar_chem;
+    FlatPairStore K_bar_ji;
+    FlatPairStore J_ij_kj, K_ij_kj;
+    FlatPairStore L_iajb, L_bar;
+    // Per canonical pair, two K_tilde_chem variants (Psi4 i/j orientations);
+    // shape (npno_p, npno_p^2).  Used by C_tilde / D_tilde.
+    FlatPairStore K_tilde_chem_i, K_tilde_chem_j;
+
+    // pno overlap cache — cross-canonical S_PNO between any two canonical
+    // pairs.  Full-table layout (sparse OK via zero-size entries):
+    //   S_pno_offsets has length n_canon_pairs^2 + 1.
+    //   block[(p_a, p_b)] starts at S_pno_data[ S_pno_offsets[p_a*n + p_b] ]
+    //   block size       = S_pno_offsets[p_a*n + p_b + 1] - S_pno_offsets[p_a*n + p_b]
+    //                    = npno[p_a] * npno[p_b]   (matrix shape (npno_a, npno_b))
+    //   For canonical pair pairs not stored, block size is zero (offsets equal).
+    // S_pno_index is reserved for a future sparse-tier optimisation; not yet
+    // consumed by any phase.
+    const double  *S_pno_data;
+    const int64_t *S_pno_offsets;
+    const int     *S_pno_index;
+
+    // amplitudes (READ-WRITE views into Python buffers)
+    double *T1_flat;                  // pno_offsets[nocc] doubles
+    double *T2_flat;                  // sum_p npno_p^2 doubles
+
+    // T1 projected into each pair's PNO basis, restricted to the pair's
+    // pair_lmo_idx domain.  Per pair p: row-major (nlmo_p, npno_p) doubles
+    // where row k is t1_pno[pair_lmo_idx[p][k]] projected via S_PNO into
+    // pair p's PNO basis.  Built by Python today (build_t1_cache); will be
+    // built inside the class once Step 2m wires the cycle loop.
+    FlatPairStore T1_in_pair;
+
+    // Full-nocc version of the same projection: per pair p, a (nocc, npno_p)
+    // matrix where row k is t1_pno[k] projected to p's PNO basis (zero for
+    // k not in domain).  Required by Stage 4 of the T1 residual
+    // (R1[i] -= Fij_bar[:, i] @ T1_in_pair_full[(i,i)]).
+    FlatPairStore T1_in_pair_full;
+
+    // Ordered-pair sparsity (Psi4 all_pairs = canonical (a,b) ∪ (b,a)).
+    // Used by C_tilde / D_tilde / G_tilde phases.  Each ordered pair maps
+    // to a canonical pair via i_j_to_ij[i*nocc + k]; orientation drives
+    // which K_tilde_chem / K_bar variant the kernel consumes.
+    int n_ordered_pairs;
+    const int *ordered_pair_i_idx;    // length n_ordered_pairs
+    const int *ordered_pair_k_idx;    // length n_ordered_pairs
+
+    // CAS injection (optional; n_cas_blocks==0 disables)
+    int n_cas_blocks;
+    const int *cas_block_pair;        // n_cas_blocks: canonical pair index
+    const int *cas_block_offsets;     // n_cas_blocks + 1: into cas_block_data
+    const double *cas_block_data;     // flat storage for the CAS T2 slice
+    const int *cas_block_slice;       // n_cas_blocks * 2: (start, stop) PNO range
+
+    // Optional Psi4-faithful override fields.  When set non-null, the
+    // class consumes these directly instead of computing them locally.
+    // Used to reach Psi4-exact match by including weak-pair contributions
+    // not captured by the strong-pair-only t1_fock path.
+    //
+    // Fij_bar_full: (nocc, nocc) row-major.  Replaces the F_lmo + scatter(d_flat)
+    //   snapshot that the class builds in t1_fock_finalize, with the FULL
+    //   T1-dressed F_oo (strong + weak pair contributions, Psi4 ccsd.cc:1660).
+    //   Used by R1 Stage 4: r1[i] -= Fij_bar_full[:, i] @ T_n_ii.
+    const double *Fij_bar_full;
+    // Fkc_per_ordered: FlatPairStore indexed by ORDERED pair (a,b).  Per
+    //   ordered pair, length npno[i_j_to_ij[a, b]].  Replaces the LT1-chain
+    //   inline build in run_phase_t1_residual_AC_init_into.  Built per Psi4
+    //   ccsd.cc:1683-1692 with full LMO-domain scope (strong + weak).
+    FlatPairStore Fkc_per_ordered;
+};
+
+// -- Output struct for the t1_ints phase (Step 2b) --------------------------
+//
+// Mutable counterpart to FlatPairStore: caller pre-allocates four flat
+// buffers with offsets indexing per-pair output slices.  Per pair p:
+//   i_Qa_t1[p] : (n_local_p, npno_p) doubles
+//   i_Qk_t1[p] : (n_local_p, nlmo_p) doubles
+//   j_Qa_t1[p] : (n_local_p, npno_p) doubles
+//   j_Qk_t1[p] : (n_local_p, nlmo_p) doubles
+struct WritablePairStore {
+    double *data;
+    const int64_t *offsets;
+};
+
+struct T1IntsOutputs {
+    WritablePairStore i_Qa_t1, j_Qa_t1, i_Qk_t1, j_Qk_t1;
+};
+
+// -- B_tilde phase (Step 2c) -------------------------------------------------
+//
+// Inputs: i_Qk_t1, j_Qk_t1 from phase_t1_ints output (each per pair shape
+// (n_local_p, nlmo_p)).  Output per pair: (nlmo_p, nlmo_p) B_tilde matrix.
+struct BTildeInputs {
+    FlatPairStore i_Qk_t1;
+    FlatPairStore j_Qk_t1;
+};
+
+struct BTildeOutputs {
+    WritablePairStore B_tilde;
+};
+
+// -- t1_fock phase (Step 2d) -------------------------------------------------
+//
+// No phase-specific input struct: t1_fock reads everything from SolverInputs
+// (T1_in_pair, K_bar_chem, K_bar_ij, K_bar_ji, Qma, Qab, e_pno_flat).
+//
+// Outputs:
+//   Fab    : per pair (npno_p, npno_p)            via Fab_offsets (== t2_offsets)
+//   d_flat : (n_canon_pairs * 2) — per pair (d_ij, d_ji); caller scatters into
+//            Fij_bar in a later phase.
+struct T1FockOutputs {
+    WritablePairStore Fab;
+    double *d_flat;
+};
+
+// -- t1_fock finalize (Step 2h): Fkj + Fij_bar + foo_t1 -----------------------
+//
+// Consumes `d_flat` from a prior `run_phase_t1_fock_into` call (Step 2d).
+// Produces:
+//   Fkj             : (nocc, nocc) F_lmo + scatter(d_flat) + Eq 94 contribution
+//   Fij_bar_snapshot: (nocc, nocc) snapshot AFTER d-scatter, BEFORE Eq 94
+//                     (used by the T1 residual to avoid recomputing d).
+//   foo_t1          : (nocc, nocc) Fkj - F_lmo
+struct T1FockExtraInputs {
+    const double *d_flat;     // length 2 * n_canon_pairs (from Step 2d)
+};
+
+struct T1FockExtraOutputs {
+    double *Fkj;
+    double *Fij_bar_snapshot;
+    double *foo_t1;
+};
+
+// -- T1 residual per-(k, l) batched B + A2 phase (Step 2i) -------------------
+//
+// Wraps DLPNOper_kl_batched.  Plan provides ALL inputs (buffers + metadata);
+// class only sizes and allocates scratch arenas.  Plan-builder integration
+// (and binding `t2_buffer` / `t1_cache_buffer` to SolverInputs) lands in 2l.
+struct PerKlPlanInputs {
+    int n_tasks;
+    int M;                            // = nocc
+
+    // Per-task arrays (length n_tasks).
+    const int  *n_kl_arr;
+    const int  *t2_swap_kl;
+    const long *K_iajb_kl_off;
+    const long *K_bar_kl_off;
+    const long *t2_kl_canon_off;
+    const long *T_n_kl_off;
+    const long *inner_off;            // length n_tasks + 1
+
+    // Per-(task, inner_i) arrays (length total_inner = inner_off[n_tasks]).
+    const int  *i_arr;
+    const int  *n_pno_ii_arr;
+    const int  *is_diag_kl_ii;
+    const int  *has_S_ii_kl;
+    const long *S_ii_kl_off;
+    const int  *has_A2;
+    const int  *is_diag_kl_ki;
+    const int  *n_ki_arr;
+    const int  *t2_swap_ki;
+    const long *t2_ki_canon_off;
+    const long *S_kl_ki_off;
+    const long *S_ki_kl_off;
+    const long *T_n_l_ii_off;
+    const long *contrib_off;          // length total_inner; [ti] = start of contrib[ti]
+
+    // Static + dynamic buffers (plan-owned).
+    const double *K_iajb_buffer;
+    const double *K_bar_kl_static;
+    const double *S_pno_buffer;
+    const double *t2_buffer;
+    const double *t1_cache_buffer;
+
+    // Scratch sizing bounds.
+    int max_n_kl;
+    int max_n_ki;
+};
+
+struct PerKlOutputs {
+    double *contrib_flat;
+};
+
+// -- R2 B + E term per-bucket (Step 2j-a) ------------------------------------
+//
+// Wraps DLPNObe_kernel.  The Python wrapper buckets items by (n_ij, n_kl)
+// shape and calls the kernel once per bucket; we mirror that — phase entry
+// processes one bucket per call.  Kernel mallocs its own internal scratch.
+struct BEInputs {
+    int N;                // items in this bucket
+    int n_ij;
+    int n_kl;
+    int n_slots;          // for caller-allocated output buffer sizing
+    const double        *S;          // (N, n_ij, n_kl)
+    const double        *T;          // (N, n_kl, n_kl)
+    const double        *K;          // (N, n_kl, n_kl)
+    const double        *beta_kl;    // (N,)
+    const double        *beta_lk;    // (N,)
+    const unsigned char *same;       // (N,)
+    const long          *idx;        // (N,)
+};
+
+struct BEOutputs {
+    double *out_B;        // (n_slots, n_ij, n_ij)
+    double *out_E;        // (n_slots, n_ij, n_ij)
+};
+
+// -- R2 C-term batched (Step 2j-b1) ------------------------------------------
+struct CTermInputs {
+    int N;
+    const int  *n_pno_arr;       // (N,)
+    const int  *n_ct_arr;        // (N,)
+    const int  *n_other_arr;     // (N,)
+    const long *S_big_off;       // (N,)
+    const long *ct_off;          // (N,)
+    const long *S_mid_off;       // (N,)
+    const long *J_bold_off;      // (N,)
+    const long *t2_off;          // (N,)
+    const long *S_outer_off;     // (N,)
+    const long *tile_off;        // (N,)
+    const double *S_big_flat;
+    const double *S_mid_flat;
+    const double *J_bold_flat;
+    const double *S_outer_flat;
+    const double *ct_flat;
+    const double *t2_flat;
+    int max_n_pno;
+    int max_n_ct;
+    int max_n_other;
+};
+
+struct CTermOutputs {
+    double *tiles_flat;  // length = sum of n_pno_arr[n]^2
+};
+
+// -- R2 D-term batched (Step 2j-b2) ------------------------------------------
+struct DTermInputs {
+    int N;
+    const int  *n_pno_arr;       // (N,)
+    const int  *n_A_arr;         // (N,)
+    const int  *n_B_arr;         // (N,)
+    const long *S_a_off;
+    const long *u_off;
+    const long *S_b_off;
+    const long *S_c_off;
+    const long *dt_off;
+    const long *KJ_off;
+    const long *tile_off;
+    const double *S_a_flat;
+    const double *S_b_flat;
+    const double *S_c_flat;
+    const double *KJ_flat;
+    const double *u_flat;
+    const double *dt_flat;
+    int max_n_pno;
+    int max_n_A;
+    int max_n_B;
+};
+
+struct DTermOutputs {
+    double *tiles_flat;  // length = sum of n_pno_arr[n]^2
+};
+
+// -- R2 G-term batched (Step 2j-c) ------------------------------------------
+//
+// Wraps DLPNOg_term_batched.  Per-item math: scalar = G_tilde[k_idx[n],
+// scalar_lmo[n]]; tmp = S @ t2; Cc = scalar * tmp @ S.T.  Naturally chains
+// with phase 2g's output (G_tilde matrix).
+struct GTermInputs {
+    int N;
+    const int  *n_ij_arr;        // (N,)
+    const int  *n_ik_arr;        // (N,)
+    const long *S_off;           // (N,)
+    const long *t2_off;          // (N,)
+    const long *tile_off;        // (N,)
+    const long *k_idx;           // (N,) — row index into G_tilde
+    const long *scalar_lmo;      // (N,) — col index into G_tilde
+    const double *S_flat;
+    const double *t2_flat;
+    const double *G_tilde;       // (G_stride, G_stride) — typically nocc x nocc
+    int G_stride;                // = nocc
+    int max_n_ij;
+    int max_n_ik;
+};
+
+struct GTermOutputs {
+    double *tiles_flat;          // length = sum of n_ij_arr[n]^2
+};
+
+// -- C/D Phase 2 t3 + t4 batched (Step 2j-d) --------------------------------
+//
+// t3: contrib = -T1l ⊗ (S @ K.T @ t1i)  (rank-1 outer product per item).
+// t4: contrib = scale * S_ki_li @ t2 @ S_li_kl @ K @ S_kl_ki  (4 matmuls).
+struct T3Inputs {
+    int N;
+    const int  *n_kl_arr;        // (N,)
+    const int  *n_ki_arr;        // (N,)
+    const long *K_off;
+    const long *S_off;
+    const long *t1i_off;         // offsets into t1_flat for the t1i vectors
+    const long *T1l_off;         // offsets into t1_flat for the T1l vectors
+    const long *tile_off;
+    const double *K_flat;
+    const double *S_flat;
+    const double *t1_flat;       // shared buffer for both t1i and T1l
+    int max_n_kl;
+    int max_n_ki;
+};
+
+struct T3Outputs {
+    double *tiles_flat;          // length = sum of n_ki_arr[n]^2
+};
+
+struct T4Inputs {
+    int N;
+    const int  *n_ki_arr;        // (N,)
+    const int  *n_li_arr;        // (N,)
+    const int  *n_kl_arr;        // (N,)
+    const long *S_ki_li_off;
+    const long *t2_off;
+    const long *S_li_kl_off;
+    const long *K_off;
+    const long *S_kl_ki_off;
+    const long *tile_off;
+    const double *S_ki_li_flat;
+    const double *S_li_kl_flat;
+    const double *K_flat;
+    const double *S_kl_ki_flat;
+    const double *t2_flat;
+    double scale;
+    int max_n_ki;
+    int max_n_li;
+    int max_n_kl;
+};
+
+struct T4Outputs {
+    double *tiles_flat;          // length = sum of n_ki_arr[n]^2
+};
+
+// -- R2 K + ladder (Step 2j-e) -----------------------------------------------
+//
+// No existing C kernel — math is small per pair, written inline in the class.
+// Per canonical pair (i, j):
+//   K[a, b]      = Σ_Q i_Qa_t1[Q, a] * j_Qa_t1[Q, b]
+//   For each Q:
+//     Qab_t1[a, b] = Qab[Q, a, b] - Σ_n T1_in_pair[n, a] * Qma[Q, n, b]
+//     A[a, b]     += Σ_{c, d} Qab_t1[a, c] * T2[c, d] * Qab_t1[b, d]
+// Both K and A share the per-pair (npno, npno) layout; use t2_offsets.
+struct KLadderInputs {
+    FlatPairStore i_Qa_t1;       // from phase_t1_ints output
+    FlatPairStore j_Qa_t1;
+};
+
+struct KLadderOutputs {
+    WritablePairStore K;         // per pair (npno_p, npno_p)
+    WritablePairStore A;         // per pair (npno_p, npno_p)
+};
+
+// -- Update amplitudes + energy (Step 2k) ------------------------------------
+//
+// Combined phase: T1 -= R1 / D_T1, T2 -= R2 / D_T2 (in-place mutation of
+// T1_flat / T2_flat in SolverInputs), then compute correlation energy.
+// Energy = Σ_i fov[i] · T1[i] + Σ_p (1 or 2) · K_iajb[p] : (2τ - τᵀ)
+//   where τ = T2[p] + t1_i ⊗ t1_j (t1 in pair p's PNO basis), and the
+//   factor is 1 for diagonal pairs (i == j), 2 for off-diagonal.
+struct UpdateAmpsInputs {
+    const double *R1_flat;       // pno_offsets[nocc] doubles
+    const double *R2_flat;       // t2_offsets[n_canon_pairs] doubles
+};
+
+struct UpdateAmpsOutputs {
+    double energy;
+};
+
+// -- t1_fock Fia_bar per pair (Step 2l-b) ------------------------------------
+//
+// Computes Fia_bar per canonical pair from Qma + T1_in_pair (same math as
+// Eq 94 in 2h, but for ALL pairs — diagonal AND off-diagonal — so callers
+// can extract Fai[i] = Fia_bar[(i,i)][i_in_p, :] and
+// Fkc[(k,i)] = Fia_bar[canonical_p][k_in_p, :].
+struct FiaBarOutputs {
+    WritablePairStore Fia_bar;   // per pair (nlmo_p, npno_p)
+};
+
+// -- R1 init + A + C contribution (Step 2l-c) --------------------------------
+//
+// Combined phase covering DePrince Eq 19 Term 1 (init) + Eqs 20 (A) and 22 (C).
+// Iterates ordered pairs (a_ord, b_ord) — Psi4's (i, k).  Per ordered pair:
+//   A: R1[a_ord] += S_PNO(p_canon, p_ii).T @ K_chem_ki @ Tt_ki.ravel()
+//   C: R1[a_ord] += S_PNO(p_canon, p_ii).T @ Tt_ik @ Fkc_ki
+// Init: R1[i] = Fai[i] = Fia_bar[(i,i)][i_in_p, :].
+//
+// Uses cross-canonical S_pno_cache (2l-a) and Fia_bar from 2l-b.  Per-thread
+// R1 buffer + reduction (multiple ordered pairs scatter to the same R1[i]).
+struct R1AcInputs {
+    FlatPairStore Fia_bar;       // from 2l-b output
+    int do_init;                 // 1 = include Fai init step (legacy); 0 = AC only
+};
+
+struct R1AcOutputs {
+    double *R1_flat;             // length pno_offsets[nocc]
+};
+
+// -- D_tilde Phase 1 (Step 2e) ----------------------------------------------
+//
+// Iterates ordered pairs (Psi4 all_pairs).  Per ordered pair (i, k) with
+// canonical key (a, b) = (min(i,k), max(i,k)):
+//   K_tilde_chem = K_tilde_chem_i if a == k else K_tilde_chem_j
+//   K_bar        = K_bar_ij       if a == i else K_bar_ji
+//   M_static     = 2 * K_bar - K_bar_chem
+//   t1[i]        = T1_in_pair[(a,b)] row at position i_in_p[(a,b), i]
+//   T1_rows      = T1_in_pair[(a,b)]
+// Output per ordered pair: D_tilde[(i,k)] of shape (npno_(a,b), npno_(a,b)).
+struct DTildeOutputs {
+    WritablePairStore D_tilde;        // length n_ordered_pairs entries
+};
+
+// -- C_tilde Phase 1 (Step 2f) ----------------------------------------------
+//
+// Iterates ordered pairs (Psi4 all_pairs).  Per ordered pair (a, b) with
+// canonical key (ca, cb) = (min(a, b), max(a, b)) — note Psi4 wrapper
+// unpacks the ordered tuple as (k, i) with k=a, i=b:
+//   K_tilde_chem = K_tilde_chem_i if ca == a else K_tilde_chem_j
+//   K_bar_chem   = canonical K_bar_chem (no orientation flip)
+//   t1[i]        = T1_in_pair[(ca, cb)] row at position i_in_p[(ca, cb), b]
+//   T1_local     = T1_in_pair[(ca, cb)]
+struct CTildeOutputs {
+    WritablePairStore C_tilde;
+};
+
+// -- G_tilde inner phase (Step 2g) ------------------------------------------
+//
+// Plan (effective_flat + triple lists + slot lists) is provided by the
+// caller — it folds S_PNO(il, lj), K_iajb[il], and orientation handling
+// into a per-triple precomputed tensor.  The class runs only the inner
+// reduction (per (i, j) slot, accumulate Σ_t effective[t] : T2[pair[t]]).
+// Plan-building moves into the class in Step 2l along with S_pno_cache
+// prewarming.
+struct GTildeInputs {
+    int n_ij_slots;
+    const long  *triple_eff_offset;       // length sum-of-triples
+    const long  *triple_T2_pair_idx;      // length sum-of-triples
+    const int   *triple_n_lj;             // length sum-of-triples
+    const long  *ij_triple_starts;        // length n_ij_slots + 1
+    const int   *ij_i_arr;                // length n_ij_slots
+    const int   *ij_j_arr;                // length n_ij_slots
+    const double *effective_flat;         // length determined by triple_eff_offset[last]
+};
+
+struct GTildeOutputs {
+    // (nocc, nocc) row-major.  Caller pre-initializes to Fkj; the kernel
+    // accumulates into it.
+    double *G_tilde;
+};
+
+// -- Cycle-collapse (c-collapse-1) -------------------------------------------
+//
+// Walking skeleton for one full CCSD cycle inside C++.  Plan-cached phases
+// are passed as nullable plan struct pointers; null = skip the phase
+// (zero contribution).  Plans get filled in incrementally as plan-build
+// is hoisted out of existing Python wrappers.
+struct RunCycleInputs {
+    const GTildeInputs    *g_tilde_plan;
+    const PerKlPlanInputs *per_kl_plan;
+    const BEInputs        *be_plan;
+    const CTermInputs     *c_term_plan;
+    const DTermInputs     *d_term_plan;
+    const GTermInputs     *g_term_plan;
+    const T3Inputs        *t3_plan;
+    const T4Inputs        *t4_plan;
+};
+
+struct RunCycleOutputs {
+    double *R1_flat;        // pno_offsets[nocc] doubles
+    double *R2_flat;        // sum_p npno_p^2 doubles
+    double  energy;
+};
+
+// -- Solver class (skeleton) -------------------------------------------------
+class DLPNOCCSDSolver {
+   public:
+    explicit DLPNOCCSDSolver(const SolverInputs &in) : in_(in) {}
+
+    // Returns final cycle count on success, -1 if skeleton/not implemented.
+    int solve();
+    double get_energy() const { return e_corr_; }
+
+    // Step 2b helper: runs ONLY the t1_ints phase, writing into caller-
+    // provided output buffers.  Cross-validation entry — when phase_t1_ints_
+    // becomes class-internal in Step 2m, this entry can be retired or kept
+    // for per-phase parity dumps.
+    void run_phase_t1_ints_into(T1IntsOutputs *out);
+
+    // Step 2c helper: runs ONLY the B_tilde phase (jiang).  Inputs include
+    // i_Qk_t1/j_Qk_t1 from a prior phase_t1_ints call; T2 + Qma come from
+    // SolverInputs.
+    void run_phase_b_tilde_into(const BTildeInputs *t1_dressed,
+                                BTildeOutputs *out);
+
+    // Step 2d helper: runs the t1_fock phase (per-pair Fab + d_ij/d_ji).
+    // Wraps DLPNOt1_fock_batched (single batched kernel call).  Class
+    // allocates the 6 scratch arenas locally per entry call until Step 2m
+    // promotes them to long-lived members.
+    void run_phase_t1_fock_into(T1FockOutputs *out);
+
+    // Step 2e helper: runs the D_tilde Phase 1 (Terms 1+2) over ordered
+    // pairs.  Class builds ephemeral flat buffers (K_tilde_chem chosen per
+    // orientation, M_static computed inline, t1[i] gathered) then calls the
+    // existing batched kernel.
+    void run_phase_d_tilde_ph1_into(DTildeOutputs *out);
+
+    // Step 2f helper: runs the C_tilde Phase 1 (Terms 1+2) over ordered
+    // pairs.  Same ordered-pair iteration as 2e; orientation rules and
+    // t1 source differ — see CTildeOutputs comment.
+    void run_phase_c_tilde_ph1_into(CTildeOutputs *out);
+
+    // Step 2g helper: runs the G_tilde inner kernel given a precomputed
+    // plan (effective_flat from S_pno × K_iajb × orientation folding).
+    // Plan-building moves into the class in Step 2l.
+    void run_phase_g_tilde_inner_into(const GTildeInputs *plan,
+                                       GTildeOutputs *out);
+
+    // Step 2h helper: t1_fock finalize — Fkj scatter, Fij_bar snapshot,
+    // Eq 94 (Fia_bar_jj contribution per occupied j), foo_t1 = Fkj - F_lmo.
+    void run_phase_t1_fock_finalize_into(const T1FockExtraInputs *extra,
+                                          T1FockExtraOutputs *out);
+
+    // Step 2i helper: T1 residual per-(k, l) batched B + A2 contributions.
+    // Wraps DLPNOper_kl_batched.  Class allocates the 6 per-thread scratch
+    // arenas; plan supplies everything else.
+    void run_phase_t1_residual_per_kl_into(const PerKlPlanInputs *plan,
+                                            PerKlOutputs *out);
+
+    // Step 2j-a helper: R2 B + E term per (n_ij, n_kl) bucket.  Wraps
+    // DLPNObe_kernel.  Caller pre-allocates out_B / out_E sized by
+    // (n_slots, n_ij, n_ij) and passes one bucket at a time.
+    void run_phase_be_into(const BEInputs *plan, BEOutputs *out);
+
+    // Step 2j-b helpers: R2 C-term and D-term batched.  Wrap
+    // DLPNOc_term_batched / DLPNOd_term_batched.  Class allocates the
+    // per-thread scratch arenas (3 for C-term, 4 for D-term).
+    void run_phase_c_term_into(const CTermInputs *plan, CTermOutputs *out);
+    void run_phase_d_term_into(const DTermInputs *plan, DTermOutputs *out);
+
+    // Step 2j-c helper: R2 G-term batched.  Wraps DLPNOg_term_batched.
+    // Per-item: lookup scalar in G_tilde, then tmp = S @ t2, Cc = scalar *
+    // tmp @ S.T.  One per-thread scratch arena.
+    void run_phase_g_term_into(const GTermInputs *plan, GTermOutputs *out);
+
+    // Step 2j-d helpers: C/D Phase 2 t3 + t4 batched.
+    void run_phase_t3_into(const T3Inputs *plan, T3Outputs *out);
+    void run_phase_t4_into(const T4Inputs *plan, T4Outputs *out);
+
+    // Step 2j-e helper: R2 K + ladder.  Math is small per pair; written
+    // inline (no existing C kernel).  OMP-parallel over canonical pairs.
+    void run_phase_k_ladder_into(const KLadderInputs *t1_dressed,
+                                  KLadderOutputs *out);
+
+    // Step 2k helper: update T1 / T2 in place, then compute correlation
+    // energy.  Mutates `in_.T1_flat` and `in_.T2_flat` (both non-const).
+    void run_phase_update_amps_and_energy_into(
+            const UpdateAmpsInputs *resid, UpdateAmpsOutputs *out);
+
+    // Step 2l-b helper: compute Fia_bar per canonical pair (used by 2l-c
+    // to derive Fai and Fkc on the fly via ordered-pair indexing).
+    void run_phase_t1_fock_fia_bar_into(FiaBarOutputs *out);
+
+    // Step 2l-c helper: R1 init + A + C contribution per ordered pair.
+    // Consumes Fia_bar (2l-b) + cross-canonical S_pno_cache (2l-a) +
+    // K_tilde_chem variants + T2 (with orientation handling).
+    void run_phase_t1_residual_AC_init_into(
+            const R1AcInputs *fia, R1AcOutputs *out);
+
+    // R1 Stages 1-3 (Psi4 Fai_bar / Fab_bar*t1 / -T_n^T*Fia*t1) per
+    // occupied i — wraps DLPNOper_i_stages123.  Consumes pair (i, i)'s
+    // cc_ints (Qma/Qab/i_Qa/i_Qk) + T1_in_pair[(i,i)] + t1_i + e_pno.
+    void run_phase_t1_residual_stages123_into(double *R1_flat);
+
+    // c-collapse-1: run one full CCSD cycle inside C++.  Plan-cached
+    // phases are passed via plans (nullable for stubs).  Outputs R1, R2,
+    // energy.  T1/T2 are NOT updated by this method — the driver runs
+    // DIIS externally and writes T1/T2 in place via SolverInputs.
+    void run_one_cycle(const RunCycleInputs *plans, RunCycleOutputs *out);
+
+   private:
+    // -- Phase methods (all empty in the skeleton) --
+    void initialize_amplitudes_();
+    void prewarm_s_pno_cache_();
+    void build_plan_caches_();
+    void build_T_n_ij_();
+    void phase_t1_ints_();
+    void phase_t1_fock_();
+    void phase_jiang_B_tilde_();
+    void phase_jiang_C_tilde_();
+    void phase_jiang_D_tilde_();
+    void phase_jiang_G_tilde_();
+    void phase_pairs_residual_();
+    void phase_t1_residual_();
+    void phase_update_amps_();
+    void apply_diis_();
+    double compute_iter_energy_();
+
+    SolverInputs in_;
+    double e_corr_ = 0.0;
+    int final_cycle_ = -1;
+};
+
+int DLPNOCCSDSolver::solve() {
+    // Skeleton: log shape, leave amplitudes untouched, return sentinel.
+    std::fprintf(stderr,
+        "[DLPNO-CCSD MONO skeleton] nocc=%d nlmo=%d n_canon_pairs=%d "
+        "n_strong_pairs=%d max_cycle=%d e_conv=%.2e r_conv=%.2e\n",
+        in_.nocc, in_.nlmo, in_.n_canon_pairs, in_.n_strong_pairs,
+        in_.max_cycle, in_.e_conv, in_.r_conv);
+    return -1;
+}
+
+// All phase methods are intentionally empty in the skeleton — Step 2+ fills
+// them in by delegating to the existing dlpno_*.c per-pair kernels.
+void DLPNOCCSDSolver::initialize_amplitudes_()    {}
+void DLPNOCCSDSolver::prewarm_s_pno_cache_()      {}
+void DLPNOCCSDSolver::build_plan_caches_()        {}
+void DLPNOCCSDSolver::build_T_n_ij_()             {}
+
+// Step 2b: t1_ints phase.  Loops over canonical pairs, derives per-pair
+// shapes from offsets, calls DLPNOt1_ints_pair_side once per ordered side
+// (i and j) of each canonical pair.  Phase-internal version (writes into
+// class-owned buffers) lands in Step 2m; for now we expose the body via
+// run_phase_t1_ints_into so the parity test can compare per-pair outputs.
+void DLPNOCCSDSolver::phase_t1_ints_() {}
+
+void DLPNOCCSDSolver::run_phase_t1_ints_into(T1IntsOutputs *out) {
+    const int n_pairs = in_.n_canon_pairs;
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int p = 0; p < n_pairs; ++p) {
+        const int i = in_.ij_to_i_j[2 * p];
+        const int j = in_.ij_to_i_j[2 * p + 1];
+        const int npno = in_.n_pno_per_pair[p];
+        if (npno == 0) continue;
+
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
+        const int nlmo_p = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+        const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
+
+        // Locate i and j within pair_lmo_idx[p].  For STRONG pairs the
+        // invariant holds (endpoints always in their own LMO domain).  For
+        // weak/extended pairs the endpoints may not appear; in that case
+        // skip — the pair contributes only via T2 in per_kl, not via t1
+        // dressing.
+        int i_in_p = -1, j_in_p = -1;
+        for (int k = 0; k < nlmo_p; ++k) {
+            if (lmo_list[k] == i) i_in_p = k;
+            if (lmo_list[k] == j) j_in_p = k;
+        }
+        if (i_in_p < 0 || j_in_p < 0) continue;
+
+        // n_local (= naux per pair) inferred from Qma extent.
+        const int64_t qma_size = in_.Qma.offsets[p + 1] - in_.Qma.offsets[p];
+        const int64_t per_q = (int64_t)nlmo_p * (int64_t)npno;
+        const size_t n_local = (size_t)(qma_size / per_q);
+
+        const double *Qma_p   = in_.Qma.data   + in_.Qma.offsets[p];
+        const double *Qab_p   = in_.Qab.data   + in_.Qab.offsets[p];
+        const double *i_Qa_p  = in_.i_Qa.data  + in_.i_Qa.offsets[p];
+        const double *i_Qk_p  = in_.i_Qk.data  + in_.i_Qk.offsets[p];
+        const double *j_Qa_p  = in_.j_Qa.data  + in_.j_Qa.offsets[p];
+        const double *j_Qk_p  = in_.j_Qk.data  + in_.j_Qk.offsets[p];
+
+        const double *T1_local =
+            in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        const double *t1_lmo_i = T1_local + (int64_t)i_in_p * npno;
+        const double *t1_lmo_j = T1_local + (int64_t)j_in_p * npno;
+
+        double *i_Qa_out = out->i_Qa_t1.data + out->i_Qa_t1.offsets[p];
+        double *i_Qk_out = out->i_Qk_t1.data + out->i_Qk_t1.offsets[p];
+        double *j_Qa_out = out->j_Qa_t1.data + out->j_Qa_t1.offsets[p];
+        double *j_Qk_out = out->j_Qk_t1.data + out->j_Qk_t1.offsets[p];
+
+        DLPNOt1_ints_pair_side(
+            i_Qa_out, i_Qk_out, i_Qa_p, i_Qk_p,
+            Qma_p, Qab_p, t1_lmo_i, T1_local,
+            n_local, (size_t)nlmo_p, (size_t)npno);
+
+        DLPNOt1_ints_pair_side(
+            j_Qa_out, j_Qk_out, j_Qa_p, j_Qk_p,
+            Qma_p, Qab_p, t1_lmo_j, T1_local,
+            n_local, (size_t)nlmo_p, (size_t)npno);
+    }
+}
+
+void DLPNOCCSDSolver::run_phase_t1_fock_into(T1FockOutputs *out) {
+    const int N = in_.n_canon_pairs;
+
+    // Per-pair shape arrays (int32, kernel signature).
+    std::vector<int> nlmo_arr(N), npno_arr(N), n_local_arr(N), need_dji_arr(N);
+    int max_nlmo = 0, max_npno = 0, max_n_local = 0;
+    for (int p = 0; p < N; ++p) {
+        const int npno = in_.n_pno_per_pair[p];
+        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1]
+                                - in_.pair_lmo_idx_offsets[p]);
+        const int64_t qma_size = in_.Qma.offsets[p + 1] - in_.Qma.offsets[p];
+        const int64_t per_q = (int64_t)nlmo * (int64_t)npno;
+        const int n_local = (per_q > 0) ? (int)(qma_size / per_q) : 0;
+        nlmo_arr[p] = nlmo;
+        npno_arr[p] = npno;
+        n_local_arr[p] = n_local;
+        const int i = in_.ij_to_i_j[2 * p];
+        const int j = in_.ij_to_i_j[2 * p + 1];
+        need_dji_arr[p] = (i != j) ? 1 : 0;
+        if (nlmo > max_nlmo)        max_nlmo = nlmo;
+        if (npno > max_npno)        max_npno = npno;
+        if (n_local > max_n_local)  max_n_local = n_local;
+    }
+
+    int num_threads = 1;
+    #ifdef _OPENMP
+        num_threads = std::min(omp_get_max_threads(), 16);
+        if (N < num_threads) num_threads = (N > 0) ? N : 1;
+    #endif
+
+    // Scratch arenas sized to (num_threads, max_*).
+    const size_t s_gamma   = (size_t)max_n_local;
+    const size_t s_Y       = (size_t)max_n_local * max_nlmo * max_npno;
+    const size_t s_Fia     = (size_t)max_nlmo * max_npno;
+    const size_t s_Z       = (size_t)max_n_local * max_nlmo * max_nlmo;
+
+    std::vector<double> gamma_sc((size_t)num_threads * s_gamma, 0.0);
+    std::vector<double> Y_trans_sc((size_t)num_threads * s_Y, 0.0);
+    std::vector<double> Y_alt_sc((size_t)num_threads * s_Y, 0.0);
+    std::vector<double> Fia_sc((size_t)num_threads * s_Fia, 0.0);
+    std::vector<double> Z_stk_sc((size_t)num_threads * s_Z, 0.0);
+    std::vector<double> Z_xxx_sc((size_t)num_threads * s_Z, 0.0);
+
+    DLPNOt1_fock_batched(
+        in_.T1_in_pair.data,    (const long *)in_.T1_in_pair.offsets,
+        in_.K_bar_chem.data,    (const long *)in_.K_bar_chem.offsets,
+        in_.K_bar_ji.data,      (const long *)in_.K_bar_ji.offsets,
+        in_.K_bar_ij.data,      (const long *)in_.K_bar_ij.offsets,
+        in_.Qma.data,           (const long *)in_.Qma.offsets,
+        in_.Qab.data,           (const long *)in_.Qab.offsets,
+        in_.e_pno_flat,         (const long *)in_.pno_offsets,
+        nlmo_arr.data(), npno_arr.data(), n_local_arr.data(), need_dji_arr.data(),
+        gamma_sc.data(),  s_gamma,
+        Y_trans_sc.data(), s_Y,
+        Y_alt_sc.data(),   s_Y,
+        Fia_sc.data(),     s_Fia,
+        Z_stk_sc.data(),   s_Z,
+        Z_xxx_sc.data(),   s_Z,
+        out->d_flat,
+        out->Fab.data, (const long *)out->Fab.offsets,
+        (size_t)N, num_threads);
+}
+
+void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
+                                     RunCycleOutputs *out) {
+    const int nocc   = in_.nocc;
+    const int N      = in_.n_canon_pairs;
+    const int N_ord  = in_.n_ordered_pairs;
+    const int64_t R1_total = (N > 0) ? in_.pno_offsets[nocc] : 0;
+    const int64_t R2_total = (N > 0) ? in_.t2_offsets[N] : 0;
+
+    // ------------------------------------------------------------------
+    // Per-pair shape derivation + offset tables for scratch buffers.
+    // ------------------------------------------------------------------
+    std::vector<int> npno_arr(N), nlmo_arr(N), n_local_arr(N);
+    for (int p = 0; p < N; ++p) {
+        const int npno = in_.n_pno_per_pair[p];
+        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1]
+                                - in_.pair_lmo_idx_offsets[p]);
+        npno_arr[p] = npno;
+        nlmo_arr[p] = nlmo;
+        if (nlmo > 0 && npno > 0) {
+            const int64_t qma_size = in_.Qma.offsets[p + 1] - in_.Qma.offsets[p];
+            const int64_t per_q = (int64_t)nlmo * npno;
+            n_local_arr[p] = (per_q > 0) ? (int)(qma_size / per_q) : 0;
+        } else {
+            n_local_arr[p] = 0;
+        }
+    }
+
+    // Offsets for dressed Qa (n_local x npno), dressed Qk (n_local x nlmo),
+    // Fia_bar (nlmo x npno), B_tilde (nlmo x nlmo).
+    std::vector<int64_t> dressed_qa_off(N + 1, 0);
+    std::vector<int64_t> dressed_qk_off(N + 1, 0);
+    std::vector<int64_t> fia_bar_off(N + 1, 0);
+    std::vector<int64_t> b_tilde_off(N + 1, 0);
+    for (int p = 0; p < N; ++p) {
+        const int64_t a_sz = (int64_t)n_local_arr[p] * npno_arr[p];
+        const int64_t k_sz = (int64_t)n_local_arr[p] * nlmo_arr[p];
+        const int64_t f_sz = (int64_t)nlmo_arr[p] * npno_arr[p];
+        const int64_t b_sz = (int64_t)nlmo_arr[p] * nlmo_arr[p];
+        dressed_qa_off[p + 1] = dressed_qa_off[p] + a_sz;
+        dressed_qk_off[p + 1] = dressed_qk_off[p] + k_sz;
+        fia_bar_off[p + 1]    = fia_bar_off[p]    + f_sz;
+        b_tilde_off[p + 1]    = b_tilde_off[p]    + b_sz;
+    }
+
+    // Per-ordered-pair offsets for C_tilde / D_tilde Ph1 outputs (npno²
+    // of the canonical pair).
+    std::vector<int64_t> ord_npno2_off(N_ord + 1, 0);
+    for (int o = 0; o < N_ord; ++o) {
+        const int a = in_.ordered_pair_i_idx[o];
+        const int k = in_.ordered_pair_k_idx[o];
+        const int p_canon = in_.i_j_to_ij[(int64_t)a * nocc + k];
+        const int npno = (p_canon >= 0) ? in_.n_pno_per_pair[p_canon] : 0;
+        ord_npno2_off[o + 1] = ord_npno2_off[o] + (int64_t)npno * npno;
+    }
+
+    // ------------------------------------------------------------------
+    // Allocate scratch buffers (per-call; promote to class members later).
+    // ------------------------------------------------------------------
+    std::vector<double> dressed_iQa(dressed_qa_off[N], 0.0);
+    std::vector<double> dressed_jQa(dressed_qa_off[N], 0.0);
+    std::vector<double> dressed_iQk(dressed_qk_off[N], 0.0);
+    std::vector<double> dressed_jQk(dressed_qk_off[N], 0.0);
+    std::vector<double> Fab_flat(in_.t2_offsets[N], 0.0);
+    std::vector<double> d_flat((size_t)N * 2, 0.0);
+    std::vector<double> Fkj_mat((size_t)nocc * nocc, 0.0);
+    std::vector<double> Fij_bar_mat((size_t)nocc * nocc, 0.0);
+    std::vector<double> foo_t1_mat((size_t)nocc * nocc, 0.0);
+    std::vector<double> Fia_bar_flat(fia_bar_off[N], 0.0);
+    std::vector<double> B_tilde_flat(b_tilde_off[N], 0.0);
+    std::vector<double> C_tilde_flat(ord_npno2_off[N_ord], 0.0);
+    std::vector<double> D_tilde_flat(ord_npno2_off[N_ord], 0.0);
+    std::vector<double> K_flat(in_.t2_offsets[N], 0.0);
+    std::vector<double> A_flat(in_.t2_offsets[N], 0.0);
+    std::vector<double> G_tilde_mat((size_t)nocc * nocc, 0.0);
+
+
+    // ------------------------------------------------------------------
+    // Phase 1: t1_ints — produce dressed Qa/Qk per pair.
+    // ------------------------------------------------------------------
+    T1IntsOutputs t1_out;
+    t1_out.i_Qa_t1.data    = dressed_iQa.data();
+    t1_out.i_Qa_t1.offsets = dressed_qa_off.data();
+    t1_out.j_Qa_t1.data    = dressed_jQa.data();
+    t1_out.j_Qa_t1.offsets = dressed_qa_off.data();
+    t1_out.i_Qk_t1.data    = dressed_iQk.data();
+    t1_out.i_Qk_t1.offsets = dressed_qk_off.data();
+    t1_out.j_Qk_t1.data    = dressed_jQk.data();
+    t1_out.j_Qk_t1.offsets = dressed_qk_off.data();
+    run_phase_t1_ints_into(&t1_out);
+    // ------------------------------------------------------------------
+    // Phase 2: t1_fock — Fab per pair + d_flat.
+    // ------------------------------------------------------------------
+    T1FockOutputs t1f_out;
+    t1f_out.Fab.data    = Fab_flat.data();
+    t1f_out.Fab.offsets = (const int64_t *)in_.t2_offsets;
+    t1f_out.d_flat      = d_flat.data();
+    run_phase_t1_fock_into(&t1f_out);
+    // ------------------------------------------------------------------
+    // Phase 3: t1_fock_finalize — Fkj / Fij_bar / foo_t1.
+    // ------------------------------------------------------------------
+    T1FockExtraInputs t1ff_in;
+    t1ff_in.d_flat = d_flat.data();
+    T1FockExtraOutputs t1ff_out;
+    t1ff_out.Fkj              = Fkj_mat.data();
+    t1ff_out.Fij_bar_snapshot = Fij_bar_mat.data();
+    t1ff_out.foo_t1           = foo_t1_mat.data();
+    run_phase_t1_fock_finalize_into(&t1ff_in, &t1ff_out);
+    // ------------------------------------------------------------------
+    // Phase 4: Fia_bar per pair.
+    // ------------------------------------------------------------------
+    FiaBarOutputs fia_out;
+    fia_out.Fia_bar.data    = Fia_bar_flat.data();
+    fia_out.Fia_bar.offsets = fia_bar_off.data();
+    run_phase_t1_fock_fia_bar_into(&fia_out);
+    // ------------------------------------------------------------------
+    // Phase 5: B_tilde — consumes dressed_iQk_t1 / dressed_jQk_t1.
+    // ------------------------------------------------------------------
+    BTildeInputs bt_in;
+    bt_in.i_Qk_t1.data    = dressed_iQk.data();
+    bt_in.i_Qk_t1.offsets = dressed_qk_off.data();
+    bt_in.j_Qk_t1.data    = dressed_jQk.data();
+    bt_in.j_Qk_t1.offsets = dressed_qk_off.data();
+    BTildeOutputs bt_out;
+    bt_out.B_tilde.data    = B_tilde_flat.data();
+    bt_out.B_tilde.offsets = b_tilde_off.data();
+    run_phase_b_tilde_into(&bt_in, &bt_out);
+    // ------------------------------------------------------------------
+    // Phase 6: C_tilde / D_tilde Phase 1 (Phase 2 from t3+t4 plans
+    // is skipped in skeleton).
+    // ------------------------------------------------------------------
+    CTildeOutputs ct_out;
+    ct_out.C_tilde.data    = C_tilde_flat.data();
+    ct_out.C_tilde.offsets = ord_npno2_off.data();
+    run_phase_c_tilde_ph1_into(&ct_out);
+    DTildeOutputs dt_out;
+    dt_out.D_tilde.data    = D_tilde_flat.data();
+    dt_out.D_tilde.offsets = ord_npno2_off.data();
+    run_phase_d_tilde_ph1_into(&dt_out);
+    // ------------------------------------------------------------------
+    // Phase 7: G_tilde — initialize to Fkj (Psi4 convention); skip
+    // plan-cached inner if plan absent.
+    // ------------------------------------------------------------------
+    std::memcpy(G_tilde_mat.data(), Fkj_mat.data(),
+                (size_t)nocc * nocc * sizeof(double));
+    if (plans->g_tilde_plan != nullptr) {
+        GTildeOutputs g_out;
+        g_out.G_tilde = G_tilde_mat.data();
+        run_phase_g_tilde_inner_into(plans->g_tilde_plan, &g_out);
+    }
+    // ------------------------------------------------------------------
+    // Phase 8: K + ladder — per canonical pair K and A.
+    // ------------------------------------------------------------------
+    KLadderInputs kl_in;
+    kl_in.i_Qa_t1.data    = dressed_iQa.data();
+    kl_in.i_Qa_t1.offsets = dressed_qa_off.data();
+    kl_in.j_Qa_t1.data    = dressed_jQa.data();
+    kl_in.j_Qa_t1.offsets = dressed_qa_off.data();
+    KLadderOutputs kl_out;
+    kl_out.K.data    = K_flat.data();
+    kl_out.K.offsets = (const int64_t *)in_.t2_offsets;
+    kl_out.A.data    = A_flat.data();
+    kl_out.A.offsets = (const int64_t *)in_.t2_offsets;
+    run_phase_k_ladder_into(&kl_in, &kl_out);
+    // ------------------------------------------------------------------
+    // Phase 9: R1 build.
+    //   R1[i] = Stages 1-3 (Psi4 Fai_bar/Fab_bar*t1/-T_n^T*Fia*t1)
+    //         + Stage 4 (-Fij_bar[:, i] @ T1_in_pair_full[(i,i)])
+    //         + A + C (per ordered pair, no init)
+    //         + per_kl B+A2 (if plan provided).
+    // ------------------------------------------------------------------
+    std::vector<double> R1_buf((size_t)R1_total, 0.0);
+
+    // Stages 1-3.
+    run_phase_t1_residual_stages123_into(R1_buf.data());
+    // Stage 4: r1[i] -= Fij_bar[:, i] @ T1_in_pair_full[(i,i)]
+    // T1_in_pair_full per pair (i, i) is shape (nocc, npno_ii) row-major.
+    // Use Psi4-faithful override (Fij_bar_full) when provided — it includes
+    // weak-pair dressing the strong-only t1_fock snapshot misses.
+    const double *Fij_bar_use = (in_.Fij_bar_full != nullptr)
+                                  ? in_.Fij_bar_full : Fij_bar_mat.data();
+    if (in_.T1_in_pair_full.data != nullptr) {
+        for (int i = 0; i < nocc; ++i) {
+            const int p_ii = in_.i_j_to_ij[(int64_t)i * nocc + i];
+            if (p_ii < 0) continue;
+            const int npno_ii = in_.n_pno_per_pair[p_ii];
+            if (npno_ii == 0) continue;
+            const double *T_full = in_.T1_in_pair_full.data
+                                    + in_.T1_in_pair_full.offsets[p_ii];
+            const int64_t r1_off = in_.pno_offsets[i];
+            for (int a = 0; a < npno_ii; ++a) {
+                double s = 0.0;
+                for (int k = 0; k < nocc; ++k) {
+                    s += Fij_bar_use[(int64_t)k * nocc + i]
+                       * T_full[(int64_t)k * npno_ii + a];
+                }
+                R1_buf[r1_off + a] -= s;
+            }
+        }
+    }
+
+    // A + C contribution (no init — Stages 1-3 + Stage 4 already produced
+    // the Fai equivalent via Psi4-style dressing).
+    R1AcInputs r1ac_in;
+    r1ac_in.Fia_bar.data    = Fia_bar_flat.data();
+    r1ac_in.Fia_bar.offsets = fia_bar_off.data();
+    r1ac_in.do_init         = 0;
+    R1AcOutputs r1ac_out;
+    r1ac_out.R1_flat = R1_buf.data();
+    run_phase_t1_residual_AC_init_into(&r1ac_in, &r1ac_out);
+
+    if (plans->per_kl_plan != nullptr) {
+        const PerKlPlanInputs *p_plan = plans->per_kl_plan;
+        const int n_tasks = p_plan->n_tasks;
+        const int64_t total_inner = p_plan->inner_off[n_tasks];
+
+        // Total contrib_flat size = sum of n_pno_ii_arr[0..total_inner-1].
+        int64_t contrib_total = 0;
+        for (int64_t ti = 0; ti < total_inner; ++ti) {
+            contrib_total += p_plan->n_pno_ii_arr[ti];
+        }
+        std::vector<double> contrib_flat((size_t)contrib_total, 0.0);
+
+        PerKlOutputs perkl_out;
+        perkl_out.contrib_flat = contrib_flat.data();
+        run_phase_t1_residual_per_kl_into(p_plan, &perkl_out);
+
+        // Scatter contrib_flat into R1_buf: for each (task, inner_i),
+        // R1[i_arr[ti] block] += contrib_flat[contrib_off[ti] : ...].
+        for (int64_t ti = 0; ti < total_inner; ++ti) {
+            const int i = p_plan->i_arr[ti];
+            const int n_pno_ii = p_plan->n_pno_ii_arr[ti];
+            const int64_t r1_off = in_.pno_offsets[i];
+            const int64_t c_off = p_plan->contrib_off[ti];
+            for (int a = 0; a < n_pno_ii; ++a) {
+                R1_buf[r1_off + a] += contrib_flat[c_off + a];
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // R2 orchestration (skeleton): R2[p] += K[p] + A[p].
+    // BE / CD / G_term / t3+t4 contributions skipped (plans=null).
+    // ------------------------------------------------------------------
+    std::vector<double> R2_buf((size_t)R2_total, 0.0);
+    for (int p = 0; p < N; ++p) {
+        const int npno = npno_arr[p];
+        if (npno == 0) continue;
+        const int64_t off = in_.t2_offsets[p];
+        const int64_t sz  = (int64_t)npno * npno;
+        for (int64_t e = 0; e < sz; ++e) {
+            R2_buf[off + e] = K_flat[off + e] + A_flat[off + e];
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Update T1/T2 in place + compute correlation energy.
+    // ------------------------------------------------------------------
+    UpdateAmpsInputs resid;
+    resid.R1_flat = R1_buf.data();
+    resid.R2_flat = R2_buf.data();
+    UpdateAmpsOutputs upd_out;
+    upd_out.energy = 0.0;
+    run_phase_update_amps_and_energy_into(&resid, &upd_out);
+
+    // ------------------------------------------------------------------
+    // Copy R1/R2 to caller's output buffers.
+    // ------------------------------------------------------------------
+    std::memcpy(out->R1_flat, R1_buf.data(),
+                (size_t)R1_total * sizeof(double));
+    std::memcpy(out->R2_flat, R2_buf.data(),
+                (size_t)R2_total * sizeof(double));
+    out->energy = upd_out.energy;
+}
+
+void DLPNOCCSDSolver::run_phase_t1_residual_stages123_into(double *R1_flat) {
+    const int nocc = in_.nocc;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < nocc; ++i) {
+        const int p_ii = in_.i_j_to_ij[(int64_t)i * nocc + i];
+        if (p_ii < 0) continue;
+        const int npno_ii = in_.n_pno_per_pair[p_ii];
+        if (npno_ii == 0) continue;
+
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p_ii];
+        const int nlmo_p = (int)(in_.pair_lmo_idx_offsets[p_ii + 1] - lmo_off);
+        if (nlmo_p == 0) continue;
+
+        const int64_t qma_size = in_.Qma.offsets[p_ii + 1]
+                                  - in_.Qma.offsets[p_ii];
+        const int64_t per_q = (int64_t)nlmo_p * npno_ii;
+        const int n_local = (per_q > 0) ? (int)(qma_size / per_q) : 0;
+
+        const double *Qma = in_.Qma.data + in_.Qma.offsets[p_ii];
+        const double *Qab = in_.Qab.data + in_.Qab.offsets[p_ii];
+        const double *Qia = in_.i_Qa.data + in_.i_Qa.offsets[p_ii];
+        const double *Qik = in_.i_Qk.data + in_.i_Qk.offsets[p_ii];
+        const double *T_n = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p_ii];
+        const double *t1_i = in_.T1_flat + in_.pno_offsets[i];
+        const double *e_pno = in_.e_pno_flat + in_.pno_offsets[p_ii];
+
+        const int64_t r1_off = in_.pno_offsets[i];
+        DLPNOper_i_stages123(
+            R1_flat + r1_off,
+            Qma, Qab, Qia, Qik, T_n, t1_i, e_pno,
+            /*do_stage_23=*/1,
+            (size_t)n_local, (size_t)nlmo_p, (size_t)npno_ii);
+    }
+}
+
+void DLPNOCCSDSolver::run_phase_t1_residual_AC_init_into(
+    const R1AcInputs *fia, R1AcOutputs *out) {
+    const int nocc      = in_.nocc;
+    const int N_canon   = in_.n_canon_pairs;
+    const int N_ord     = in_.n_ordered_pairs;
+    const int total_R1  = (int)in_.pno_offsets[nocc];
+
+    // Zero R1 output ONLY when init is enabled (legacy behavior).
+    // When called from run_one_cycle with do_init=0, the caller has
+    // already populated R1 with Stages 1-3 + Stage 4 contributions and
+    // we only ADD A + C on top.
+    if (fia->do_init) {
+        for (int e = 0; e < total_R1; ++e) out->R1_flat[e] = 0.0;
+    }
+
+    // ------------------------------------------------------------------
+    // Init: R1[i] += Fai[i] = Fia_bar[(i,i)][i_in_p, :]   (gated)
+    // ------------------------------------------------------------------
+    if (fia->do_init) {
+    for (int i = 0; i < nocc; ++i) {
+        const int p_ii = in_.i_j_to_ij[(int64_t)i * nocc + i];
+        if (p_ii < 0) continue;
+        const int npno_ii = in_.n_pno_per_pair[p_ii];
+        if (npno_ii == 0) continue;
+
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p_ii];
+        const int nlmo_ii = (int)(in_.pair_lmo_idx_offsets[p_ii + 1] - lmo_off);
+        const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
+
+        int i_in_p = -1;
+        for (int kk = 0; kk < nlmo_ii; ++kk) {
+            if (lmo_list[kk] == i) { i_in_p = kk; break; }
+        }
+        if (i_in_p < 0) continue;
+
+        const double *Fia_bar_p =
+            fia->Fia_bar.data + fia->Fia_bar.offsets[p_ii];
+        const double *Fai = Fia_bar_p + (int64_t)i_in_p * npno_ii;
+        const int64_t r1_off = in_.pno_offsets[i];
+        for (int a = 0; a < npno_ii; ++a) {
+            out->R1_flat[r1_off + a] += Fai[a];
+        }
+    }
+    }  // end if(do_init)
+
+    // ------------------------------------------------------------------
+    // Precompute LT1 per ordered pair (i, m) for the C term inner sum.
+    //   LT1[(i, m)] = (2·K_iajb[canon(i,m)] - K_iajb[canon(i,m)]ᵀ) @ t1_m_in_im
+    // where t1_m_in_im = T1_in_pair_full[canon(i,m)][m, :] (length npno_canon).
+    // Plus a lookup table ord_idx_lookup[i*nocc + m] = ordered-pair index.
+    // ------------------------------------------------------------------
+    std::vector<int> ord_idx_lookup((size_t)nocc * nocc, -1);
+    for (int o = 0; o < N_ord; ++o) {
+        const int i_o = in_.ordered_pair_i_idx[o];
+        const int m_o = in_.ordered_pair_k_idx[o];
+        ord_idx_lookup[(int64_t)i_o * nocc + m_o] = o;
+    }
+
+    std::vector<int64_t> lt1_offsets((size_t)N_ord + 1, 0);
+    for (int o = 0; o < N_ord; ++o) {
+        const int i_o = in_.ordered_pair_i_idx[o];
+        const int m_o = in_.ordered_pair_k_idx[o];
+        const int p_canon = in_.i_j_to_ij[(int64_t)i_o * nocc + m_o];
+        const int npno = (p_canon >= 0) ? in_.n_pno_per_pair[p_canon] : 0;
+        lt1_offsets[o + 1] = lt1_offsets[o] + npno;
+    }
+    std::vector<double> lt1_flat((size_t)lt1_offsets[N_ord], 0.0);
+
+    if (in_.T1_in_pair_full.data != nullptr) {
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int o = 0; o < N_ord; ++o) {
+            const int i_o = in_.ordered_pair_i_idx[o];
+            const int m_o = in_.ordered_pair_k_idx[o];
+            const int p_im = in_.i_j_to_ij[(int64_t)i_o * nocc + m_o];
+            if (p_im < 0) continue;
+            const int npno_im = in_.n_pno_per_pair[p_im];
+            if (npno_im == 0) continue;
+
+            const double *K = in_.K_iajb.data + in_.K_iajb.offsets[p_im];
+            const double *T_full = in_.T1_in_pair_full.data
+                                    + in_.T1_in_pair_full.offsets[p_im];
+            const double *t1_m = T_full + (int64_t)m_o * npno_im;
+
+            double *lt1_o = lt1_flat.data() + lt1_offsets[o];
+            for (int a = 0; a < npno_im; ++a) {
+                double s = 0.0;
+                for (int b = 0; b < npno_im; ++b) {
+                    s += (2.0 * K[a * npno_im + b] - K[b * npno_im + a])
+                         * t1_m[b];
+                }
+                lt1_o[a] = s;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // A + C contribution per ordered pair.  Per-thread R1 buffer to avoid
+    // races on R1[a_ord] (multiple ordered pairs share a_ord).
+    // ------------------------------------------------------------------
+    int num_threads = 1;
+    #ifdef _OPENMP
+        num_threads = std::min(omp_get_max_threads(), 16);
+        if (N_ord > 0 && num_threads > N_ord) num_threads = N_ord;
+    #endif
+    std::vector<double> R1_thread((size_t)num_threads * total_R1, 0.0);
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        int tid = 0;
+        #ifdef _OPENMP
+            tid = omp_get_thread_num();
+        #endif
+        double *R1_t = R1_thread.data() + (size_t)tid * total_R1;
+
+        #pragma omp for schedule(dynamic, 1)
+        for (int o = 0; o < N_ord; ++o) {
+            const int a_ord = in_.ordered_pair_i_idx[o];   // Psi4 "i"
+            const int b_ord = in_.ordered_pair_k_idx[o];   // Psi4 "k"
+
+            const int p_canon = in_.i_j_to_ij[(int64_t)a_ord * nocc + b_ord];
+            if (p_canon < 0) continue;
+            const int npno_p = in_.n_pno_per_pair[p_canon];
+            if (npno_p == 0) continue;
+
+            const int p_ii = in_.i_j_to_ij[(int64_t)a_ord * nocc + a_ord];
+            if (p_ii < 0) continue;
+            const int npno_ii = in_.n_pno_per_pair[p_ii];
+            if (npno_ii == 0) continue;
+
+            const int can_first = in_.ij_to_i_j[2 * p_canon];
+
+            // Look up S_PNO(p_canon, p_ii).  Skip if not stored.
+            const int64_t s_idx = (int64_t)p_canon * N_canon + p_ii;
+            const int64_t s_off = in_.S_pno_offsets[s_idx];
+            const int64_t s_size = in_.S_pno_offsets[s_idx + 1] - s_off;
+            if (s_size != (int64_t)npno_p * (int64_t)npno_ii) continue;
+            const double *S_p = in_.S_pno_data + s_off;
+
+            const double *T2_p = in_.T2_flat + in_.t2_offsets[p_canon];
+
+            // -- A term --------------------------------------------------
+            // K_tilde_chem variant for ordered (b_ord, a_ord) ("ki"):
+            //   pick "_i" if can_first == b_ord, else "_j".
+            const FlatPairStore &kt = (can_first == b_ord)
+                ? in_.K_tilde_chem_i : in_.K_tilde_chem_j;
+            const double *K_chem_ki = kt.data + kt.offsets[p_canon];
+
+            // T2 swap for "ki": swap iff can_first != b_ord.
+            const bool swap_ki = (can_first != b_ord);
+
+            // Build Tt_ki = 2*T2_ki - T2_ki.T as a flat (npno_p², ) array.
+            // T2_ki[a, b] = swap ? T2_p[b, a] : T2_p[a, b].
+            std::vector<double> Tt_ki((size_t)npno_p * npno_p);
+            for (int a = 0; a < npno_p; ++a) {
+                for (int b = 0; b < npno_p; ++b) {
+                    double T_ab, T_ba;
+                    if (swap_ki) {
+                        T_ab = T2_p[b * npno_p + a];
+                        T_ba = T2_p[a * npno_p + b];
+                    } else {
+                        T_ab = T2_p[a * npno_p + b];
+                        T_ba = T2_p[b * npno_p + a];
+                    }
+                    Tt_ki[(int64_t)a * npno_p + b] = 2.0 * T_ab - T_ba;
+                }
+            }
+
+            // Y[c] = Σ_R K_chem_ki[R, c] * Tt_ki.flat[R]
+            // K_chem_ki has linear layout from (npno_p, npno_p²) row-major,
+            // viewed as (npno_p², npno_p) post-reshape: K[R, c] at offset R*npno_p + c.
+            std::vector<double> Y((size_t)npno_p, 0.0);
+            const int npno_p2 = npno_p * npno_p;
+            for (int c = 0; c < npno_p; ++c) {
+                double s = 0.0;
+                for (int R = 0; R < npno_p2; ++R) {
+                    s += K_chem_ki[(int64_t)R * npno_p + c] * Tt_ki[R];
+                }
+                Y[(size_t)c] = s;
+            }
+
+            // R1[a_ord, a_ii] += Σ_c S_p[c, a_ii] * Y[c]
+            const int64_t r1_off = in_.pno_offsets[a_ord];
+            for (int a_ii = 0; a_ii < npno_ii; ++a_ii) {
+                double s = 0.0;
+                for (int c = 0; c < npno_p; ++c) {
+                    s += S_p[(int64_t)c * npno_ii + a_ii] * Y[(size_t)c];
+                }
+                R1_t[r1_off + a_ii] += s;
+            }
+
+            // -- C term --------------------------------------------------
+            // T2 swap for "ik": swap iff can_first != a_ord.
+            const bool swap_ik = (can_first != a_ord);
+            std::vector<double> Tt_ik((size_t)npno_p * npno_p);
+            for (int a = 0; a < npno_p; ++a) {
+                for (int b = 0; b < npno_p; ++b) {
+                    double T_ab, T_ba;
+                    if (swap_ik) {
+                        T_ab = T2_p[b * npno_p + a];
+                        T_ba = T2_p[a * npno_p + b];
+                    } else {
+                        T_ab = T2_p[a * npno_p + b];
+                        T_ba = T2_p[b * npno_p + a];
+                    }
+                    Tt_ik[(int64_t)a * npno_p + b] = 2.0 * T_ab - T_ba;
+                }
+            }
+
+            // Build fkc_dress.  Two paths:
+            //   1. Fkc_per_ordered (PySCF/Psi4-faithful, FULL scope including
+            //      weak pairs).  Indexed by the CURRENT ordered pair `o` =
+            //      (a_ord, b_ord) = (i, k) where i is the R1 owner.  PySCF
+            //      builds _LT1_cache.get((i, m)) keyed by the R1 owner i.
+            //      The Fkc array is in canonical pair (k,i)'s PNO basis,
+            //      length npno_p.
+            //   2. Else: legacy LT1-chain inline (strong-only).
+            std::vector<double> fkc_dress((size_t)npno_p, 0.0);
+            if (in_.Fkc_per_ordered.data != nullptr) {
+                const double *Fkc_o = in_.Fkc_per_ordered.data
+                                       + in_.Fkc_per_ordered.offsets[o];
+                for (int a = 0; a < npno_p; ++a) fkc_dress[a] = Fkc_o[a];
+            } else {
+                for (int m_ = 0; m_ < nocc; ++m_) {
+                    const int o_im = ord_idx_lookup[(int64_t)a_ord * nocc + m_];
+                    if (o_im < 0) continue;
+                    const int p_im = in_.i_j_to_ij[(int64_t)a_ord * nocc + m_];
+                    if (p_im < 0) continue;
+                    const int npno_im = in_.n_pno_per_pair[p_im];
+                    if (npno_im == 0) continue;
+                    const double *lt1_im = lt1_flat.data() + lt1_offsets[o_im];
+
+                    if (p_canon == p_im) {
+                        for (int a = 0; a < npno_p; ++a) {
+                            fkc_dress[a] += lt1_im[a];
+                        }
+                    } else {
+                        const int64_t s_idx = (int64_t)p_canon * N_canon + p_im;
+                        const int64_t s_off = in_.S_pno_offsets[s_idx];
+                        const int64_t s_size = in_.S_pno_offsets[s_idx + 1] - s_off;
+                        if (s_size != (int64_t)npno_p * npno_im) continue;
+                        const double *S_p_im = in_.S_pno_data + s_off;
+                        for (int a = 0; a < npno_p; ++a) {
+                            double s = 0.0;
+                            for (int b = 0; b < npno_im; ++b) {
+                                s += S_p_im[a * npno_im + b] * lt1_im[b];
+                            }
+                            fkc_dress[a] += s;
+                        }
+                    }
+                }
+            }
+
+            // contrib_C_local[a] = Σ_b Tt_ik[a, b] * fkc_dress[b]
+            std::vector<double> contrib_C((size_t)npno_p, 0.0);
+            for (int a = 0; a < npno_p; ++a) {
+                double s = 0.0;
+                for (int b = 0; b < npno_p; ++b) {
+                    s += Tt_ik[(int64_t)a * npno_p + b] * fkc_dress[b];
+                }
+                contrib_C[a] = s;
+            }
+
+            // R1[a_ord] += S_PNO((i,i)_canon, (k,i)_canon) @ contrib_C
+            // (direct add when (i,i)_canon == (k,i)_canon).
+            if (p_canon == p_ii) {
+                for (int a = 0; a < npno_p; ++a) {
+                    R1_t[r1_off + a] += contrib_C[a];
+                }
+            } else {
+                const int64_t s_idx2 = (int64_t)p_ii * N_canon + p_canon;
+                const int64_t s_off2 = in_.S_pno_offsets[s_idx2];
+                const int64_t s_size2 = in_.S_pno_offsets[s_idx2 + 1] - s_off2;
+                if (s_size2 != (int64_t)npno_ii * npno_p) continue;
+                const double *S_ii_ki = in_.S_pno_data + s_off2;
+                for (int a = 0; a < npno_ii; ++a) {
+                    double s = 0.0;
+                    for (int b = 0; b < npno_p; ++b) {
+                        s += S_ii_ki[a * npno_p + b] * contrib_C[b];
+                    }
+                    R1_t[r1_off + a] += s;
+                }
+            }
+        }
+    }
+
+    // Reduce per-thread buffers into out->R1_flat.
+    for (int tid = 0; tid < num_threads; ++tid) {
+        const double *R1_t = R1_thread.data() + (size_t)tid * total_R1;
+        for (int e = 0; e < total_R1; ++e) {
+            out->R1_flat[e] += R1_t[e];
+        }
+    }
+}
+
+void DLPNOCCSDSolver::run_phase_t1_fock_fia_bar_into(FiaBarOutputs *out) {
+    const int N = in_.n_canon_pairs;
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int p = 0; p < N; ++p) {
+        const int npno = in_.n_pno_per_pair[p];
+        if (npno == 0) continue;
+
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
+        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+        if (nlmo == 0) continue;
+
+        const int64_t qma_size = in_.Qma.offsets[p + 1] - in_.Qma.offsets[p];
+        const int64_t per_q = (int64_t)nlmo * (int64_t)npno;
+        const int n_local = (per_q > 0) ? (int)(qma_size / per_q) : 0;
+
+        const double *Qma = in_.Qma.data + in_.Qma.offsets[p];
+        const double *T1l = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        double *Fia_bar = out->Fia_bar.data + out->Fia_bar.offsets[p];
+
+        // Zero output up front (covers the n_local == 0 case too).
+        for (int64_t e = 0; e < per_q; ++e) Fia_bar[e] = 0.0;
+        if (n_local == 0) continue;
+
+        // gamma[Q] = Σ_{m, a} Qma[Q, m, a] * T1l[m, a]
+        std::vector<double> gamma((size_t)n_local, 0.0);
+        for (int Q = 0; Q < n_local; ++Q) {
+            const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
+            double s = 0.0;
+            for (int64_t e = 0; e < per_q; ++e) s += Qma_Q[e] * T1l[e];
+            gamma[(size_t)Q] = s;
+        }
+
+        // Z[Q, n_, k] = Σ_b T1l[n_, b] * Qma[Q, k, b]
+        std::vector<double> Z((size_t)n_local * nlmo * nlmo, 0.0);
+        for (int Q = 0; Q < n_local; ++Q) {
+            const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
+            for (int n_ = 0; n_ < nlmo; ++n_) {
+                for (int kk = 0; kk < nlmo; ++kk) {
+                    const double *Qma_Qk = Qma_Q + (int64_t)kk * npno;
+                    double s = 0.0;
+                    for (int b = 0; b < npno; ++b) {
+                        s += T1l[(int64_t)n_ * npno + b] * Qma_Qk[b];
+                    }
+                    Z[(int64_t)Q * nlmo * nlmo
+                      + (int64_t)n_ * nlmo + kk] = s;
+                }
+            }
+        }
+
+        // Fia_bar[k, a] = 2 * Σ_Q gamma[Q] * Qma[Q, k, a]
+        //              -  Σ_{Q, n_} Qma[Q, n_, a] * Z[Q, n_, k]
+        for (int k = 0; k < nlmo; ++k) {
+            for (int a = 0; a < npno; ++a) {
+                double s_pos = 0.0, s_neg = 0.0;
+                for (int Q = 0; Q < n_local; ++Q) {
+                    const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
+                    s_pos += gamma[(size_t)Q]
+                           * Qma_Q[(int64_t)k * npno + a];
+                    for (int n_ = 0; n_ < nlmo; ++n_) {
+                        s_neg += Qma_Q[(int64_t)n_ * npno + a]
+                              * Z[(int64_t)Q * nlmo * nlmo
+                                  + (int64_t)n_ * nlmo + k];
+                    }
+                }
+                Fia_bar[(int64_t)k * npno + a] = 2.0 * s_pos - s_neg;
+            }
+        }
+    }
+}
+
+void DLPNOCCSDSolver::run_phase_update_amps_and_energy_into(
+    const UpdateAmpsInputs *resid, UpdateAmpsOutputs *out) {
+    const int nocc = in_.nocc;
+    const int N    = in_.n_canon_pairs;
+    const double DENOM_FLOOR = 1e-12;
+
+    // T1 update: T1[i, a] -= R1[i, a] / (e_pno_ii[a] - F_lmo[i, i]).
+    // Diagonal canonical pair (i, i) holds the e_pno used here.  Convention:
+    // i_j_to_ij[i*nocc + i] gives the canonical pair index for diagonal (i,i).
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int i = 0; i < nocc; ++i) {
+        const int p_ii = in_.i_j_to_ij[(int64_t)i * nocc + i];
+        if (p_ii < 0) continue;
+        const int npno_ii = in_.n_pno_per_pair[p_ii];
+        if (npno_ii == 0) continue;
+
+        const int64_t t1_off  = in_.pno_offsets[i];
+        const int64_t epno_off = in_.pno_offsets[p_ii];
+        const double F_ii = in_.F_lmo[(int64_t)i * nocc + i];
+
+        double *T1_i       = in_.T1_flat + t1_off;
+        const double *R1_i = resid->R1_flat + t1_off;
+        const double *e_p  = in_.e_pno_flat + epno_off;
+
+        for (int a = 0; a < npno_ii; ++a) {
+            double denom = e_p[a] - F_ii;
+            if (denom > -DENOM_FLOOR && denom < DENOM_FLOOR) denom = DENOM_FLOOR;
+            T1_i[a] -= R1_i[a] / denom;
+        }
+    }
+
+    // T2 update.
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int p = 0; p < N; ++p) {
+        const int npno = in_.n_pno_per_pair[p];
+        if (npno == 0) continue;
+        const int i = in_.ij_to_i_j[2 * p];
+        const int j = in_.ij_to_i_j[2 * p + 1];
+
+        const int64_t t2_off = in_.t2_offsets[p];
+        const double F_ii = in_.F_lmo[(int64_t)i * nocc + i];
+        const double F_jj = in_.F_lmo[(int64_t)j * nocc + j];
+        const double *e_p = in_.e_pno_flat + in_.pno_offsets[p];
+
+        double *T2_p       = in_.T2_flat + t2_off;
+        const double *R2_p = resid->R2_flat + t2_off;
+
+        for (int a = 0; a < npno; ++a) {
+            for (int b = 0; b < npno; ++b) {
+                double denom = e_p[a] + e_p[b] - F_ii - F_jj;
+                if (denom > -DENOM_FLOOR && denom < DENOM_FLOOR) denom = DENOM_FLOOR;
+                T2_p[a * npno + b] -= R2_p[a * npno + b] / denom;
+            }
+        }
+    }
+
+    // Energy: T1 contribution.
+    double e_T1 = 0.0;
+    #pragma omp parallel for reduction(+:e_T1) schedule(static)
+    for (int i = 0; i < nocc; ++i) {
+        const int p_ii = in_.i_j_to_ij[(int64_t)i * nocc + i];
+        if (p_ii < 0) continue;
+        const int npno_ii = in_.n_pno_per_pair[p_ii];
+        if (npno_ii == 0) continue;
+        const int64_t t1_off = in_.pno_offsets[i];
+        const double *T1_i  = in_.T1_flat  + t1_off;
+        const double *fov_i = in_.fov_flat + t1_off;
+        double s = 0.0;
+        for (int a = 0; a < npno_ii; ++a) s += fov_i[a] * T1_i[a];
+        e_T1 += s;
+    }
+
+    // Energy: T2 contribution.
+    //   tau = T2[p] + outer(t1_i_pno, t1_j_pno);  Tt = 2*tau - tau.T
+    //   e_p = K_iajb[p] : Tt;  add (1 or 2)*e_p depending on diag.
+    double e_T2 = 0.0;
+    #pragma omp parallel for reduction(+:e_T2) schedule(dynamic, 1)
+    for (int p = 0; p < N; ++p) {
+        const int npno = in_.n_pno_per_pair[p];
+        if (npno == 0) continue;
+        const int i = in_.ij_to_i_j[2 * p];
+        const int j = in_.ij_to_i_j[2 * p + 1];
+
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
+        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+        const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
+
+        // i_in_p / j_in_p positions in pair_lmo_idx[p].
+        int i_in_p = -1, j_in_p = -1;
+        for (int k = 0; k < nlmo; ++k) {
+            if (lmo_list[k] == i) i_in_p = k;
+            if (lmo_list[k] == j) j_in_p = k;
+        }
+        if (i_in_p < 0 || j_in_p < 0) continue;
+
+        const double *T2_p =
+            in_.T2_flat + in_.t2_offsets[p];
+        const double *T1_pair =
+            in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        const double *t1_i = T1_pair + (int64_t)i_in_p * npno;
+        const double *t1_j = T1_pair + (int64_t)j_in_p * npno;
+        const double *K_p = in_.K_iajb.data + in_.K_iajb.offsets[p];
+
+        // e_p = Σ_{a, b} K[a, b] * (2*tau[a, b] - tau[b, a])
+        // with tau[a, b] = T2[a, b] + t1_i[a] * t1_j[b].
+        double s = 0.0;
+        for (int a = 0; a < npno; ++a) {
+            for (int b = 0; b < npno; ++b) {
+                double tau_ab = T2_p[a * npno + b] + t1_i[a] * t1_j[b];
+                double tau_ba = T2_p[b * npno + a] + t1_i[b] * t1_j[a];
+                s += K_p[a * npno + b] * (2.0 * tau_ab - tau_ba);
+            }
+        }
+        e_T2 += (i == j) ? s : 2.0 * s;
+    }
+
+    out->energy = e_T1 + e_T2;
+}
+
+void DLPNOCCSDSolver::run_phase_k_ladder_into(
+    const KLadderInputs *t1_dressed, KLadderOutputs *out) {
+    const int n_pairs = in_.n_canon_pairs;
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int p = 0; p < n_pairs; ++p) {
+        const int npno = in_.n_pno_per_pair[p];
+        if (npno == 0) continue;
+
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
+        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+
+        // n_local = naux per pair, derived from Qma extent.
+        const int64_t qma_size = in_.Qma.offsets[p + 1] - in_.Qma.offsets[p];
+        const int64_t per_q_qma = (int64_t)nlmo * (int64_t)npno;
+        const int n_local = (per_q_qma > 0) ? (int)(qma_size / per_q_qma) : 0;
+        if (n_local == 0) continue;
+
+        const double *iQa = t1_dressed->i_Qa_t1.data
+                            + t1_dressed->i_Qa_t1.offsets[p];
+        const double *jQa = t1_dressed->j_Qa_t1.data
+                            + t1_dressed->j_Qa_t1.offsets[p];
+        const double *Qma = in_.Qma.data + in_.Qma.offsets[p];
+        const double *Qab = in_.Qab.data + in_.Qab.offsets[p];
+        const double *T1l = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        const double *T2  = in_.T2_flat + in_.t2_offsets[p];
+
+        double *K_out = out->K.data + out->K.offsets[p];
+        double *A_out = out->A.data + out->A.offsets[p];
+
+        // K[a, b] = Σ_Q iQa[Q, a] * jQa[Q, b]
+        for (int a = 0; a < npno; ++a) {
+            for (int b = 0; b < npno; ++b) {
+                double s = 0.0;
+                for (int Q = 0; Q < n_local; ++Q) {
+                    s += iQa[(int64_t)Q * npno + a]
+                       * jQa[(int64_t)Q * npno + b];
+                }
+                K_out[a * npno + b] = s;
+            }
+        }
+
+        // A initialised to zero.
+        for (int e = 0; e < npno * npno; ++e) A_out[e] = 0.0;
+
+        // Per-Q ladder accumulation. Per-thread scratch:
+        //   Qab_t1: (npno, npno)
+        //   QT:     (npno, npno) = Qab_t1 @ T2
+        std::vector<double> Qab_t1((size_t)npno * npno);
+        std::vector<double> QT((size_t)npno * npno);
+
+        for (int Q = 0; Q < n_local; ++Q) {
+            const double *Qab_Q = Qab + (int64_t)Q * npno * npno;
+            const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
+
+            // Qab_t1[a, b] = Qab[Q, a, b] - Σ_n T1l[n, a] * Qma[Q, n, b]
+            for (int a = 0; a < npno; ++a) {
+                for (int b = 0; b < npno; ++b) {
+                    double s = Qab_Q[a * npno + b];
+                    for (int n_ = 0; n_ < nlmo; ++n_) {
+                        s -= T1l[n_ * npno + a]
+                           * Qma_Q[n_ * npno + b];
+                    }
+                    Qab_t1[(int64_t)a * npno + b] = s;
+                }
+            }
+
+            // QT[a, d] = Σ_c Qab_t1[a, c] * T2[c, d]
+            for (int a = 0; a < npno; ++a) {
+                for (int d = 0; d < npno; ++d) {
+                    double s = 0.0;
+                    for (int c = 0; c < npno; ++c) {
+                        s += Qab_t1[(int64_t)a * npno + c]
+                           * T2[(int64_t)c * npno + d];
+                    }
+                    QT[(int64_t)a * npno + d] = s;
+                }
+            }
+
+            // A[a, b] += Σ_d QT[a, d] * Qab_t1[b, d]
+            for (int a = 0; a < npno; ++a) {
+                for (int b = 0; b < npno; ++b) {
+                    double s = 0.0;
+                    for (int d = 0; d < npno; ++d) {
+                        s += QT[(int64_t)a * npno + d]
+                           * Qab_t1[(int64_t)b * npno + d];
+                    }
+                    A_out[a * npno + b] += s;
+                }
+            }
+        }
+    }
+}
+
+void DLPNOCCSDSolver::run_phase_t3_into(
+    const T3Inputs *plan, T3Outputs *out) {
+    int num_threads = 1;
+    #ifdef _OPENMP
+        num_threads = std::min(omp_get_max_threads(), 16);
+        if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
+    #endif
+    const size_t Kt1_stride    = (size_t)plan->max_n_kl;
+    const size_t Kt1_ki_stride = (size_t)plan->max_n_ki;
+    std::vector<double> Kt1_sc((size_t)num_threads * Kt1_stride);
+    std::vector<double> Kt1_ki_sc((size_t)num_threads * Kt1_ki_stride);
+
+    DLPNOt3_kernel_batched(
+        plan->N,
+        plan->n_kl_arr, plan->n_ki_arr,
+        plan->K_off, plan->S_off,
+        plan->t1i_off, plan->T1l_off, plan->tile_off,
+        plan->K_flat, plan->S_flat, plan->t1_flat,
+        Kt1_sc.data(),    Kt1_stride,
+        Kt1_ki_sc.data(), Kt1_ki_stride,
+        out->tiles_flat,
+        num_threads);
+}
+
+void DLPNOCCSDSolver::run_phase_t4_into(
+    const T4Inputs *plan, T4Outputs *out) {
+    int num_threads = 1;
+    #ifdef _OPENMP
+        num_threads = std::min(omp_get_max_threads(), 16);
+        if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
+    #endif
+    const size_t tmp1_stride = (size_t)plan->max_n_ki * plan->max_n_li;
+    const size_t tmp2_stride = (size_t)plan->max_n_ki * plan->max_n_kl;
+    const size_t tmp3_stride = (size_t)plan->max_n_ki * plan->max_n_kl;
+    std::vector<double> tmp1_sc((size_t)num_threads * tmp1_stride);
+    std::vector<double> tmp2_sc((size_t)num_threads * tmp2_stride);
+    std::vector<double> tmp3_sc((size_t)num_threads * tmp3_stride);
+
+    DLPNOt4_kernel_batched(
+        plan->N,
+        plan->n_ki_arr, plan->n_li_arr, plan->n_kl_arr,
+        plan->S_ki_li_off, plan->t2_off, plan->S_li_kl_off,
+        plan->K_off, plan->S_kl_ki_off, plan->tile_off,
+        plan->S_ki_li_flat, plan->S_li_kl_flat,
+        plan->K_flat, plan->S_kl_ki_flat,
+        plan->t2_flat,
+        tmp1_sc.data(), tmp1_stride,
+        tmp2_sc.data(), tmp2_stride,
+        tmp3_sc.data(), tmp3_stride,
+        out->tiles_flat,
+        plan->scale,
+        num_threads);
+}
+
+void DLPNOCCSDSolver::run_phase_g_term_into(
+    const GTermInputs *plan, GTermOutputs *out) {
+    int num_threads = 1;
+    #ifdef _OPENMP
+        num_threads = std::min(omp_get_max_threads(), 16);
+        if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
+    #endif
+    const size_t tmp_stride = (size_t)plan->max_n_ij * plan->max_n_ik;
+    std::vector<double> tmp_sc((size_t)num_threads * tmp_stride);
+
+    DLPNOg_term_batched(
+        plan->N,
+        plan->n_ij_arr, plan->n_ik_arr,
+        plan->S_off, plan->t2_off, plan->tile_off,
+        plan->k_idx, plan->scalar_lmo,
+        plan->S_flat, plan->t2_flat,
+        plan->G_tilde, (size_t)plan->G_stride,
+        tmp_sc.data(), tmp_stride,
+        out->tiles_flat,
+        num_threads);
+}
+
+void DLPNOCCSDSolver::run_phase_c_term_into(
+    const CTermInputs *plan, CTermOutputs *out) {
+    int num_threads = 1;
+    #ifdef _OPENMP
+        num_threads = std::min(omp_get_max_threads(), 16);
+        if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
+    #endif
+    const size_t STB_stride   = (size_t)plan->max_n_pno * plan->max_n_ct;
+    const size_t GAMMA_stride = (size_t)plan->max_n_pno * plan->max_n_other;
+    const size_t GT_stride    = (size_t)plan->max_n_pno * plan->max_n_other;
+
+    std::vector<double> STB_sc((size_t)num_threads * STB_stride);
+    std::vector<double> GAMMA_sc((size_t)num_threads * GAMMA_stride);
+    std::vector<double> GT_sc((size_t)num_threads * GT_stride);
+
+    DLPNOc_term_batched(
+        plan->N,
+        plan->n_pno_arr, plan->n_ct_arr, plan->n_other_arr,
+        plan->S_big_off, plan->ct_off, plan->S_mid_off,
+        plan->J_bold_off, plan->t2_off, plan->S_outer_off, plan->tile_off,
+        plan->S_big_flat, plan->S_mid_flat,
+        plan->J_bold_flat, plan->S_outer_flat,
+        plan->ct_flat, plan->t2_flat,
+        STB_sc.data(),   STB_stride,
+        GAMMA_sc.data(), GAMMA_stride,
+        GT_sc.data(),    GT_stride,
+        out->tiles_flat,
+        num_threads);
+}
+
+void DLPNOCCSDSolver::run_phase_d_term_into(
+    const DTermInputs *plan, DTermOutputs *out) {
+    int num_threads = 1;
+    #ifdef _OPENMP
+        num_threads = std::min(omp_get_max_threads(), 16);
+        if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
+    #endif
+    const size_t SU_stride   = (size_t)plan->max_n_pno * plan->max_n_A;
+    const size_t UP_stride   = (size_t)plan->max_n_pno * plan->max_n_B;
+    const size_t SCD_stride  = (size_t)plan->max_n_pno * plan->max_n_B;
+    const size_t Bint_stride = (size_t)plan->max_n_pno * plan->max_n_A;
+
+    std::vector<double> SU_sc((size_t)num_threads * SU_stride);
+    std::vector<double> UP_sc((size_t)num_threads * UP_stride);
+    std::vector<double> SCD_sc((size_t)num_threads * SCD_stride);
+    std::vector<double> Bint_sc((size_t)num_threads * Bint_stride);
+
+    DLPNOd_term_batched(
+        plan->N,
+        plan->n_pno_arr, plan->n_A_arr, plan->n_B_arr,
+        plan->S_a_off, plan->u_off, plan->S_b_off, plan->S_c_off,
+        plan->dt_off, plan->KJ_off, plan->tile_off,
+        plan->S_a_flat, plan->S_b_flat, plan->S_c_flat,
+        plan->KJ_flat, plan->u_flat, plan->dt_flat,
+        SU_sc.data(),   SU_stride,
+        UP_sc.data(),   UP_stride,
+        SCD_sc.data(),  SCD_stride,
+        Bint_sc.data(), Bint_stride,
+        out->tiles_flat,
+        num_threads);
+}
+
+void DLPNOCCSDSolver::run_phase_be_into(
+    const BEInputs *plan, BEOutputs *out) {
+    int num_threads = 1;
+    #ifdef _OPENMP
+        num_threads = std::min(omp_get_max_threads(), 16);
+        if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
+    #endif
+    DLPNObe_kernel(
+        plan->S, plan->T, plan->K,
+        plan->beta_kl, plan->beta_lk,
+        plan->same, plan->idx,
+        out->out_B, out->out_E,
+        (size_t)plan->N, (size_t)plan->n_ij, (size_t)plan->n_kl,
+        num_threads);
+}
+
+void DLPNOCCSDSolver::run_phase_t1_residual_per_kl_into(
+    const PerKlPlanInputs *plan, PerKlOutputs *out) {
+    int num_threads = 1;
+    #ifdef _OPENMP
+        num_threads = std::min(omp_get_max_threads(), 16);
+        if (plan->n_tasks > 0 && num_threads > plan->n_tasks)
+            num_threads = plan->n_tasks;
+    #endif
+
+    const int M       = plan->M;
+    const int max_kl  = plan->max_n_kl;
+    const int max_ki  = plan->max_n_ki;
+
+    const size_t Tt_kl_stride  = (size_t)max_kl * max_kl;
+    const size_t K_kilc_stride = (size_t)M * max_kl;
+    const size_t B_ia_stride   = (size_t)max_kl * M;
+    const size_t Tt_ki_stride  = (size_t)max_ki * max_ki;
+    const size_t X_stride      = (size_t)max_ki * max_kl;
+    const size_t Z_stride      = (size_t)max_ki * max_ki;
+
+    std::vector<double> Tt_kl_sc((size_t)num_threads * Tt_kl_stride);
+    std::vector<double> K_kilc_sc((size_t)num_threads * K_kilc_stride);
+    std::vector<double> B_ia_sc((size_t)num_threads * B_ia_stride);
+    std::vector<double> Tt_ki_sc((size_t)num_threads * Tt_ki_stride);
+    std::vector<double> X_sc((size_t)num_threads * X_stride);
+    std::vector<double> Z_sc((size_t)num_threads * Z_stride);
+
+    DLPNOper_kl_batched(
+        plan->n_tasks, plan->M,
+        plan->n_kl_arr, plan->t2_swap_kl,
+        plan->K_iajb_kl_off, plan->K_bar_kl_off,
+        plan->t2_kl_canon_off, plan->T_n_kl_off,
+        plan->inner_off,
+        plan->i_arr, plan->n_pno_ii_arr,
+        plan->is_diag_kl_ii, plan->has_S_ii_kl, plan->S_ii_kl_off,
+        plan->has_A2, plan->is_diag_kl_ki,
+        plan->n_ki_arr, plan->t2_swap_ki, plan->t2_ki_canon_off,
+        plan->S_kl_ki_off, plan->S_ki_kl_off,
+        plan->T_n_l_ii_off, plan->contrib_off,
+        plan->K_iajb_buffer, plan->K_bar_kl_static, plan->S_pno_buffer,
+        plan->t2_buffer, plan->t1_cache_buffer,
+        Tt_kl_sc.data(),  Tt_kl_stride,
+        K_kilc_sc.data(), K_kilc_stride,
+        B_ia_sc.data(),   B_ia_stride,
+        Tt_ki_sc.data(),  Tt_ki_stride,
+        X_sc.data(),      X_stride,
+        Z_sc.data(),      Z_stride,
+        out->contrib_flat,
+        num_threads);
+}
+
+void DLPNOCCSDSolver::run_phase_t1_fock_finalize_into(
+    const T1FockExtraInputs *extra, T1FockExtraOutputs *out) {
+    const int nocc   = in_.nocc;
+    const int N      = in_.n_canon_pairs;
+    const int64_t nn = (int64_t)nocc * nocc;
+
+    // Step A: Fkj = F_lmo + scatter(d_flat).
+    std::memcpy(out->Fkj, in_.F_lmo, (size_t)nn * sizeof(double));
+    for (int p = 0; p < N; ++p) {
+        const int i = in_.ij_to_i_j[2 * p];
+        const int j = in_.ij_to_i_j[2 * p + 1];
+        out->Fkj[(int64_t)i * nocc + j] += extra->d_flat[2 * p];
+        if (i != j) {
+            out->Fkj[(int64_t)j * nocc + i] += extra->d_flat[2 * p + 1];
+        }
+    }
+
+    // Step B: snapshot Fij_bar before Eq 94.
+    std::memcpy(out->Fij_bar_snapshot, out->Fkj, (size_t)nn * sizeof(double));
+
+    // Step C: Eq 94 — per occupied j, build Fia_bar_jj from Qma[(j,j)] +
+    // T1_in_pair[(j,j)], accumulate (Fia_bar_jj @ t1_j) into Fkj[lmo_list, j].
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int j = 0; j < nocc; ++j) {
+        const int p_jj = in_.i_j_to_ij[(int64_t)j * nocc + j];
+        if (p_jj < 0) continue;
+        const int npno = in_.n_pno_per_pair[p_jj];
+        if (npno == 0) continue;
+
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p_jj];
+        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p_jj + 1] - lmo_off);
+        const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
+
+        const int64_t qma_size = in_.Qma.offsets[p_jj + 1] - in_.Qma.offsets[p_jj];
+        const int64_t per_q = (int64_t)nlmo * npno;
+        const int n_local = (per_q > 0) ? (int)(qma_size / per_q) : 0;
+        if (n_local == 0) continue;
+
+        const double *Qma = in_.Qma.data + in_.Qma.offsets[p_jj];
+        const double *T1_local =
+            in_.T1_in_pair.data + in_.T1_in_pair.offsets[p_jj];
+
+        // Find j's row position in this pair's lmo_list.
+        int j_in_p = -1;
+        for (int k = 0; k < nlmo; ++k) {
+            if (lmo_list[k] == j) { j_in_p = k; break; }
+        }
+        if (j_in_p < 0) continue;
+        const double *t1_j = T1_local + (int64_t)j_in_p * npno;
+
+        // gamma[Q] = Σ_{m, a} Qma[Q, m, a] * T1_local[m, a]
+        std::vector<double> gamma((size_t)n_local, 0.0);
+        for (int Q = 0; Q < n_local; ++Q) {
+            const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
+            double s = 0.0;
+            for (int64_t e = 0; e < per_q; ++e) {
+                s += Qma_Q[e] * T1_local[e];
+            }
+            gamma[(size_t)Q] = s;
+        }
+
+        // Z[Q, n, k] = Σ_b T1_local[n, b] * Qma[Q, k, b]
+        std::vector<double> Z((size_t)n_local * nlmo * nlmo, 0.0);
+        for (int Q = 0; Q < n_local; ++Q) {
+            const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
+            for (int n_ = 0; n_ < nlmo; ++n_) {
+                for (int kk = 0; kk < nlmo; ++kk) {
+                    const double *Qma_Qk = Qma_Q + (int64_t)kk * npno;
+                    double s = 0.0;
+                    for (int b = 0; b < npno; ++b) {
+                        s += T1_local[(int64_t)n_ * npno + b] * Qma_Qk[b];
+                    }
+                    Z[(int64_t)Q * nlmo * nlmo
+                      + (int64_t)n_ * nlmo + kk] = s;
+                }
+            }
+        }
+
+        // Fia_bar[k, a] = 2 * Σ_Q gamma[Q] * Qma[Q, k, a]
+        //              -  Σ_{Q, n_} Qma[Q, n_, a] * Z[Q, n_, k]
+        std::vector<double> Fia_bar((size_t)nlmo * npno, 0.0);
+        for (int k = 0; k < nlmo; ++k) {
+            for (int a = 0; a < npno; ++a) {
+                double s_pos = 0.0, s_neg = 0.0;
+                for (int Q = 0; Q < n_local; ++Q) {
+                    const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
+                    s_pos += gamma[(size_t)Q]
+                           * Qma_Q[(int64_t)k * npno + a];
+                    for (int n_ = 0; n_ < nlmo; ++n_) {
+                        s_neg += Qma_Q[(int64_t)n_ * npno + a]
+                              * Z[(int64_t)Q * nlmo * nlmo
+                                  + (int64_t)n_ * nlmo + k];
+                    }
+                }
+                Fia_bar[(int64_t)k * npno + a] = 2.0 * s_pos - s_neg;
+            }
+        }
+
+        // Scatter Fia_bar[k, :] @ t1_j  →  Fkj[lmo_list[k], j].
+        for (int k = 0; k < nlmo; ++k) {
+            double s = 0.0;
+            for (int a = 0; a < npno; ++a) {
+                s += Fia_bar[(int64_t)k * npno + a] * t1_j[a];
+            }
+            out->Fkj[(int64_t)lmo_list[k] * nocc + j] += s;
+        }
+    }
+
+    // foo_t1 = Fkj - F_lmo
+    for (int64_t e = 0; e < nn; ++e) {
+        out->foo_t1[e] = out->Fkj[e] - in_.F_lmo[e];
+    }
+}
+
+void DLPNOCCSDSolver::run_phase_d_tilde_ph1_into(DTildeOutputs *out) {
+    const int N = in_.n_ordered_pairs;
+    const int nocc = in_.nocc;
+
+    // Per-ordered-pair sizing + canonical mapping.
+    std::vector<int> can_p_arr(N);
+    std::vector<int> n_pno_arr(N), n_domain_arr(N);
+    std::vector<int> i_in_p_arr(N);
+    // For each ordered pair, choose K_tilde_chem (i or j variant) and
+    // K_bar (ij or ji variant) per Psi4 orientation rules.
+    std::vector<const double*> K_tilde_chem_src(N);
+    std::vector<int64_t>       K_tilde_chem_size(N);
+    std::vector<const double*> K_bar_src(N);
+    std::vector<int64_t>       K_bar_size(N);
+    std::vector<const double*> K_bar_chem_src(N);
+    int64_t kt_total = 0, M_total = 0, t1_total = 0, T1r_total = 0, D_total = 0;
+
+    for (int o = 0; o < N; ++o) {
+        const int i = in_.ordered_pair_i_idx[o];
+        const int k = in_.ordered_pair_k_idx[o];
+        const int p = in_.i_j_to_ij[i * nocc + k];
+        can_p_arr[o] = p;
+        const int can_i = in_.ij_to_i_j[2 * p];
+        const int can_j = in_.ij_to_i_j[2 * p + 1];
+
+        const int npno = in_.n_pno_per_pair[p];
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
+        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+        n_pno_arr[o] = npno;
+        n_domain_arr[o] = nlmo;
+
+        // Find i's position within pair p's lmo list.
+        const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
+        int i_in_p = -1;
+        for (int kk = 0; kk < nlmo; ++kk) {
+            if (lmo_list[kk] == i) { i_in_p = kk; break; }
+        }
+        i_in_p_arr[o] = i_in_p;
+
+        // Orientation for K_tilde_chem: pick "_i" if canonical FIRST index is k.
+        const FlatPairStore &kt = (can_i == k) ? in_.K_tilde_chem_i
+                                                : in_.K_tilde_chem_j;
+        K_tilde_chem_src[o]  = kt.data + kt.offsets[p];
+        K_tilde_chem_size[o] = kt.offsets[p + 1] - kt.offsets[p];
+
+        // Orientation for K_bar: pick "_ij" if canonical FIRST index is i.
+        const FlatPairStore &kb = (can_i == i) ? in_.K_bar_ij : in_.K_bar_ji;
+        K_bar_src[o]  = kb.data + kb.offsets[p];
+        K_bar_size[o] = kb.offsets[p + 1] - kb.offsets[p];
+        K_bar_chem_src[o] = in_.K_bar_chem.data + in_.K_bar_chem.offsets[p];
+
+        kt_total   += K_tilde_chem_size[o];
+        M_total    += (int64_t)nlmo * (int64_t)npno;
+        t1_total   += npno;
+        T1r_total  += (int64_t)nlmo * (int64_t)npno;
+        D_total    += (int64_t)npno * (int64_t)npno;
+    }
+
+    std::vector<int64_t> kt_off(N + 1, 0);
+    std::vector<int64_t> M_off(N + 1, 0);
+    std::vector<int64_t> t1_off(N + 1, 0);
+    std::vector<int64_t> T1r_off(N + 1, 0);
+    std::vector<int64_t> D_off(N + 1, 0);
+    for (int o = 0; o < N; ++o) {
+        kt_off[o + 1]   = kt_off[o]   + K_tilde_chem_size[o];
+        M_off[o + 1]    = M_off[o]    + (int64_t)n_domain_arr[o] * n_pno_arr[o];
+        t1_off[o + 1]   = t1_off[o]   + n_pno_arr[o];
+        T1r_off[o + 1]  = T1r_off[o]  + (int64_t)n_domain_arr[o] * n_pno_arr[o];
+        D_off[o + 1]    = D_off[o]    + (int64_t)n_pno_arr[o] * n_pno_arr[o];
+    }
+
+    std::vector<double> kt_flat((size_t)kt_total);
+    std::vector<double> M_flat((size_t)M_total);
+    std::vector<double> t1_flat((size_t)t1_total);
+    std::vector<double> T1r_flat((size_t)T1r_total);
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int o = 0; o < N; ++o) {
+        const int p = can_p_arr[o];
+        const int npno = n_pno_arr[o];
+        const int nlmo = n_domain_arr[o];
+        const int i_in_p = i_in_p_arr[o];
+
+        // K_tilde_chem: copy raw bytes per orientation.
+        std::memcpy(kt_flat.data() + kt_off[o], K_tilde_chem_src[o],
+                    (size_t)K_tilde_chem_size[o] * sizeof(double));
+
+        // M_static = 2 * K_bar - K_bar_chem (both shape (nlmo, npno)).
+        const double *Kb = K_bar_src[o];
+        const double *Kc = K_bar_chem_src[o];
+        double *M = M_flat.data() + M_off[o];
+        const int64_t mn = (int64_t)nlmo * npno;
+        for (int64_t e = 0; e < mn; ++e) {
+            M[e] = 2.0 * Kb[e] - Kc[e];
+        }
+
+        // t1[i] = T1_in_pair[p] row at i_in_p (length npno).
+        const double *T1pair = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        double *t1 = t1_flat.data() + t1_off[o];
+        const double *t1_row_src = T1pair + (int64_t)i_in_p * npno;
+        std::memcpy(t1, t1_row_src, (size_t)npno * sizeof(double));
+
+        // T1_rows = full T1_in_pair[p] (nlmo x npno).
+        double *T1r = T1r_flat.data() + T1r_off[o];
+        std::memcpy(T1r, T1pair, (size_t)mn * sizeof(double));
+    }
+
+    DLPNOcompute_D_tilde_ph1_batched(
+        kt_flat.data(),  (const long *)kt_off.data(),
+        M_flat.data(),   (const long *)M_off.data(),
+        t1_flat.data(),  (const long *)t1_off.data(),
+        T1r_flat.data(), (const long *)T1r_off.data(),
+        n_pno_arr.data(), n_domain_arr.data(),
+        out->D_tilde.data, (const long *)out->D_tilde.offsets,
+        (size_t)N);
+}
+
+void DLPNOCCSDSolver::run_phase_g_tilde_inner_into(
+    const GTildeInputs *plan, GTildeOutputs *out) {
+    DLPNOcompute_G_tilde_inner(
+        plan->triple_eff_offset,
+        plan->triple_T2_pair_idx,
+        plan->triple_n_lj,
+        plan->ij_triple_starts,
+        plan->ij_i_arr,
+        plan->ij_j_arr,
+        plan->effective_flat,
+        in_.T2_flat,
+        (const long *)in_.t2_offsets,
+        out->G_tilde,
+        (size_t)plan->n_ij_slots,
+        (size_t)in_.nocc);
+}
+
+void DLPNOCCSDSolver::run_phase_c_tilde_ph1_into(CTildeOutputs *out) {
+    const int N = in_.n_ordered_pairs;
+    const int nocc = in_.nocc;
+
+    std::vector<int> can_p_arr(N);
+    std::vector<int> n_pno_arr(N), n_domain_arr(N);
+    std::vector<int> i_for_t1_in_p_arr(N);
+    std::vector<const double*> K_tilde_chem_src(N);
+    std::vector<int64_t>       K_tilde_chem_size(N);
+    std::vector<const double*> K_bar_chem_src(N);
+    int64_t kt_total = 0, Kbc_total = 0, t1_total = 0, T1l_total = 0, C_total = 0;
+
+    for (int o = 0; o < N; ++o) {
+        // C_tilde wrapper: ordered tuple = (k, i).  We expose the ordered pair
+        // as (ordered_pair_i_idx[o], ordered_pair_k_idx[o]) by our convention,
+        // so map: a := ordered_pair_i_idx[o] (= "k" in C_tilde), b := ordered_pair_k_idx[o] (= "i").
+        const int a = in_.ordered_pair_i_idx[o];
+        const int b = in_.ordered_pair_k_idx[o];
+        const int p = in_.i_j_to_ij[a * nocc + b];
+        can_p_arr[o] = p;
+        const int can_a = in_.ij_to_i_j[2 * p];
+
+        const int npno = in_.n_pno_per_pair[p];
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
+        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+        n_pno_arr[o] = npno;
+        n_domain_arr[o] = nlmo;
+
+        // C_tilde's "i" (index into T1) is the SECOND of the ordered pair.
+        const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
+        int i_in_p = -1;
+        for (int kk = 0; kk < nlmo; ++kk) {
+            if (lmo_list[kk] == b) { i_in_p = kk; break; }
+        }
+        i_for_t1_in_p_arr[o] = i_in_p;
+
+        // K_tilde_chem orientation: "_i" if canonical first == a (= "k").
+        const FlatPairStore &kt = (can_a == a) ? in_.K_tilde_chem_i
+                                                : in_.K_tilde_chem_j;
+        K_tilde_chem_src[o]  = kt.data + kt.offsets[p];
+        K_tilde_chem_size[o] = kt.offsets[p + 1] - kt.offsets[p];
+        K_bar_chem_src[o]    = in_.K_bar_chem.data + in_.K_bar_chem.offsets[p];
+
+        kt_total  += K_tilde_chem_size[o];
+        Kbc_total += (int64_t)nlmo * (int64_t)npno;
+        t1_total  += npno;
+        T1l_total += (int64_t)nlmo * (int64_t)npno;
+        C_total   += (int64_t)npno * (int64_t)npno;
+    }
+
+    std::vector<int64_t> kt_off(N + 1, 0);
+    std::vector<int64_t> Kbc_off(N + 1, 0);
+    std::vector<int64_t> t1_off(N + 1, 0);
+    std::vector<int64_t> T1l_off(N + 1, 0);
+    for (int o = 0; o < N; ++o) {
+        kt_off[o + 1]  = kt_off[o]  + K_tilde_chem_size[o];
+        Kbc_off[o + 1] = Kbc_off[o] + (int64_t)n_domain_arr[o] * n_pno_arr[o];
+        t1_off[o + 1]  = t1_off[o]  + n_pno_arr[o];
+        T1l_off[o + 1] = T1l_off[o] + (int64_t)n_domain_arr[o] * n_pno_arr[o];
+    }
+
+    std::vector<double> kt_flat((size_t)kt_total);
+    std::vector<double> Kbc_flat((size_t)Kbc_total);
+    std::vector<double> t1_flat((size_t)t1_total);
+    std::vector<double> T1l_flat((size_t)T1l_total);
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int o = 0; o < N; ++o) {
+        const int p = can_p_arr[o];
+        const int npno = n_pno_arr[o];
+        const int nlmo = n_domain_arr[o];
+        const int i_in_p = i_for_t1_in_p_arr[o];
+        const int64_t mn = (int64_t)nlmo * npno;
+
+        std::memcpy(kt_flat.data() + kt_off[o], K_tilde_chem_src[o],
+                    (size_t)K_tilde_chem_size[o] * sizeof(double));
+        std::memcpy(Kbc_flat.data() + Kbc_off[o], K_bar_chem_src[o],
+                    (size_t)mn * sizeof(double));
+
+        const double *T1pair = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        const double *t1_row = T1pair + (int64_t)i_in_p * npno;
+        std::memcpy(t1_flat.data() + t1_off[o], t1_row,
+                    (size_t)npno * sizeof(double));
+        std::memcpy(T1l_flat.data() + T1l_off[o], T1pair,
+                    (size_t)mn * sizeof(double));
+    }
+
+    DLPNOcompute_C_tilde_ph1_batched(
+        kt_flat.data(),  (const long *)kt_off.data(),
+        Kbc_flat.data(), (const long *)Kbc_off.data(),
+        t1_flat.data(),  (const long *)t1_off.data(),
+        T1l_flat.data(), (const long *)T1l_off.data(),
+        n_pno_arr.data(), n_domain_arr.data(),
+        out->C_tilde.data, (const long *)out->C_tilde.offsets,
+        (size_t)N);
+}
+
+void DLPNOCCSDSolver::run_phase_b_tilde_into(
+    const BTildeInputs *t1_dressed, BTildeOutputs *out) {
+    const int n_pairs = in_.n_canon_pairs;
+
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int p = 0; p < n_pairs; ++p) {
+        const int npno = in_.n_pno_per_pair[p];
+        if (npno == 0) continue;
+
+        const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
+        const int nlmo_p = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+        if (nlmo_p == 0) continue;
+
+        const int64_t qma_size = in_.Qma.offsets[p + 1] - in_.Qma.offsets[p];
+        const int64_t per_q = (int64_t)nlmo_p * (int64_t)npno;
+        if (per_q == 0) continue;
+        const size_t n_local = (size_t)(qma_size / per_q);
+        if (n_local == 0) continue;
+
+        const double *Qma_p = in_.Qma.data + in_.Qma.offsets[p];
+        const double *T2_p  = in_.T2_flat + in_.t2_offsets[p];
+        const double *iQk   = t1_dressed->i_Qk_t1.data
+                              + t1_dressed->i_Qk_t1.offsets[p];
+        const double *jQk   = t1_dressed->j_Qk_t1.data
+                              + t1_dressed->j_Qk_t1.offsets[p];
+
+        double *B_p = out->B_tilde.data + out->B_tilde.offsets[p];
+
+        DLPNOcompute_B_tilde_pair(
+            B_p, iQk, jQk, Qma_p, T2_p,
+            n_local, (size_t)nlmo_p, (size_t)npno);
+    }
+}
+void DLPNOCCSDSolver::phase_t1_fock_()            {}
+void DLPNOCCSDSolver::phase_jiang_B_tilde_()      {}
+void DLPNOCCSDSolver::phase_jiang_C_tilde_()      {}
+void DLPNOCCSDSolver::phase_jiang_D_tilde_()      {}
+void DLPNOCCSDSolver::phase_jiang_G_tilde_()      {}
+void DLPNOCCSDSolver::phase_pairs_residual_()     {}
+void DLPNOCCSDSolver::phase_t1_residual_()        {}
+void DLPNOCCSDSolver::phase_update_amps_()        {}
+void DLPNOCCSDSolver::apply_diis_()               {}
+double DLPNOCCSDSolver::compute_iter_energy_()    { return 0.0; }
+
+}  // namespace pyscf_dlpno_ccsd
+
+// -- C entry point exported to Python (ctypes) -------------------------------
+extern "C" {
+
+int DLPNOcompute_lccsd_omp(const pyscf_dlpno_ccsd::SolverInputs *in,
+                           double *e_out) {
+    if (in == nullptr) return -2;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    int rc = solver.solve();
+    if (e_out != nullptr) *e_out = solver.get_energy();
+    return rc;
+}
+
+// Lightweight smoke-test entry: validates that the library loaded and that
+// ctypes can call into it.  Returns the size of SolverInputs in bytes — used
+// by the Python smoke test to confirm the struct layouts agree.
+int DLPNOcompute_lccsd_solver_inputs_size(void) {
+    return (int)sizeof(pyscf_dlpno_ccsd::SolverInputs);
+}
+
+}  // extern "C"
+
+// ============================================================================
+// Step 2a: dump-and-compare parity test entry.  Reads SolverInputs and writes
+// per-field checksums (sum of all values) into checksums_out[0:N].  Python
+// computes the same checksums against the same numpy buffers and compares.
+// This validates: (a) ctypes Structure layout matches the C++ struct;
+// (b) FlatPairStore offsets are interpreted identically; (c) buffer pointer
+// arithmetic agrees on both sides.
+// ============================================================================
+
+namespace pyscf_dlpno_ccsd {
+
+static double sum_doubles_(const double *p, size_t n) {
+    if (p == nullptr) return std::nan("");
+    double s = 0.0;
+    for (size_t i = 0; i < n; ++i) s += p[i];
+    return s;
+}
+
+static double sum_ints_(const int *p, size_t n) {
+    if (p == nullptr) return std::nan("");
+    double s = 0.0;
+    for (size_t i = 0; i < n; ++i) s += (double)p[i];
+    return s;
+}
+
+static double sum_int64s_(const int64_t *p, size_t n) {
+    if (p == nullptr) return std::nan("");
+    double s = 0.0;
+    for (size_t i = 0; i < n; ++i) s += (double)p[i];
+    return s;
+}
+
+static double sum_pair_store_(const FlatPairStore &fps, int n_pairs) {
+    if (fps.data == nullptr || fps.offsets == nullptr) return std::nan("");
+    const int64_t total = fps.offsets[n_pairs];
+    return sum_doubles_(fps.data, (size_t)total);
+}
+
+}  // namespace pyscf_dlpno_ccsd
+
+extern "C" {
+
+// Field index → meaning (Python-side mirrors this exact order).  Adding new
+// fields: APPEND only; never reorder.  NaN means "buffer was null" — Python
+// must handle it as expected when the caller didn't populate that field.
+enum DumpField {
+    F_NOCC = 0,             F_NLMO,
+    F_N_CANON_PAIRS,        F_N_STRONG_PAIRS,
+    F_DIIS_MAX_VECS,        F_MAX_CYCLE,
+    F_E_CONV,               F_R_CONV,
+    F_F_LMO,                F_EPS_LMO,
+    F_FOO,                  F_FOV_FLAT,
+    F_E_PNO_FLAT,
+    F_T1_FLAT,              F_T2_FLAT,
+    F_PAIR_LMO_IDX_FLAT,    F_PAIR_LMO_IDX_OFFSETS_LAST,
+    F_N_PNO_PER_PAIR,       F_PNO_OFFSETS_LAST,
+    F_QMA,                  F_QAB,
+    F_I_QK,                 F_J_QK,
+    F_I_QA,                 F_J_QA,
+    F_K_IAJB,               F_K_BAR_IJ,        F_K_BAR_CHEM,
+    F_J_IJ_KJ,              F_K_IJ_KJ,
+    F_L_IAJB,               F_L_BAR,
+    F_T1_IN_PAIR,
+    F_T2_OFFSETS_LAST,
+    F_K_BAR_JI,
+    F_T1_IN_PAIR_FULL,
+    F_K_TILDE_CHEM_I,
+    F_K_TILDE_CHEM_J,
+    F_N_ORDERED_PAIRS,
+    F_ORDERED_PAIR_I_IDX,
+    F_ORDERED_PAIR_K_IDX,
+    F_S_PNO_DATA,
+    F_S_PNO_OFFSETS_LAST,
+    DUMP_N_FIELDS,
+};
+
+int DLPNOcompute_lccsd_dump_inputs(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    double *checksums_out,
+    int checksums_out_n) {
+    using namespace pyscf_dlpno_ccsd;
+    if (in == nullptr || checksums_out == nullptr) return -2;
+    if (checksums_out_n < (int)DUMP_N_FIELDS) return -3;
+
+    for (int i = 0; i < (int)DUMP_N_FIELDS; ++i) {
+        checksums_out[i] = std::nan("");
+    }
+
+    checksums_out[F_NOCC]            = (double)in->nocc;
+    checksums_out[F_NLMO]            = (double)in->nlmo;
+    checksums_out[F_N_CANON_PAIRS]   = (double)in->n_canon_pairs;
+    checksums_out[F_N_STRONG_PAIRS]  = (double)in->n_strong_pairs;
+    checksums_out[F_DIIS_MAX_VECS]   = (double)in->diis_max_vecs;
+    checksums_out[F_MAX_CYCLE]       = (double)in->max_cycle;
+    checksums_out[F_E_CONV]          = in->e_conv;
+    checksums_out[F_R_CONV]          = in->r_conv;
+
+    const int n_pairs = in->n_canon_pairs;
+    const int nocc    = in->nocc;
+
+    checksums_out[F_F_LMO]    = sum_doubles_(in->F_lmo, (size_t)nocc * nocc);
+    checksums_out[F_EPS_LMO]  = sum_doubles_(in->eps_lmo, (size_t)nocc);
+    checksums_out[F_FOO]      = sum_doubles_(in->foo, (size_t)nocc * nocc);
+
+    if (in->pno_offsets != nullptr) {
+        const int64_t fov_total = in->pno_offsets[nocc];
+        const int64_t e_pno_total = in->pno_offsets[n_pairs];
+        checksums_out[F_FOV_FLAT]   = sum_doubles_(in->fov_flat, (size_t)fov_total);
+        checksums_out[F_E_PNO_FLAT] = sum_doubles_(in->e_pno_flat, (size_t)e_pno_total);
+
+        // T1: one (npno_ii) block per occupied i (npno_ii == n_pno_per_pair[ii])
+        // T2: per-pair npno×npno; total is sum(n_pno_per_pair[p]^2)
+        if (in->n_pno_per_pair != nullptr) {
+            int64_t t2_total = 0;
+            for (int p = 0; p < n_pairs; ++p) {
+                int64_t n = in->n_pno_per_pair[p];
+                t2_total += n * n;
+            }
+            checksums_out[F_T1_FLAT] = sum_doubles_(in->T1_flat, (size_t)fov_total);
+            checksums_out[F_T2_FLAT] = sum_doubles_(in->T2_flat, (size_t)t2_total);
+        }
+        checksums_out[F_PNO_OFFSETS_LAST] = (double)in->pno_offsets[n_pairs];
+    }
+
+    if (in->pair_lmo_idx_offsets != nullptr) {
+        const int64_t total = in->pair_lmo_idx_offsets[n_pairs];
+        checksums_out[F_PAIR_LMO_IDX_FLAT] = sum_ints_(in->pair_lmo_idx_flat, (size_t)total);
+        checksums_out[F_PAIR_LMO_IDX_OFFSETS_LAST] = (double)total;
+    }
+    if (in->n_pno_per_pair != nullptr) {
+        checksums_out[F_N_PNO_PER_PAIR] = sum_ints_(in->n_pno_per_pair, (size_t)n_pairs);
+    }
+
+    checksums_out[F_QMA]        = sum_pair_store_(in->Qma, n_pairs);
+    checksums_out[F_QAB]        = sum_pair_store_(in->Qab, n_pairs);
+    checksums_out[F_I_QK]       = sum_pair_store_(in->i_Qk, n_pairs);
+    checksums_out[F_J_QK]       = sum_pair_store_(in->j_Qk, n_pairs);
+    checksums_out[F_I_QA]       = sum_pair_store_(in->i_Qa, n_pairs);
+    checksums_out[F_J_QA]       = sum_pair_store_(in->j_Qa, n_pairs);
+    checksums_out[F_K_IAJB]     = sum_pair_store_(in->K_iajb, n_pairs);
+    checksums_out[F_K_BAR_IJ]   = sum_pair_store_(in->K_bar_ij, n_pairs);
+    checksums_out[F_K_BAR_CHEM] = sum_pair_store_(in->K_bar_chem, n_pairs);
+    checksums_out[F_J_IJ_KJ]    = sum_pair_store_(in->J_ij_kj, n_pairs);
+    checksums_out[F_K_IJ_KJ]    = sum_pair_store_(in->K_ij_kj, n_pairs);
+    checksums_out[F_L_IAJB]     = sum_pair_store_(in->L_iajb, n_pairs);
+    checksums_out[F_L_BAR]      = sum_pair_store_(in->L_bar, n_pairs);
+    checksums_out[F_T1_IN_PAIR] = sum_pair_store_(in->T1_in_pair, n_pairs);
+    if (in->t2_offsets != nullptr) {
+        checksums_out[F_T2_OFFSETS_LAST] = (double)in->t2_offsets[n_pairs];
+    }
+    checksums_out[F_K_BAR_JI]      = sum_pair_store_(in->K_bar_ji, n_pairs);
+    checksums_out[F_T1_IN_PAIR_FULL] = sum_pair_store_(in->T1_in_pair_full, n_pairs);
+    checksums_out[F_K_TILDE_CHEM_I] = sum_pair_store_(in->K_tilde_chem_i, n_pairs);
+    checksums_out[F_K_TILDE_CHEM_J] = sum_pair_store_(in->K_tilde_chem_j, n_pairs);
+    checksums_out[F_N_ORDERED_PAIRS] = (double)in->n_ordered_pairs;
+    checksums_out[F_ORDERED_PAIR_I_IDX] = sum_ints_(in->ordered_pair_i_idx,
+                                                    (size_t)in->n_ordered_pairs);
+    checksums_out[F_ORDERED_PAIR_K_IDX] = sum_ints_(in->ordered_pair_k_idx,
+                                                    (size_t)in->n_ordered_pairs);
+
+    if (in->S_pno_offsets != nullptr) {
+        const int64_t total =
+            in->S_pno_offsets[(int64_t)n_pairs * n_pairs];
+        checksums_out[F_S_PNO_OFFSETS_LAST] = (double)total;
+        checksums_out[F_S_PNO_DATA] =
+            sum_doubles_(in->S_pno_data, (size_t)total);
+    }
+
+    return (int)DUMP_N_FIELDS;
+}
+
+int DLPNOcompute_lccsd_dump_n_fields(void) {
+    return (int)DUMP_N_FIELDS;
+}
+
+// Step 2b entry: run only the t1_ints phase, writing into caller-provided
+// output buffers.  Returns 0 on success, negative on argument errors.
+int DLPNOcompute_lccsd_phase_t1_ints(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    pyscf_dlpno_ccsd::T1IntsOutputs *out) {
+    if (in == nullptr || out == nullptr) return -2;
+    if (out->i_Qa_t1.data == nullptr || out->j_Qa_t1.data == nullptr
+        || out->i_Qk_t1.data == nullptr || out->j_Qk_t1.data == nullptr) {
+        return -3;
+    }
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_t1_ints_into(out);
+    return 0;
+}
+
+// Step 2c entry: run only the B_tilde phase given previously-computed
+// t1-dressed intermediates.
+int DLPNOcompute_lccsd_phase_b_tilde(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::BTildeInputs *t1_dressed,
+    pyscf_dlpno_ccsd::BTildeOutputs *out) {
+    if (in == nullptr || t1_dressed == nullptr || out == nullptr) return -2;
+    if (out->B_tilde.data == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_b_tilde_into(t1_dressed, out);
+    return 0;
+}
+
+// Step 2d entry: run only the t1_fock phase (per-pair Fab + d_ij/d_ji).
+int DLPNOcompute_lccsd_phase_t1_fock(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    pyscf_dlpno_ccsd::T1FockOutputs *out) {
+    if (in == nullptr || out == nullptr) return -2;
+    if (out->Fab.data == nullptr || out->d_flat == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_t1_fock_into(out);
+    return 0;
+}
+
+// Step 2e entry: run only the D_tilde Phase 1 (Terms 1+2) over ordered pairs.
+int DLPNOcompute_lccsd_phase_d_tilde_ph1(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    pyscf_dlpno_ccsd::DTildeOutputs *out) {
+    if (in == nullptr || out == nullptr) return -2;
+    if (out->D_tilde.data == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_d_tilde_ph1_into(out);
+    return 0;
+}
+
+// Step 2f entry: run only the C_tilde Phase 1 (Terms 1+2) over ordered pairs.
+int DLPNOcompute_lccsd_phase_c_tilde_ph1(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    pyscf_dlpno_ccsd::CTildeOutputs *out) {
+    if (in == nullptr || out == nullptr) return -2;
+    if (out->C_tilde.data == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_c_tilde_ph1_into(out);
+    return 0;
+}
+
+// Step 2g entry: run the G_tilde inner kernel given a precomputed plan.
+int DLPNOcompute_lccsd_phase_g_tilde_inner(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::GTildeInputs *plan,
+    pyscf_dlpno_ccsd::GTildeOutputs *out) {
+    if (in == nullptr || plan == nullptr || out == nullptr) return -2;
+    if (out->G_tilde == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_g_tilde_inner_into(plan, out);
+    return 0;
+}
+
+// Step 2h entry: t1_fock finalize (Fkj scatter, Fij_bar snapshot, Eq 94).
+int DLPNOcompute_lccsd_phase_t1_fock_finalize(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::T1FockExtraInputs *extra,
+    pyscf_dlpno_ccsd::T1FockExtraOutputs *out) {
+    if (in == nullptr || extra == nullptr || out == nullptr) return -2;
+    if (out->Fkj == nullptr || out->Fij_bar_snapshot == nullptr
+        || out->foo_t1 == nullptr) return -3;
+    if (extra->d_flat == nullptr) return -4;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_t1_fock_finalize_into(extra, out);
+    return 0;
+}
+
+// Step 2i entry: T1 residual per-(k, l) batched B + A2 phase.
+int DLPNOcompute_lccsd_phase_t1_residual_per_kl(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::PerKlPlanInputs *plan,
+    pyscf_dlpno_ccsd::PerKlOutputs *out) {
+    if (in == nullptr || plan == nullptr || out == nullptr) return -2;
+    if (out->contrib_flat == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_t1_residual_per_kl_into(plan, out);
+    return 0;
+}
+
+// Step 2j-a entry: R2 B + E term per bucket.
+int DLPNOcompute_lccsd_phase_be(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::BEInputs *plan,
+    pyscf_dlpno_ccsd::BEOutputs *out) {
+    if (in == nullptr || plan == nullptr || out == nullptr) return -2;
+    if (out->out_B == nullptr || out->out_E == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_be_into(plan, out);
+    return 0;
+}
+
+// Step 2j-b1 entry: R2 C-term batched.
+int DLPNOcompute_lccsd_phase_c_term(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::CTermInputs *plan,
+    pyscf_dlpno_ccsd::CTermOutputs *out) {
+    if (in == nullptr || plan == nullptr || out == nullptr) return -2;
+    if (out->tiles_flat == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_c_term_into(plan, out);
+    return 0;
+}
+
+// Step 2j-b2 entry: R2 D-term batched.
+int DLPNOcompute_lccsd_phase_d_term(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::DTermInputs *plan,
+    pyscf_dlpno_ccsd::DTermOutputs *out) {
+    if (in == nullptr || plan == nullptr || out == nullptr) return -2;
+    if (out->tiles_flat == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_d_term_into(plan, out);
+    return 0;
+}
+
+// Step 2j-c entry: R2 G-term batched.
+int DLPNOcompute_lccsd_phase_g_term(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::GTermInputs *plan,
+    pyscf_dlpno_ccsd::GTermOutputs *out) {
+    if (in == nullptr || plan == nullptr || out == nullptr) return -2;
+    if (out->tiles_flat == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_g_term_into(plan, out);
+    return 0;
+}
+
+// Step 2j-d1 entry: C/D Phase 2 t3 batched.
+int DLPNOcompute_lccsd_phase_t3(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::T3Inputs *plan,
+    pyscf_dlpno_ccsd::T3Outputs *out) {
+    if (in == nullptr || plan == nullptr || out == nullptr) return -2;
+    if (out->tiles_flat == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_t3_into(plan, out);
+    return 0;
+}
+
+// Step 2j-d2 entry: C/D Phase 2 t4 batched.
+int DLPNOcompute_lccsd_phase_t4(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::T4Inputs *plan,
+    pyscf_dlpno_ccsd::T4Outputs *out) {
+    if (in == nullptr || plan == nullptr || out == nullptr) return -2;
+    if (out->tiles_flat == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_t4_into(plan, out);
+    return 0;
+}
+
+// Step 2j-e entry: R2 K + ladder.
+int DLPNOcompute_lccsd_phase_k_ladder(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::KLadderInputs *t1_dressed,
+    pyscf_dlpno_ccsd::KLadderOutputs *out) {
+    if (in == nullptr || t1_dressed == nullptr || out == nullptr) return -2;
+    if (out->K.data == nullptr || out->A.data == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_k_ladder_into(t1_dressed, out);
+    return 0;
+}
+
+// Step 2k entry: update T1/T2 in place + compute correlation energy.
+int DLPNOcompute_lccsd_phase_update_amps_and_energy(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::UpdateAmpsInputs *resid,
+    pyscf_dlpno_ccsd::UpdateAmpsOutputs *out) {
+    if (in == nullptr || resid == nullptr || out == nullptr) return -2;
+    if (resid->R1_flat == nullptr || resid->R2_flat == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_update_amps_and_energy_into(resid, out);
+    return 0;
+}
+
+// Step 2l-b entry: compute Fia_bar per canonical pair.
+int DLPNOcompute_lccsd_phase_t1_fock_fia_bar(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    pyscf_dlpno_ccsd::FiaBarOutputs *out) {
+    if (in == nullptr || out == nullptr) return -2;
+    if (out->Fia_bar.data == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_t1_fock_fia_bar_into(out);
+    return 0;
+}
+
+// Step 2l-c entry: R1 init + A + C contribution per ordered pair.
+int DLPNOcompute_lccsd_phase_t1_residual_AC_init(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::R1AcInputs *fia,
+    pyscf_dlpno_ccsd::R1AcOutputs *out) {
+    if (in == nullptr || fia == nullptr || out == nullptr) return -2;
+    if (out->R1_flat == nullptr) return -3;
+    if (fia->Fia_bar.data == nullptr) return -4;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_phase_t1_residual_AC_init_into(fia, out);
+    return 0;
+}
+
+// c-collapse-1: run one full CCSD cycle.
+int DLPNOcompute_lccsd_run_one_cycle(
+    const pyscf_dlpno_ccsd::SolverInputs *in,
+    const pyscf_dlpno_ccsd::RunCycleInputs *plans,
+    pyscf_dlpno_ccsd::RunCycleOutputs *out) {
+    if (in == nullptr || plans == nullptr || out == nullptr) return -2;
+    if (out->R1_flat == nullptr || out->R2_flat == nullptr) return -3;
+    pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
+    solver.run_one_cycle(plans, out);
+    return 0;
+}
+
+}  // extern "C"
