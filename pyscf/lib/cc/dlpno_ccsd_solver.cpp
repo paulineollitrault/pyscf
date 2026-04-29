@@ -757,6 +757,9 @@ struct RunCycleOutputs {
     double *R1_flat;        // pno_offsets[nocc] doubles
     double *R2_flat;        // sum_p npno_p^2 doubles
     double  energy;
+    // Optional: when non-null, run_one_cycle writes the post-g_tilde_inner
+    // (nocc, nocc) G_tilde matrix here for cross-validation.
+    double *G_tilde_out;
 };
 
 // -- Solver class (skeleton) -------------------------------------------------
@@ -1183,6 +1186,10 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
         GTildeOutputs g_out;
         g_out.G_tilde = G_tilde_mat.data();
         run_phase_g_tilde_inner_into(plans->g_tilde_plan, &g_out);
+    }
+    if (out->G_tilde_out != nullptr) {
+        std::memcpy(out->G_tilde_out, G_tilde_mat.data(),
+                    (size_t)nocc * nocc * sizeof(double));
     }
     // ------------------------------------------------------------------
     // Phase 8: K + ladder — per canonical pair K and A.

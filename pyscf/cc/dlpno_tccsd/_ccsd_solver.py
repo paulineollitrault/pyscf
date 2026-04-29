@@ -794,6 +794,7 @@ class PyRunCycleOutputs(ctypes.Structure):
         ('R1_flat', ctypes.c_void_p),
         ('R2_flat', ctypes.c_void_p),
         ('energy',  ctypes.c_double),
+        ('G_tilde_out', ctypes.c_void_p),
     ]
 
 
@@ -5047,7 +5048,7 @@ def validate_run_one_cycle_full_with_external_R2(
         r1_pno, r2_all,
         pno_spaces, pair_lmo_idx, F_lmo, eps_lmo, fov_pno, nocc,
         keys_sorted, S_pno_cache, cc_ints_flat, pair_index, ovL_pno_cache,
-        K_pno_cache, verbose=True):
+        K_pno_cache, g_tilde_pyscf=None, verbose=True):
     """End-to-end validator: compares class's run_one_cycle output to
     PySCF's BEFORE-DIIS state.  Uses PySCF's r2_all as ``R2_external``
     while the native plan extraction (BE/CD/G_term/t3/t4) is incremental.
@@ -5129,16 +5130,39 @@ def validate_run_one_cycle_full_with_external_R2(
     R1_size = sum(int(npno[i]) for i in range(nocc))
     R1_class = np.zeros(R1_size, dtype=np.float64)
     R2_class = np.zeros(R2_total, dtype=np.float64)
+
+    # ---- G_tilde plan: validate G_tilde matrix matches PySCF. ----
+    # build_G_tilde was called during cycle 0 → its _batched_plan cache
+    # is populated.  Extract it, run the class's g_tilde_inner kernel
+    # directly with Fkj as the initial G, and compare to PySCF's
+    # _local_df_G (passed as g_tilde_pyscf).
+    g_plan_struct, g_plan_own = _extract_g_tilde_plan(key_to_p)
+    if g_plan_struct is not None and g_tilde_pyscf is not None:
+        # Build Fkj initial state via t1_fock_finalize (run separately).
+        # We need to actually invoke the class's t1_fock pipeline to get
+        # Fkj — but for a self-contained test, just initialize G to
+        # Fkj_pyscf (PySCF's _local_Fkj is in scope at the hook but not
+        # passed; reuse g_tilde_pyscf - increment from its initial Fkj
+        # is what we want).  Simpler: take G_init = g_tilde_pyscf - delta
+        # is hard.  Instead: re-init G to zero, run kernel, compare to
+        # (g_tilde_pyscf - Fkj_initial).  But Fkj_initial is also not
+        # passed.  So skip the matrix-level check for now; once we have
+        # native run_one_cycle producing G_tilde, that path validates it.
+        pass
     plans = PyRunCycleInputs()
     for fname in ('g_tilde_plan', 'be_plan', 'c_term_plan',
                   'd_term_plan', 'g_term_plan', 't3_plan', 't4_plan'):
         setattr(plans, fname, None)
     plans.per_kl_plan = ctypes.pointer(plan_struct)
+    if g_plan_struct is not None:
+        plans.g_tilde_plan = ctypes.pointer(g_plan_struct)
 
+    G_tilde_class = np.zeros((nocc, nocc), dtype=np.float64)
     out = PyRunCycleOutputs()
     out.R1_flat = R1_class.ctypes.data
     out.R2_flat = R2_class.ctypes.data
     out.energy = 0.0
+    out.G_tilde_out = G_tilde_class.ctypes.data
     rc = _libcc.DLPNOcompute_lccsd_run_one_cycle(
         ctypes.byref(inputs), ctypes.byref(plans), ctypes.byref(out))
     if rc != 0:
@@ -5226,6 +5250,13 @@ def validate_run_one_cycle_full_with_external_R2(
         print(f'    |dT1| = {d_T1:.3e}', flush=True)
         print(f'    |dT2| = {d_T2:.3e}', flush=True)
         print(f'    |dE|  = {d_E:.3e}  (E_class={energy_class:.10f}  E_ref={e_ref:.10f})',
+              flush=True)
+
+    # ---- G_tilde matrix cross-check (if PySCF reference provided). ----
+    if g_tilde_pyscf is not None:
+        d_G = float(np.max(np.abs(G_tilde_class - g_tilde_pyscf)))
+        print(f'    |dG_tilde| = {d_G:.3e}  '
+              f'(class plan extracted from build_G_tilde._batched_plan)',
               flush=True)
 
     del plan_own, ownership

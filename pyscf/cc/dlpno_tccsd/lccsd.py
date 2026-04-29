@@ -2715,7 +2715,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     r1_pno, r2_all,
                     pno_spaces, pair_lmo_idx, F_lmo, eps_lmo, fov_pno,
                     nocc, keys_sorted, S_pno_cache, _cc_ints_flat,
-                    _pair_index, ovL_pno_cache, K_pno_cache)
+                    _pair_index, ovL_pno_cache, K_pno_cache,
+                    g_tilde_pyscf=_local_df_G)
                 import sys as _sys
                 _sys.exit(0)
 
