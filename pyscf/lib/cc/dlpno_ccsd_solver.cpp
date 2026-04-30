@@ -1475,39 +1475,33 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
         std::memcpy(R2_buf.data(), in_.R2_external,
                     (size_t)R2_total * sizeof(double));
     } else {
-        // Step 1: K + ladder (always in C++ via run_phase_k_ladder).
-        // Skip weak pairs: PySCF's r2_all only contains strong-pair entries
-        // (compute_residual_v2 is only called for strong pairs); R2_buf for
-        // weak pairs must stay zero to match.
-        for (int p = 0; p < N; ++p) {
-            if (in_.is_strong_pair != nullptr && in_.is_strong_pair[p] == 0) continue;
-            const int npno = npno_arr[p];
-            if (npno == 0) continue;
-            const int64_t off = in_.t2_offsets[p];
-            const int64_t sz  = (int64_t)npno * npno;
-            for (int64_t e = 0; e < sz; ++e) {
-                R2_buf[off + e] = K_flat[off + e] + A_flat[off + e];
-            }
-        }
-        _tick(&_t_r2_kload);
+        // ----------------------------------------------------------------
+        // R2 build — Psi4-mirror monolithic per-pair fusion.
+        //   Phase A: run all kernels (G_term ik/jk, BE per bucket, C/D term)
+        //            populating their flat output buffers.
+        //   Phase B: ONE fused per-pair loop combines K+A+B+E_tilde+G+C+D
+        //            into R2[p].  Cache-locality win vs separate scatters.
+        // ----------------------------------------------------------------
 
-        // Step 2: G_term contribution (two-sided ik + jk).
-        // Per pair p: G_term[p] = flat_G_ij[p] + flat_G_ji[p].T  where
-        // flat_G_ij is built by scattering (with subtraction) ik tiles
-        // and flat_G_ji from jk tiles (PySCF residual.py:877 convention).
+        // Hoisted flat buffers (empty when feature disabled).
+        std::vector<double> flat_G_ij_buf, flat_G_ji_buf;
+        bool have_g_term = false;
+        std::vector<double> flat_B, flat_E;
+        bool have_be = false;
+        std::vector<double> flat_C_ij_buf, flat_C_ji_buf;
+        std::vector<double> flat_D_ij_buf, flat_D_ji_buf;
+        bool have_cd = false;
+        _tick(&_t_r2_kload);  // K + A already populated by run_phase_k_ladder_into
+
+        // ---- Phase A.1: G_term kernels (ik + jk) ----
         if (plans->g_term_plan != nullptr
                 && plans->g_term_plan_jk != nullptr
-                && in_.R2_external == nullptr
                 && plans->g_term_target_pair_idx_ik != nullptr
                 && plans->g_term_target_pair_idx_jk != nullptr) {
-            // Allocate flat_G_ij, flat_G_ji as per-canonical-pair buffers
-            // sized for the FULL T2 layout (npno_p² per pair).
-            std::vector<double> flat_G_ij_buf((size_t)R2_total, 0.0);
-            std::vector<double> flat_G_ji_buf((size_t)R2_total, 0.0);
+            flat_G_ij_buf.assign((size_t)R2_total, 0.0);
+            flat_G_ji_buf.assign((size_t)R2_total, 0.0);
+            have_g_term = true;
 
-            // Run kernel for ik side.  Make a mutable local copy of the
-            // plan struct so we can plug in the G_tilde matrix that was
-            // built in Phase 7 (extractor doesn't know its address).
             GTermInputs g_ik_local = *plans->g_term_plan;
             g_ik_local.G_tilde = G_tilde_mat.data();
             g_ik_local.G_stride = nocc;
@@ -1519,8 +1513,6 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             GTermOutputs gout_ik;
             gout_ik.tiles_flat = tiles_ik_buf.data();
             run_phase_g_term_into(&g_ik_local, &gout_ik);
-            // Scatter ik tiles -> flat_G_ij_buf at target pair offsets.
-            // PySCF SUBTRACTS (residual.py:877).
             const int *n_ij_ik = (const int *)g_ik_local.n_ij_arr;
             for (int n = 0; n < N_ik; ++n) {
                 const int n_ij = n_ij_ik[n];
@@ -1534,7 +1526,6 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 }
             }
 
-            // Run kernel for jk side (same G_tilde plug-in pattern).
             GTermInputs g_jk_local = *plans->g_term_plan_jk;
             g_jk_local.G_tilde = G_tilde_mat.data();
             g_jk_local.G_stride = nocc;
@@ -1558,34 +1549,18 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                     flat_G_ji_buf[r2_off + e] -= tiles_jk_buf[t_start + e];
                 }
             }
-
-            // Per pair: R2[p] += flat_G_ij[p] + flat_G_ji[p].T.
-            for (int p = 0; p < N; ++p) {
-                const int npno = npno_arr[p];
-                if (npno == 0) continue;
-                const int64_t r2_off = in_.t2_offsets[p];
-                for (int a = 0; a < npno; ++a) {
-                    for (int b = 0; b < npno; ++b) {
-                        const int64_t e_ab = (int64_t)a * npno + b;
-                        const int64_t e_ba = (int64_t)b * npno + a;
-                        R2_buf[r2_off + e_ab] +=
-                            flat_G_ij_buf[r2_off + e_ab]
-                            + flat_G_ji_buf[r2_off + e_ba];
-                    }
-                }
-            }
         }
         _tick(&_t_r2_gterm);
 
-        // Step 3: BE contribution (multi-bucket).
-        if (in_.R2_external == nullptr
-                && plans->be_n_buckets > 0
+        // ---- Phase A.2: BE kernels per bucket (multi-bucket) ----
+        if (plans->be_n_buckets > 0
                 && plans->be_plan_buckets != nullptr
                 && plans->be_pair_n_ij_idx != nullptr) {
             const int n_unique = plans->be_n_unique_n_ij;
             const int64_t total_flat = plans->be_flat_off_per_n_ij[n_unique];
-            std::vector<double> flat_B((size_t)total_flat, 0.0);
-            std::vector<double> flat_E((size_t)total_flat, 0.0);
+            flat_B.assign((size_t)total_flat, 0.0);
+            flat_E.assign((size_t)total_flat, 0.0);
+            have_be = true;
 
             // BE-bucket beta_kl/lk refresh from native B_tilde_flat.  The
             // dict-extracted values were populated at pack time from
@@ -1628,53 +1603,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 out.out_E = flat_E.data() + group_off;
                 run_phase_be_into(bucket, &out);
             }
-
-            // Per canonical pair, two contributions per PySCF compute_residual_v2:
-            //   R += B[p]                                (direct B contribution)
-            //   E_tilde[p] = Fab[p] - E[p]
-            //   R += T2[p] @ E_tilde.T + E_tilde @ T2[p] (the Fab*T2 / E term)
-            // (residual.py:5160-5192).  BE plan's E output is the u×K
-            // subtraction; combined with Fab gives E_tilde.
-            #pragma omp parallel for schedule(dynamic, 1)
-            for (int p = 0; p < N; ++p) {
-                const int g = plans->be_pair_n_ij_idx[p];
-                if (g < 0) continue;
-                const int npno = npno_arr[p];
-                if (npno == 0) continue;
-                const int slot = plans->be_pair_slot[p];
-                const int64_t group_off = plans->be_flat_off_per_n_ij[g];
-                const int64_t base = group_off + (int64_t)slot * npno * npno;
-                const int64_t r2_off = in_.t2_offsets[p];
-                const int64_t sz = (int64_t)npno * npno;
-
-                // R += B[p]
-                for (int64_t e = 0; e < sz; ++e) {
-                    R2_buf[r2_off + e] += flat_B[base + e];
-                }
-
-                // E_tilde[a,b] = Fab[a,b] - E[a,b]
-                std::vector<double> E_tilde((size_t)sz, 0.0);
-                const double *Fab_p = Fab_flat.data() + r2_off;
-                for (int64_t e = 0; e < sz; ++e) {
-                    E_tilde[e] = Fab_p[e] - flat_E[base + e];
-                }
-
-                // R[a,b] += sum_c T2[a,c]*E_tilde[b,c] + sum_c E_tilde[a,c]*T2[c,b]
-                // Triple loop chosen over BLAS: npno ≈ 25 makes GEMM call
-                // overhead dominate the actual compute.  gcc auto-vectorises
-                // the inner-c loop.
-                const double *T2_p = in_.T2_flat + r2_off;
-                for (int a = 0; a < npno; ++a) {
-                    for (int b = 0; b < npno; ++b) {
-                        double s = 0.0;
-                        for (int c = 0; c < npno; ++c) {
-                            s += T2_p[a * npno + c] * E_tilde[b * npno + c]
-                               + E_tilde[a * npno + c] * T2_p[c * npno + b];
-                        }
-                        R2_buf[r2_off + a * npno + b] += s;
-                    }
-                }
-            }
+            // BE per-pair scatter is fused below (Phase B).
         }
         _tick(&_t_r2_be);
 
@@ -1685,14 +1614,15 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
         // where Cij/Cji are flat per-pair buffers populated by scattering
         // c-kernel tiles with sign convention (PySCF residual.py:4749 -=).
         // Dij/Dji are populated with +0.5*tile (residual.py:4874).
-        if (in_.R2_external == nullptr
-                && plans->c_term_plan != nullptr
+        // ---- Phase A.3: C_term + D_term kernels ----
+        if (plans->c_term_plan != nullptr
                 && plans->d_term_plan != nullptr
                 && plans->c_term_target_pair_idx_ij != nullptr) {
-            std::vector<double> flat_C_ij_buf((size_t)R2_total, 0.0);
-            std::vector<double> flat_C_ji_buf((size_t)R2_total, 0.0);
-            std::vector<double> flat_D_ij_buf((size_t)R2_total, 0.0);
-            std::vector<double> flat_D_ji_buf((size_t)R2_total, 0.0);
+            flat_C_ij_buf.assign((size_t)R2_total, 0.0);
+            flat_C_ji_buf.assign((size_t)R2_total, 0.0);
+            flat_D_ij_buf.assign((size_t)R2_total, 0.0);
+            flat_D_ji_buf.assign((size_t)R2_total, 0.0);
+            have_cd = true;
 
             // C side.
             const CTermInputs *c_plan_orig = plans->c_term_plan;
@@ -1790,27 +1720,93 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                     }
                 }
             }
+            // CD per-pair assembly is fused below (Phase B).
+        }
 
-            // Assemble C_term + D_term per pair into R2.
-            for (int p = 0; p < N; ++p) {
-                const int npno = npno_arr[p];
-                if (npno == 0) continue;
-                const int64_t r2_off = in_.t2_offsets[p];
+        // ------------------------------------------------------------
+        // Phase B: Fused per-pair R2 assembly.  Touch each pair's
+        // R2_buf[r2_off : r2_off + npno²] ONCE; combine K + A + G + B
+        // + (T2*E_tilde + E_tilde*T2) + C + D in cache.  Mirrors Psi4's
+        // monolithic per-pair loop in ccsd.cc:2417+.
+        // ------------------------------------------------------------
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int p = 0; p < N; ++p) {
+            if (in_.is_strong_pair != nullptr
+                    && in_.is_strong_pair[p] == 0) continue;
+            const int npno = npno_arr[p];
+            if (npno == 0) continue;
+            const int64_t r2_off = in_.t2_offsets[p];
+            const int64_t sz = (int64_t)npno * npno;
+            double *R = R2_buf.data() + r2_off;
+
+            // Init from K + A (K_flat, A_flat populated by run_phase_k_ladder).
+            const double *Kp = K_flat.data() + r2_off;
+            const double *Ap = A_flat.data() + r2_off;
+            for (int64_t e = 0; e < sz; ++e) {
+                R[e] = Kp[e] + Ap[e];
+            }
+
+            // G_term: R += flat_G_ij[p] + flat_G_ji[p].T
+            if (have_g_term) {
+                const double *Gij = flat_G_ij_buf.data() + r2_off;
+                const double *Gji = flat_G_ji_buf.data() + r2_off;
+                for (int a = 0; a < npno; ++a) {
+                    for (int b = 0; b < npno; ++b) {
+                        R[(int64_t)a * npno + b] +=
+                            Gij[(int64_t)a * npno + b]
+                            + Gji[(int64_t)b * npno + a];
+                    }
+                }
+            }
+
+            // BE: R += B[p]; E_tilde = Fab[p] - E[p]; R += T2 @ E_tilde.T + E_tilde @ T2
+            if (have_be) {
+                const int g = plans->be_pair_n_ij_idx[p];
+                if (g >= 0) {
+                    const int slot = plans->be_pair_slot[p];
+                    const int64_t group_off = plans->be_flat_off_per_n_ij[g];
+                    const int64_t base = group_off + (int64_t)slot * sz;
+
+                    // R += B[p]
+                    for (int64_t e = 0; e < sz; ++e) {
+                        R[e] += flat_B[base + e];
+                    }
+
+                    // E_tilde[a, b] = Fab[a, b] - E[base + (a*npno+b)]
+                    std::vector<double> E_tilde((size_t)sz);
+                    const double *Fab_p = Fab_flat.data() + r2_off;
+                    for (int64_t e = 0; e < sz; ++e) {
+                        E_tilde[(size_t)e] = Fab_p[e] - flat_E[base + e];
+                    }
+
+                    // R[a, b] += sum_c T2[a, c]*E_tilde[b, c] + E_tilde[a, c]*T2[c, b]
+                    const double *T2_p = in_.T2_flat + r2_off;
+                    for (int a = 0; a < npno; ++a) {
+                        for (int b = 0; b < npno; ++b) {
+                            double s = 0.0;
+                            for (int c = 0; c < npno; ++c) {
+                                s += T2_p[a * npno + c] * E_tilde[b * npno + c]
+                                   + E_tilde[a * npno + c] * T2_p[c * npno + b];
+                            }
+                            R[(int64_t)a * npno + b] += s;
+                        }
+                    }
+                }
+            }
+
+            // CD: R += 0.5*Cij + Cij.T + 0.5*Cji.T + Cji + Dij + Dji.T
+            if (have_cd) {
+                const double *Cij = flat_C_ij_buf.data() + r2_off;
+                const double *Cji = flat_C_ji_buf.data() + r2_off;
+                const double *Dij = flat_D_ij_buf.data() + r2_off;
+                const double *Dji = flat_D_ji_buf.data() + r2_off;
                 for (int a = 0; a < npno; ++a) {
                     for (int b = 0; b < npno; ++b) {
                         const int64_t e_ab = (int64_t)a * npno + b;
                         const int64_t e_ba = (int64_t)b * npno + a;
-                        // C_term = 0.5*Cij + Cij.T + 0.5*Cji.T + Cji
-                        const double C_class =
-                            0.5 * flat_C_ij_buf[r2_off + e_ab]
-                            + flat_C_ij_buf[r2_off + e_ba]
-                            + 0.5 * flat_C_ji_buf[r2_off + e_ba]
-                            + flat_C_ji_buf[r2_off + e_ab];
-                        // D_term = Dij + Dji.T
-                        const double D_class =
-                            flat_D_ij_buf[r2_off + e_ab]
-                            + flat_D_ji_buf[r2_off + e_ba];
-                        R2_buf[r2_off + e_ab] += C_class + D_class;
+                        R[e_ab] += 0.5 * Cij[e_ab] + Cij[e_ba]
+                                + 0.5 * Cji[e_ba] + Cji[e_ab]
+                                + Dij[e_ab] + Dji[e_ba];
                     }
                 }
             }
