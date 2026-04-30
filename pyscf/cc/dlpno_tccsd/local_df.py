@@ -232,7 +232,7 @@ def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
     }
 
 
-def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps):
+def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps, _pool=None):
     """Build sparse per-aux DF integrals qij_[Q], qia_[Q], qab_[Q].
 
     For each aux function Q on atom A_Q, stores:
@@ -266,8 +266,7 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps):
     qia = [None] * naux
     qab = [None] * naux
 
-    # Iterate aux SHELLS (each shell's aux functions share centerQ and thus bfs1/bfs2)
-    for Q_sh in range(auxmol.nbas):
+    def _process_shell(Q_sh):
         centerQ = aux_shell_to_atom[Q_sh]
         nq = aux_shell_loc[Q_sh + 1] - aux_shell_loc[Q_sh]
         q_start = aux_shell_loc[Q_sh]
@@ -285,41 +284,31 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps):
         atoms2 = riatom_to_atoms2[centerQ]
         if len(bfs1) == 0 or len(bfs2) == 0 or len(lmos_ext) == 0:
             # Empty neighborhood — no contribution from this Q
-            for q in range(nq):
-                qij[q_start + q] = np.zeros((len(lmos_ext), len(lmos_ext)))
-                qia[q_start + q] = np.zeros((len(lmos_ext), len(paos_ext)))
-                qab[q_start + q] = np.zeros((len(paos_ext), len(paos_ext)))
-            continue
+            return [(q_start + q,
+                     np.zeros((len(lmos_ext), len(lmos_ext))),
+                     np.zeros((len(lmos_ext), len(paos_ext))),
+                     np.zeros((len(paos_ext), len(paos_ext))))
+                    for q in range(nq)]
 
         # Build shell slices for atoms1, atoms2
         sh1_list = np.concatenate([atom_to_ao_sh[a] for a in atoms1])
         sh2_list = np.concatenate([atom_to_ao_sh[a] for a in atoms2])
-        # Shell ranges must be contiguous for intor slicing — atoms are sorted,
-        # but shells of each atom ARE contiguous within the atom's shell range.
-        # Use the min/max shell and extract the desired subset afterward.
         sh1_min, sh1_max = sh1_list.min(), sh1_list.max() + 1
         sh2_min, sh2_max = sh2_list.min(), sh2_list.max() + 1
 
-        # Intor over this slice: (μν | Q_sh) for μ∈[sh1_min..sh1_max), ν∈[sh2_min..sh2_max)
         buf = pmol.intor(
             'int3c2e',
             shls_slice=(sh1_min, sh1_max, sh2_min, sh2_max,
                         mol.nbas + Q_sh, mol.nbas + Q_sh + 1))
-        # buf shape (nao1_range, nao2_range, nq)
 
-        # Need AO indices within sh1/sh2 ranges that land in bfs1/bfs2
-        bf1_start, bf1_end = ao_shell_loc[sh1_min], ao_shell_loc[sh1_max]
-        bf2_start, bf2_end = ao_shell_loc[sh2_min], ao_shell_loc[sh2_max]
-        rel_bfs1 = bfs1 - bf1_start  # indices into buf
+        bf1_start = ao_shell_loc[sh1_min]
+        bf2_start = ao_shell_loc[sh2_min]
+        rel_bfs1 = bfs1 - bf1_start
         rel_bfs2 = bfs2 - bf2_start
-        # Sanity: all must be in [0, bf_end - bf_start)
-        mn_block = buf[rel_bfs1][:, rel_bfs2, :]  # (|bfs1|, |bfs2|, nq)
+        mn_block = buf[rel_bfs1][:, rel_bfs2, :]
 
-        # Also compute (μν' | Q) with μ,ν' ∈ bfs1 (for qij). Reuse intor if
-        # bfs1==bfs2 or sub-slice. For simplicity compute separately:
-        sh1a_min, sh1a_max = sh1_min, sh1_max
         if atoms1.tolist() == atoms2.tolist():
-            mn1_block = mn_block  # (|bfs1|, |bfs1|, nq) = same
+            mn1_block = mn_block
         else:
             buf1 = pmol.intor(
                 'int3c2e',
@@ -327,7 +316,6 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps):
                             mol.nbas + Q_sh, mol.nbas + Q_sh + 1))
             mn1_block = buf1[rel_bfs1][:, rel_bfs1, :]
 
-        # qab needs (μν | Q) with μ, ν ∈ bfs2
         if atoms1.tolist() == atoms2.tolist():
             mn2_block = mn_block
         else:
@@ -337,18 +325,28 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps):
                             mol.nbas + Q_sh, mol.nbas + Q_sh + 1))
             mn2_block = buf2[rel_bfs2][:, rel_bfs2, :]
 
-        # Transform
-        # C_pao_slice: (|bfs2|, |paos_ext|) — C_pao restricted to bfs2 rows, paos_ext cols
         C_pao_slice = C_pao[np.ix_(bfs2, paos_ext)]
-
+        results = []
         for qi in range(nq):
             Q = q_start + qi
-            # qij[Q][i, j] = Σ_{μν} C_refit[μ, i] (μν|Q)_{bfs1 bfs1} C_refit[ν, j]
-            qij[Q] = C_r.T @ mn1_block[:, :, qi] @ C_r
-            # qia[Q][i, u] = Σ_{μν} C_refit[μ, i] (μν|Q)_{bfs1 bfs2} C_pao_slice[ν, u]
-            qia[Q] = C_r.T @ mn_block[:, :, qi] @ C_pao_slice
-            # qab[Q][u, v] = Σ_{μν} C_pao_slice[μ, u] (μν|Q)_{bfs2 bfs2} C_pao_slice[ν, v]
-            qab[Q] = C_pao_slice.T @ mn2_block[:, :, qi] @ C_pao_slice
+            results.append((
+                Q,
+                C_r.T @ mn1_block[:, :, qi] @ C_r,
+                C_r.T @ mn_block[:, :, qi] @ C_pao_slice,
+                C_pao_slice.T @ mn2_block[:, :, qi] @ C_pao_slice,
+            ))
+        return results
+
+    Q_shells = list(range(auxmol.nbas))
+    if _pool is not None:
+        all_results = list(_pool.map(_process_shell, Q_shells))
+    else:
+        all_results = [_process_shell(Q_sh) for Q_sh in Q_shells]
+    for shell_results in all_results:
+        for Q, qij_Q, qia_Q, qab_Q in shell_results:
+            qij[Q] = qij_Q
+            qia[Q] = qia_Q
+            qab[Q] = qab_Q
 
     return {'qij': qij, 'qia': qia, 'qab': qab}
 
@@ -650,13 +648,18 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     if strong_pair_keys is None:
         strong_pair_keys = list(keys)
 
+    import time as _ccints_setup_time
+    _t_setup0 = _ccints_setup_time.perf_counter()
     if screening_maps is None:
         screening_maps = build_screening_maps(
             mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
             T_CUT_MKN=T_CUT_MKN, T_CUT_CLMO=T_CUT_CLMO, C_pao=C_pao)
+    _t_screening = _ccints_setup_time.perf_counter() - _t_setup0
+    _t_setup0 = _ccints_setup_time.perf_counter()
     if sparse_arrays is None:
         sparse_arrays = build_sparse_df_arrays(
-            mol, auxmol, C_lmo, C_pao, screening_maps)
+            mol, auxmol, C_lmo, C_pao, screening_maps, _pool=_pool)
+    _t_sparse = _ccints_setup_time.perf_counter() - _t_setup0
 
     qij = sparse_arrays['qij']
     qia = sparse_arrays['qia']
@@ -675,6 +678,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     # share the same lmos_ext/paos_ext neighborhood, so stacking is well
     # defined.
     naux = auxmol.nao_nr()
+    _t_setup0 = _ccints_setup_time.perf_counter()
     aux_at_atom = [np.where(aux_atom_ids == A)[0] for A in range(natm)]
     qij_atom = [None] * natm
     qia_atom = [None] * natm
@@ -695,6 +699,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     for A in range(natm):
         for pos, Q in enumerate(aux_at_atom[A]):
             aux_pos_in_atom[Q] = pos
+    _t_atom_stacks = _ccints_setup_time.perf_counter() - _t_setup0
 
     cc_ints = {}
     key_set = set(keys)
@@ -774,7 +779,10 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     _dbg_ccints = bool(int(os.environ.get('DLPNO_CCINTS_DBG', '0')))
     _dbg_acc = {'setup': 0.0, 'centerQ_loop': 0.0, 'jhi_eigh': 0.0,
                 'jhi_apply': 0.0, 'final_KJ': 0.0, 'cross_kj': 0.0,
-                'partner_calls': 0.0, 'centerQ_inner': 0.0}
+                'partner_calls': 0.0, 'centerQ_inner': 0.0,
+                'partner_enum': 0.0, 'pair_alloc': 0.0,
+                'partner_flat': 0.0, 'flat_scatter': 0.0,
+                'returnpack': 0.0, 'pair_total': 0.0}
     _dbg_lock = _ccints_threading.Lock()
     def _dbg_add(k, v):
         if _dbg_ccints:
@@ -789,6 +797,15 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
 
     def _process_pair(key):
         """Build cc_ints[key] entry. Pure function — safe for thread parallel."""
+        _t_pair_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
+        try:
+            return _process_pair_inner(key)
+        finally:
+            if _dbg_ccints:
+                _dbg_add('pair_total',
+                         _ccints_time.perf_counter() - _t_pair_start)
+
+    def _process_pair_inner(key):
         if key not in pair_aux_idx:
             return key, None
         i, j = key
@@ -805,10 +822,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         n_local = len(aux_idx)
         if n_local == 0:
             return key, None
-        # Cross-pair partner enumeration, restricted to pair (i,j)'s local
-        # LMO domain when pair_lmo_idx is provided.  This drops per-pair
-        # cost from O(nocc) to O(nlmo_ij), turning cc_ints build from
-        # O(N^3) into O(N^2).
+        _t_pe_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         if pair_lmo_idx is not None and key in pair_lmo_idx:
             _k_iter = pair_lmo_idx[key]
         else:
@@ -827,11 +841,15 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 Xp = pno_spaces[key_ki].get('X_pno')
                 if Xp is not None and Xp.shape[1] > 0:
                     ki_partners.append((k, key_ki, Xp.shape[1]))
+        if _dbg_ccints:
+            _dbg_add('partner_enum',
+                     _ccints_time.perf_counter() - _t_pe_start)
 
         # Pre-fit accumulators.  raw_io/raw_jo/raw_ma's LMO axis is set
         # to ``nocc`` below once we know which LMOs actually get
         # populated from the centerQ stacks (the union of
         # riatom_to_lmos_ext over all of this pair's aux centers).
+        _t_alloc_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         raw_iv = np.zeros((n_local, npno))
         raw_jv = np.zeros((n_local, npno))
         raw_ab = np.zeros((n_local, npno, npno))
@@ -849,6 +867,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         for k, _, n_ki in ki_partners}
         raw_kv_ki = {k: np.zeros((n_local, n_ki))
                      for k, _, n_ki in ki_partners}
+        if _dbg_ccints:
+            _dbg_add('pair_alloc',
+                     _ccints_time.perf_counter() - _t_alloc_start)
 
         # Session: per-pair flat partner buffers for the C centerQ
         # partners kernel.  Built once per pair (iteration-invariant since
@@ -900,6 +921,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     'raw_cross_flat': raw_cross_flat,
                     'raw_kv_flat': raw_kv_flat,
                 }
+            _t_pf_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
             _kj_pdat = [(k, pno_spaces[key]['X_pno'],
                          np.asarray(pno_spaces[key]['pair_paos']), n_kj)
                         for k, key, n_kj in kj_partners]
@@ -908,6 +930,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         for k, key, n_ki in ki_partners]
             _kj_flat = _build_partner_flat(_kj_pdat, len(kj_partners))
             _ki_flat = _build_partner_flat(_ki_pdat, len(ki_partners))
+            if _dbg_ccints:
+                _dbg_add('partner_flat',
+                         _ccints_time.perf_counter() - _t_pf_start)
 
         pair_paos_ij = np.asarray(pair_paos_ij)
 
@@ -1245,6 +1270,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         # raw_cross_*_flat / raw_kv_*_flat buffers back into the per-k
         # dicts that the cross_partner phase consumes.  Cheap: O(npno*n_kj)
         # per partner; partner counts are small.
+        _t_scatter_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         if _use_centerQ_c and _kj_flat is not None:
             cross_off = _kj_flat['cross_off']; kv_off = _kj_flat['kv_off']
             cross_flat = _kj_flat['raw_cross_flat']; kv_flat = _kj_flat['raw_kv_flat']
@@ -1265,6 +1291,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 raw_kv_ki[k] = kv_flat[
                     kv_off[p]:kv_off[p + 1]
                 ].reshape(n_local, n_ki).copy()
+        if _dbg_ccints:
+            _dbg_add('flat_scatter',
+                     _ccints_time.perf_counter() - _t_scatter_start)
         _t_jhi_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         # Apply local J^{-1/2}
         j2c_local = j2c[np.ix_(aux_idx, aux_idx)]
@@ -1451,6 +1480,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     # work is read-only on shared inputs (pno_spaces, pair_aux_idx, sparse
     # arrays) and writes only to its own local arrays before returning the
     # cc_ints entry — thread-safe.
+    _t_pool_start = _ccints_setup_time.perf_counter()
     if _pool is not None:
         for k, entry in _pool.map(_process_pair, keys):
             cc_ints[k] = entry
@@ -1458,11 +1488,15 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         for key in keys:
             k, entry = _process_pair(key)
             cc_ints[k] = entry
+    _t_pool_wall = _ccints_setup_time.perf_counter() - _t_pool_start
 
     if _dbg_ccints:
         _items = sorted(_dbg_acc.items(), key=lambda kv: -kv[1])
         _summary = ' '.join(f'{n}={v:.2f}s' for n, v in _items if v > 0.0)
         print(f"[CCINTS_DBG] (n_pairs={len(keys)}) {_summary}", flush=True)
+        print(f"[CCINTS_DBG] OUTER walls: screening={_t_screening:.2f}s "
+              f"sparse_arrays={_t_sparse:.2f}s atom_stacks={_t_atom_stacks:.2f}s "
+              f"pool_dispatch={_t_pool_wall:.2f}s", flush=True)
 
     if _stats_ccints and _stats_pairs:
         _np = len(_stats_pairs)
