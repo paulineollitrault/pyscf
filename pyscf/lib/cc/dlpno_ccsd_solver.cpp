@@ -2784,6 +2784,11 @@ void DLPNOCCSDSolver::run_phase_t1_fock_finalize_into(
 
     // Step C: Eq 94 — per occupied j, build Fia_bar_jj from Qma[(j,j)] +
     // T1_in_pair[(j,j)], accumulate (Fia_bar_jj @ t1_j) into Fkj[lmo_list, j].
+    // BLAS-based per-j; same identity as run_phase_t1_fock_fia_bar_into.
+    {
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0;
+    const int int_one = 1;
     #pragma omp parallel for schedule(dynamic, 1)
     for (int j = 0; j < nocc; ++j) {
         const int p_jj = in_.i_j_to_ij[(int64_t)j * nocc + j];
@@ -2812,62 +2817,60 @@ void DLPNOCCSDSolver::run_phase_t1_fock_finalize_into(
         if (j_in_p < 0) continue;
         const double *t1_j = T1_local + (int64_t)j_in_p * npno;
 
-        // gamma[Q] = Σ_{m, a} Qma[Q, m, a] * T1_local[m, a]
+        const int int_nlmo = nlmo;
+        const int int_npno = npno;
+        const int int_n_local = n_local;
+        const int int_per_q = (int)per_q;
+        const int int_nl_nlmo = (int)((int64_t)n_local * nlmo);
+
+        // gamma[Q] = sum_{m,a} Qma[Q, m, a] * T1_local[m, a]
+        // Qma_flat row (n_local, per_q) @ T1 (per_q,) → gamma (n_local,)
         std::vector<double> gamma((size_t)n_local, 0.0);
-        for (int Q = 0; Q < n_local; ++Q) {
-            const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
-            double s = 0.0;
-            for (int64_t e = 0; e < per_q; ++e) {
-                s += Qma_Q[e] * T1_local[e];
-            }
-            gamma[(size_t)Q] = s;
-        }
+        dgemv_(&T_flag, &int_per_q, &int_n_local,
+               &one, Qma, &int_per_q,
+               T1_local, &int_one,
+               &zero, gamma.data(), &int_one);
 
-        // Z[Q, n, k] = Σ_b T1_local[n, b] * Qma[Q, k, b]
+        // Z[Q, n, k] = sum_b T1_local[n, b] * Qma[Q, k, b]
+        // Per-Q small dgemm: Z_Q (nlmo, nlmo) = T1 (nlmo, npno) @ Qma_Q^T (npno, nlmo)
         std::vector<double> Z((size_t)n_local * nlmo * nlmo, 0.0);
+        const int64_t Z_stride = (int64_t)nlmo * nlmo;
         for (int Q = 0; Q < n_local; ++Q) {
-            const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
-            for (int n_ = 0; n_ < nlmo; ++n_) {
-                for (int kk = 0; kk < nlmo; ++kk) {
-                    const double *Qma_Qk = Qma_Q + (int64_t)kk * npno;
-                    double s = 0.0;
-                    for (int b = 0; b < npno; ++b) {
-                        s += T1_local[(int64_t)n_ * npno + b] * Qma_Qk[b];
-                    }
-                    Z[(int64_t)Q * nlmo * nlmo
-                      + (int64_t)n_ * nlmo + kk] = s;
-                }
-            }
+            const double *Qma_Q = Qma + (int64_t)Q * per_q;
+            double *Z_Q = Z.data() + (int64_t)Q * Z_stride;
+            dgemm_(&T_flag, &N_flag,
+                   &int_nlmo, &int_nlmo, &int_npno,
+                   &one, Qma_Q, &int_npno,
+                   T1_local, &int_npno,
+                   &zero, Z_Q, &int_nlmo);
         }
 
-        // Fia_bar[k, a] = 2 * Σ_Q gamma[Q] * Qma[Q, k, a]
-        //              -  Σ_{Q, n_} Qma[Q, n_, a] * Z[Q, n_, k]
-        std::vector<double> Fia_bar((size_t)nlmo * npno, 0.0);
-        for (int k = 0; k < nlmo; ++k) {
-            for (int a = 0; a < npno; ++a) {
-                double s_pos = 0.0, s_neg = 0.0;
-                for (int Q = 0; Q < n_local; ++Q) {
-                    const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
-                    s_pos += gamma[(size_t)Q]
-                           * Qma_Q[(int64_t)k * npno + a];
-                    for (int n_ = 0; n_ < nlmo; ++n_) {
-                        s_neg += Qma_Q[(int64_t)n_ * npno + a]
-                              * Z[(int64_t)Q * nlmo * nlmo
-                                  + (int64_t)n_ * nlmo + k];
-                    }
-                }
-                Fia_bar[(int64_t)k * npno + a] = 2.0 * s_pos - s_neg;
-            }
-        }
+        // Fia_pos[k, a] = sum_Q gamma[Q] * Qma[Q, k, a]
+        std::vector<double> Fia_pos((size_t)per_q, 0.0);
+        dgemv_(&N_flag, &int_per_q, &int_n_local,
+               &one, Qma, &int_per_q,
+               gamma.data(), &int_one,
+               &zero, Fia_pos.data(), &int_one);
 
-        // Scatter Fia_bar[k, :] @ t1_j  →  Fkj[lmo_list[k], j].
+        // Fia_neg[k, a] = sum_{Q, n} Qma[Q, n, a] * Z[Q, n, k]
+        // = (npno, nlmo) result of Qma_F @ Z_F^T (col-major view).
+        std::vector<double> Fia_neg((size_t)per_q, 0.0);
+        dgemm_(&N_flag, &T_flag,
+               &int_npno, &int_nlmo, &int_nl_nlmo,
+               &one, Qma, &int_npno,
+               Z.data(), &int_nlmo,
+               &zero, Fia_neg.data(), &int_npno);
+
+        // Scatter (Fia_bar[k, :] = 2*Fia_pos - Fia_neg) @ t1_j → Fkj[lmo_list[k], j]
         for (int k = 0; k < nlmo; ++k) {
             double s = 0.0;
             for (int a = 0; a < npno; ++a) {
-                s += Fia_bar[(int64_t)k * npno + a] * t1_j[a];
+                s += (2.0 * Fia_pos[(int64_t)k * npno + a]
+                      - Fia_neg[(int64_t)k * npno + a]) * t1_j[a];
             }
             out->Fkj[(int64_t)lmo_list[k] * nocc + j] += s;
         }
+    }
     }
 
     // foo_t1 = Fkj - F_lmo
