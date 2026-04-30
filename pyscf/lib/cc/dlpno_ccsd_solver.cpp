@@ -1452,7 +1452,13 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 run_phase_be_into(bucket, &out);
             }
 
-            // Per canonical pair: add flat_B[base] + flat_E[base] to R2.
+            // Per canonical pair, two contributions per PySCF compute_residual_v2:
+            //   R += B[p]                                (direct B contribution)
+            //   E_tilde[p] = Fab[p] - E[p]
+            //   R += T2[p] @ E_tilde.T + E_tilde @ T2[p] (the Fab*T2 / E term)
+            // (residual.py:5160-5192).  BE plan's E output is the u×K
+            // subtraction; combined with Fab gives E_tilde.
+            #pragma omp parallel for schedule(dynamic, 1)
             for (int p = 0; p < N; ++p) {
                 const int g = plans->be_pair_n_ij_idx[p];
                 if (g < 0) continue;
@@ -1463,8 +1469,30 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 const int64_t base = group_off + (int64_t)slot * npno * npno;
                 const int64_t r2_off = in_.t2_offsets[p];
                 const int64_t sz = (int64_t)npno * npno;
+
+                // R += B[p]
                 for (int64_t e = 0; e < sz; ++e) {
-                    R2_buf[r2_off + e] += flat_B[base + e] + flat_E[base + e];
+                    R2_buf[r2_off + e] += flat_B[base + e];
+                }
+
+                // E_tilde[a,b] = Fab[a,b] - E[a,b]
+                std::vector<double> E_tilde((size_t)sz, 0.0);
+                const double *Fab_p = Fab_flat.data() + r2_off;
+                for (int64_t e = 0; e < sz; ++e) {
+                    E_tilde[e] = Fab_p[e] - flat_E[base + e];
+                }
+
+                // R[a,b] += sum_c T2[a,c]*E_tilde[b,c] + sum_c E_tilde[a,c]*T2[c,b]
+                const double *T2_p = in_.T2_flat + r2_off;
+                for (int a = 0; a < npno; ++a) {
+                    for (int b = 0; b < npno; ++b) {
+                        double s = 0.0;
+                        for (int c = 0; c < npno; ++c) {
+                            s += T2_p[a * npno + c] * E_tilde[b * npno + c]
+                               + E_tilde[a * npno + c] * T2_p[c * npno + b];
+                        }
+                        R2_buf[r2_off + a * npno + b] += s;
+                    }
                 }
             }
         }
