@@ -762,6 +762,21 @@ struct RunCycleInputs {
     // pair `target_pair_idx_ik[n]` / `target_pair_idx_jk[n]`.
     const int *g_term_target_pair_idx_ik;
     const int *g_term_target_pair_idx_jk;
+
+    // -- Native R2 assembly: BE multi-bucket (Step 2j-a orchestration). ---
+    // Multiple BE buckets, one per (n_ij, n_kl) shape pair.  Class iterates
+    // them, calling DLPNObe_kernel per bucket with the appropriate output
+    // buffer offset (buckets sharing n_ij accumulate into the same
+    // flat_B/flat_E group buffer).  After all kernels run, per canonical
+    // pair p we look up its (group, slot) and add flat_B[base] + flat_E[base]
+    // to R2_buf[t2_offsets[p]].
+    int be_n_buckets;
+    const BEInputs *be_plan_buckets;          // length be_n_buckets
+    int be_n_unique_n_ij;
+    const int *be_unique_n_ij;                // length be_n_unique_n_ij
+    const int64_t *be_flat_off_per_n_ij;      // length be_n_unique_n_ij + 1
+    const int *be_pair_n_ij_idx;              // length n_canon_pairs (-1 = no BE)
+    const int *be_pair_slot;                  // length n_canon_pairs
 };
 
 struct RunCycleOutputs {
@@ -1394,6 +1409,50 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                             flat_G_ij_buf[r2_off + e_ab]
                             + flat_G_ji_buf[r2_off + e_ba];
                     }
+                }
+            }
+        }
+
+        // Step 3: BE contribution (multi-bucket).
+        if (in_.R2_external == nullptr
+                && plans->be_n_buckets > 0
+                && plans->be_plan_buckets != nullptr
+                && plans->be_pair_n_ij_idx != nullptr) {
+            const int n_unique = plans->be_n_unique_n_ij;
+            const int64_t total_flat = plans->be_flat_off_per_n_ij[n_unique];
+            std::vector<double> flat_B((size_t)total_flat, 0.0);
+            std::vector<double> flat_E((size_t)total_flat, 0.0);
+
+            // Per bucket: find n_ij group, run kernel with offset output.
+            for (int b = 0; b < plans->be_n_buckets; ++b) {
+                const BEInputs *bucket = &plans->be_plan_buckets[b];
+                int g = -1;
+                for (int gi = 0; gi < n_unique; ++gi) {
+                    if (plans->be_unique_n_ij[gi] == bucket->n_ij) {
+                        g = gi; break;
+                    }
+                }
+                if (g < 0) continue;
+                const int64_t group_off = plans->be_flat_off_per_n_ij[g];
+                BEOutputs out;
+                out.out_B = flat_B.data() + group_off;
+                out.out_E = flat_E.data() + group_off;
+                run_phase_be_into(bucket, &out);
+            }
+
+            // Per canonical pair: add flat_B[base] + flat_E[base] to R2.
+            for (int p = 0; p < N; ++p) {
+                const int g = plans->be_pair_n_ij_idx[p];
+                if (g < 0) continue;
+                const int npno = npno_arr[p];
+                if (npno == 0) continue;
+                const int slot = plans->be_pair_slot[p];
+                const int64_t group_off = plans->be_flat_off_per_n_ij[g];
+                const int64_t base = group_off + (int64_t)slot * npno * npno;
+                const int64_t r2_off = in_.t2_offsets[p];
+                const int64_t sz = (int64_t)npno * npno;
+                for (int64_t e = 0; e < sz; ++e) {
+                    R2_buf[r2_off + e] += flat_B[base + e] + flat_E[base + e];
                 }
             }
         }

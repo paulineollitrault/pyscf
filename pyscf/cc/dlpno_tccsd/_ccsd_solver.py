@@ -791,6 +791,14 @@ class PyRunCycleInputs(ctypes.Structure):
         ('g_term_plan_jk',           ctypes.POINTER(PyGTermInputs)),
         ('g_term_target_pair_idx_ik', ctypes.c_void_p),
         ('g_term_target_pair_idx_jk', ctypes.c_void_p),
+        # Native R2 assembly: BE multi-bucket dispatch + per-pair scatter.
+        ('be_n_buckets',              ctypes.c_int),
+        ('be_plan_buckets',           ctypes.c_void_p),  # array of BEInputs
+        ('be_n_unique_n_ij',          ctypes.c_int),
+        ('be_unique_n_ij',            ctypes.c_void_p),
+        ('be_flat_off_per_n_ij',      ctypes.c_void_p),
+        ('be_pair_n_ij_idx',          ctypes.c_void_p),
+        ('be_pair_slot',              ctypes.c_void_p),
     ]
 
 
