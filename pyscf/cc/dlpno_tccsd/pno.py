@@ -24,6 +24,7 @@ References:
     Ye & Berkelbach, JCTC 2024 (for ovL integral infrastructure)
 """
 
+import os
 import numpy as np
 from functools import reduce
 from pyscf import lib
@@ -328,6 +329,12 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         # Precompute raw_3c @ C_pao for half-transform
         _raw_half_pao = np.tensordot(_raw_3c, C_pao, axes=([1], [0]))  # (nao, naux, npao)
         del _raw_3c
+        # Hoist the LMO contraction out of the per-pair Phase 1 loop.
+        # _raw_lmo_pao[i, Q, b] = sum_u C_lmo[u, i] * _raw_half_pao[u, Q, b]
+        # Each pair then slices columns instead of fancy-indexing the full
+        # (nao, naux, npao) tensor (which copies ~115 MB per pair on water10).
+        _raw_lmo_pao = np.tensordot(
+            C_lmo, _raw_half_pao, axes=([0], [0]))  # (nocc_lmo, naux, npao)
     else:
         log.info('Building LMO/PAO exact 4-index integrals (no density fitting)...')
         from pyscf import ao2mo as _ao2mo_mod
@@ -390,6 +397,14 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     # Phase 1: Build per-pair domain data and SC-MP2 initial guess
     # (parallelized via _pool.map — each (i,j) pair is independent)
     # ===================================================================
+    import time as _pno_time_p1
+    _t_p1_start = _pno_time_p1.perf_counter()
+    import threading as _p1_threading
+    _p1_lock = _p1_threading.Lock()
+    _p1_sub = {'orth': 0.0, 'df': 0.0, 'solve': 0.0, 'eigh': 0.0, 'mp2': 0.0}
+    def _p1_add(k, v):
+        with _p1_lock:
+            _p1_sub[k] += v
     pair_domain_data = {}   # intermediate data for L-MP2 iteration
 
     def _phase1_one(ij):
@@ -398,6 +413,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         if len(domain_ij) == 0:
             return ij, None
 
+        _t = _pno_time_p1.perf_counter()
         C_orth_ij, X_orth_ij = orthogonalize_pao_domain(
             C_pao, S_pao, domain_ij, S_cut=S_cut_domain, method='psi4')
         n_orth = C_orth_ij.shape[1]
@@ -406,28 +422,31 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                   f'npao_ortho={n_orth}', flush=True)
         if n_orth == 0:
             return ij, None
+        _p1_add('orth', _pno_time_p1.perf_counter() - _t)
 
         F_dom = F_pao[np.ix_(domain_ij, domain_ij)]
         F_orth = reduce(np.dot, (X_orth_ij.T, F_dom, X_orth_ij))
 
+        _t = _pno_time_p1.perf_counter()
         if use_df:
             if _lmo_aux_mask is not None:
                 if getattr(make_pnos, '_force_full_aux', False):
                     _pair_aux = np.arange(_j2c.shape[0])
                 else:
                     _pair_aux = np.where(_lmo_aux_mask[i] | _lmo_aux_mask[j])[0]
-                _raw_i_dom = np.tensordot(C_lmo[:, i],
-                                          _raw_half_pao[:, :, domain_ij],
-                                          axes=([0], [0]))
-                _raw_j_dom = np.tensordot(C_lmo[:, j],
-                                          _raw_half_pao[:, :, domain_ij],
-                                          axes=([0], [0]))
+                # Slice the pre-contracted LMO×AUX×PAO tensor (cheap copy
+                # of (naux, ndomain) per pair vs (nao, naux, ndomain) before).
+                _raw_i_dom = _raw_lmo_pao[i][:, domain_ij]
+                _raw_j_dom = _raw_lmo_pao[j][:, domain_ij]
                 _raw_i_orth = _raw_i_dom @ X_orth_ij
                 _raw_j_orth = _raw_j_dom @ X_orth_ij
                 _raw_i_local = _raw_i_orth[_pair_aux, :]
                 _raw_j_local = _raw_j_orth[_pair_aux, :]
                 _j2c_local = _j2c[np.ix_(_pair_aux, _pair_aux)]
+                _p1_add('df', _pno_time_p1.perf_counter() - _t)
+                _t = _pno_time_p1.perf_counter()
                 _fitted_j = np.linalg.solve(_j2c_local, _raw_j_local)
+                _p1_add('solve', _pno_time_p1.perf_counter() - _t)
                 K_ij = _raw_i_local.T @ _fitted_j
             else:
                 ovL_i_dom = ovL[i][domain_ij, :]
@@ -435,11 +454,16 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                 ovL_i_orth = np.dot(X_orth_ij.T, ovL_i_dom)
                 ovL_j_orth = np.dot(X_orth_ij.T, ovL_j_dom)
                 K_ij = _pair_K_iajb(ovL_i_orth, ovL_j_orth)
+                _p1_add('df', _pno_time_p1.perf_counter() - _t)
         else:
             K_dom_ij = K_iajb_exact[i, :, j, :][np.ix_(domain_ij, domain_ij)]
             K_ij = X_orth_ij.T @ K_dom_ij @ X_orth_ij
+            _p1_add('df', _pno_time_p1.perf_counter() - _t)
 
+        _t = _pno_time_p1.perf_counter()
         eps_sc, U_sc = np.linalg.eigh(F_orth)
+        _p1_add('eigh', _pno_time_p1.perf_counter() - _t)
+        _t = _pno_time_p1.perf_counter()
         K_sc = reduce(np.dot, (U_sc.T, K_ij, U_sc))
         D_ij_sc = (eps_i[i] + eps_i[j]
                    - eps_sc[:, None] - eps_sc[None, :])
@@ -447,6 +471,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         T2_sc = K_sc / D_safe
         T2_sc = np.where(np.abs(D_ij_sc) > 1e-12, T2_sc, 0.0)
         T2_orth = reduce(np.dot, (U_sc, T2_sc, U_sc.T))
+        _p1_add('mp2', _pno_time_p1.perf_counter() - _t)
 
         return ij, {
             'C_orth': C_orth_ij, 'X_orth': X_orth_ij, 'F_orth': F_orth,
@@ -463,6 +488,13 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         if data is not None:
             pair_domain_data[ij] = data
 
+    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
+    _pno_dbg and print(f'[PNO_DBG] Phase 1: {_pno_time_p1.perf_counter() - _t_p1_start:.2f}s '
+          f'CPU sum={sum(_p1_sub.values()):.1f}s '
+          f'orth={_p1_sub["orth"]:.1f} df={_p1_sub["df"]:.1f} '
+          f'solve={_p1_sub["solve"]:.1f} eigh={_p1_sub["eigh"]:.1f} '
+          f'mp2={_p1_sub["mp2"]:.1f}', flush=True)
+    _t_p2a_start = _pno_time_p1.perf_counter()
     # ===================================================================
     # Phase 2a: Build INITIAL PNOs from direct SC-MP2 T2
     # (matching Psi4 compute_pair_energies<false>() lines 489-609)
@@ -585,11 +617,20 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     for ij, val in _p2a_iter:
         initial_pno_data[ij] = val
 
+    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
+    _pno_dbg and print(f'[PNO_DBG] Phase 2a: {_pno_time_p1.perf_counter() - _t_p2a_start:.2f}s',
+          flush=True)
     # ===================================================================
     # Phase 2b: Iterative LMP2 in PNO space
     # (matching Psi4 pno_lmp2_iterations() lines 690-802)
     # ===================================================================
     log.info('Running iterative LMP2 in PNO space...')
+    import time as _pno_time
+    _t_p2b_start = _pno_time.perf_counter()
+    _t_p2b_residual = 0.0
+    _t_p2b_jacobi = 0.0
+    _t_p2b_diis = 0.0
+    _t_p2b_energy = 0.0
 
     # Build PNO overlap matrices for inter-pair coupling
     pno_S_cache = {}
@@ -626,6 +667,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
 
     for lmp2_iter in range(max_lmp2_iter):
         # Step 1: Compute residuals for ALL pairs
+        _t0 = _pno_time.perf_counter()
         R_all = {}
         r_max = 0.0
         for key_ij, pdata in initial_pno_data.items():
@@ -664,6 +706,8 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             R_all[key_ij] = R
             r_max = max(r_max, np.max(np.abs(R)))
 
+        _t_p2b_residual += _pno_time.perf_counter() - _t0
+        _t0 = _pno_time.perf_counter()
         # Step 2: Jacobi update (matching Psi4 lines 757-767)
         for key_ij, pdata in initial_pno_data.items():
             n = pdata['n_pno']
@@ -675,6 +719,8 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             D_safe = np.where(np.abs(D) > 1e-12, D, 1.0)
             T2_pno_all[key_ij] -= R_all[key_ij] / D_safe
 
+        _t_p2b_jacobi += _pno_time.perf_counter() - _t0
+        _t0 = _pno_time.perf_counter()
         # Step 3: DIIS extrapolation (matching Psi4 lines 769-781)
         t2_flat = np.concatenate([T2_pno_all[k].ravel() for k in _lmp2_keys])
         r_flat = np.concatenate([R_all[k].ravel() for k in _lmp2_keys])
@@ -687,6 +733,8 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             T2_pno_all[k] = t2_flat[offset:offset + sz].reshape(n, n)
             offset += sz
 
+        _t_p2b_diis += _pno_time.perf_counter() - _t0
+        _t0 = _pno_time.perf_counter()
         # Step 4: Build Tt and energy (matching Psi4 lines 783-799)
         e_curr_lmp2 = 0.0
         for key_ij, pdata in initial_pno_data.items():
@@ -697,6 +745,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             e_pair = np.einsum('ab,ab->', K_pno, Tt)
             e_curr_lmp2 += e_pair if i == j else 2.0 * e_pair
 
+        _t_p2b_energy += _pno_time.perf_counter() - _t0
         dE = abs(e_curr_lmp2 - e_prev_lmp2)
         if lmp2_iter > 0:
             log.info('LMP2-Iter=%3d: E_LMP2=%.12f  dE=%.1e  Rmax=%.1e',
@@ -708,15 +757,29 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         e_prev_lmp2 = e_curr_lmp2
 
     log.info('L-MP2 correlation energy = %.15g', e_curr_lmp2)
+    _t_p2b = _pno_time.perf_counter() - _t_p2b_start
+    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
+    _pno_dbg and print(f'[PNO_DBG] Phase 2b: {_t_p2b:.2f}s '
+          f'(residual={_t_p2b_residual:.2f} jacobi={_t_p2b_jacobi:.2f} '
+          f'diis={_t_p2b_diis:.2f} energy={_t_p2b_energy:.2f})', flush=True)
 
     # ===================================================================
     # Phase 3: Recompute PNOs from converged PNO-LMP2 amplitudes
     # (matching Psi4 pno_lmp2_iterations lines 816-900)
     # ===================================================================
-    for (i, j), pdata in initial_pno_data.items():
+    _t_p3_start = _pno_time.perf_counter()
+    # Parallelised via _pool.map — each pair is independent. Worker returns
+    # (key, pno_spaces_entry_or_None, e_ij, is_strong_flag).  is_strong flag
+    # also carries -1 for "neither strong nor weak" (n_pno==0 or e_ij==0).
+    fock_ao_local_p3 = (mf._fock_cache if hasattr(mf, '_fock_cache')
+                        else mf.get_fock())
+    occ_cas_set_p3 = set(occ_cas_idx.tolist()) if occ_cas_idx is not None else set()
+
+    def _phase3_one(item):
+        (i, j), pdata = item
         n = pdata['n_pno']
         if n == 0:
-            continue
+            return (i, j), None, 0.0, -1
         K_pno = pdata['K_pno']
         T2 = T2_pno_all[(i, j)]
         Tt = 2.0 * T2 - T2.T
@@ -748,7 +811,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         Tt_pno_new = reduce(np.dot, (U_pno.T, Tt, U_pno))
 
         # --- PNO selection (matching Psi4 lines 856-873) ---
-        is_cas_pair = (i in occ_cas_set and j in occ_cas_set
+        is_cas_pair = (i in occ_cas_set_p3 and j in occ_cas_set_p3
                        and C_cas_vir is not None and nvir_cas > 0)
 
         nvir_cas_local = 0
@@ -831,7 +894,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
 
             C_pno_ij = np.hstack([C_cas_vir, C_ext_pno])
 
-            fock_ao_local = mf.get_fock() if not hasattr(mf, '_fock_cache') else mf._fock_cache
+            fock_ao_local = fock_ao_local_p3
             F_cas_vir = reduce(np.dot, (C_cas_vir.T, fock_ao_local, C_cas_vir))
             e_cas_vir = np.diag(F_cas_vir).real
             if C_ext_pno.shape[1] > 0:
@@ -855,8 +918,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             K_pno = reduce(np.dot, (U_pno_kept.T, pdata['K_pno'], U_pno_kept))
             T2_pno = reduce(np.dot, (U_pno_kept.T, T2, U_pno_kept))
 
-        e_lmp2_total += e_ij * (1 if i == j else 2)
-
         is_strong = abs(e_ij) > T_CutPairs
 
         # Psi4-style PAO-domain storage: X_pno = (|domain_ij|, npno) is the
@@ -872,7 +933,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             X_pno_pair = pdata['X_orth'] @ X_new
             pair_paos = domain_ij
 
-        pno_spaces[(i, j)] = {
+        entry = {
             'C_pno': C_pno_ij,
             'X_pno': X_pno_pair,
             'pair_paos': pair_paos,
@@ -888,18 +949,32 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             'is_cas_pair': is_cas_pair,
             'nvir_cas_local': nvir_cas_local,
         }
+        # Status code: 1 = strong, 0 = weak (e_ij != 0), -1 = neither.
+        status = 1 if is_strong else (0 if abs(e_ij) > 0.0 else -1)
+        return (i, j), entry, e_ij, status
 
-        if is_strong:
-            strong_pairs.append((i, j))
+    _p3_iter = (_pool.map(_phase3_one, initial_pno_data.items())
+                if _pool is not None
+                else (_phase3_one(item) for item in initial_pno_data.items()))
+    for key, entry, e_ij, status in _p3_iter:
+        if entry is None:
+            continue
+        i, j = key
+        pno_spaces[key] = entry
+        e_lmp2_total += e_ij * (1 if i == j else 2)
+        if status == 1:
+            strong_pairs.append(key)
             n_pairs_strong += 1
-        else:
-            if abs(e_ij) > 0.0:
-                weak_pairs.append((i, j))
-                n_pairs_weak += 1
+        elif status == 0:
+            weak_pairs.append(key)
+            n_pairs_weak += 1
 
     log.info('PNO construction complete: %d strong pairs, %d weak pairs',
              n_pairs_strong, n_pairs_weak)
     log.info('Total LMP2 energy = %.15g', e_lmp2_total)
+    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
+    _pno_dbg and print(f'[PNO_DBG] Phase 3: {_pno_time.perf_counter() - _t_p3_start:.2f}s',
+          flush=True)
 
     return pno_spaces, strong_pairs, weak_pairs, e_lmp2_total
 
