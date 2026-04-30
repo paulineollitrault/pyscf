@@ -676,6 +676,12 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             with _dbg_lock:
                 _dbg_acc[k] += v
 
+    # === Per-pair scaling stats (read DLPNO_CCINTS_STATS=1) ===
+    _stats_ccints = bool(int(os.environ.get('DLPNO_CCINTS_STATS', '0')))
+    _stats_lock = _ccints_threading.Lock()
+    _stats_pairs = []   # list of dicts: {npno, n_local, nlmo_p,
+                        #                 ncenters, n_partners, work}
+
     def _process_pair(key):
         """Build cc_ints[key] entry. Pure function — safe for thread parallel."""
         if key not in pair_aux_idx:
@@ -811,12 +817,27 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         # systems instead of O(nocc).  No integral information is lost
         # because rows outside the union are zero in the original
         # formulation too.
-        if len(unique_centers) > 0:
-            _ext_union = np.unique(np.concatenate(
-                [riatom_to_lmos_ext[c] for c in unique_centers]))
+        # Working LMO axis = pair_lmo_idx (F-coupling neighborhood) when
+        # available, else fall back to the dense union over aux centers.
+        # Using pair_lmo_idx from the start cuts per-pair work tensors
+        # from (n_local, nocc, npno) to (n_local, nlmo_pair, npno) — the
+        # dominant scaling factor in cc_ints. Rows for LMOs outside
+        # pair_lmo_idx have zero contribution downstream anyway (they're
+        # cropped at the storage step) so dropping them now is exact.
+        if pair_lmo_idx is not None and key in pair_lmo_idx:
+            _pl = np.asarray(pair_lmo_idx[key], dtype=np.int64)
+            # Defensive: include endpoints i, j (Psi4-faithful invariant).
+            if i not in _pl:
+                _pl = np.append(_pl, i)
+            if j != i and j not in _pl:
+                _pl = np.append(_pl, j)
+            p_lmos = np.unique(_pl).astype(np.int64)
+        elif len(unique_centers) > 0:
+            p_lmos = np.unique(np.concatenate(
+                [riatom_to_lmos_ext[c] for c in unique_centers])
+            ).astype(np.int64)
         else:
-            _ext_union = np.zeros(0, dtype=np.int64)
-        p_lmos = _ext_union.astype(np.int64)
+            p_lmos = np.zeros(0, dtype=np.int64)
         nlmo_p = len(p_lmos)
         p_lmos_dense = np.full(nocc, -1, dtype=np.int64)
         if nlmo_p > 0:
@@ -839,6 +860,26 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             X_ki = pno_spaces[key_ki]['X_pno']
             pp_ki = np.asarray(pno_spaces[key_ki]['pair_paos'])
             ki_data.append((k, X_ki, pp_ki, n_ki))
+
+        if _stats_ccints:
+            n_partners = len(kj_data) + len(ki_data)
+            sum_n_kj = sum(d[3] for d in kj_data) + sum(d[3] for d in ki_data)
+            np_full_avg = (sum(qab_atom[c].shape[1]
+                               for c in unique_centers
+                               if qab_atom[c] is not None)
+                           / max(1, len(unique_centers)))
+            with _stats_lock:
+                _stats_pairs.append({
+                    'i': int(i), 'j': int(j),
+                    'npno': int(npno),
+                    'n_local': int(n_local),
+                    'nlmo_p': int(nlmo_p),
+                    'ncenters': int(len(unique_centers)),
+                    'n_partners': int(n_partners),
+                    'sum_n_kj': int(sum_n_kj),
+                    'np_avg': float(np_full_avg),
+                    'n_pao_pair': int(len(pair_paos_ij)),
+                })
 
         _t_centerQ_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         for centerQ in unique_centers:
@@ -1136,43 +1177,11 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     ).reshape(n_local, nlmo_p, npno)
         Qab = (jhi @ raw_ab.reshape(n_local, -1)).reshape(n_local, npno, npno)
 
-        # Phase III: project to pair_lmo_idx-axis (Psi4-truly-faithful,
-        # smaller subset). With Phase II kernels 1+2 in C taking pair-domain
-        # inputs natively, the only remaining scatter-back is the per_kl
-        # K_bar one (still scatters to nocc; insensitive to axis size).
-        # The pair_lmo_idx construction always includes endpoints i, j
-        # below so helpers like get_local_K never see a missing pair.
-        if pair_lmo_idx is not None and key in pair_lmo_idx:
-            pair_lmos = np.asarray(pair_lmo_idx[key], dtype=np.int64)
-            # Defensive: ensure i, j are in pair_lmos (Psi4-faithful).
-            i, j = key
-            if i not in pair_lmos:
-                pair_lmos = np.append(pair_lmos, i)
-            if j != i and j not in pair_lmos:
-                pair_lmos = np.append(pair_lmos, j)
-            pair_lmos = np.sort(pair_lmos.astype(np.int64))
-        else:
-            pair_lmos = p_lmos
-        nlmo_pair = len(pair_lmos)
-        pair_in_p = (p_lmos_dense[pair_lmos]).astype(np.int64)
-        if nlmo_pair == 0 or (pair_in_p < 0).any():
-            raise RuntimeError(
-                f"pair_lmo_idx[{key}] not subset of p_lmos: "
-                f"missing {pair_lmos[pair_in_p < 0].tolist()}")
-        q_io_red = q_io_pfit[:, pair_in_p]      # (n_local, nlmo_pair)
-        q_jo_red = q_jo_pfit[:, pair_in_p]
-        Qma_red  = Qma_pfit[:, pair_in_p, :]
-
-        # Override p_lmos / p_lmos_dense to pair_lmo_idx semantics — the
-        # axis is now the smallest possible (Psi4's lmopair_to_lmos_[ij]).
-        p_lmos = pair_lmos
-        nlmo_p = nlmo_pair
-        p_lmos_dense = np.full(nocc, -1, dtype=np.int64)
-        p_lmos_dense[p_lmos] = np.arange(nlmo_p)
-
-        q_io = q_io_red
-        q_jo = q_jo_red
-        Qma = Qma_red
+        # Working axis = storage axis (pair_lmo_idx). No crop needed —
+        # the centerQ loop already populated rows only for LMOs in p_lmos.
+        q_io = q_io_pfit
+        q_jo = q_jo_pfit
+        Qma  = Qma_pfit
 
         if _dbg_ccints:
             _dbg_add('jhi_apply',
@@ -1181,9 +1190,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         K_iajb = q_iv.T @ q_jv
         # K_mnij removed: dead code (built but never read by any consumer).
         # K_bar_ij/ji/chem all reduced on the p_lmos axis: (nlmo_p, npno).
-        K_bar_ij = q_io_red.T @ q_jv
-        K_bar_ji = q_jo_red.T @ q_iv
-        K_bar_chem = np.tensordot(q_pair, Qma_red, axes=(0, 0))
+        K_bar_ij = q_io.T @ q_jv
+        K_bar_ji = q_jo.T @ q_iv
+        K_bar_chem = np.tensordot(q_pair, Qma, axes=(0, 0))
         J_ijab = np.tensordot(q_pair, Qab, axes=(0, 0))
         # Psi4 ccsd.cc:1402 K_tilde_chem (L pre-summed (q_iv|Qab) tensors).
         # Stored once here so compute_C_tilde, build_D_tilde, and the T1
@@ -1318,8 +1327,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             'K_ji_ki': K_ji_ki_dict,
             'i_Qa': q_iv.copy(),
             'j_Qa': q_jv.copy(),
-            'i_Qk': q_io_red.copy(),     # (n_local, nlmo_p) reduced
-            'j_Qk': q_jo_red.copy(),     # (n_local, nlmo_p) reduced
+            'i_Qk': q_io.copy(),     # (n_local, nlmo_p) reduced
+            'j_Qk': q_jo.copy(),     # (n_local, nlmo_p) reduced
             'Qma': Qma,              # (n_local, nlmo_p, npno) reduced
             'Qab': Qab,
             'n_local': n_local,
@@ -1349,6 +1358,43 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         _items = sorted(_dbg_acc.items(), key=lambda kv: -kv[1])
         _summary = ' '.join(f'{n}={v:.2f}s' for n, v in _items if v > 0.0)
         print(f"[CCINTS_DBG] (n_pairs={len(keys)}) {_summary}", flush=True)
+
+    if _stats_ccints and _stats_pairs:
+        _np = len(_stats_pairs)
+        def _avg(field):
+            return sum(p[field] for p in _stats_pairs) / _np
+        def _max(field):
+            return max(p[field] for p in _stats_pairs)
+        def _sum(field):
+            return sum(p[field] for p in _stats_pairs)
+        # Per-pair work proxies (units of FLOPs ~ leading O()):
+        # phase A (centerQ loop): ncenters * (n_partners*npno*np_avg + npno*nlmo_p*np_avg)
+        # phase B (final KJ): n_local * npno^2 * nlmo_p
+        # phase C (cross_kj): n_partners * n_local * npno * sum_n_kj
+        wA = sum(p['ncenters'] * (p['n_partners'] * p['npno'] * p['np_avg']
+                                  + p['npno'] * p['nlmo_p'] * p['np_avg'])
+                 for p in _stats_pairs)
+        wB = sum(p['n_local'] * p['npno']**2 * p['nlmo_p']
+                 for p in _stats_pairs)
+        wC = sum(p['n_partners'] * p['n_local'] * p['npno'] * p['sum_n_kj']
+                 / max(1, p['n_partners'])
+                 for p in _stats_pairs)
+        print(f"[CCINTS_STATS] n_pairs={_np}", flush=True)
+        print(f"  per-pair avg: npno={_avg('npno'):.1f} "
+              f"n_local={_avg('n_local'):.1f} "
+              f"nlmo_p={_avg('nlmo_p'):.1f} "
+              f"ncenters={_avg('ncenters'):.1f} "
+              f"n_partners={_avg('n_partners'):.1f} "
+              f"sum_n_kj={_avg('sum_n_kj'):.1f}", flush=True)
+        print(f"  per-pair max: npno={_max('npno')} "
+              f"n_local={_max('n_local')} "
+              f"nlmo_p={_max('nlmo_p')} "
+              f"ncenters={_max('ncenters')} "
+              f"n_partners={_max('n_partners')}", flush=True)
+        print(f"  totals: n_local_sum={_sum('n_local')} "
+              f"nlmo_p_sum={_sum('nlmo_p')} "
+              f"partners_sum={_sum('n_partners')}", flush=True)
+        print(f"  workA={wA:.2e} workB={wB:.2e} workC={wC:.2e}", flush=True)
 
     # Debug: zero p_lmos\pair_lmo_idx rows in selected cc_ints fields, to
     # localize which consumer(s) drift the energy when those rows go away.

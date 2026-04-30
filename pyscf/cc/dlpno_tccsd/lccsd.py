@@ -1815,6 +1815,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         _pool=_pool)
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
+    if int(os.environ.get('DLPNO_STOP_AFTER_CCINTS', '0')):
+        raise SystemExit('STOP_AFTER_CCINTS')
     _t_post_ccints = _time_cc.perf_counter()
 
     # ------------------------------------------------------------------
