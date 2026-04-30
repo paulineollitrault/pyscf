@@ -47,10 +47,16 @@ References:
 """
 
 import copy as _copy
+import os as _os
 import time as _time
 import numpy as np
 from pyscf import mcscf
 from pyscf.lib import logger
+
+# Default to the most-optimised (T) path: full per-triple body in one C call
+# (Phase 3c-2/3, ~2x faster on water-10 than the default driver-orchestrated
+# variant). Caller can opt out with DLPNO_TRIPLE_ORCH_FULL=0.
+_os.environ.setdefault('DLPNO_TRIPLE_ORCH_FULL', '1')
 
 from pyscf.cc.dlpno_tccsd.dmrg_interface import extract_amplitudes_from_mps
 from pyscf.cc.dlpno_tccsd.local_orbs import split_localize_orbitals, make_paos
