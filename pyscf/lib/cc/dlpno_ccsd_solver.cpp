@@ -21,6 +21,8 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <vector>
 #ifdef _OPENMP
 #include <omp.h>
@@ -28,6 +30,19 @@
 
 // Forward decls of per-pair kernels implemented in dlpno_*.c (compiled as C;
 // declared here as extern "C" to suppress C++ mangling).
+// BLAS prototypes (fortran ABI).
+extern "C" {
+void dgemm_(const char *transa, const char *transb,
+            const int *m, const int *n, const int *k,
+            const double *alpha, const double *A, const int *lda,
+            const double *B, const int *ldb,
+            const double *beta, double *C, const int *ldc);
+void dgemv_(const char *trans, const int *m, const int *n,
+            const double *alpha, const double *A, const int *lda,
+            const double *x, const int *incx,
+            const double *beta, double *y, const int *incy);
+}
+
 extern "C" void DLPNOt1_ints_pair_side(
     double *Qa_t1_out, double *Qk_t1_out,
     const double *Qa_full, const double *Qk_local,
@@ -1181,6 +1196,23 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     std::vector<double> A_flat(in_.t2_offsets[N], 0.0);
     std::vector<double> G_tilde_mat((size_t)nocc * nocc, 0.0);
 
+    // Per-phase profiling (set DLPNO_CCSD_PROFILE=1 to enable).
+    const bool _profile = (std::getenv("DLPNO_CCSD_PROFILE") != nullptr
+                            && std::getenv("DLPNO_CCSD_PROFILE")[0] != '0');
+    using _clock = std::chrono::high_resolution_clock;
+    auto _t0 = _clock::now();
+    auto _tprev = _t0;
+    double _t_setup = 0, _t_p1 = 0, _t_p2 = 0, _t_p3 = 0, _t_p4 = 0,
+           _t_p5 = 0, _t_p6 = 0, _t_p6b = 0, _t_p7 = 0, _t_p8 = 0,
+           _t_p9 = 0, _t_p10kl = 0, _t_r2_kload = 0, _t_r2_gterm = 0,
+           _t_r2_be = 0, _t_r2_cd = 0, _t_r2_upd = 0;
+    auto _tick = [&](double *acc) {
+        auto now = _clock::now();
+        *acc = std::chrono::duration<double>(now - _tprev).count();
+        _tprev = now;
+    };
+
+    _tick(&_t_setup);
 
     // ------------------------------------------------------------------
     // Phase 1: t1_ints — produce dressed Qa/Qk per pair.
@@ -1195,6 +1227,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     t1_out.j_Qk_t1.data    = dressed_jQk.data();
     t1_out.j_Qk_t1.offsets = dressed_qk_off.data();
     run_phase_t1_ints_into(&t1_out);
+    _tick(&_t_p1);
     // ------------------------------------------------------------------
     // Phase 2: t1_fock — Fab per pair + d_flat.
     // ------------------------------------------------------------------
@@ -1203,6 +1236,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     t1f_out.Fab.offsets = (const int64_t *)in_.t2_offsets;
     t1f_out.d_flat      = d_flat.data();
     run_phase_t1_fock_into(&t1f_out);
+    _tick(&_t_p2);
     // ------------------------------------------------------------------
     // Phase 3: t1_fock_finalize — Fkj / Fij_bar / foo_t1.
     // ------------------------------------------------------------------
@@ -1213,6 +1247,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     t1ff_out.Fij_bar_snapshot = Fij_bar_mat.data();
     t1ff_out.foo_t1           = foo_t1_mat.data();
     run_phase_t1_fock_finalize_into(&t1ff_in, &t1ff_out);
+    _tick(&_t_p3);
     // ------------------------------------------------------------------
     // Phase 4: Fia_bar per pair.
     // ------------------------------------------------------------------
@@ -1220,6 +1255,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     fia_out.Fia_bar.data    = Fia_bar_flat.data();
     fia_out.Fia_bar.offsets = fia_bar_off.data();
     run_phase_t1_fock_fia_bar_into(&fia_out);
+    _tick(&_t_p4);
     // ------------------------------------------------------------------
     // Phase 5: B_tilde — consumes dressed_iQk_t1 / dressed_jQk_t1.
     // ------------------------------------------------------------------
@@ -1232,6 +1268,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     bt_out.B_tilde.data    = B_tilde_flat.data();
     bt_out.B_tilde.offsets = b_tilde_off.data();
     run_phase_b_tilde_into(&bt_in, &bt_out);
+    _tick(&_t_p5);
     // ------------------------------------------------------------------
     // Phase 6: C_tilde / D_tilde Phase 1 (Phase 2 from t3+t4 plans
     // is skipped in skeleton).
@@ -1244,6 +1281,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     dt_out.D_tilde.data    = D_tilde_flat.data();
     dt_out.D_tilde.offsets = ord_npno2_off.data();
     run_phase_d_tilde_ph1_into(&dt_out);
+    _tick(&_t_p6);
 
     // ------------------------------------------------------------------
     // Phase 6b: C_tilde / D_tilde Phase 2 (t3 + t4 contributions).
@@ -1300,6 +1338,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     _scatter_t4_into(plans->c_t4_plan, plans->c_t4_target_ord_idx, C_tilde_flat);
     _scatter_t3_into(plans->d_t3_plan, plans->d_t3_target_ord_idx, D_tilde_flat);
     _scatter_t4_into(plans->d_t4_plan, plans->d_t4_target_ord_idx, D_tilde_flat);
+    _tick(&_t_p6b);
 
     // ------------------------------------------------------------------
     // Phase 7: G_tilde — initialize to Fkj (Psi4 convention); skip
@@ -1316,6 +1355,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
         std::memcpy(out->G_tilde_out, G_tilde_mat.data(),
                     (size_t)nocc * nocc * sizeof(double));
     }
+    _tick(&_t_p7);
     // ------------------------------------------------------------------
     // Phase 8: K + ladder — per canonical pair K and A.
     // ------------------------------------------------------------------
@@ -1330,6 +1370,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     kl_out.A.data    = A_flat.data();
     kl_out.A.offsets = (const int64_t *)in_.t2_offsets;
     run_phase_k_ladder_into(&kl_in, &kl_out);
+    _tick(&_t_p8);
     // ------------------------------------------------------------------
     // Phase 9: R1 build.
     //   R1[i] = Stages 1-3 (Psi4 Fai_bar/Fab_bar*t1/-T_n^T*Fia*t1)
@@ -1377,6 +1418,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     r1ac_out.R1_flat = R1_buf.data();
     run_phase_t1_residual_AC_init_into(&r1ac_in, &r1ac_out);
 
+    _tick(&_t_p9);
     if (plans->per_kl_plan != nullptr) {
         const PerKlPlanInputs *p_plan = plans->per_kl_plan;
         const int n_tasks = p_plan->n_tasks;
@@ -1405,6 +1447,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             }
         }
     }
+    _tick(&_t_p10kl);
 
     // ------------------------------------------------------------------
     // R2 orchestration.  Two paths:
@@ -1432,6 +1475,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 R2_buf[off + e] = K_flat[off + e] + A_flat[off + e];
             }
         }
+        _tick(&_t_r2_kload);
 
         // Step 2: G_term contribution (two-sided ik + jk).
         // Per pair p: G_term[p] = flat_G_ij[p] + flat_G_ji[p].T  where
@@ -1517,6 +1561,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 }
             }
         }
+        _tick(&_t_r2_gterm);
 
         // Step 3: BE contribution (multi-bucket).
         if (in_.R2_external == nullptr
@@ -1614,6 +1659,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 }
             }
         }
+        _tick(&_t_r2_be);
 
         // Step 4: CD contribution (C_term + D_term).
         // PySCF assembly:
@@ -1753,6 +1799,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             }
         }
     }
+    _tick(&_t_r2_cd);
 
     // ------------------------------------------------------------------
     // Update T1/T2 in place + compute correlation energy.
@@ -1763,6 +1810,19 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     UpdateAmpsOutputs upd_out;
     upd_out.energy = 0.0;
     run_phase_update_amps_and_energy_into(&resid, &upd_out);
+    _tick(&_t_r2_upd);
+
+    if (_profile) {
+        const double total = std::chrono::duration<double>(_tprev - _t0).count();
+        std::fprintf(stderr,
+            "[CCSD-PROFILE] total=%.3fs setup=%.3f p1=%.3f p2=%.3f p3=%.3f "
+            "p4=%.3f p5=%.3f p6=%.3f p6b=%.3f p7=%.3f p8=%.3f p9=%.3f "
+            "p10kl=%.3f r2_K=%.3f r2_G=%.3f r2_BE=%.3f r2_CD=%.3f r2_upd=%.3f\n",
+            total, _t_setup, _t_p1, _t_p2, _t_p3, _t_p4, _t_p5, _t_p6,
+            _t_p6b, _t_p7, _t_p8, _t_p9, _t_p10kl, _t_r2_kload,
+            _t_r2_gterm, _t_r2_be, _t_r2_cd, _t_r2_upd);
+        std::fflush(stderr);
+    }
 
     // ------------------------------------------------------------------
     // Copy R1/R2 to caller's output buffers.
@@ -2105,6 +2165,9 @@ void DLPNOCCSDSolver::run_phase_t1_residual_AC_init_into(
 
 void DLPNOCCSDSolver::run_phase_t1_fock_fia_bar_into(FiaBarOutputs *out) {
     const int N = in_.n_canon_pairs;
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0, neg_one = -1.0, two = 2.0;
+    const int int_one = 1;
 
     #pragma omp parallel for schedule(dynamic, 1)
     for (int p = 0; p < N; ++p) {
@@ -2128,50 +2191,68 @@ void DLPNOCCSDSolver::run_phase_t1_fock_fia_bar_into(FiaBarOutputs *out) {
         for (int64_t e = 0; e < per_q; ++e) Fia_bar[e] = 0.0;
         if (n_local == 0) continue;
 
-        // gamma[Q] = Σ_{m, a} Qma[Q, m, a] * T1l[m, a]
+        const int int_nlmo = nlmo;
+        const int int_npno = npno;
+        const int int_n_local = n_local;
+        const int int_per_q = (int)per_q;
+
+        // Step 1: gamma[Q] = sum_{m,a} Qma[Q, m, a] * T1l[m, a]
+        // Treat Qma as (n_local, per_q) and T1l as (per_q,).
+        // gamma = Qma_flat @ T1l   (matrix-vector).
+        // In Fortran: Qma_flat row-major (n_local, per_q) → col-major (per_q, n_local).
+        // dgemv('T', m=per_q, n=n_local, alpha=1, A=Qma_flat, lda=per_q,
+        //       x=T1l, incx=1, beta=0, y=gamma, incy=1).
         std::vector<double> gamma((size_t)n_local, 0.0);
-        for (int Q = 0; Q < n_local; ++Q) {
-            const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
-            double s = 0.0;
-            for (int64_t e = 0; e < per_q; ++e) s += Qma_Q[e] * T1l[e];
-            gamma[(size_t)Q] = s;
-        }
+        dgemv_(&T_flag, &int_per_q, &int_n_local,
+               &one, Qma, &int_per_q,
+               T1l, &int_one,
+               &zero, gamma.data(), &int_one);
 
-        // Z[Q, n_, k] = Σ_b T1l[n_, b] * Qma[Q, k, b]
+        // Step 2: Z[Q, n, k] = sum_b T1l[n, b] * Qma[Q, k, b]
+        // Per Q small GEMM: Z_Q (nlmo, nlmo) = T1l (nlmo, npno) @ Qma_Q^T (npno, nlmo)
+        // Fortran: Z_Q_F[k, n] = sum_b Qma_Q_F[b, k] * T1l_F[b, n]
+        //   = Qma_Q^T @ T1l (col-major view) → dgemm('T', 'N', nlmo, nlmo, npno,
+        //                                             1, Qma_Q, npno, T1l, npno, 0, Z_Q, nlmo)
         std::vector<double> Z((size_t)n_local * nlmo * nlmo, 0.0);
+        const int64_t Z_stride = (int64_t)nlmo * nlmo;
         for (int Q = 0; Q < n_local; ++Q) {
-            const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
-            for (int n_ = 0; n_ < nlmo; ++n_) {
-                for (int kk = 0; kk < nlmo; ++kk) {
-                    const double *Qma_Qk = Qma_Q + (int64_t)kk * npno;
-                    double s = 0.0;
-                    for (int b = 0; b < npno; ++b) {
-                        s += T1l[(int64_t)n_ * npno + b] * Qma_Qk[b];
-                    }
-                    Z[(int64_t)Q * nlmo * nlmo
-                      + (int64_t)n_ * nlmo + kk] = s;
-                }
-            }
+            const double *Qma_Q = Qma + (int64_t)Q * per_q;
+            double *Z_Q = Z.data() + (int64_t)Q * Z_stride;
+            dgemm_(&T_flag, &N_flag,
+                   &int_nlmo, &int_nlmo, &int_npno,
+                   &one, Qma_Q, &int_npno,
+                   T1l, &int_npno,
+                   &zero, Z_Q, &int_nlmo);
         }
 
-        // Fia_bar[k, a] = 2 * Σ_Q gamma[Q] * Qma[Q, k, a]
-        //              -  Σ_{Q, n_} Qma[Q, n_, a] * Z[Q, n_, k]
-        for (int k = 0; k < nlmo; ++k) {
-            for (int a = 0; a < npno; ++a) {
-                double s_pos = 0.0, s_neg = 0.0;
-                for (int Q = 0; Q < n_local; ++Q) {
-                    const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
-                    s_pos += gamma[(size_t)Q]
-                           * Qma_Q[(int64_t)k * npno + a];
-                    for (int n_ = 0; n_ < nlmo; ++n_) {
-                        s_neg += Qma_Q[(int64_t)n_ * npno + a]
-                              * Z[(int64_t)Q * nlmo * nlmo
-                                  + (int64_t)n_ * nlmo + k];
-                    }
-                }
-                Fia_bar[(int64_t)k * npno + a] = 2.0 * s_pos - s_neg;
-            }
+        // Step 3a: Fia_pos[k, a] = sum_Q gamma[Q] * Qma[Q, k, a]
+        // = gamma (n_local) @ Qma_flat (n_local, per_q) → result (per_q,)
+        // dgemv('N', m=per_q, n=n_local, alpha=1, A=Qma, lda=per_q, x=gamma, incx=1, beta=0, y=Fia_pos)
+        std::vector<double> Fia_pos((size_t)per_q, 0.0);
+        dgemv_(&N_flag, &int_per_q, &int_n_local,
+               &one, Qma, &int_per_q,
+               gamma.data(), &int_one,
+               &zero, Fia_pos.data(), &int_one);
+
+        // Step 3b: Fia_neg[k, a] = sum_{Q, n} Qma[Q, n, a] * Z[Q, n, k]
+        // View Qma_view[Q*nlmo+n, a] = Qma[Q, n, a]; Z_view[Q*nlmo+n, k] = Z[Q, n, k].
+        // Fia_neg[k, a] = sum_{Qn} Z_view[Qn, k] * Qma_view[Qn, a] = Z_view^T @ Qma_view → (nlmo, npno)
+        // Fortran: result_F[a, k] = sum_{Qn} Qma_F[a, Qn] * Z_F[k, Qn]
+        //   = Qma_F @ Z_F^T (col-major view of (n_local*nlmo, npno) and (n_local*nlmo, nlmo))
+        // dgemm('N', 'T', m=npno, n=nlmo, k=n_local*nlmo, 1, Qma, npno, Z, nlmo, 0, Fia_neg, npno)
+        std::vector<double> Fia_neg((size_t)per_q, 0.0);
+        const int int_nl_nlmo = (int)((int64_t)n_local * nlmo);
+        dgemm_(&N_flag, &T_flag,
+               &int_npno, &int_nlmo, &int_nl_nlmo,
+               &one, Qma, &int_npno,
+               Z.data(), &int_nlmo,
+               &zero, Fia_neg.data(), &int_npno);
+
+        // Final: Fia_bar[k, a] = 2 * Fia_pos[k, a] - Fia_neg[k, a]
+        for (int64_t e = 0; e < per_q; ++e) {
+            Fia_bar[e] = 2.0 * Fia_pos[(size_t)e] - Fia_neg[(size_t)e];
         }
+        (void)neg_one; (void)two;
     }
 }
 
