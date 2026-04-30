@@ -5061,6 +5061,279 @@ def validate_run_one_cycle_with_per_kl(
     return d_R1
 
 
+def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
+                              pno_spaces, b_tilde_per_ij, C_tilde_cache,
+                              D_tilde_cache, n_canon_pairs):
+    """Build all scatter tables + plan structs needed to drive
+    run_one_cycle's native R2 path (R2_external=None).  Returns a dict
+    of arrays + the ownership list to keep them alive.
+
+    Wires:
+      G_term: g_term_plan, g_term_plan_jk, target_pair_idx_ik/jk
+      BE:     be_plan_buckets array, be_unique_n_ij, be_flat_off_per_n_ij,
+              be_pair_n_ij_idx, be_pair_slot
+      CD:     c_term_plan, d_term_plan, target_pair_idx_ij/ji per side
+    """
+    from pyscf.cc.dlpno_tccsd.residual import (
+        compute_G_term_batched, compute_B_E_batched_v2,
+        compute_CD_terms_batched, _get_or_build_g_term_batched_view,
+        _get_or_build_cd_batched_view)
+    from pyscf.cc.dlpno_tccsd._cd_gather_cy import (
+        gather_t2_with_transpose, gather_u_from_t2)
+    own = []
+
+    # ----------------------- G_term -----------------------
+    g_term_cache = getattr(compute_G_term_batched, '_plan_cache', None)
+    g_plan = next(iter(g_term_cache.values())) if g_term_cache else None
+    g_plan_struct_ik = g_plan_struct_jk = None
+    g_target_ik_arr = g_target_jk_arr = None
+    if g_plan is not None:
+        for side, suffix in [('ik', 'ik'), ('jk', 'jk')]:
+            ps, po, target_slots, _ = _extract_g_term_plan(
+                t2_pno_all, key_to_p, side=side)
+            if ps is None:
+                continue
+            # Build per-item target canonical pair index.
+            tgt = np.full(ps.N, -1, dtype=np.int32)
+            pairs_by_n_ij = g_plan['pairs_by_n_ij']
+            for n in range(ps.N):
+                n_ij_n, slot_n = target_slots[n]
+                if n_ij_n in pairs_by_n_ij:
+                    pyscf_pair = pairs_by_n_ij[n_ij_n][slot_n]
+                    tgt[n] = key_to_p.get(pyscf_pair, -1)
+            own.append(tgt)
+            own.extend(po)
+            if side == 'ik':
+                g_plan_struct_ik = ps
+                g_target_ik_arr = tgt
+            else:
+                g_plan_struct_jk = ps
+                g_target_jk_arr = tgt
+
+    # ----------------------- BE -----------------------
+    be_cache = getattr(compute_B_E_batched_v2, '_plan_cache', None)
+    be_plan = next(iter(be_cache.values())) if be_cache else None
+    be_plan_buckets_arr = be_unique_n_ij = be_flat_off = None
+    be_pair_n_ij_idx_arr = be_pair_slot_arr = None
+    be_n_buckets = 0
+    be_n_unique = 0
+    be_owned_buckets = []
+    if be_plan is not None:
+        unique_n_ij = sorted(be_plan['pairs_by_n_ij'].keys())
+        n_unique = len(unique_n_ij)
+        flat_off = np.zeros(n_unique + 1, dtype=np.int64)
+        for gi, n_ij in enumerate(unique_n_ij):
+            n_pairs_in_group = len(be_plan['pairs_by_n_ij'][n_ij])
+            flat_off[gi + 1] = flat_off[gi] + n_pairs_in_group * n_ij * n_ij
+
+        # Build buckets array (PyBEInputs[N]).
+        buckets = be_plan['buckets']
+        BUCK_T = PyBEInputs * len(buckets)
+        buckets_arr = BUCK_T()
+        for b_idx, bucket in enumerate(buckets):
+            n_ij = bucket['n_ij']
+            n_kl = bucket['n_kl']
+            N_b = len(bucket['kl_keys'])
+            T_arr = np.empty((N_b, n_kl, n_kl))
+            beta_kl_arr = np.empty(N_b)
+            beta_lk_arr = np.empty(N_b)
+            for n in range(N_b):
+                T_arr[n] = t2_pno_all[bucket['kl_keys'][n]]
+                key_ij_n, k_n, l_n = bucket['beta_coords'][n]
+                B_tilde = b_tilde_per_ij[key_ij_n]
+                if isinstance(B_tilde, tuple):
+                    B_local, p_dense = B_tilde
+                    beta_kl_arr[n] = B_local[p_dense[k_n], p_dense[l_n]]
+                    beta_lk_arr[n] = (
+                        0.0 if k_n == l_n
+                        else B_local[p_dense[l_n], p_dense[k_n]])
+                else:
+                    beta_kl_arr[n] = B_tilde[k_n, l_n]
+                    beta_lk_arr[n] = (0.0 if k_n == l_n
+                                       else B_tilde[l_n, k_n])
+            S_c = np.ascontiguousarray(bucket['S'])
+            T_c = np.ascontiguousarray(T_arr)
+            K_c = np.ascontiguousarray(bucket['K'])
+            same_c = np.ascontiguousarray(bucket['same']).astype(
+                np.uint8, copy=False)
+            idx_c = np.ascontiguousarray(bucket['item_idx']).astype(
+                np.int64, copy=False)
+            n_pairs_in_group = len(be_plan['pairs_by_n_ij'][n_ij])
+            buckets_arr[b_idx].N = int(N_b)
+            buckets_arr[b_idx].n_ij = int(n_ij)
+            buckets_arr[b_idx].n_kl = int(n_kl)
+            buckets_arr[b_idx].n_slots = int(n_pairs_in_group)
+            buckets_arr[b_idx].S       = S_c.ctypes.data
+            buckets_arr[b_idx].T       = T_c.ctypes.data
+            buckets_arr[b_idx].K       = K_c.ctypes.data
+            buckets_arr[b_idx].beta_kl = beta_kl_arr.ctypes.data
+            buckets_arr[b_idx].beta_lk = beta_lk_arr.ctypes.data
+            buckets_arr[b_idx].same    = same_c.ctypes.data
+            buckets_arr[b_idx].idx     = idx_c.ctypes.data
+            be_owned_buckets.extend([S_c, T_c, K_c, beta_kl_arr,
+                                     beta_lk_arr, same_c, idx_c])
+
+        unique_arr = np.asarray(unique_n_ij, dtype=np.int32)
+        own.extend([buckets_arr, unique_arr, flat_off])
+        own.extend(be_owned_buckets)
+        be_plan_buckets_arr = buckets_arr
+        be_unique_n_ij = unique_arr
+        be_flat_off = flat_off
+        be_n_buckets = len(buckets)
+        be_n_unique = n_unique
+
+        # Per-pair (group, slot) lookup.
+        be_pair_n_ij_idx_arr = np.full(n_canon_pairs, -1, dtype=np.int32)
+        be_pair_slot_arr = np.zeros(n_canon_pairs, dtype=np.int32)
+        for key, slot in be_plan['pair_to_slot'].items():
+            p = key_to_p.get(key, -1)
+            if p < 0:
+                continue
+            n_ij = pno_spaces[key]['C_pno'].shape[1]
+            if n_ij in unique_n_ij:
+                be_pair_n_ij_idx_arr[p] = unique_n_ij.index(n_ij)
+                be_pair_slot_arr[p] = slot
+        own.extend([be_pair_n_ij_idx_arr, be_pair_slot_arr])
+
+    # ----------------------- CD -----------------------
+    cd_cache = getattr(compute_CD_terms_batched, '_plan_cache', None)
+    cd_plan = next(iter(cd_cache.values())) if cd_cache else None
+    c_plan_struct = d_plan_struct = None
+    c_target_ij_arr = c_target_ji_arr = None
+    d_target_ij_arr = d_target_ji_arr = None
+    if cd_plan is not None:
+        bv = _get_or_build_cd_batched_view(cd_plan, pno_spaces, t2_pno_all)
+        n_pno_offsets = bv['n_pno_offsets']
+
+        # Build per-item canonical pair maps.  Walk back target_off → (n_pno, slot).
+        # n_pno_offsets[n_pno] is the global flat-offset start.  slot = (off-start)//(n_pno²).
+        def _off_to_pair(off, n_pno):
+            if off < 0:
+                return -1
+            slot = (int(off) - int(n_pno_offsets[n_pno])) // (n_pno * n_pno)
+            pairs_in_group = cd_plan['pairs_by_n_pno'][n_pno]
+            if slot < 0 or slot >= len(pairs_in_group):
+                return -1
+            return key_to_p.get(pairs_in_group[slot], -1)
+
+        # C side.
+        c_N = bv['c_N']
+        if c_N > 0:
+            # Gather ct_flat + t2_flat per cycle.
+            ct_flat = np.zeros(int(bv['c_ct_off'][-1]))
+            for n in range(c_N):
+                ct_val = (C_tilde_cache.get(bv['c_ct_keys'][n])
+                          if C_tilde_cache is not None else None)
+                if ct_val is not None and ct_val.shape[0] == int(bv['c_n_ct'][n]):
+                    ct_flat[bv['c_ct_off'][n]:bv['c_ct_off'][n + 1]] = (
+                        ct_val.ravel())
+            t2_flat = np.empty(int(bv['c_t2_off'][-1]))
+            gather_t2_with_transpose(
+                c_N, bv['c_n_other'],
+                bv['c_t2_canon_off'], bv['c_t2_trans_arr'],
+                bv['c_t2_off'], t2_pno_all._buffer, t2_flat,
+                min(64, c_N))
+            c_plan_struct = PyCTermInputs()
+            c_plan_struct.N           = int(c_N)
+            c_plan_struct.n_pno_arr   = bv['c_n_pno'].ctypes.data
+            c_plan_struct.n_ct_arr    = bv['c_n_ct'].ctypes.data
+            c_plan_struct.n_other_arr = bv['c_n_other'].ctypes.data
+            c_plan_struct.S_big_off   = bv['c_S_big_off'].ctypes.data
+            c_plan_struct.ct_off      = bv['c_ct_off'].ctypes.data
+            c_plan_struct.S_mid_off   = bv['c_S_mid_off'].ctypes.data
+            c_plan_struct.J_bold_off  = bv['c_J_bold_off'].ctypes.data
+            c_plan_struct.t2_off      = bv['c_t2_off'].ctypes.data
+            c_plan_struct.S_outer_off = bv['c_S_outer_off'].ctypes.data
+            c_plan_struct.tile_off    = bv['c_tile_off'].ctypes.data
+            c_plan_struct.S_big_flat  = bv['c_S_big_flat'].ctypes.data
+            c_plan_struct.S_mid_flat  = bv['c_S_mid_flat'].ctypes.data
+            c_plan_struct.J_bold_flat = bv['c_J_bold_flat'].ctypes.data
+            c_plan_struct.S_outer_flat= bv['c_S_outer_flat'].ctypes.data
+            c_plan_struct.ct_flat     = ct_flat.ctypes.data
+            c_plan_struct.t2_flat     = t2_flat.ctypes.data
+            c_plan_struct.max_n_pno   = int(bv['c_n_pno'].max(initial=1))
+            c_plan_struct.max_n_ct    = int(bv['c_n_ct'].max(initial=1))
+            c_plan_struct.max_n_other = int(bv['c_n_other'].max(initial=1))
+            c_target_ij_arr = np.full(c_N, -1, dtype=np.int32)
+            c_target_ji_arr = np.full(c_N, -1, dtype=np.int32)
+            c_n_pno_arr = bv['c_n_pno']
+            c_target_ij_off = bv['c_target_off_ij']
+            c_target_ji_off = bv['c_target_off_ji']
+            for n in range(c_N):
+                np_n = int(c_n_pno_arr[n])
+                if c_target_ij_off[n] >= 0:
+                    c_target_ij_arr[n] = _off_to_pair(c_target_ij_off[n], np_n)
+                if c_target_ji_off[n] >= 0:
+                    c_target_ji_arr[n] = _off_to_pair(c_target_ji_off[n], np_n)
+            own.extend([ct_flat, t2_flat, c_target_ij_arr, c_target_ji_arr])
+
+        # D side.
+        d_N = bv['d_N']
+        if d_N > 0:
+            u_flat = np.empty(int(bv['d_u_off'][-1]))
+            gather_u_from_t2(
+                d_N, bv['d_n_A'],
+                bv['d_t2_canon_off'], bv['d_t2_trans_arr'],
+                bv['d_u_off'], t2_pno_all._buffer, u_flat,
+                min(64, d_N))
+            dt_flat = np.zeros(int(bv['d_dt_off'][-1]))
+            for n in range(d_N):
+                dk = bv['d_dt_keys'][n]
+                dt_val = (D_tilde_cache.get(dk)
+                          if D_tilde_cache is not None else None)
+                if dt_val is not None:
+                    dt_flat[bv['d_dt_off'][n]:bv['d_dt_off'][n + 1]] = (
+                        dt_val.ravel())
+            d_plan_struct = PyDTermInputs()
+            d_plan_struct.N         = int(d_N)
+            d_plan_struct.n_pno_arr = bv['d_n_pno'].ctypes.data
+            d_plan_struct.n_A_arr   = bv['d_n_A'].ctypes.data
+            d_plan_struct.n_B_arr   = bv['d_n_B'].ctypes.data
+            d_plan_struct.S_a_off   = bv['d_S_a_off'].ctypes.data
+            d_plan_struct.u_off     = bv['d_u_off'].ctypes.data
+            d_plan_struct.S_b_off   = bv['d_S_b_off'].ctypes.data
+            d_plan_struct.S_c_off   = bv['d_S_c_off'].ctypes.data
+            d_plan_struct.dt_off    = bv['d_dt_off'].ctypes.data
+            d_plan_struct.KJ_off    = bv['d_KJ_off'].ctypes.data
+            d_plan_struct.tile_off  = bv['d_tile_off'].ctypes.data
+            d_plan_struct.S_a_flat  = bv['d_S_a_flat'].ctypes.data
+            d_plan_struct.S_b_flat  = bv['d_S_b_flat'].ctypes.data
+            d_plan_struct.S_c_flat  = bv['d_S_c_flat'].ctypes.data
+            d_plan_struct.KJ_flat   = bv['d_KJ_flat'].ctypes.data
+            d_plan_struct.u_flat    = u_flat.ctypes.data
+            d_plan_struct.dt_flat   = dt_flat.ctypes.data
+            d_plan_struct.max_n_pno = int(bv['d_n_pno'].max(initial=1))
+            d_plan_struct.max_n_A   = int(bv['d_n_A'].max(initial=1))
+            d_plan_struct.max_n_B   = int(bv['d_n_B'].max(initial=1))
+            d_target_ij_arr = np.full(d_N, -1, dtype=np.int32)
+            d_target_ji_arr = np.full(d_N, -1, dtype=np.int32)
+            d_n_pno_arr = bv['d_n_pno']
+            d_target_ij_off = bv['d_target_off_ij']
+            d_target_ji_off = bv['d_target_off_ji']
+            for n in range(d_N):
+                np_n = int(d_n_pno_arr[n])
+                if d_target_ij_off[n] >= 0:
+                    d_target_ij_arr[n] = _off_to_pair(d_target_ij_off[n], np_n)
+                if d_target_ji_off[n] >= 0:
+                    d_target_ji_arr[n] = _off_to_pair(d_target_ji_off[n], np_n)
+            own.extend([u_flat, dt_flat, d_target_ij_arr, d_target_ji_arr])
+
+    return {
+        'g_plan_ik': g_plan_struct_ik, 'g_plan_jk': g_plan_struct_jk,
+        'g_target_ik': g_target_ik_arr, 'g_target_jk': g_target_jk_arr,
+        'be_n_buckets': be_n_buckets,
+        'be_plan_buckets': be_plan_buckets_arr,
+        'be_n_unique': be_n_unique,
+        'be_unique_n_ij': be_unique_n_ij,
+        'be_flat_off_per_n_ij': be_flat_off,
+        'be_pair_n_ij_idx': be_pair_n_ij_idx_arr,
+        'be_pair_slot': be_pair_slot_arr,
+        'c_plan': c_plan_struct, 'd_plan': d_plan_struct,
+        'c_target_ij': c_target_ij_arr, 'c_target_ji': c_target_ji_arr,
+        'd_target_ij': d_target_ij_arr, 'd_target_ji': d_target_ji_arr,
+    }, own
+
+
 def validate_run_one_cycle_full_with_external_R2(
         cc_ints, t1_pno_old, t1_pno_new, t2_pno_all_old, t2_new_dict,
         r1_pno, r2_all,
@@ -5177,6 +5450,11 @@ def validate_run_one_cycle_full_with_external_R2(
     plans.per_kl_plan = ctypes.pointer(plan_struct)
     if g_plan_struct is not None:
         plans.g_tilde_plan = ctypes.pointer(g_plan_struct)
+
+    # Snapshot T1/T2 BEFORE first run_one_cycle (so we can reset for the
+    # native-R2 second pass).
+    T1_snapshot = aux['T1_flat'].copy()
+    T2_snapshot = aux['T2_flat'].copy()
 
     G_tilde_class = np.zeros((nocc, nocc), dtype=np.float64)
     out = PyRunCycleOutputs()
@@ -5307,6 +5585,102 @@ def validate_run_one_cycle_full_with_external_R2(
             pno_spaces, c_term_pyscf, d_term_pyscf)
         print(f'    |dC_term|  = {d_c_term:.3e}  |dD_term| = {d_d_term:.3e}  '
               f'(per-pair CD build)', flush=True)
+
+    # ============================================================
+    # NATIVE R2 path: R2_external=null, all plans wired.  Compares
+    # class-built R2 to PySCF's r2_all to localize what contributions
+    # remain to be implemented (Fab*T2, ooL/ovL, P-symm).
+    # ============================================================
+    if (b_tilde_per_ij_pyscf is not None and jiang_C_pyscf is not None
+            and jiang_D_pyscf is not None):
+        natives, native_own = _build_native_r2_plans(
+            t2_pno_all_old, key_to_p, keys_reorder, pno_spaces,
+            b_tilde_per_ij_pyscf, jiang_C_pyscf, jiang_D_pyscf, n_pairs)
+
+        # Build a fresh inputs without R2_external; reuse aux's T1/T2.
+        # (Reset T1/T2 to old state first.)
+        aux['T1_flat'][:] = T1_snapshot
+        aux['T2_flat'][:] = T2_snapshot
+
+        plans_native = PyRunCycleInputs()
+        for fname in ('g_tilde_plan', 'be_plan', 'c_term_plan',
+                      'd_term_plan', 'g_term_plan', 't3_plan', 't4_plan',
+                      'g_term_plan_jk'):
+            setattr(plans_native, fname, None)
+        plans_native.per_kl_plan = ctypes.pointer(plan_struct)
+        if g_plan_struct is not None:
+            plans_native.g_tilde_plan = ctypes.pointer(g_plan_struct)
+        # Wire native R2 plans.
+        if natives['g_plan_ik'] is not None:
+            plans_native.g_term_plan = ctypes.pointer(natives['g_plan_ik'])
+            plans_native.g_term_plan_jk = ctypes.pointer(natives['g_plan_jk'])
+            plans_native.g_term_target_pair_idx_ik = (
+                natives['g_target_ik'].ctypes.data)
+            plans_native.g_term_target_pair_idx_jk = (
+                natives['g_target_jk'].ctypes.data)
+        else:
+            plans_native.g_term_target_pair_idx_ik = None
+            plans_native.g_term_target_pair_idx_jk = None
+        # BE
+        plans_native.be_n_buckets    = natives['be_n_buckets']
+        plans_native.be_plan_buckets = (
+            ctypes.addressof(natives['be_plan_buckets'])
+            if natives['be_plan_buckets'] is not None else 0)
+        plans_native.be_n_unique_n_ij = natives['be_n_unique']
+        plans_native.be_unique_n_ij = (
+            natives['be_unique_n_ij'].ctypes.data
+            if natives['be_unique_n_ij'] is not None else None)
+        plans_native.be_flat_off_per_n_ij = (
+            natives['be_flat_off_per_n_ij'].ctypes.data
+            if natives['be_flat_off_per_n_ij'] is not None else None)
+        plans_native.be_pair_n_ij_idx = (
+            natives['be_pair_n_ij_idx'].ctypes.data
+            if natives['be_pair_n_ij_idx'] is not None else None)
+        plans_native.be_pair_slot = (
+            natives['be_pair_slot'].ctypes.data
+            if natives['be_pair_slot'] is not None else None)
+        # CD
+        if natives['c_plan'] is not None:
+            plans_native.c_term_plan = ctypes.pointer(natives['c_plan'])
+            plans_native.c_term_target_pair_idx_ij = (
+                natives['c_target_ij'].ctypes.data)
+            plans_native.c_term_target_pair_idx_ji = (
+                natives['c_target_ji'].ctypes.data)
+        if natives['d_plan'] is not None:
+            plans_native.d_term_plan = ctypes.pointer(natives['d_plan'])
+            plans_native.d_term_target_pair_idx_ij = (
+                natives['d_target_ij'].ctypes.data)
+            plans_native.d_term_target_pair_idx_ji = (
+                natives['d_target_ji'].ctypes.data)
+
+        # Disable R2_external to force native path.
+        inputs.R2_external = None
+
+        R1_native = np.zeros(R1_size, dtype=np.float64)
+        R2_native = np.zeros(R2_total, dtype=np.float64)
+        out_native = PyRunCycleOutputs()
+        out_native.R1_flat = R1_native.ctypes.data
+        out_native.R2_flat = R2_native.ctypes.data
+        out_native.energy = 0.0
+        out_native.G_tilde_out = 0
+        rc = _libcc.DLPNOcompute_lccsd_run_one_cycle(
+            ctypes.byref(inputs), ctypes.byref(plans_native),
+            ctypes.byref(out_native))
+        if rc != 0:
+            raise RuntimeError(f'native run_one_cycle rc={rc}')
+        # Compare R2 to PySCF r2_all.
+        R2_ref = np.zeros(R2_total, dtype=np.float64)
+        for p, key in enumerate(keys_reorder):
+            if key not in r2_all:
+                continue
+            sl = slice(int(t2_offsets[p]), int(t2_offsets[p + 1]))
+            R2_ref[sl] = r2_all[key].ravel()
+        d_R2_native = float(np.max(np.abs(R2_native - R2_ref)))
+        print(f'[CCSD MONO] NATIVE R2 (no R2_external) vs PySCF r2_all: '
+              f'|dR2| = {d_R2_native:.3e}', flush=True)
+        # Restore for cleanup.
+        inputs.R2_external = R2_external.ctypes.data
+        del native_own
 
     del plan_own, ownership
     return d_R1, d_T1, d_T2, d_E

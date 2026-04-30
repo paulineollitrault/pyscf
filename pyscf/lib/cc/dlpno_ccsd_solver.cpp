@@ -1354,23 +1354,23 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             std::vector<double> flat_G_ij_buf((size_t)R2_total, 0.0);
             std::vector<double> flat_G_ji_buf((size_t)R2_total, 0.0);
 
-            // Run kernel for ik side.
-            std::vector<double> tiles_ik((size_t)
-                plans->g_term_plan->tile_off
-                ? 0 : 0);  // placeholder; actual size from plan.tile_off[N].
-            const GTermInputs *g_ik = plans->g_term_plan;
-            const int N_ik = g_ik->N;
-            // tile_off has N+1 entries; total = tile_off[N].
+            // Run kernel for ik side.  Make a mutable local copy of the
+            // plan struct so we can plug in the G_tilde matrix that was
+            // built in Phase 7 (extractor doesn't know its address).
+            GTermInputs g_ik_local = *plans->g_term_plan;
+            g_ik_local.G_tilde = G_tilde_mat.data();
+            g_ik_local.G_stride = nocc;
+            const int N_ik = g_ik_local.N;
             const int64_t *tile_off_ik =
-                (const int64_t *)g_ik->tile_off;
+                (const int64_t *)g_ik_local.tile_off;
             const int64_t total_tiles_ik = tile_off_ik[N_ik];
             std::vector<double> tiles_ik_buf((size_t)total_tiles_ik, 0.0);
             GTermOutputs gout_ik;
             gout_ik.tiles_flat = tiles_ik_buf.data();
-            run_phase_g_term_into(g_ik, &gout_ik);
+            run_phase_g_term_into(&g_ik_local, &gout_ik);
             // Scatter ik tiles -> flat_G_ij_buf at target pair offsets.
             // PySCF SUBTRACTS (residual.py:877).
-            const int *n_ij_ik = (const int *)g_ik->n_ij_arr;
+            const int *n_ij_ik = (const int *)g_ik_local.n_ij_arr;
             for (int n = 0; n < N_ik; ++n) {
                 const int n_ij = n_ij_ik[n];
                 const int target_p = plans->g_term_target_pair_idx_ik[n];
@@ -1383,17 +1383,19 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 }
             }
 
-            // Run kernel for jk side.
-            const GTermInputs *g_jk = plans->g_term_plan_jk;
-            const int N_jk = g_jk->N;
+            // Run kernel for jk side (same G_tilde plug-in pattern).
+            GTermInputs g_jk_local = *plans->g_term_plan_jk;
+            g_jk_local.G_tilde = G_tilde_mat.data();
+            g_jk_local.G_stride = nocc;
+            const int N_jk = g_jk_local.N;
             const int64_t *tile_off_jk =
-                (const int64_t *)g_jk->tile_off;
+                (const int64_t *)g_jk_local.tile_off;
             const int64_t total_tiles_jk = tile_off_jk[N_jk];
             std::vector<double> tiles_jk_buf((size_t)total_tiles_jk, 0.0);
             GTermOutputs gout_jk;
             gout_jk.tiles_flat = tiles_jk_buf.data();
-            run_phase_g_term_into(g_jk, &gout_jk);
-            const int *n_ij_jk = (const int *)g_jk->n_ij_arr;
+            run_phase_g_term_into(&g_jk_local, &gout_jk);
+            const int *n_ij_jk = (const int *)g_jk_local.n_ij_arr;
             for (int n = 0; n < N_jk; ++n) {
                 const int n_ij = n_ij_jk[n];
                 const int target_p = plans->g_term_target_pair_idx_jk[n];
