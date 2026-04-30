@@ -189,6 +189,8 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                 id(S_pno_cache), id(pno_spaces))
     plan = getattr(build_G_tilde, '_batched_plan', None)
     if plan is None or plan.get('key') != plan_key:
+        import time as _gtime
+        _g_t0 = _gtime.perf_counter()
         # Enumerate canonical pairs touched by t2_pno_all and assign
         # contiguous indices for T2 buffer access.
         canonical_pair_idx = {}
@@ -213,88 +215,304 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
         T2_offsets[0] = 0
         T2_offsets[1:] = np.cumsum(T2_sizes)
 
-        # Cache K_proj_static per UNIQUE (key_il, key_lj, i, l) tuple so
-        # different (i, j) outer slots that share these inputs reuse the
-        # static computation. K_proj depends on (key_il, key_lj) pair-pair
-        # and (i, l) — the LMO indices used to slice K_il = (Qma_i.T @ Qma_l).
-        # Two of the four orientation/transpose variants are needed:
-        #   case_le: 2*K_proj_T - K_proj   (used when l <= j)
-        #   case_gt: 2*K_proj   - K_proj_T (used when l >  j)
-        # Cache K_proj_static per UNIQUE (key_il, key_lj, i, l) tuple.
-        kproj_cache = {}
-        # Enumerate triples grouped by outer (i, j) slot.
-        ij_slots = []          # list of (i, j)
+        # Build (i, l) → canon_il lookup table. canon_lut[i, l] = -1 when
+        # (min(i,l), max(i,l)) is not a canonical pair.
+        canon_lut = np.full((nocc, nocc), -1, dtype=np.int64)
+        for key, idx in canonical_pair_idx.items():
+            a, b = key
+            canon_lut[a, b] = idx
+            canon_lut[b, a] = idx
+
+        # C plan-build path: enumerate valid triples (skipping those
+        # without an S_pno_cache flat-tier entry, matching the original
+        # `S_il_lj is None: continue`), pre-compute K_il only for
+        # (canon_il, i, l) tuples used by valid triples, and dispatch a
+        # single C kernel call to compute per-triple K_proj via dgemm
+        # (was 92% of cycle-1 plan-build cost in numpy/BLAS dispatch).
+
+        # Cache p_lmos_dense per canonical pair so the triple loop
+        # doesn't re-fetch from cc_ints[key] dicts.
+        canon_p_dense = [None] * n_canon
+        canon_Qma = [None] * n_canon
+        for canon_idx, key in enumerate(canonical_pairs):
+            ci = cc_ints.get(key)
+            if ci is None:
+                continue
+            canon_p_dense[canon_idx] = ci['p_lmos_dense']
+            canon_Qma[canon_idx] = ci['Qma']
+
+        # Map canon_idx → S_pno_cache PairIndex idx for flat-tier lookup.
+        S_pi = S_pno_cache._pi
+        S_idx_matrix = S_pno_cache._idx_matrix
+        S_offsets_arr = S_pno_cache._offsets
+        canonical_to_idx_global = S_pi.canonical_to_idx
+        canon_to_S_pi = np.full(n_canon, -1, dtype=np.int64)
+        for canon_idx, key in enumerate(canonical_pairs):
+            pi_idx = canonical_to_idx_global.get(key)
+            if pi_idx is not None:
+                canon_to_S_pi[canon_idx] = pi_idx
+
+        # PASS 1: enumerate valid triples (i, j, l). Defer K_il
+        # computation: just record the (canon_il, i, l) tuples we'll need.
+        _t_loop0 = _gtime.perf_counter()
+        ij_slots = []
         ij_triple_offsets = [0]
-        triple_eff_list = []
-        triple_n_lj = []
-        triple_T2_pair_idx = []
+        # Per-triple deferred records: (canon_il, i, l, S_off, canon_lj,
+        # n_il, n_lj, l_le_j). We'll pack into arrays after the loop.
+        t_canon_il = []
+        t_i_idx = []
+        t_l_idx = []
+        t_S_off = []
+        t_S_sel = []     # 0 = main S buffer, 1 = side buffer (lazy compute)
+        t_canon_lj = []
+        t_n_il = []
+        t_n_lj = []
+        t_l_le_j = []
+
+        # kil_seen: maps (canon_il, i, l) → kil_entry index (allocated lazily)
+        kil_seen = {}
 
         for i in range(nocc):
             for j in range(nocc):
                 for l in range(nocc):
-                    key_il = (min(i, l), max(i, l))
-                    if key_il not in t2_pno_all:
+                    canon_il = canon_lut[i, l]
+                    if canon_il < 0:
                         continue
-                    t2_il = t2_pno_all[key_il]
-                    if t2_il is None or t2_il.shape[0] == 0:
+                    canon_lj = canon_lut[l, j]
+                    if canon_lj < 0:
                         continue
-                    key_lj = (min(l, j), max(l, j))
-                    if key_lj not in canonical_pair_idx:
+                    p_dense_il = canon_p_dense[canon_il]
+                    if p_dense_il is None:
                         continue
-                    n_lj = pno_spaces[key_lj]['C_pno'].shape[1]
+                    if p_dense_il[i] < 0 or p_dense_il[l] < 0:
+                        continue   # K_il would be None in original code
 
-                    cache_key = (key_il, key_lj, i, l)
-                    pair_kproj = kproj_cache.get(cache_key)
-                    if pair_kproj is None:
-                        # Python fallback: only hit when not _use_g_kproj_c
-                        # OR when the C path skipped a task (K_il / S None).
-                        K_il = get_local_K(cc_ints, key_il, i, l)
-                        if K_il is None:
+                    if canon_il == canon_lj:
+                        S_off = -1
+                        S_sel = 0
+                    else:
+                        pi_il = canon_to_S_pi[canon_il]
+                        pi_lj = canon_to_S_pi[canon_lj]
+                        if pi_il < 0 or pi_lj < 0:
                             continue
-                        if key_il == key_lj:
-                            K_proj = K_il   # self-pair: S_il_lj = I
+                        S_k = S_idx_matrix[pi_il, pi_lj]
+                        if S_k < 0:
+                            # No flat-tier entry — original code calls
+                            # `_s_pno_get` which lazy-computes via
+                            # X_pno + S_pao paths. We capture the
+                            # (canon_il, canon_lj) pair to fill into a
+                            # side buffer after the loop, and mark the
+                            # triple with S_sel=1 for the kernel.
+                            S_off = -3   # placeholder, fixed up below
+                            S_sel = 1
                         else:
-                            S_il_lj = _s_pno_get(key_il, key_lj)
-                            if S_il_lj is None:
-                                continue
-                            K_proj = S_il_lj.T @ K_il @ S_il_lj
-                        K_proj_T = K_proj.T
-                        case_le = np.ascontiguousarray(
-                            2.0 * K_proj_T - K_proj)
-                        case_gt = np.ascontiguousarray(
-                            2.0 * K_proj - K_proj_T)
-                        pair_kproj = (case_le, case_gt)
-                        kproj_cache[cache_key] = pair_kproj
+                            S_off = int(S_offsets_arr[S_k])
+                            S_sel = 0
 
-                    case_le, case_gt = pair_kproj
-                    eff = case_le if l <= j else case_gt
-                    triple_eff_list.append(eff)
-                    triple_n_lj.append(n_lj)
-                    triple_T2_pair_idx.append(canonical_pair_idx[key_lj])
+                    n_il = int(canon_n_pno[canon_il])
+                    n_lj = int(canon_n_pno[canon_lj])
+
+                    # Track unique (canon_il, i, l) for K_il pool.
+                    seen_key = (canon_il, i, l)
+                    if seen_key not in kil_seen:
+                        kil_seen[seen_key] = len(kil_seen)
+
+                    t_canon_il.append(canon_il)
+                    t_i_idx.append(i)
+                    t_l_idx.append(l)
+                    t_S_off.append(S_off)
+                    t_S_sel.append(S_sel)
+                    t_canon_lj.append(canon_lj)
+                    t_n_il.append(n_il)
+                    t_n_lj.append(n_lj)
+                    t_l_le_j.append(1 if l <= j else 0)
 
                 ij_slots.append((i, j))
-                ij_triple_offsets.append(len(triple_eff_list))
+                ij_triple_offsets.append(len(t_canon_il))
+        _g_t_loop = _gtime.perf_counter() - _t_loop0
 
-        if not ij_slots:
-            # Nothing to do — Fkj copy is the answer.
+        if not t_canon_il:
             build_G_tilde._batched_plan = {'key': plan_key, 'empty': True}
             return G
 
-        # Flatten effective per-triple buffers
-        eff_sizes = np.array([e.size for e in triple_eff_list], dtype=np.int64)
-        eff_offsets = np.empty(len(triple_eff_list) + 1, dtype=np.int64)
+        # PASS 2: build K_il pool only for needed (canon_il, i, l) tuples.
+        _t_kil0 = _gtime.perf_counter()
+        kil_count = len(kil_seen)
+        kil_n_il_arr = np.empty(kil_count, dtype=np.int32)
+        for (canon_il_, i_, l_), kil_idx in kil_seen.items():
+            kil_n_il_arr[kil_idx] = int(canon_n_pno[canon_il_])
+        kil_sizes = (kil_n_il_arr.astype(np.int64))**2
+        kil_offsets = np.empty(kil_count + 1, dtype=np.int64)
+        kil_offsets[0] = 0
+        kil_offsets[1:] = np.cumsum(kil_sizes)
+        K_il_pool = np.empty(int(kil_offsets[-1]))
+        for (canon_il_, i_, l_), kil_idx in kil_seen.items():
+            Qma_il = canon_Qma[canon_il_]
+            p_dense = canon_p_dense[canon_il_]
+            l1 = int(p_dense[i_])
+            l2 = int(p_dense[l_])
+            K_il_arr = Qma_il[:, l1, :].T @ Qma_il[:, l2, :]
+            K_il_pool[kil_offsets[kil_idx]:kil_offsets[kil_idx + 1]] = (
+                K_il_arr.ravel())
+        _g_t_kil = _gtime.perf_counter() - _t_kil0
+
+        # Map every triple to its kil_entry.
+        N_t = len(t_canon_il)
+        triple_K_il_off = np.empty(N_t, dtype=np.int64)
+        for t in range(N_t):
+            kil_idx = kil_seen[(t_canon_il[t], t_i_idx[t], t_l_idx[t])]
+            triple_K_il_off[t] = int(kil_offsets[kil_idx])
+        triple_S_off = np.asarray(t_S_off, dtype=np.int64)
+        triple_S_sel = np.asarray(t_S_sel, dtype=np.int8)
+        triple_n_il = np.asarray(t_n_il, dtype=np.int32)
+        triple_n_lj_arr = np.asarray(t_n_lj, dtype=np.int32)
+        triple_T2_pair_idx_arr = np.asarray(t_canon_lj, dtype=np.int64)
+        triple_l_le_j = np.asarray(t_l_le_j, dtype=np.int8)
+        eff_size_arr = (triple_n_lj_arr.astype(np.int64))**2
+
+        # Build side buffer for lazy-computed S entries by batching per
+        # canon_il through the C kernel `DLPNObuild_S_pno_for_pair`,
+        # dispatched in parallel via `_pool` across canon_il groups.
+        _t_side0 = _gtime.perf_counter()
+        side_unique_lut = {}
+        side_unique_keys = []
+        side_by_canon_il = {}
+        for t in range(N_t):
+            if triple_S_sel[t] != 1:
+                continue
+            ck = (t_canon_il[t], t_canon_lj[t])
+            if ck not in side_unique_lut:
+                side_unique_lut[ck] = len(side_unique_keys)
+                side_unique_keys.append(ck)
+                side_by_canon_il.setdefault(ck[0], []).append(ck[1])
+
+        n_unique = len(side_unique_keys)
+        side_offsets = np.full(n_unique, -1, dtype=np.int64)
+        side_total = 0
+
+        if n_unique > 0 and S_pao_full is not None:
+            # Per-(canon_il, canon_lj) sizes
+            size_lut = np.empty(n_unique, dtype=np.int64)
+            for u_idx, (canon_il_, canon_lj_) in enumerate(side_unique_keys):
+                size_lut[u_idx] = (int(canon_n_pno[canon_il_])
+                                   * int(canon_n_pno[canon_lj_]))
+            offs = np.cumsum(size_lut)
+            for u_idx in range(n_unique):
+                side_offsets[u_idx] = int(offs[u_idx]) - int(size_lut[u_idx])
+            side_total = int(offs[-1]) if n_unique > 0 else 0
+            S_side_buf = np.empty(side_total, dtype=np.float64)
+
+            from pyscf.cc.dlpno_tccsd.local_df import (
+                compute_S_pno, compute_S_pno_batched)
+
+            # Pre-contiguous S_pao_full to avoid the per-canon-il
+            # ascontiguousarray call inside the batched kernel.
+            _S_pao_full_c = np.ascontiguousarray(S_pao_full)
+
+            def _compute_one_canon_il(canon_il):
+                """Compute S for all (canon_il, canon_lj) partners via the
+                batched C kernel — one DLPNObuild_S_pno_for_pair call instead
+                of N Python np.ix_ + matmul calls."""
+                key_a = canonical_pairs[canon_il]
+                partner_keys = [canonical_pairs[lj]
+                                for lj in side_by_canon_il[canon_il]]
+                S_dict = compute_S_pno_batched(
+                    key_a, partner_keys, pno_spaces, S_pao_full, s1e,
+                    _S_pao_full_c=_S_pao_full_c)
+                results = []
+                for canon_lj in side_by_canon_il[canon_il]:
+                    key_b = canonical_pairs[canon_lj]
+                    S = S_dict[key_b]
+                    u_idx = side_unique_lut[(canon_il, canon_lj)]
+                    results.append((u_idx, S.ravel()))
+                return results
+
+            il_keys = list(side_by_canon_il.keys())
+            if _pool is not None:
+                all_results = list(_pool.map(_compute_one_canon_il, il_keys))
+            else:
+                all_results = [_compute_one_canon_il(k) for k in il_keys]
+            for results in all_results:
+                for u_idx, S_flat in results:
+                    off = int(side_offsets[u_idx])
+                    S_side_buf[off:off + S_flat.size] = S_flat
+        else:
+            S_side_buf = np.empty(0, dtype=np.float64)
+
+        # Patch each triple's S_off.
+        for t in range(N_t):
+            if triple_S_sel[t] != 1:
+                continue
+            ck = (t_canon_il[t], t_canon_lj[t])
+            u_idx = side_unique_lut[ck]
+            off = int(side_offsets[u_idx])
+            if off < 0:
+                triple_S_off[t] = -1
+                triple_S_sel[t] = 0
+            else:
+                triple_S_off[t] = off
+        side_S_lut = side_unique_lut  # for debug print
+        _g_t_side = _gtime.perf_counter() - _t_side0
+
+        eff_offsets = np.empty(N_t + 1, dtype=np.int64)
         eff_offsets[0] = 0
-        eff_offsets[1:] = np.cumsum(eff_sizes)
+        eff_offsets[1:] = np.cumsum(eff_size_arr)
         effective_flat = np.empty(int(eff_offsets[-1]))
-        for k, e in enumerate(triple_eff_list):
-            effective_flat[eff_offsets[k]:eff_offsets[k + 1]] = e.ravel()
+
+        # PASS 3: dispatch to C kernel (libcc::DLPNOcompute_kproj_batched).
+        _t_cy0 = _gtime.perf_counter()
+        n_pno_max = int(canon_n_pno.max())
+        n_threads = int(os.environ.get('DLPNO_GTILDE_PLAN_OMP', '0') or 0)
+        if n_threads <= 0:
+            n_threads = min(16, int(os.cpu_count() or 16))
+
+        import ctypes
+        from pyscf import lib as _pyscflib
+        _libcc = getattr(build_G_tilde, '_libcc_kp', None)
+        if _libcc is None:
+            _libcc = _pyscflib.load_library('libcc')
+            _libcc.DLPNOcompute_kproj_batched.restype = None
+            _libcc.DLPNOcompute_kproj_batched.argtypes = [
+                ctypes.c_long, ctypes.c_int,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            build_G_tilde._libcc_kp = _libcc
+        eff_offsets_in = np.ascontiguousarray(eff_offsets[:-1])
+        _libcc.DLPNOcompute_kproj_batched(
+            ctypes.c_long(N_t), ctypes.c_int(n_pno_max),
+            triple_K_il_off.ctypes.data_as(ctypes.c_void_p),
+            K_il_pool.ctypes.data_as(ctypes.c_void_p),
+            triple_n_il.ctypes.data_as(ctypes.c_void_p),
+            triple_S_off.ctypes.data_as(ctypes.c_void_p),
+            S_pno_cache._buffer.ctypes.data_as(ctypes.c_void_p),
+            S_side_buf.ctypes.data_as(ctypes.c_void_p),
+            triple_S_sel.ctypes.data_as(ctypes.c_void_p),
+            triple_n_lj_arr.ctypes.data_as(ctypes.c_void_p),
+            eff_offsets_in.ctypes.data_as(ctypes.c_void_p),
+            effective_flat.ctypes.data_as(ctypes.c_void_p),
+            triple_l_le_j.ctypes.data_as(ctypes.c_void_p),
+            ctypes.c_int(n_threads),
+        )
+        _g_t_cy = _gtime.perf_counter() - _t_cy0
+
+        if int(os.environ.get('DLPNO_GTILDE_PLAN_DBG', '0')):
+            _g_t_total = _gtime.perf_counter() - _g_t0
+            print(f'  [G_TILDE_PLAN_C] N_t={N_t} kil_pool={kil_count} '
+                  f'side_S={len(side_S_lut)} | '
+                  f'loop={_g_t_loop*1000:.0f}ms kil={_g_t_kil*1000:.0f}ms '
+                  f'side={_g_t_side*1000:.0f}ms '
+                  f'kernel={_g_t_cy*1000:.0f}ms '
+                  f'total={_g_t_total*1000:.0f}ms',
+                  flush=True)
 
         ij_i_arr = np.array([s[0] for s in ij_slots], dtype=np.int32)
         ij_j_arr = np.array([s[1] for s in ij_slots], dtype=np.int32)
         ij_triple_starts = np.array(ij_triple_offsets, dtype=np.int64)
         triple_eff_off_arr = eff_offsets[:-1].astype(np.int64)
-        triple_n_lj_arr = np.array(triple_n_lj, dtype=np.int32)
-        triple_T2_pair_idx_arr = np.array(triple_T2_pair_idx, dtype=np.int64)
 
         plan = {
             'key': plan_key,

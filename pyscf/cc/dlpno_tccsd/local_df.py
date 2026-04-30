@@ -353,6 +353,111 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps):
     return {'qij': qij, 'qia': qia, 'qab': qab}
 
 
+_S_PNO_BATCHED_LIBCC = None
+
+
+def compute_S_pno_batched(key_a, partner_keys, pno_spaces,
+                          S_pao_full, s1e, _S_pao_full_c=None):
+    """Batched S_pno: one C kernel call for all (key_a, partner_keys[p]).
+
+    Returns a dict {partner_key: (n_pno_a, n_pno_b) ndarray}. Handles the
+    fallback (any partner without X_pno) by falling through to the slow
+    per-pair path for those entries only.
+    """
+    pd_a = pno_spaces[key_a]
+    X_a_full = pd_a.get('X_pno')
+    pp_a = pd_a.get('pair_paos')
+    if X_a_full is None or pp_a is None:
+        return {kb: compute_S_pno(key_a, kb, pno_spaces, S_pao_full, s1e)
+                for kb in partner_keys}
+
+    good = []
+    fallback = []
+    for kb in partner_keys:
+        pd_b = pno_spaces[kb]
+        if (pd_b.get('X_pno') is not None
+                and pd_b.get('pair_paos') is not None):
+            good.append(kb)
+        else:
+            fallback.append(kb)
+
+    out = {kb: compute_S_pno(key_a, kb, pno_spaces, S_pao_full, s1e)
+           for kb in fallback}
+    if not good:
+        return out
+
+    global _S_PNO_BATCHED_LIBCC
+    if _S_PNO_BATCHED_LIBCC is None:
+        import ctypes as _ct
+        from pyscf import lib as _pyscflib
+        _lib = _pyscflib.load_library('libcc')
+        _lib.DLPNObuild_S_pno_for_pair.restype = None
+        _lib.DLPNObuild_S_pno_for_pair.argtypes = (
+            [_ct.c_void_p, _ct.c_void_p,
+             _ct.c_int, _ct.c_int, _ct.c_int]
+            + [_ct.c_void_p] * 8
+            + [_ct.c_void_p, _ct.c_size_t])
+        _S_PNO_BATCHED_LIBCC = _lib
+    import ctypes as _ct
+    if _S_pao_full_c is None:
+        _S_pao_full_c = np.ascontiguousarray(S_pao_full)
+    _n_pao_total = _S_pao_full_c.shape[0]
+
+    n_pao_a = int(np.asarray(pp_a).size)
+    n_pno_a = int(X_a_full.shape[1])
+    n_partners = len(good)
+    partner_n_pao = np.empty(n_partners, dtype=np.int32)
+    partner_n_pno = np.empty(n_partners, dtype=np.int32)
+    for p, kb in enumerate(good):
+        pd_b = pno_spaces[kb]
+        partner_n_pao[p] = int(np.asarray(pd_b['pair_paos']).size)
+        partner_n_pno[p] = int(pd_b['X_pno'].shape[1])
+    pp_off = np.empty(n_partners + 1, dtype=np.int64)
+    pp_off[0] = 0
+    pp_off[1:] = np.cumsum(partner_n_pao.astype(np.int64))
+    X_sizes = (partner_n_pao.astype(np.int64)
+               * partner_n_pno.astype(np.int64))
+    X_off = np.empty(n_partners + 1, dtype=np.int64)
+    X_off[0] = 0
+    X_off[1:] = np.cumsum(X_sizes)
+    S_sizes = (partner_n_pno.astype(np.int64) * n_pno_a)
+    S_off = np.empty(n_partners + 1, dtype=np.int64)
+    S_off[0] = 0
+    S_off[1:] = np.cumsum(S_sizes)
+
+    pp_flat = np.empty(int(pp_off[-1]), dtype=np.int64)
+    X_flat = np.empty(int(X_off[-1]))
+    for p, kb in enumerate(good):
+        pd_b = pno_spaces[kb]
+        pp_flat[pp_off[p]:pp_off[p + 1]] = np.asarray(
+            pd_b['pair_paos'], dtype=np.int64)
+        X_flat[X_off[p]:X_off[p + 1]] = np.ascontiguousarray(
+            pd_b['X_pno']).ravel()
+    S_flat = np.empty(int(S_off[-1]))
+    pp_a_arr = np.ascontiguousarray(pp_a, dtype=np.int64)
+    X_a_arr = np.ascontiguousarray(X_a_full)
+    _S_PNO_BATCHED_LIBCC.DLPNObuild_S_pno_for_pair(
+        pp_a_arr.ctypes.data_as(_ct.c_void_p),
+        X_a_arr.ctypes.data_as(_ct.c_void_p),
+        int(n_pao_a), int(n_pno_a), int(n_partners),
+        partner_n_pao.ctypes.data_as(_ct.c_void_p),
+        partner_n_pno.ctypes.data_as(_ct.c_void_p),
+        pp_off.ctypes.data_as(_ct.c_void_p),
+        pp_flat.ctypes.data_as(_ct.c_void_p),
+        X_off.ctypes.data_as(_ct.c_void_p),
+        X_flat.ctypes.data_as(_ct.c_void_p),
+        S_off.ctypes.data_as(_ct.c_void_p),
+        S_flat.ctypes.data_as(_ct.c_void_p),
+        _S_pao_full_c.ctypes.data_as(_ct.c_void_p),
+        _n_pao_total,
+    )
+    for p, kb in enumerate(good):
+        n_pno_b = int(partner_n_pno[p])
+        out[kb] = (S_flat[S_off[p]:S_off[p + 1]]
+                   .reshape(n_pno_a, n_pno_b).copy())
+    return out
+
+
 def compute_S_pno(key_a, key_b, pno_spaces, S_pao_full, s1e):
     """Compute the (n_pno_a, n_pno_b) PNO overlap matrix S_ab.
 
