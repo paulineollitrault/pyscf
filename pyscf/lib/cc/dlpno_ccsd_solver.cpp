@@ -977,6 +977,10 @@ void DLPNOCCSDSolver::run_phase_t1_ints_into(T1IntsOutputs *out) {
 
     #pragma omp parallel for schedule(dynamic, 1)
     for (int p = 0; p < n_pairs; ++p) {
+        // Skip weak pairs: PySCF's t1_ints is called for keys_sorted +
+        // diagonals (strong-only); dressed Q for weak pairs is not used
+        // by any downstream phase (B_tilde/K_ladder are strong-only too).
+        if (in_.is_strong_pair != nullptr && in_.is_strong_pair[p] == 0) continue;
         const int i = in_.ij_to_i_j[2 * p];
         const int j = in_.ij_to_i_j[2 * p + 1];
         const int npno = in_.n_pno_per_pair[p];
@@ -1036,12 +1040,17 @@ void DLPNOCCSDSolver::run_phase_t1_fock_into(T1FockOutputs *out) {
     const int N = in_.n_canon_pairs;
 
     // Per-pair shape arrays (int32, kernel signature).
+    // Weak pairs get npno=0 (the kernel skips them); PySCF's t1_fock is
+    // strong-only so dressed Fab and d_flat for weak pairs aren't needed.
     std::vector<int> nlmo_arr(N), npno_arr(N), n_local_arr(N), need_dji_arr(N);
     int max_nlmo = 0, max_npno = 0, max_n_local = 0;
     for (int p = 0; p < N; ++p) {
-        const int npno = in_.n_pno_per_pair[p];
-        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1]
-                                - in_.pair_lmo_idx_offsets[p]);
+        const bool is_weak = (in_.is_strong_pair != nullptr
+                               && in_.is_strong_pair[p] == 0);
+        const int npno = is_weak ? 0 : in_.n_pno_per_pair[p];
+        const int nlmo = is_weak ? 0
+            : (int)(in_.pair_lmo_idx_offsets[p + 1]
+                     - in_.pair_lmo_idx_offsets[p]);
         const int64_t qma_size = in_.Qma.offsets[p + 1] - in_.Qma.offsets[p];
         const int64_t per_q = (int64_t)nlmo * (int64_t)npno;
         const int n_local = (per_q > 0) ? (int)(qma_size / per_q) : 0;
@@ -2072,6 +2081,7 @@ void DLPNOCCSDSolver::run_phase_t1_fock_fia_bar_into(FiaBarOutputs *out) {
 
     #pragma omp parallel for schedule(dynamic, 1)
     for (int p = 0; p < N; ++p) {
+        if (in_.is_strong_pair != nullptr && in_.is_strong_pair[p] == 0) continue;
         const int npno = in_.n_pno_per_pair[p];
         if (npno == 0) continue;
 
@@ -2169,9 +2179,12 @@ void DLPNOCCSDSolver::run_phase_update_amps_and_energy_into(
         }
     }
 
-    // T2 update.
+    // T2 update.  Weak pairs are skipped — PySCF only updates T2 for
+    // strong pairs (compute_residual_v2 is only called for strong pairs;
+    // R2_external for weak pairs is zero so T2_weak stays unchanged).
     #pragma omp parallel for schedule(dynamic, 1)
     for (int p = 0; p < N; ++p) {
+        if (in_.is_strong_pair != nullptr && in_.is_strong_pair[p] == 0) continue;
         const int npno = in_.n_pno_per_pair[p];
         if (npno == 0) continue;
         const int i = in_.ij_to_i_j[2 * p];
@@ -2328,6 +2341,7 @@ void DLPNOCCSDSolver::run_phase_k_ladder_into(
 
     #pragma omp parallel for schedule(dynamic, 1)
     for (int p = 0; p < n_pairs; ++p) {
+        if (in_.is_strong_pair != nullptr && in_.is_strong_pair[p] == 0) continue;
         const int npno = in_.n_pno_per_pair[p];
         if (npno == 0) continue;
 
@@ -2759,10 +2773,13 @@ void DLPNOCCSDSolver::run_phase_d_tilde_ph1_into(DTildeOutputs *out) {
         can_p_arr[o] = p;
         const int can_i = in_.ij_to_i_j[2 * p];
         const int can_j = in_.ij_to_i_j[2 * p + 1];
+        const bool is_weak = (in_.is_strong_pair != nullptr
+                               && p >= 0 && in_.is_strong_pair[p] == 0);
 
-        const int npno = in_.n_pno_per_pair[p];
+        const int npno = is_weak ? 0 : in_.n_pno_per_pair[p];
         const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
-        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+        const int nlmo = is_weak ? 0
+            : (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
         n_pno_arr[o] = npno;
         n_domain_arr[o] = nlmo;
 
@@ -2890,10 +2907,13 @@ void DLPNOCCSDSolver::run_phase_c_tilde_ph1_into(CTildeOutputs *out) {
         const int p = in_.i_j_to_ij[a * nocc + b];
         can_p_arr[o] = p;
         const int can_a = in_.ij_to_i_j[2 * p];
+        const bool is_weak = (in_.is_strong_pair != nullptr
+                               && p >= 0 && in_.is_strong_pair[p] == 0);
 
-        const int npno = in_.n_pno_per_pair[p];
+        const int npno = is_weak ? 0 : in_.n_pno_per_pair[p];
         const int64_t lmo_off = in_.pair_lmo_idx_offsets[p];
-        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+        const int nlmo = is_weak ? 0
+            : (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
         n_pno_arr[o] = npno;
         n_domain_arr[o] = nlmo;
 
@@ -2972,6 +2992,7 @@ void DLPNOCCSDSolver::run_phase_b_tilde_into(
 
     #pragma omp parallel for schedule(dynamic, 1)
     for (int p = 0; p < n_pairs; ++p) {
+        if (in_.is_strong_pair != nullptr && in_.is_strong_pair[p] == 0) continue;
         const int npno = in_.n_pno_per_pair[p];
         if (npno == 0) continue;
 
