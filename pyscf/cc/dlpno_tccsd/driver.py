@@ -57,6 +57,11 @@ from pyscf.lib import logger
 # (Phase 3c-2/3, ~2x faster on water-10 than the default driver-orchestrated
 # variant). Caller can opt out with DLPNO_TRIPLE_ORCH_FULL=0.
 _os.environ.setdefault('DLPNO_TRIPLE_ORCH_FULL', '1')
+# Default to the C-cycle path for cc_ints / B_tilde / etc per-pair kernels.
+_os.environ.setdefault('DLPNO_C_CYCLE', '1')
+# Default to the C++ DLPNOCCSDSolver class for cycles 2+ (Cycle 1 still
+# uses the Python baseline path to populate caches the class consumes).
+_os.environ.setdefault('DLPNO_CCSD_MONO_DROPIN_CYCLE', '1')
 
 from pyscf.cc.dlpno_tccsd.dmrg_interface import extract_amplitudes_from_mps
 from pyscf.cc.dlpno_tccsd.local_orbs import split_localize_orbitals, make_paos
