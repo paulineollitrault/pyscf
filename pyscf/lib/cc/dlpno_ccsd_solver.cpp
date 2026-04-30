@@ -1646,6 +1646,9 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 }
 
                 // R[a,b] += sum_c T2[a,c]*E_tilde[b,c] + sum_c E_tilde[a,c]*T2[c,b]
+                // Triple loop chosen over BLAS: npno ≈ 25 makes GEMM call
+                // overhead dominate the actual compute.  gcc auto-vectorises
+                // the inner-c loop.
                 const double *T2_p = in_.T2_flat + r2_off;
                 for (int a = 0; a < npno; ++a) {
                     for (int b = 0; b < npno; ++b) {
@@ -2446,6 +2449,8 @@ void DLPNOCCSDSolver::run_phase_update_amps_and_energy_into(
 void DLPNOCCSDSolver::run_phase_k_ladder_into(
     const KLadderInputs *t1_dressed, KLadderOutputs *out) {
     const int n_pairs = in_.n_canon_pairs;
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0, neg_one = -1.0;
 
     #pragma omp parallel for schedule(dynamic, 1)
     for (int p = 0; p < n_pairs; ++p) {
@@ -2474,20 +2479,22 @@ void DLPNOCCSDSolver::run_phase_k_ladder_into(
         double *K_out = out->K.data + out->K.offsets[p];
         double *A_out = out->A.data + out->A.offsets[p];
 
+        int int_npno = npno;
+        int int_nlmo = nlmo;
+        int int_n_local = n_local;
+
         // K[a, b] = Σ_Q iQa[Q, a] * jQa[Q, b]
-        for (int a = 0; a < npno; ++a) {
-            for (int b = 0; b < npno; ++b) {
-                double s = 0.0;
-                for (int Q = 0; Q < n_local; ++Q) {
-                    s += iQa[(int64_t)Q * npno + a]
-                       * jQa[(int64_t)Q * npno + b];
-                }
-                K_out[a * npno + b] = s;
-            }
-        }
+        // iQa, jQa row-major (n_local, npno). Math: K = iQa^T @ jQa → (npno, npno).
+        // Fortran view: K_F[b, a] = sum_Q jQa_F[b, Q] * iQa_F[a, Q] = jQa_F @ iQa_F^T.
+        // dgemm('N', 'T', npno, npno, n_local, 1, jQa, npno, iQa, npno, 0, K, npno).
+        dgemm_(&N_flag, &T_flag,
+               &int_npno, &int_npno, &int_n_local,
+               &one, jQa, &int_npno,
+               iQa, &int_npno,
+               &zero, K_out, &int_npno);
 
         // A initialised to zero.
-        for (int e = 0; e < npno * npno; ++e) A_out[e] = 0.0;
+        std::memset(A_out, 0, sizeof(double) * (size_t)npno * npno);
 
         // Per-Q ladder accumulation. Per-thread scratch:
         //   Qab_t1: (npno, npno)
@@ -2500,40 +2507,38 @@ void DLPNOCCSDSolver::run_phase_k_ladder_into(
             const double *Qma_Q = Qma + (int64_t)Q * nlmo * npno;
 
             // Qab_t1[a, b] = Qab[Q, a, b] - Σ_n T1l[n, a] * Qma[Q, n, b]
-            for (int a = 0; a < npno; ++a) {
-                for (int b = 0; b < npno; ++b) {
-                    double s = Qab_Q[a * npno + b];
-                    for (int n_ = 0; n_ < nlmo; ++n_) {
-                        s -= T1l[n_ * npno + a]
-                           * Qma_Q[n_ * npno + b];
-                    }
-                    Qab_t1[(int64_t)a * npno + b] = s;
-                }
-            }
+            // Start from Qab[Q] then accumulate -T1l^T @ Qma_Q via dgemm.
+            std::memcpy(Qab_t1.data(), Qab_Q,
+                        sizeof(double) * (size_t)npno * npno);
+            // Math: Qab_t1 (npno, npno) -= T1l^T (npno, nlmo) @ Qma_Q (nlmo, npno).
+            // F view: (Qab_t1)_F[b, a] -= sum_n Qma_Q_F[b, n] * T1l_F[a, n]
+            //   = Qma_Q_F @ T1l_F^T.
+            // dgemm('N', 'T', npno, npno, nlmo, -1, Qma_Q, npno, T1l, npno, 1, Qab_t1, npno).
+            dgemm_(&N_flag, &T_flag,
+                   &int_npno, &int_npno, &int_nlmo,
+                   &neg_one, Qma_Q, &int_npno,
+                   T1l, &int_npno,
+                   &one, Qab_t1.data(), &int_npno);
 
             // QT[a, d] = Σ_c Qab_t1[a, c] * T2[c, d]
-            for (int a = 0; a < npno; ++a) {
-                for (int d = 0; d < npno; ++d) {
-                    double s = 0.0;
-                    for (int c = 0; c < npno; ++c) {
-                        s += Qab_t1[(int64_t)a * npno + c]
-                           * T2[(int64_t)c * npno + d];
-                    }
-                    QT[(int64_t)a * npno + d] = s;
-                }
-            }
+            // Math: QT (npno, npno) = Qab_t1 (npno, npno) @ T2 (npno, npno).
+            // F view: QT_F[d, a] = sum_c T2_F[d, c] * Qab_t1_F[c, a] = T2_F @ Qab_t1_F.
+            // dgemm('N', 'N', npno, npno, npno, 1, T2, npno, Qab_t1, npno, 0, QT, npno).
+            dgemm_(&N_flag, &N_flag,
+                   &int_npno, &int_npno, &int_npno,
+                   &one, T2, &int_npno,
+                   Qab_t1.data(), &int_npno,
+                   &zero, QT.data(), &int_npno);
 
             // A[a, b] += Σ_d QT[a, d] * Qab_t1[b, d]
-            for (int a = 0; a < npno; ++a) {
-                for (int b = 0; b < npno; ++b) {
-                    double s = 0.0;
-                    for (int d = 0; d < npno; ++d) {
-                        s += QT[(int64_t)a * npno + d]
-                           * Qab_t1[(int64_t)b * npno + d];
-                    }
-                    A_out[a * npno + b] += s;
-                }
-            }
+            // Math: A += QT (npno, npno) @ Qab_t1^T (npno, npno).
+            // F view: A_F[b, a] += sum_d Qab_t1_F[d, b] * QT_F[d, a] = Qab_t1_F^T @ QT_F.
+            // dgemm('T', 'N', npno, npno, npno, 1, Qab_t1, npno, QT, npno, 1, A, npno).
+            dgemm_(&T_flag, &N_flag,
+                   &int_npno, &int_npno, &int_npno,
+                   &one, Qab_t1.data(), &int_npno,
+                   QT.data(), &int_npno,
+                   &one, A_out, &int_npno);
         }
     }
 }
