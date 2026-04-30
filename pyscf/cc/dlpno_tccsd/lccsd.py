@@ -2848,6 +2848,26 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                       f'dE={dE:.2e}).',
                       flush=True)
                 break
+
+            # CCSD MONO drop-in cycle driver: after cycle 0 (when all plan
+            # caches are populated), take over remaining cycles via the
+            # C++ class.  Returns to the outer loop with t1_pno / t2_pno_all
+            # at the converged or max-cycle state.
+            if (cycle == 0 and int(os.environ.get(
+                    'DLPNO_CCSD_MONO_DROPIN_CYCLE', '0'))):
+                print('[CCSD MONO DROPIN] Taking over remaining cycles via C++ class...',
+                      flush=True)
+                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+                    run_remaining_cycles_via_class)
+                _last_cycle, _e_corr = run_remaining_cycles_via_class(
+                    cycle + 1, this_max, this_tol,
+                    t1_pno, t2_pno_all,
+                    _cc_ints, pno_spaces, pair_lmo_idx, F_lmo, eps_lmo,
+                    fov_pno, nocc, keys_sorted, S_pno_cache,
+                    _cc_ints_flat, _pair_index, ovL_pno_cache, K_pno_cache,
+                    _B_tilde_per_ij, _jiang_C, _jiang_D,
+                    mydiis, diis_start_cycle, strong_pairs, cas_blocks)
+                break
         else:
             if boot_step == n_bootstrap - 1:
                 print('  WARNING: DLPNO-CCSD did not converge.', flush=True)
