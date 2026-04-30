@@ -477,10 +477,17 @@ struct BEInputs {
     const double        *S;          // (N, n_ij, n_kl)
     const double        *T;          // (N, n_kl, n_kl)
     const double        *K;          // (N, n_kl, n_kl)
-    const double        *beta_kl;    // (N,)
+    const double        *beta_kl;    // (N,) — refreshable; see p_ij_arr
     const double        *beta_lk;    // (N,)
     const unsigned char *same;       // (N,)
     const long          *idx;        // (N,)
+    // Native B_tilde refresh: when p_ij_arr != nullptr, run_one_cycle
+    // overwrites beta_kl[n] and beta_lk[n] from the freshly-built
+    // B_tilde_flat after Phase 5.  beta_kl/lk arrays must be writable
+    // by the caller; we cast away const at the refresh site.
+    const int *p_ij_arr;             // (N,) source pair index
+    const int *dense_k_arr;          // (N,) k row index in B_tilde_flat[p]
+    const int *dense_l_arr;          // (N,) l col index in B_tilde_flat[p]
 };
 
 struct BEOutputs {
@@ -1040,17 +1047,12 @@ void DLPNOCCSDSolver::run_phase_t1_fock_into(T1FockOutputs *out) {
     const int N = in_.n_canon_pairs;
 
     // Per-pair shape arrays (int32, kernel signature).
-    // Weak pairs get npno=0 (the kernel skips them); PySCF's t1_fock is
-    // strong-only so dressed Fab and d_flat for weak pairs aren't needed.
     std::vector<int> nlmo_arr(N), npno_arr(N), n_local_arr(N), need_dji_arr(N);
     int max_nlmo = 0, max_npno = 0, max_n_local = 0;
     for (int p = 0; p < N; ++p) {
-        const bool is_weak = (in_.is_strong_pair != nullptr
-                               && in_.is_strong_pair[p] == 0);
-        const int npno = is_weak ? 0 : in_.n_pno_per_pair[p];
-        const int nlmo = is_weak ? 0
-            : (int)(in_.pair_lmo_idx_offsets[p + 1]
-                     - in_.pair_lmo_idx_offsets[p]);
+        const int npno = in_.n_pno_per_pair[p];
+        const int nlmo = (int)(in_.pair_lmo_idx_offsets[p + 1]
+                                - in_.pair_lmo_idx_offsets[p]);
         const int64_t qma_size = in_.Qma.offsets[p + 1] - in_.Qma.offsets[p];
         const int64_t per_q = (int64_t)nlmo * (int64_t)npno;
         const int n_local = (per_q > 0) ? (int)(qma_size / per_q) : 0;
@@ -1525,6 +1527,31 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             const int64_t total_flat = plans->be_flat_off_per_n_ij[n_unique];
             std::vector<double> flat_B((size_t)total_flat, 0.0);
             std::vector<double> flat_E((size_t)total_flat, 0.0);
+
+            // BE-bucket beta_kl/lk refresh from native B_tilde_flat.  The
+            // dict-extracted values were populated at pack time from
+            // cycle-0 B_tilde and are stale for cycle 1+.  Phase 5 rebuilt
+            // B_tilde_flat (sized nlmo×nlmo per pair) from current T1;
+            // mirror the dict extraction using p_ij_arr / dense_k_arr /
+            // dense_l_arr (LMO-domain indices into the pair's nlmo basis).
+            for (int b = 0; b < plans->be_n_buckets; ++b) {
+                const BEInputs *bucket = &plans->be_plan_buckets[b];
+                if (bucket->p_ij_arr == nullptr) continue;
+                double *bk = const_cast<double *>(bucket->beta_kl);
+                double *bl = const_cast<double *>(bucket->beta_lk);
+                for (int n = 0; n < bucket->N; ++n) {
+                    const int p  = bucket->p_ij_arr[n];
+                    if (p < 0) continue;
+                    const int dk = bucket->dense_k_arr[n];
+                    const int dl = bucket->dense_l_arr[n];
+                    const int nlmo_p = nlmo_arr[p];
+                    if (nlmo_p == 0) continue;
+                    const int64_t off = b_tilde_off[p];
+                    bk[n] = B_tilde_flat[off + (int64_t)dk * nlmo_p + dl];
+                    bl[n] = (dk == dl) ? 0.0
+                          : B_tilde_flat[off + (int64_t)dl * nlmo_p + dk];
+                }
+            }
 
             // Per bucket: find n_ij group, run kernel with offset output.
             for (int b = 0; b < plans->be_n_buckets; ++b) {

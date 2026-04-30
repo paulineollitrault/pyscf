@@ -434,17 +434,24 @@ _libcc.DLPNOper_kl_batched.argtypes = (
 
 class PyBEInputs(ctypes.Structure):
     _fields_ = [
-        ('N',        ctypes.c_int),
-        ('n_ij',     ctypes.c_int),
-        ('n_kl',     ctypes.c_int),
-        ('n_slots',  ctypes.c_int),
-        ('S',        ctypes.c_void_p),
-        ('T',        ctypes.c_void_p),
-        ('K',        ctypes.c_void_p),
-        ('beta_kl',  ctypes.c_void_p),
-        ('beta_lk',  ctypes.c_void_p),
-        ('same',     ctypes.c_void_p),
-        ('idx',      ctypes.c_void_p),
+        ('N',          ctypes.c_int),
+        ('n_ij',       ctypes.c_int),
+        ('n_kl',       ctypes.c_int),
+        ('n_slots',    ctypes.c_int),
+        ('S',          ctypes.c_void_p),
+        ('T',          ctypes.c_void_p),
+        ('K',          ctypes.c_void_p),
+        ('beta_kl',    ctypes.c_void_p),
+        ('beta_lk',    ctypes.c_void_p),
+        ('same',       ctypes.c_void_p),
+        ('idx',        ctypes.c_void_p),
+        # Native B_tilde refresh: per bucket-entry index of source pair
+        # in B_tilde_flat plus dense k/l within that pair's PNO basis.
+        # When set on every bucket, run_one_cycle refreshes beta_kl/lk
+        # from B_tilde_flat after Phase 5, before BE step.
+        ('p_ij_arr',    ctypes.c_void_p),
+        ('dense_k_arr', ctypes.c_void_p),
+        ('dense_l_arr', ctypes.c_void_p),
     ]
 
 
@@ -5271,20 +5278,27 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             T_arr = np.empty((N_b, n_kl, n_kl))
             beta_kl_arr = np.empty(N_b)
             beta_lk_arr = np.empty(N_b)
+            p_ij_arr    = np.empty(N_b, dtype=np.int32)
+            dense_k_arr = np.empty(N_b, dtype=np.int32)
+            dense_l_arr = np.empty(N_b, dtype=np.int32)
             for n in range(N_b):
                 T_arr[n] = t2_pno_all[bucket['kl_keys'][n]]
                 key_ij_n, k_n, l_n = bucket['beta_coords'][n]
                 B_tilde = b_tilde_per_ij[key_ij_n]
                 if isinstance(B_tilde, tuple):
                     B_local, p_dense = B_tilde
-                    beta_kl_arr[n] = B_local[p_dense[k_n], p_dense[l_n]]
-                    beta_lk_arr[n] = (
-                        0.0 if k_n == l_n
-                        else B_local[p_dense[l_n], p_dense[k_n]])
-                else:
-                    beta_kl_arr[n] = B_tilde[k_n, l_n]
+                    dk = int(p_dense[k_n]); dl = int(p_dense[l_n])
+                    beta_kl_arr[n] = B_local[dk, dl]
                     beta_lk_arr[n] = (0.0 if k_n == l_n
-                                       else B_tilde[l_n, k_n])
+                                       else B_local[dl, dk])
+                else:
+                    dk = int(k_n); dl = int(l_n)
+                    beta_kl_arr[n] = B_tilde[dk, dl]
+                    beta_lk_arr[n] = (0.0 if k_n == l_n
+                                       else B_tilde[dl, dk])
+                p_ij_arr[n]    = key_to_p.get(key_ij_n, -1)
+                dense_k_arr[n] = dk
+                dense_l_arr[n] = dl
             S_c = np.ascontiguousarray(bucket['S'])
             T_c = np.ascontiguousarray(T_arr)
             K_c = np.ascontiguousarray(bucket['K'])
@@ -5297,15 +5311,19 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             buckets_arr[b_idx].n_ij = int(n_ij)
             buckets_arr[b_idx].n_kl = int(n_kl)
             buckets_arr[b_idx].n_slots = int(n_pairs_in_group)
-            buckets_arr[b_idx].S       = S_c.ctypes.data
-            buckets_arr[b_idx].T       = T_c.ctypes.data
-            buckets_arr[b_idx].K       = K_c.ctypes.data
-            buckets_arr[b_idx].beta_kl = beta_kl_arr.ctypes.data
-            buckets_arr[b_idx].beta_lk = beta_lk_arr.ctypes.data
-            buckets_arr[b_idx].same    = same_c.ctypes.data
-            buckets_arr[b_idx].idx     = idx_c.ctypes.data
+            buckets_arr[b_idx].S           = S_c.ctypes.data
+            buckets_arr[b_idx].T           = T_c.ctypes.data
+            buckets_arr[b_idx].K           = K_c.ctypes.data
+            buckets_arr[b_idx].beta_kl     = beta_kl_arr.ctypes.data
+            buckets_arr[b_idx].beta_lk     = beta_lk_arr.ctypes.data
+            buckets_arr[b_idx].same        = same_c.ctypes.data
+            buckets_arr[b_idx].idx         = idx_c.ctypes.data
+            buckets_arr[b_idx].p_ij_arr    = p_ij_arr.ctypes.data
+            buckets_arr[b_idx].dense_k_arr = dense_k_arr.ctypes.data
+            buckets_arr[b_idx].dense_l_arr = dense_l_arr.ctypes.data
             be_owned_buckets.extend([S_c, T_c, K_c, beta_kl_arr,
-                                     beta_lk_arr, same_c, idx_c])
+                                     beta_lk_arr, same_c, idx_c,
+                                     p_ij_arr, dense_k_arr, dense_l_arr])
 
         unique_arr = np.asarray(unique_n_ij, dtype=np.int32)
         own.extend([buckets_arr, unique_arr, flat_off])
@@ -5688,6 +5706,12 @@ def run_remaining_cycles_via_class(
     _t_setup = _time.perf_counter() - _t_setup0
     print(f'[CCSD MONO PACK-ONCE] setup: {_t_setup:.2f}s', flush=True)
 
+    # Per-cycle refresh helpers for T1-dependent intermediates.  PySCF's
+    # cycle loop rebuilds these each iteration; in our drop-in we must
+    # do the same so BE plan's beta_kl/lk are in sync with current t1.
+    # (CD plan's C_tilde / D_tilde are built natively by the class via
+    #  c_term_ct_ord_pair_idx / d_term_dt_ord_pair_idx — no Python
+    #  refresh needed.)
     e_prev = float('-inf')
 
     for cycle in range(cycle_start, max_cycle):
@@ -5695,6 +5719,9 @@ def run_remaining_cycles_via_class(
 
         # Per-iter: rebuild t1_cache from current t1_pno (DIIS may have
         # mixed it; t1_pno is the reference).  Sync T1_flat from t1_pno.
+        # All T1-dressed intermediates (B_tilde, C_tilde, D_tilde,
+        # G_tilde, t1_ints) are rebuilt natively by the class on each
+        # cycle — Python passes through cycle-0 dicts unchanged.
         _t_t1cache0 = _time.perf_counter()
         t1_cache = build_t1_cache(t1_pno, _pi, S_pno_cache, pno_spaces)
         plan_struct.t1_cache_buffer = t1_cache._buffer.ctypes.data
