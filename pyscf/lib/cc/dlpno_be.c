@@ -1,42 +1,38 @@
 /* DLPNO-CCSD T2 residual: per-bucket B + E scatter-accumulator.
  *
- * Full-C cycle session 10 port. Mirrors the existing Cython kernel
- * _be_cy.pyx::be_kernel byte-for-byte. Called once per bucketed
- * (n_ij, n_kl) shape from compute_B_E_batched_v2.
- *
- * Per-item math (one (ij, kl) item with kl in pair_lmo_idx[ij]):
+ * Math per item (one (ij, kl) item with kl in pair_lmo_idx[ij]):
  *
  *   if same (k == l):
  *     UK[b, c]   = sum_d (2 T[b, d] - T[d, b]) * K[c, d]
+ *     TB[b, c]   = beta_kl * T[b, c]
  *   else:
  *     UK[b, c]   = sum_d (2 T[b, d] - T[d, b]) * K[c, d]
  *                + sum_d (2 T[d, b] - T[b, d]) * K[d, c]
+ *     TB[b, c]   = beta_kl * T[b, c] + beta_lk * T[c, b]
  *
  *   STB[a, c]  = sum_b S[a, b] * TB[b, c]
- *      TB     = beta_kl * T                      (same)
- *             = beta_kl * T + beta_lk * T.T      (!same)
- *
  *   SUK[a, c]  = sum_b S[a, b] * UK[b, c]
- *   Bc[a, d]   = sum_c STB[a, c] * S[d, c]
+ *   Bc[a, d]   = sum_c STB[a, c] * S[d, c]   (= STB @ S^T)
  *   Ec[a, d]   = sum_c SUK[a, c] * S[d, c]
  *
  *   out_B[idx[n]] += Bc
  *   out_E[idx[n]] += Ec
  *
- * Two-stage layout matching Cython:
- *   Stage 1: parallel prange over n, compute per-item Bc/Ec into N-sized
- *            scratch (no race — disjoint writes).
- *   Stage 2: sequential scatter-add into out_B / out_E (race-free; idx
- *            may collide).
+ * BLAS port (2026-04-30): per-item triple loops -> 4-5 DGEMM calls with the
+ * MKL link.  At npno~25, MKL's JIT-compiled small-GEMM kernels are 2-3x
+ * faster than hand-rolled triple loops; the Compute R2 work is the largest
+ * non-BLAS phase per cycle.
  *
- * Per-item scratch sizes: UK = n_kl², STB = SUK = n_ij*n_kl,
- *                          Bc = Ec = n_ij². All malloc'd internally
- * up-front for the whole batch.
+ * Layout:
+ *   Stage 1: parallel prange over items.  Per item: build TT_minus, TB
+ *            (small vec ops), then 4-5 DGEMMs into per-item Bc/Ec.
+ *   Stage 2: sequential scatter-add into out_B / out_E (race-free).
  */
 
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vhf/fblas.h"
 
 void DLPNObe_kernel(const double      *S,           /* (N, n_ij, n_kl) */
                     const double      *T,           /* (N, n_kl, n_kl) */
@@ -58,17 +54,23 @@ void DLPNObe_kernel(const double      *S,           /* (N, n_ij, n_kl) */
     const size_t TK_stride = n_kl * n_kl;
     const size_t out_stride = n_ij * n_ij;
 
-    /* Per-item scratch — Bc/Ec are (n_ij²); UK/STB/SUK live within one
-     * item's iteration so we keep them per-thread, not per-item. */
+    /* Per-item Bc/Ec output buffers (race-free in Stage 1). */
     double *Bc = (double *)malloc(sizeof(double) * N * out_stride);
     double *Ec = (double *)malloc(sizeof(double) * N * out_stride);
 
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0;
+    int int_n_ij = (int)n_ij, int_n_kl = (int)n_kl;
+
 #pragma omp parallel num_threads(num_threads)
     {
-        /* Per-thread per-item working buffers (sized per-call: ~few KB) */
-        double *UK  = (double *)malloc(sizeof(double) * n_kl * n_kl);
-        double *STB = (double *)malloc(sizeof(double) * n_ij * n_kl);
-        double *SUK = (double *)malloc(sizeof(double) * n_ij * n_kl);
+        /* Per-thread scratch */
+        double *TT_minus = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *TT_plus  = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *TB       = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *UK       = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *STB      = (double *)malloc(sizeof(double) * n_ij * n_kl);
+        double *SUK      = (double *)malloc(sizeof(double) * n_ij * n_kl);
 
 #pragma omp for schedule(dynamic, 1)
         for (size_t n = 0; n < N; n++) {
@@ -82,89 +84,111 @@ void DLPNObe_kernel(const double      *S,           /* (N, n_ij, n_kl) */
             double       *Bcn = Bc + n * out_stride;
             double       *Ecn = Ec + n * out_stride;
 
-            /* UK[b, c] */
+            /* Build TT_minus[b, d] = 2 T[b, d] - T[d, b] */
+            for (size_t b = 0; b < n_kl; b++) {
+                for (size_t d = 0; d < n_kl; d++) {
+                    TT_minus[b * n_kl + d] = 2.0 * Tn[b * n_kl + d]
+                                              - Tn[d * n_kl + b];
+                }
+            }
+
+            /* Build TB:
+             *   sm:  TB = bkl * T
+             *   !sm: TB[b, c] = bkl * T[b, c] + blk * T[c, b]
+             */
             if (sm) {
-                for (size_t b = 0; b < n_kl; b++) {
-                    for (size_t c = 0; c < n_kl; c++) {
-                        double uk_bc = 0.0;
-                        for (size_t d = 0; d < n_kl; d++) {
-                            uk_bc += (2.0 * Tn[b * n_kl + d] - Tn[d * n_kl + b])
-                                     * Kn[c * n_kl + d];
-                        }
-                        UK[b * n_kl + c] = uk_bc;
-                    }
+                for (size_t e = 0; e < TK_stride; e++) {
+                    TB[e] = bkl * Tn[e];
                 }
             } else {
                 for (size_t b = 0; b < n_kl; b++) {
                     for (size_t c = 0; c < n_kl; c++) {
-                        double uk_bc = 0.0;
-                        for (size_t d = 0; d < n_kl; d++) {
-                            uk_bc += (2.0 * Tn[b * n_kl + d] - Tn[d * n_kl + b])
-                                     * Kn[c * n_kl + d];
-                            uk_bc += (2.0 * Tn[d * n_kl + b] - Tn[b * n_kl + d])
-                                     * Kn[d * n_kl + c];
-                        }
-                        UK[b * n_kl + c] = uk_bc;
+                        TB[b * n_kl + c] = bkl * Tn[b * n_kl + c]
+                                          + blk * Tn[c * n_kl + b];
+                    }
+                }
+                /* Build TT_plus[b, d] = 2 T[d, b] - T[b, d]   (only !sm) */
+                for (size_t b = 0; b < n_kl; b++) {
+                    for (size_t d = 0; d < n_kl; d++) {
+                        TT_plus[b * n_kl + d] = 2.0 * Tn[d * n_kl + b]
+                                                 - Tn[b * n_kl + d];
                     }
                 }
             }
 
-            /* STB[a, c] = sum_b S[a, b] * TB[b, c] */
-            if (sm) {
-                for (size_t a = 0; a < n_ij; a++) {
-                    for (size_t c = 0; c < n_kl; c++) {
-                        double s = 0.0;
-                        for (size_t b = 0; b < n_kl; b++) {
-                            s += Sn[a * n_kl + b] * (bkl * Tn[b * n_kl + c]);
-                        }
-                        STB[a * n_kl + c] = s;
-                    }
-                }
-            } else {
-                for (size_t a = 0; a < n_ij; a++) {
-                    for (size_t c = 0; c < n_kl; c++) {
-                        double s = 0.0;
-                        for (size_t b = 0; b < n_kl; b++) {
-                            s += Sn[a * n_kl + b] *
-                                 (bkl * Tn[b * n_kl + c] + blk * Tn[c * n_kl + b]);
-                        }
-                        STB[a * n_kl + c] = s;
-                    }
-                }
+            /* UK[b, c] = sum_d TT_minus[b, d] * K[c, d]   (= TT_minus @ K^T)
+             * Row-major math: UK = TT_minus (n_kl, n_kl) @ K^T (n_kl, n_kl).
+             * Fortran view: UK_F[c, b] = sum_d K_F[d, c] * TT_minus_F[d, b]
+             *             = K_F^T @ TT_minus_F.  dgemm('T', 'N', n_kl, n_kl, n_kl,
+             *                                          1, K, n_kl, TT_minus, n_kl,
+             *                                          0, UK, n_kl).
+             */
+            dgemm_(&T_flag, &N_flag,
+                   &int_n_kl, &int_n_kl, &int_n_kl,
+                   &one, Kn, &int_n_kl,
+                   TT_minus, &int_n_kl,
+                   &zero, UK, &int_n_kl);
+
+            /* If !sm: UK += TT_plus @ K
+             * Math: UK[b, c] += sum_d TT_plus[b, d] * K[d, c]
+             * F view: UK_F[c, b] += sum_d K_F[c, d] * TT_plus_F[d, b]
+             *      = K_F @ TT_plus_F
+             * dgemm('N', 'N', n_kl, n_kl, n_kl, 1, K, n_kl, TT_plus, n_kl, 1, UK, n_kl)
+             */
+            if (!sm) {
+                dgemm_(&N_flag, &N_flag,
+                       &int_n_kl, &int_n_kl, &int_n_kl,
+                       &one, Kn, &int_n_kl,
+                       TT_plus, &int_n_kl,
+                       &one, UK, &int_n_kl);
             }
 
-            /* SUK[a, c] = sum_b S[a, b] * UK[b, c] */
-            for (size_t a = 0; a < n_ij; a++) {
-                for (size_t c = 0; c < n_kl; c++) {
-                    double s = 0.0;
-                    for (size_t b = 0; b < n_kl; b++) {
-                        s += Sn[a * n_kl + b] * UK[b * n_kl + c];
-                    }
-                    SUK[a * n_kl + c] = s;
-                }
-            }
+            /* STB[a, c] = sum_b S[a, b] * TB[b, c]
+             * Row-major: STB (n_ij, n_kl) = S (n_ij, n_kl) @ TB (n_kl, n_kl).
+             * F view: STB_F[c, a] = sum_b TB_F[c, b] * S_F[b, a] = TB_F @ S_F.
+             * dgemm('N', 'N', n_kl, n_ij, n_kl, 1, TB, n_kl, S, n_kl, 0, STB, n_kl)
+             */
+            dgemm_(&N_flag, &N_flag,
+                   &int_n_kl, &int_n_ij, &int_n_kl,
+                   &one, TB, &int_n_kl,
+                   Sn, &int_n_kl,
+                   &zero, STB, &int_n_kl);
 
-            /* Bc[a, d] = sum_c STB[a, c] * S[d, c]
-             * Ec[a, d] = sum_c SUK[a, c] * S[d, c] */
-            for (size_t a = 0; a < n_ij; a++) {
-                for (size_t d = 0; d < n_ij; d++) {
-                    double s_bc = 0.0, s_ec = 0.0;
-                    for (size_t c = 0; c < n_kl; c++) {
-                        s_bc += STB[a * n_kl + c] * Sn[d * n_kl + c];
-                        s_ec += SUK[a * n_kl + c] * Sn[d * n_kl + c];
-                    }
-                    Bcn[a * n_ij + d] = s_bc;
-                    Ecn[a * n_ij + d] = s_ec;
-                }
-            }
+            /* SUK = S @ UK (same shape/op as STB) */
+            dgemm_(&N_flag, &N_flag,
+                   &int_n_kl, &int_n_ij, &int_n_kl,
+                   &one, UK, &int_n_kl,
+                   Sn, &int_n_kl,
+                   &zero, SUK, &int_n_kl);
+
+            /* Bc[a, d] = sum_c STB[a, c] * S[d, c]   (= STB @ S^T)
+             * Row-major: Bc (n_ij, n_ij) = STB (n_ij, n_kl) @ S^T (n_kl, n_ij).
+             * F view: Bc_F[d, a] = sum_c S_F[c, d] * STB_F[c, a] = S_F^T @ STB_F.
+             * dgemm('T', 'N', n_ij, n_ij, n_kl, 1, S, n_kl, STB, n_kl, 0, Bc, n_ij)
+             */
+            dgemm_(&T_flag, &N_flag,
+                   &int_n_ij, &int_n_ij, &int_n_kl,
+                   &one, Sn, &int_n_kl,
+                   STB, &int_n_kl,
+                   &zero, Bcn, &int_n_ij);
+
+            /* Ec = SUK @ S^T  (same op as Bc) */
+            dgemm_(&T_flag, &N_flag,
+                   &int_n_ij, &int_n_ij, &int_n_kl,
+                   &one, Sn, &int_n_kl,
+                   SUK, &int_n_kl,
+                   &zero, Ecn, &int_n_ij);
         }
 
+        free(TT_minus);
+        free(TT_plus);
+        free(TB);
         free(UK);
         free(STB);
         free(SUK);
     }
 
-    /* Stage 2: sequential scatter-add */
+    /* Stage 2: sequential scatter-add (race-free since idx may collide). */
     for (size_t n = 0; n < N; n++) {
         const long target = idx[n];
         const double *Bcn = Bc + n * out_stride;
