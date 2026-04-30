@@ -777,6 +777,16 @@ struct RunCycleInputs {
     const int64_t *be_flat_off_per_n_ij;      // length be_n_unique_n_ij + 1
     const int *be_pair_n_ij_idx;              // length n_canon_pairs (-1 = no BE)
     const int *be_pair_slot;                  // length n_canon_pairs
+
+    // -- Native R2 assembly: CD (C_term + D_term, Step 2j-b). ---
+    // Per-item canonical-pair scatter index, one entry per side.  Length
+    // c_term_plan->N and d_term_plan->N respectively.  Item n contributes
+    // to flat_C_ij[target_pair_idx_ij[n]] (when >=0) OR
+    // flat_C_ji[target_pair_idx_ji[n]] (when >=0), exactly one set per item.
+    const int *c_term_target_pair_idx_ij;
+    const int *c_term_target_pair_idx_ji;
+    const int *d_term_target_pair_idx_ij;
+    const int *d_term_target_pair_idx_ji;
 };
 
 struct RunCycleOutputs {
@@ -1453,6 +1463,103 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 const int64_t sz = (int64_t)npno * npno;
                 for (int64_t e = 0; e < sz; ++e) {
                     R2_buf[r2_off + e] += flat_B[base + e] + flat_E[base + e];
+                }
+            }
+        }
+
+        // Step 4: CD contribution (C_term + D_term).
+        // PySCF assembly:
+        //   C_term[p] = 0.5*Cij[p] + Cij[p].T + 0.5*Cji[p].T + Cji[p]
+        //   D_term[p] = Dij[p] + Dji[p].T
+        // where Cij/Cji are flat per-pair buffers populated by scattering
+        // c-kernel tiles with sign convention (PySCF residual.py:4749 -=).
+        // Dij/Dji are populated with +0.5*tile (residual.py:4874).
+        if (in_.R2_external == nullptr
+                && plans->c_term_plan != nullptr
+                && plans->d_term_plan != nullptr
+                && plans->c_term_target_pair_idx_ij != nullptr) {
+            std::vector<double> flat_C_ij_buf((size_t)R2_total, 0.0);
+            std::vector<double> flat_C_ji_buf((size_t)R2_total, 0.0);
+            std::vector<double> flat_D_ij_buf((size_t)R2_total, 0.0);
+            std::vector<double> flat_D_ji_buf((size_t)R2_total, 0.0);
+
+            // C side.
+            const CTermInputs *c_plan = plans->c_term_plan;
+            const int N_c = c_plan->N;
+            const int64_t *c_tile_off = (const int64_t *)c_plan->tile_off;
+            std::vector<double> c_tiles_buf((size_t)c_tile_off[N_c], 0.0);
+            CTermOutputs c_out;
+            c_out.tiles_flat = c_tiles_buf.data();
+            run_phase_c_term_into(c_plan, &c_out);
+            const int *c_n_pno = (const int *)c_plan->n_pno_arr;
+            for (int n = 0; n < N_c; ++n) {
+                const int npno_n = c_n_pno[n];
+                const int p_ij = plans->c_term_target_pair_idx_ij[n];
+                const int p_ji = plans->c_term_target_pair_idx_ji[n];
+                const int64_t t_start = c_tile_off[n];
+                const int64_t tile_size = (int64_t)npno_n * npno_n;
+                if (p_ij >= 0) {
+                    const int64_t r2_off = in_.t2_offsets[p_ij];
+                    for (int64_t e = 0; e < tile_size; ++e) {
+                        flat_C_ij_buf[r2_off + e] -= c_tiles_buf[t_start + e];
+                    }
+                } else if (p_ji >= 0) {
+                    const int64_t r2_off = in_.t2_offsets[p_ji];
+                    for (int64_t e = 0; e < tile_size; ++e) {
+                        flat_C_ji_buf[r2_off + e] -= c_tiles_buf[t_start + e];
+                    }
+                }
+            }
+
+            // D side.
+            const DTermInputs *d_plan = plans->d_term_plan;
+            const int N_d = d_plan->N;
+            const int64_t *d_tile_off = (const int64_t *)d_plan->tile_off;
+            std::vector<double> d_tiles_buf((size_t)d_tile_off[N_d], 0.0);
+            DTermOutputs d_out;
+            d_out.tiles_flat = d_tiles_buf.data();
+            run_phase_d_term_into(d_plan, &d_out);
+            const int *d_n_pno = (const int *)d_plan->n_pno_arr;
+            for (int n = 0; n < N_d; ++n) {
+                const int npno_n = d_n_pno[n];
+                const int p_ij = plans->d_term_target_pair_idx_ij[n];
+                const int p_ji = plans->d_term_target_pair_idx_ji[n];
+                const int64_t t_start = d_tile_off[n];
+                const int64_t tile_size = (int64_t)npno_n * npno_n;
+                if (p_ij >= 0) {
+                    const int64_t r2_off = in_.t2_offsets[p_ij];
+                    for (int64_t e = 0; e < tile_size; ++e) {
+                        flat_D_ij_buf[r2_off + e] += 0.5 * d_tiles_buf[t_start + e];
+                    }
+                } else if (p_ji >= 0) {
+                    const int64_t r2_off = in_.t2_offsets[p_ji];
+                    for (int64_t e = 0; e < tile_size; ++e) {
+                        flat_D_ji_buf[r2_off + e] += 0.5 * d_tiles_buf[t_start + e];
+                    }
+                }
+            }
+
+            // Assemble C_term + D_term per pair into R2.
+            for (int p = 0; p < N; ++p) {
+                const int npno = npno_arr[p];
+                if (npno == 0) continue;
+                const int64_t r2_off = in_.t2_offsets[p];
+                for (int a = 0; a < npno; ++a) {
+                    for (int b = 0; b < npno; ++b) {
+                        const int64_t e_ab = (int64_t)a * npno + b;
+                        const int64_t e_ba = (int64_t)b * npno + a;
+                        // C_term = 0.5*Cij + Cij.T + 0.5*Cji.T + Cji
+                        const double C_class =
+                            0.5 * flat_C_ij_buf[r2_off + e_ab]
+                            + flat_C_ij_buf[r2_off + e_ba]
+                            + 0.5 * flat_C_ji_buf[r2_off + e_ba]
+                            + flat_C_ji_buf[r2_off + e_ab];
+                        // D_term = Dij + Dji.T
+                        const double D_class =
+                            flat_D_ij_buf[r2_off + e_ab]
+                            + flat_D_ji_buf[r2_off + e_ba];
+                        R2_buf[r2_off + e_ab] += C_class + D_class;
+                    }
                 }
             }
         }

@@ -799,6 +799,11 @@ class PyRunCycleInputs(ctypes.Structure):
         ('be_flat_off_per_n_ij',      ctypes.c_void_p),
         ('be_pair_n_ij_idx',          ctypes.c_void_p),
         ('be_pair_slot',              ctypes.c_void_p),
+        # Native R2 assembly: CD per-item canonical-pair scatter indices.
+        ('c_term_target_pair_idx_ij', ctypes.c_void_p),
+        ('c_term_target_pair_idx_ji', ctypes.c_void_p),
+        ('d_term_target_pair_idx_ij', ctypes.c_void_p),
+        ('d_term_target_pair_idx_ji', ctypes.c_void_p),
     ]
 
 
