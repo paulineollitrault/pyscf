@@ -632,20 +632,30 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     _t_p2b_diis = 0.0
     _t_p2b_energy = 0.0
 
-    # Build PNO overlap matrices for inter-pair coupling
+    # Build PNO overlap matrices for inter-pair coupling.
+    # Iterate F-neighbors only (not full nocc) — same set the LMP2
+    # residual loop touches. This eliminates O(npairs * nocc) setup
+    # scan that was matching every k to F_CUT for every pair.
     pno_S_cache = {}
     F_CUT = 1e-5  # Fock coupling threshold
+    _F_neigh_pre = [
+        [k for k in range(nocc_lmo)
+         if k != ii and abs(F_lmo[ii, k]) > F_CUT]
+        for ii in range(nocc_lmo)
+    ]
     for key_ij in initial_pno_data:
         i, j = key_ij
-        for k in range(nocc_lmo):
+        C_pno_ij = initial_pno_data[key_ij]['C_pno']
+        # First condition: F[i,k] > FCUT  →  cache (key_ij, key_kj)
+        for k in _F_neigh_pre[i]:
             key_kj = (min(k, j), max(k, j))
-            key_ik = (min(i, k), max(i, k))
-            if key_kj in initial_pno_data and i != k and abs(F_lmo[i, k]) > F_CUT:
-                C_pno_ij = initial_pno_data[key_ij]['C_pno']
+            if key_kj in initial_pno_data:
                 C_pno_kj = initial_pno_data[key_kj]['C_pno']
                 pno_S_cache[(key_ij, key_kj)] = C_pno_ij.T @ s1e @ C_pno_kj
-            if key_ik in initial_pno_data and j != k and abs(F_lmo[k, j]) > F_CUT:
-                C_pno_ij = initial_pno_data[key_ij]['C_pno']
+        # Second condition: F[k,j] > FCUT  →  cache (key_ij, key_ik)
+        for k in _F_neigh_pre[j]:
+            key_ik = (min(i, k), max(i, k))
+            if key_ik in initial_pno_data:
                 C_pno_ik = initial_pno_data[key_ik]['C_pno']
                 pno_S_cache[(key_ij, key_ik)] = C_pno_ij.T @ s1e @ C_pno_ik
 
