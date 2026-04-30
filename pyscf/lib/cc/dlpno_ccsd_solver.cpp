@@ -1330,7 +1330,11 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                     (size_t)R2_total * sizeof(double));
     } else {
         // Step 1: K + ladder (always in C++ via run_phase_k_ladder).
+        // Skip weak pairs: PySCF's r2_all only contains strong-pair entries
+        // (compute_residual_v2 is only called for strong pairs); R2_buf for
+        // weak pairs must stay zero to match.
         for (int p = 0; p < N; ++p) {
+            if (in_.is_strong_pair != nullptr && in_.is_strong_pair[p] == 0) continue;
             const int npno = npno_arr[p];
             if (npno == 0) continue;
             const int64_t off = in_.t2_offsets[p];

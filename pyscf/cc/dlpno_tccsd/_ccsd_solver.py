@@ -5676,8 +5676,19 @@ def validate_run_one_cycle_full_with_external_R2(
             sl = slice(int(t2_offsets[p]), int(t2_offsets[p + 1]))
             R2_ref[sl] = r2_all[key].ravel()
         d_R2_native = float(np.max(np.abs(R2_native - R2_ref)))
-        print(f'[CCSD MONO] NATIVE R2 (no R2_external) vs PySCF r2_all: '
-              f'|dR2| = {d_R2_native:.3e}', flush=True)
+        d_R1_native = float(np.max(np.abs(R1_native - R1_ref)))
+        d_T1_native = float(np.max(np.abs(
+            aux['T1_flat'][:int(pno_offsets[nocc])] - T1_ref)))
+        d_T2_native = float(np.max(np.abs(aux['T2_flat'] - T2_ref)))
+        print(f'[CCSD MONO] NATIVE (no R2_external) vs PySCF '
+              f'(packed n_canon_pairs={n_pairs}):',
+              flush=True)
+        print(f'    |dR1| = {d_R1_native:.3e}', flush=True)
+        print(f'    |dR2| = {d_R2_native:.3e}', flush=True)
+        print(f'    |dT1| = {d_T1_native:.3e}', flush=True)
+        print(f'    |dT2| = {d_T2_native:.3e}', flush=True)
+        print(f'    |dE|  = {abs(out_native.energy - e_ref):.3e}  '
+              f'(E_native={out_native.energy:.10f})', flush=True)
         # Restore for cleanup.
         inputs.R2_external = R2_external.ctypes.data
         del native_own
