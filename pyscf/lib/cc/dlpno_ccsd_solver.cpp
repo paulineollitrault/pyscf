@@ -224,6 +224,7 @@ extern "C" void DLPNOt1_fock_batched(
     const int    *npno_arr,
     const int    *n_local_arr,
     const int    *need_dji_arr,
+    const unsigned char *is_strong_pair,  // (N,) byte flag; nullable
     double       *gamma_scratch,    size_t gamma_sc_stride,
     double       *Y_trans_scratch,  size_t Y_trans_sc_stride,
     double       *Y_alt_scratch,    size_t Y_alt_sc_stride,
@@ -1088,18 +1089,30 @@ void DLPNOCCSDSolver::run_phase_t1_fock_into(T1FockOutputs *out) {
         if (N < num_threads) num_threads = (N > 0) ? N : 1;
     #endif
 
-    // Scratch arenas sized to (num_threads, max_*).
+    // Scratch arenas sized to (num_threads, max_*).  Reused across
+    // cycles via function-static buffers — the wrapper constructs a fresh
+    // solver per call, so member caching doesn't persist.  These are
+    // grown only.  Single-threaded entry (run_one_cycle is called
+    // serially from Python) so static (not thread_local) is fine.
     const size_t s_gamma   = (size_t)max_n_local;
     const size_t s_Y       = (size_t)max_n_local * max_nlmo * max_npno;
     const size_t s_Fia     = (size_t)max_nlmo * max_npno;
     const size_t s_Z       = (size_t)max_n_local * max_nlmo * max_nlmo;
 
-    std::vector<double> gamma_sc((size_t)num_threads * s_gamma, 0.0);
-    std::vector<double> Y_trans_sc((size_t)num_threads * s_Y, 0.0);
-    std::vector<double> Y_alt_sc((size_t)num_threads * s_Y, 0.0);
-    std::vector<double> Fia_sc((size_t)num_threads * s_Fia, 0.0);
-    std::vector<double> Z_stk_sc((size_t)num_threads * s_Z, 0.0);
-    std::vector<double> Z_xxx_sc((size_t)num_threads * s_Z, 0.0);
+    static std::vector<double> gamma_sc, Y_trans_sc, Y_alt_sc;
+    static std::vector<double> Fia_sc, Z_stk_sc, Z_xxx_sc;
+    if (gamma_sc.size()    < (size_t)num_threads * s_gamma)
+        gamma_sc.assign((size_t)num_threads * s_gamma, 0.0);
+    if (Y_trans_sc.size()  < (size_t)num_threads * s_Y)
+        Y_trans_sc.assign((size_t)num_threads * s_Y, 0.0);
+    if (Y_alt_sc.size()    < (size_t)num_threads * s_Y)
+        Y_alt_sc.assign((size_t)num_threads * s_Y, 0.0);
+    if (Fia_sc.size()      < (size_t)num_threads * s_Fia)
+        Fia_sc.assign((size_t)num_threads * s_Fia, 0.0);
+    if (Z_stk_sc.size()    < (size_t)num_threads * s_Z)
+        Z_stk_sc.assign((size_t)num_threads * s_Z, 0.0);
+    if (Z_xxx_sc.size()    < (size_t)num_threads * s_Z)
+        Z_xxx_sc.assign((size_t)num_threads * s_Z, 0.0);
 
     DLPNOt1_fock_batched(
         in_.T1_in_pair.data,    (const long *)in_.T1_in_pair.offsets,
@@ -1110,6 +1123,7 @@ void DLPNOCCSDSolver::run_phase_t1_fock_into(T1FockOutputs *out) {
         in_.Qab.data,           (const long *)in_.Qab.offsets,
         in_.e_pno_flat,         (const long *)in_.pno_offsets,
         nlmo_arr.data(), npno_arr.data(), n_local_arr.data(), need_dji_arr.data(),
+        in_.is_strong_pair,
         gamma_sc.data(),  s_gamma,
         Y_trans_sc.data(), s_Y,
         Y_alt_sc.data(),   s_Y,

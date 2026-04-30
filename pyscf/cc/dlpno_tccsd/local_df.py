@@ -1750,6 +1750,7 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
                     _libcc.DLPNOt1_fock_batched.restype = None
                     _libcc.DLPNOt1_fock_batched.argtypes = (
                         [ctypes.c_void_p] * 18 +              # 7 ptr/off pairs + 4 shape arrays
+                        [ctypes.c_void_p] +                    # is_strong_pair (nullable)
                         [ctypes.c_void_p, ctypes.c_size_t] * 6 +  # 6 scratch (ptr + stride)
                         [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,  # d, Fab, Fab_off
                          ctypes.c_size_t, ctypes.c_int])
@@ -1773,6 +1774,7 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
                     plan['npno_arr'].ctypes.data_as(ctypes.c_void_p),
                     plan['n_local_arr'].ctypes.data_as(ctypes.c_void_p),
                     plan['need_dji_arr'].ctypes.data_as(ctypes.c_void_p),
+                    None,  # is_strong_pair: baseline iterates valid_keys = strong+diag, no need to skip
                     sc['gamma'].ctypes.data_as(ctypes.c_void_p), sc['gamma'].shape[1],
                     sc['Y_trans'].ctypes.data_as(ctypes.c_void_p), sc['Y_trans'].shape[1],
                     sc['Y_alt'].ctypes.data_as(ctypes.c_void_p), sc['Y_alt'].shape[1],

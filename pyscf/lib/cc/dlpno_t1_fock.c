@@ -69,6 +69,7 @@ void DLPNOt1_fock_batched(
         const int    *npno_arr,
         const int    *n_local_arr,
         const int    *need_dji_arr,
+        const unsigned char *is_strong_pair,  /* (N,) byte flag; nullable */
         double       *gamma_scratch,
         const size_t  gamma_sc_stride,
         double       *Y_trans_scratch,
@@ -144,6 +145,12 @@ void DLPNOt1_fock_batched(
             }
             d_out[1] = 2.0 * acc_chem - acc_ij;
         }
+
+        /* Step 2 (Fab + Fia dressing) only needed for strong pairs:
+         * weak-pair Fab is consumed only in r2_BE which itself skips
+         * weak pairs.  Step 1 (d_ij/d_ji above) DOES run for weak pairs
+         * — Fij_bar dressing needs weak-pair d_ij. */
+        if (is_strong_pair != NULL && is_strong_pair[p] == 0) continue;
 
         /* Step 2: Fab init to diag(e_pno) */
         memset(Fab, 0, sizeof(double) * (size_t)int_npno2);
