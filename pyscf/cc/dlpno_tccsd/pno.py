@@ -656,6 +656,17 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     r_conv_lmp2 = 5e-9
     e_prev_lmp2 = 0.0
 
+    # Precompute F-coupling neighbors per LMO.  The inner loop in the
+    # residual previously ran over all nocc with a per-iter F_CUT check;
+    # this scales O(N_pairs * nocc).  Psi4 iterates only the pair's LMO
+    # neighborhood (lmopair_to_lmos_), giving O(N_pairs * nlmo_ij) — much
+    # better scaling for large systems (water-10: nlmo_ij~11 vs nocc=50).
+    _F_neighbors = [
+        [k for k in range(nocc_lmo)
+         if k != i and abs(F_lmo[i, k]) > F_CUT]
+        for i in range(nocc_lmo)
+    ]
+
     # Ordered pair keys for consistent flattening
     _lmp2_keys = [k for k in initial_pno_data if initial_pno_data[k]['n_pno'] > 0]
     _lmp2_sizes = {k: initial_pno_data[k]['n_pno'] ** 2 for k in _lmp2_keys}
@@ -667,6 +678,9 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
 
     for lmp2_iter in range(max_lmp2_iter):
         # Step 1: Compute residuals for ALL pairs
+        # Kept sequential — parallel ThreadPool here oversubscribes MKL
+        # threads (each worker dispatches a 16-thread BLAS call → contention).
+        # The per-pair BLAS calls already saturate cores via MKL parallelism.
         _t0 = _pno_time.perf_counter()
         R_all = {}
         r_max = 0.0
@@ -682,10 +696,13 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             D = e_pno[:, None] + e_pno[None, :] - F_lmo[i, i] - F_lmo[j, j]
             R = K_pno + D * T2
 
-            # Inter-pair Fock coupling (matching Psi4 lines 717-733)
-            for k in range(nocc_lmo):
+            # Inter-pair Fock coupling (matching Psi4 lines 717-733).
+            # Iterate ONLY the F-neighbors of i / j instead of all nocc —
+            # closes the ~3x scaling gap to Psi4 for LMP2 residual on
+            # large systems.
+            for k in _F_neighbors[i]:
                 key_kj = (min(k, j), max(k, j))
-                if key_kj in initial_pno_data and i != k and abs(F_lmo[i, k]) > F_CUT:
+                if key_kj in initial_pno_data:
                     S = pno_S_cache.get((key_ij, key_kj))
                     if S is not None and initial_pno_data[key_kj]['n_pno'] > 0:
                         T2_kj = T2_pno_all.get(key_kj)
@@ -693,8 +710,11 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                             if k > j:
                                 T2_kj = T2_kj.T
                             R -= F_lmo[i, k] * S @ T2_kj @ S.T
+            for k in _F_neighbors[j]:
+                if k == j:
+                    continue
                 key_ik = (min(i, k), max(i, k))
-                if key_ik in initial_pno_data and j != k and abs(F_lmo[k, j]) > F_CUT:
+                if key_ik in initial_pno_data:
                     S = pno_S_cache.get((key_ij, key_ik))
                     if S is not None and initial_pno_data[key_ik]['n_pno'] > 0:
                         T2_ik = T2_pno_all.get(key_ik)
