@@ -751,6 +751,17 @@ struct RunCycleInputs {
     const GTermInputs     *g_term_plan;
     const T3Inputs        *t3_plan;
     const T4Inputs        *t4_plan;
+
+    // -- Native R2 assembly: G_term two-sided (Step 2j-c orchestration). ---
+    // ik side runs g_term_plan; jk side runs g_term_plan_jk (when both
+    // non-null, R2 += flat_G_ij[p] + flat_G_ji[p].T per pair).
+    const GTermInputs *g_term_plan_jk;
+    // Per-G_term-item canonical-pair scatter table (length g_term_plan->N
+    // OR g_term_plan_jk->N respectively).  Each entry indexes into
+    // [0, n_canon_pairs); item n's tile is added to flat_G[ij/ji] at
+    // pair `target_pair_idx_ik[n]` / `target_pair_idx_jk[n]`.
+    const int *g_term_target_pair_idx_ik;
+    const int *g_term_target_pair_idx_jk;
 };
 
 struct RunCycleOutputs {
@@ -1282,17 +1293,18 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     }
 
     // ------------------------------------------------------------------
-    // R2 orchestration (skeleton): R2[p] += K[p] + A[p].
-    // BE / CD / G_term / t3+t4 contributions skipped (plans=null).
-    // When R2_external is provided, use it AS-IS (Psi4-symmetrized R2
-    // computed by PySCF's full residual machinery — incremental
-    // transition while plan extraction lands).
+    // R2 orchestration.  Two paths:
+    //   (a) R2_external provided → use AS-IS (Psi4-symmetrized R2
+    //       precomputed by PySCF's full residual machinery).
+    //   (b) Otherwise → native build: K + ladder + plan-cached R2
+    //       contributions (BE/CD/G_term/t3+t4) wired here.
     // ------------------------------------------------------------------
     std::vector<double> R2_buf((size_t)R2_total, 0.0);
     if (in_.R2_external != nullptr) {
         std::memcpy(R2_buf.data(), in_.R2_external,
                     (size_t)R2_total * sizeof(double));
     } else {
+        // Step 1: K + ladder (always in C++ via run_phase_k_ladder).
         for (int p = 0; p < N; ++p) {
             const int npno = npno_arr[p];
             if (npno == 0) continue;
@@ -1300,6 +1312,89 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             const int64_t sz  = (int64_t)npno * npno;
             for (int64_t e = 0; e < sz; ++e) {
                 R2_buf[off + e] = K_flat[off + e] + A_flat[off + e];
+            }
+        }
+
+        // Step 2: G_term contribution (two-sided ik + jk).
+        // Per pair p: G_term[p] = flat_G_ij[p] + flat_G_ji[p].T  where
+        // flat_G_ij is built by scattering (with subtraction) ik tiles
+        // and flat_G_ji from jk tiles (PySCF residual.py:877 convention).
+        if (plans->g_term_plan != nullptr
+                && plans->g_term_plan_jk != nullptr
+                && in_.R2_external == nullptr
+                && plans->g_term_target_pair_idx_ik != nullptr
+                && plans->g_term_target_pair_idx_jk != nullptr) {
+            // Allocate flat_G_ij, flat_G_ji as per-canonical-pair buffers
+            // sized for the FULL T2 layout (npno_p² per pair).
+            std::vector<double> flat_G_ij_buf((size_t)R2_total, 0.0);
+            std::vector<double> flat_G_ji_buf((size_t)R2_total, 0.0);
+
+            // Run kernel for ik side.
+            std::vector<double> tiles_ik((size_t)
+                plans->g_term_plan->tile_off
+                ? 0 : 0);  // placeholder; actual size from plan.tile_off[N].
+            const GTermInputs *g_ik = plans->g_term_plan;
+            const int N_ik = g_ik->N;
+            // tile_off has N+1 entries; total = tile_off[N].
+            const int64_t *tile_off_ik =
+                (const int64_t *)g_ik->tile_off;
+            const int64_t total_tiles_ik = tile_off_ik[N_ik];
+            std::vector<double> tiles_ik_buf((size_t)total_tiles_ik, 0.0);
+            GTermOutputs gout_ik;
+            gout_ik.tiles_flat = tiles_ik_buf.data();
+            run_phase_g_term_into(g_ik, &gout_ik);
+            // Scatter ik tiles -> flat_G_ij_buf at target pair offsets.
+            // PySCF SUBTRACTS (residual.py:877).
+            const int *n_ij_ik = (const int *)g_ik->n_ij_arr;
+            for (int n = 0; n < N_ik; ++n) {
+                const int n_ij = n_ij_ik[n];
+                const int target_p = plans->g_term_target_pair_idx_ik[n];
+                if (target_p < 0) continue;
+                const int64_t r2_off = in_.t2_offsets[target_p];
+                const int64_t tile_size = (int64_t)n_ij * n_ij;
+                const int64_t t_start = tile_off_ik[n];
+                for (int64_t e = 0; e < tile_size; ++e) {
+                    flat_G_ij_buf[r2_off + e] -= tiles_ik_buf[t_start + e];
+                }
+            }
+
+            // Run kernel for jk side.
+            const GTermInputs *g_jk = plans->g_term_plan_jk;
+            const int N_jk = g_jk->N;
+            const int64_t *tile_off_jk =
+                (const int64_t *)g_jk->tile_off;
+            const int64_t total_tiles_jk = tile_off_jk[N_jk];
+            std::vector<double> tiles_jk_buf((size_t)total_tiles_jk, 0.0);
+            GTermOutputs gout_jk;
+            gout_jk.tiles_flat = tiles_jk_buf.data();
+            run_phase_g_term_into(g_jk, &gout_jk);
+            const int *n_ij_jk = (const int *)g_jk->n_ij_arr;
+            for (int n = 0; n < N_jk; ++n) {
+                const int n_ij = n_ij_jk[n];
+                const int target_p = plans->g_term_target_pair_idx_jk[n];
+                if (target_p < 0) continue;
+                const int64_t r2_off = in_.t2_offsets[target_p];
+                const int64_t tile_size = (int64_t)n_ij * n_ij;
+                const int64_t t_start = tile_off_jk[n];
+                for (int64_t e = 0; e < tile_size; ++e) {
+                    flat_G_ji_buf[r2_off + e] -= tiles_jk_buf[t_start + e];
+                }
+            }
+
+            // Per pair: R2[p] += flat_G_ij[p] + flat_G_ji[p].T.
+            for (int p = 0; p < N; ++p) {
+                const int npno = npno_arr[p];
+                if (npno == 0) continue;
+                const int64_t r2_off = in_.t2_offsets[p];
+                for (int a = 0; a < npno; ++a) {
+                    for (int b = 0; b < npno; ++b) {
+                        const int64_t e_ab = (int64_t)a * npno + b;
+                        const int64_t e_ba = (int64_t)b * npno + a;
+                        R2_buf[r2_off + e_ab] +=
+                            flat_G_ij_buf[r2_off + e_ab]
+                            + flat_G_ji_buf[r2_off + e_ba];
+                    }
+                }
             }
         }
     }

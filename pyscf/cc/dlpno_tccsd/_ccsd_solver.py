@@ -786,6 +786,11 @@ class PyRunCycleInputs(ctypes.Structure):
         ('g_term_plan',   ctypes.POINTER(PyGTermInputs)),
         ('t3_plan',       ctypes.POINTER(PyT3Inputs)),
         ('t4_plan',       ctypes.POINTER(PyT4Inputs)),
+        # Native R2 assembly: G_term jk side + per-item canonical pair
+        # scatter tables (length g_term_plan->N / g_term_plan_jk->N).
+        ('g_term_plan_jk',           ctypes.POINTER(PyGTermInputs)),
+        ('g_term_target_pair_idx_ik', ctypes.c_void_p),
+        ('g_term_target_pair_idx_jk', ctypes.c_void_p),
     ]
 
 
