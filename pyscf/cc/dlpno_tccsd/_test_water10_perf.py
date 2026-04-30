@@ -11,6 +11,9 @@ import time
 os.environ.setdefault('OMP_NUM_THREADS', '16')
 os.environ.setdefault('OPENBLAS_NUM_THREADS', '16')
 os.environ.setdefault('MKL_NUM_THREADS', '16')
+# Enable native C cycle path (cc_ints centerQ + (T) per-triple kernels).
+# Validated: water-4 E_TCCSD(T)=-304.98979787, water-10 E_TCCSD=-2.13088299.
+os.environ.setdefault('DLPNO_C_CYCLE', '1')
 
 from pyscf import gto, scf, lib as pyscf_lib
 
