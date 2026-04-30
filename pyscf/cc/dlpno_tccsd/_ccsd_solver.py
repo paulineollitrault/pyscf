@@ -5541,6 +5541,348 @@ def run_remaining_cycles_via_class(
         # DIIS state:
         mydiis, diis_start_cycle, strong_pairs, cas_blocks,
         verbose=True):
+    """Pack-once optimized drop-in cycle driver.
+
+    SolverInputs and per_kl plan are packed ONCE at function entry; per
+    cycle only T1_flat / T2_flat / T1_in_pair are refreshed (not the
+    full 210-pair flat buffers).  DIIS operates on flat buffers
+    directly (no dict <-> array conversion).
+    """
+    import time as _time
+    from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
+    from pyscf.cc.dlpno_tccsd.pair_index import build_t1_cache, PairIndex
+    from pyscf.cc.dlpno_tccsd.lccsd import _compute_t1_residual_psi4
+
+    _pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+
+    # ---- ONE-TIME setup ----
+    _t_setup0 = _time.perf_counter()
+    if hasattr(_compute_t1_residual_psi4, '_per_kl_plan_cache'):
+        _compute_t1_residual_psi4._per_kl_plan_cache.clear()
+    _compute_t1_residual_psi4(
+        t1_pno, t2_pno_all, pno_spaces, fov_pno, F_lmo, eps_lmo, nocc,
+        S_pno_cache, cc_ints, ovL_pno_cache=ovL_pno_cache,
+        pair_lmo_idx=pair_lmo_idx, t1_cache=None, _pool=None,
+        cc_ints_flat=cc_ints_flat, pair_index=pair_index)
+    t1_cache = build_t1_cache(t1_pno, _pi, S_pno_cache, pno_spaces)
+    _all_keys = sorted(t2_pno_all.keys())
+    inputs, ownership, key_to_p, aux = pack_for_t1_ints(
+        cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
+        F_lmo, eps_lmo, fov_pno, nocc, _all_keys,
+        t2_pno_all=t2_pno_all, S_pno_cache=S_pno_cache)
+    keys_reorder = aux['keys_sorted']
+    n_pairs = len(keys_reorder)
+    npno = aux['n_pno_per_pair']
+    pno_offsets = aux['pno_offsets']
+    t2_offsets = aux['t2_offsets']
+    pair_lmo_lists = aux['pair_lmo_lists']
+    T1_flat_arr = aux['T1_flat']
+    T2_flat_arr = aux['T2_flat']
+
+    # Strong-pair flag for energy formula.
+    is_strong_arr = np.zeros(n_pairs, dtype=np.uint8)
+    _strong_keys_set = set(strong_pairs) | {(i, i) for i in range(nocc)}
+    for p, key in enumerate(keys_reorder):
+        if key in _strong_keys_set:
+            is_strong_arr[p] = 1
+    ownership.append(is_strong_arr)
+    inputs.is_strong_pair = is_strong_arr.ctypes.data
+
+    # per_kl plan extracted once.
+    from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+        _extract_per_kl_plan, _extract_g_tilde_plan)
+    plan_struct, plan_own = _extract_per_kl_plan(_compute_t1_residual_psi4)
+    if plan_struct is None:
+        raise RuntimeError('per_kl plan unavailable')
+    plan_struct.t2_buffer       = t2_pno_all._buffer.ctypes.data
+    plan_struct.t1_cache_buffer = t1_cache._buffer.ctypes.data
+    g_plan_struct, g_plan_own = _extract_g_tilde_plan(key_to_p)
+
+    # Strong-pair mask (cycle-invariant).  For DIIS we emit T1 (nocc slots)
+    # + T2 over STRONG pairs (matching PySCF DIIS vector layout).
+    strong_pair_indices = [p for p, key in enumerate(keys_reorder)
+                           if key in _strong_keys_set]
+    R1_size = sum(int(npno[i]) for i in range(nocc))
+    R2_size = int(t2_offsets[n_pairs])
+    R1_flat = np.zeros(R1_size, dtype=np.float64)
+    R2_flat = np.zeros(R2_size, dtype=np.float64)
+
+    # DIIS amplitude/error vector layout.
+    # T1: pno_offsets[nocc] doubles.  T2: sum over strong pairs of npno^2.
+    # CAS blocks: t2[cas_sl, cas_sl] zeroed before vectorization.
+    diis_t2_size = sum(int(npno[p]) ** 2 for p in strong_pair_indices)
+    diis_amp_size = int(pno_offsets[nocc]) + diis_t2_size
+
+    def _amp_to_vec(T1_flat, T2_flat):
+        """Build DIIS amp vector from current flat T1/T2 (with CAS mask)."""
+        vec = np.empty(diis_amp_size, dtype=np.float64)
+        vec[:pno_offsets[nocc]] = T1_flat[:pno_offsets[nocc]]
+        off = int(pno_offsets[nocc])
+        for p in strong_pair_indices:
+            n_p = int(npno[p])
+            if n_p == 0:
+                continue
+            sl = slice(int(t2_offsets[p]), int(t2_offsets[p + 1]))
+            t2k = T2_flat[sl].reshape(n_p, n_p).copy()
+            key = keys_reorder[p]
+            if key in cas_blocks:
+                cas_sl = cas_blocks[key][0]
+                t2k[cas_sl, cas_sl] = 0.0
+            vec[off:off + n_p * n_p] = t2k.ravel()
+            off += n_p * n_p
+        return vec
+
+    def _vec_to_amp(vec, T1_flat, T2_flat):
+        """Unpack DIIS-output amp vector back to T1_flat / T2_flat."""
+        T1_flat[:pno_offsets[nocc]] = vec[:pno_offsets[nocc]]
+        off = int(pno_offsets[nocc])
+        for p in strong_pair_indices:
+            n_p = int(npno[p])
+            if n_p == 0:
+                continue
+            sl = slice(int(t2_offsets[p]), int(t2_offsets[p + 1]))
+            T2_flat[sl] = vec[off:off + n_p * n_p]
+            off += n_p * n_p
+        # Restore CAS blocks (post-DIIS).
+        for key, cb in cas_blocks.items():
+            if key not in key_to_p:
+                continue
+            p = key_to_p[key]
+            n_p = int(npno[p])
+            if n_p == 0:
+                continue
+            sl_full = slice(int(t2_offsets[p]), int(t2_offsets[p + 1]))
+            t2_block = T2_flat[sl_full].reshape(n_p, n_p)
+            cas_sl = cb[0]
+            if len(cb) == 3:
+                _, t2c_dmrg_ref, t2c_mp2 = cb
+                t2_block[cas_sl, cas_sl] = t2c_mp2
+            else:
+                t2_block[cas_sl, cas_sl] = cb[1]
+
+    T1_in_pair_flat = aux['T1_in_pair_flat']
+    T1_in_pair_offs = aux['T1_in_pair_offs']
+    T1_in_pair_full_flat = aux['T1_in_pair_full_flat']
+    T1_in_pair_full_offs = aux['T1_in_pair_full_offs']
+
+    def _refresh_T1_in_pair(t1_cache_obj):
+        """Update T1_in_pair / T1_in_pair_full FLAT buffers from t1_cache.
+        The class kernels read from the flat buffer; per-pair list views
+        are stale until we re-flatten."""
+        for p, key in enumerate(keys_reorder):
+            n_p = int(npno[p])
+            nlmo_p = int(pair_lmo_lists[p].size)
+            if n_p == 0:
+                continue
+            full_view = t1_cache_obj[key]  # (nocc, n_p)
+            # T1_in_pair: pair-domain view (nlmo_p, n_p).
+            if nlmo_p > 0:
+                lmo_idx = np.asarray(pair_lmo_lists[p], dtype=np.intp)
+                T1_in_pair_flat[T1_in_pair_offs[p]:T1_in_pair_offs[p + 1]] = (
+                    full_view[lmo_idx].ravel())
+            # T1_in_pair_full: full (nocc, n_p).
+            T1_in_pair_full_flat[
+                T1_in_pair_full_offs[p]:T1_in_pair_full_offs[p + 1]] = (
+                full_view.ravel())
+
+    _t_setup = _time.perf_counter() - _t_setup0
+    print(f'[CCSD MONO PACK-ONCE] setup: {_t_setup:.2f}s', flush=True)
+
+    e_prev = float('-inf')
+
+    for cycle in range(cycle_start, max_cycle):
+        _t_cyc_start = _time.perf_counter()
+
+        # Per-iter: rebuild t1_cache from current t1_pno (DIIS may have
+        # mixed it; t1_pno is the reference).  Sync T1_flat from t1_pno.
+        _t_t1cache0 = _time.perf_counter()
+        t1_cache = build_t1_cache(t1_pno, _pi, S_pno_cache, pno_spaces)
+        plan_struct.t1_cache_buffer = t1_cache._buffer.ctypes.data
+        # Sync T1_flat (per occupied i) from t1_pno.
+        for ii in range(nocc):
+            n_ii = int(npno[ii])
+            if n_ii == 0:
+                continue
+            T1_flat_arr[pno_offsets[ii]:pno_offsets[ii] + n_ii] = t1_pno[ii]
+        # Sync T2_flat from t2_pno_all (DIIS may have mixed).
+        for p, key in enumerate(keys_reorder):
+            n_p = int(npno[p])
+            if n_p == 0:
+                continue
+            if key in t2_pno_all:
+                T2_flat_arr[t2_offsets[p]:t2_offsets[p + 1]] = (
+                    t2_pno_all[key].ravel())
+        _refresh_T1_in_pair(t1_cache)
+        _t_t1cache = _time.perf_counter() - _t_t1cache0
+
+        # Per-iter: rebuild plan inputs (T_arr/beta in BE, t2_flat/u_flat
+        # in CD/G_term/t34 — depend on T2 / T1).
+        _t_plans0 = _time.perf_counter()
+        from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+            _build_native_r2_plans, _add_t34_plans_to_natives)
+        natives, native_own = _build_native_r2_plans(
+            t2_pno_all, key_to_p, keys_reorder, pno_spaces,
+            b_tilde_per_ij_pyscf, jiang_C_pyscf, jiang_D_pyscf, n_pairs)
+        ord_idx_lookup = {}
+        for o in range(int(aux['ordered_pair_i_idx'].size)):
+            a = int(aux['ordered_pair_i_idx'][o])
+            b = int(aux['ordered_pair_k_idx'][o])
+            ord_idx_lookup[(a, b)] = o
+        natives, native_own = _add_t34_plans_to_natives(
+            natives, native_own, t1_cache, t2_pno_all,
+            ord_idx_lookup, key_to_p, nocc)
+        _t_plans = _time.perf_counter() - _t_plans0
+
+        # Wire plans (most fields cycle-invariant; ptrs may rebind).
+        plans = PyRunCycleInputs()
+        for fname in ('g_tilde_plan', 'be_plan', 'c_term_plan',
+                      'd_term_plan', 'g_term_plan', 't3_plan', 't4_plan',
+                      'g_term_plan_jk',
+                      'c_t3_plan', 'c_t4_plan', 'd_t3_plan', 'd_t4_plan'):
+            setattr(plans, fname, None)
+        plans.per_kl_plan = ctypes.pointer(plan_struct)
+        if g_plan_struct is not None:
+            plans.g_tilde_plan = ctypes.pointer(g_plan_struct)
+        if natives['g_plan_ik'] is not None:
+            plans.g_term_plan = ctypes.pointer(natives['g_plan_ik'])
+            plans.g_term_plan_jk = ctypes.pointer(natives['g_plan_jk'])
+            plans.g_term_target_pair_idx_ik = natives['g_target_ik'].ctypes.data
+            plans.g_term_target_pair_idx_jk = natives['g_target_jk'].ctypes.data
+        plans.be_n_buckets    = natives['be_n_buckets']
+        plans.be_plan_buckets = (
+            ctypes.addressof(natives['be_plan_buckets'])
+            if natives['be_plan_buckets'] is not None else 0)
+        plans.be_n_unique_n_ij = natives['be_n_unique']
+        plans.be_unique_n_ij = (natives['be_unique_n_ij'].ctypes.data
+            if natives['be_unique_n_ij'] is not None else None)
+        plans.be_flat_off_per_n_ij = (natives['be_flat_off_per_n_ij'].ctypes.data
+            if natives['be_flat_off_per_n_ij'] is not None else None)
+        plans.be_pair_n_ij_idx = (natives['be_pair_n_ij_idx'].ctypes.data
+            if natives['be_pair_n_ij_idx'] is not None else None)
+        plans.be_pair_slot = (natives['be_pair_slot'].ctypes.data
+            if natives['be_pair_slot'] is not None else None)
+        if natives['c_plan'] is not None:
+            plans.c_term_plan = ctypes.pointer(natives['c_plan'])
+            plans.c_term_target_pair_idx_ij = natives['c_target_ij'].ctypes.data
+            plans.c_term_target_pair_idx_ji = natives['c_target_ji'].ctypes.data
+        if natives['d_plan'] is not None:
+            plans.d_term_plan = ctypes.pointer(natives['d_plan'])
+            plans.d_term_target_pair_idx_ij = natives['d_target_ij'].ctypes.data
+            plans.d_term_target_pair_idx_ji = natives['d_target_ji'].ctypes.data
+        for k_struct, k_target, attr in [
+                ('c_t3_struct', 'c_t3_target_ord', 'c_t3'),
+                ('c_t4_struct', 'c_t4_target_ord', 'c_t4'),
+                ('d_t3_struct', 'd_t3_target_ord', 'd_t3'),
+                ('d_t4_struct', 'd_t4_target_ord', 'd_t4')]:
+            s = natives.get(k_struct)
+            t = natives.get(k_target)
+            if s is not None:
+                setattr(plans, f'{attr}_plan', ctypes.pointer(s))
+                setattr(plans, f'{attr}_target_ord_idx',
+                        t.ctypes.data if t is not None else None)
+        plans.c_term_ct_ord_pair_idx = (
+            natives['c_ct_ord_pair_idx'].ctypes.data
+            if 'c_ct_ord_pair_idx' in natives else None)
+        plans.d_term_dt_ord_pair_idx = (
+            natives['d_dt_ord_pair_idx'].ctypes.data
+            if 'd_dt_ord_pair_idx' in natives else None)
+
+        # Snapshot pre-update amp.
+        amp_old = _amp_to_vec(T1_flat_arr, T2_flat_arr)
+
+        # Run class one cycle.
+        _t_run0 = _time.perf_counter()
+        out = PyRunCycleOutputs()
+        out.R1_flat = R1_flat.ctypes.data
+        out.R2_flat = R2_flat.ctypes.data
+        out.energy = 0.0
+        out.G_tilde_out = 0
+        rc = _libcc.DLPNOcompute_lccsd_run_one_cycle(
+            ctypes.byref(inputs), ctypes.byref(plans), ctypes.byref(out))
+        if rc != 0:
+            raise RuntimeError(f'class run_one_cycle rc={rc}')
+        _t_run = _time.perf_counter() - _t_run0
+
+        # Build amp_new from updated T1_flat / T2_flat (mutated in place).
+        # Build err vec from R1, R2 (over strong pairs).
+        amp_new = _amp_to_vec(T1_flat_arr, T2_flat_arr)
+        err_vec = np.empty(diis_amp_size, dtype=np.float64)
+        err_vec[:pno_offsets[nocc]] = R1_flat[:pno_offsets[nocc]]
+        off = int(pno_offsets[nocc])
+        for p in strong_pair_indices:
+            n_p = int(npno[p])
+            if n_p == 0:
+                continue
+            sl = slice(int(t2_offsets[p]), int(t2_offsets[p + 1]))
+            r2k = R2_flat[sl].reshape(n_p, n_p).copy()
+            key = keys_reorder[p]
+            if key in cas_blocks:
+                cas_sl = cas_blocks[key][0]
+                r2k[cas_sl, cas_sl] = 0.0
+            err_vec[off:off + n_p * n_p] = r2k.ravel()
+            off += n_p * n_p
+        dT = float(np.max(np.abs(amp_new - amp_old)))
+
+        _t_diis0 = _time.perf_counter()
+        if cycle >= diis_start_cycle and err_vec.size > 0:
+            amp_new = mydiis.update(amp_new, err_vec)
+        _vec_to_amp(amp_new, T1_flat_arr, T2_flat_arr)
+        _t_diis = _time.perf_counter() - _t_diis0
+
+        # Sync T1_flat / T2_flat back to t1_pno / t2_pno_all (for next
+        # cycle's t1_cache build + post-CCSD callers).
+        _t_sync0 = _time.perf_counter()
+        for ii in range(nocc):
+            n_ii = int(npno[ii])
+            if n_ii == 0:
+                continue
+            t1_pno[ii] = T1_flat_arr[pno_offsets[ii]:pno_offsets[ii] + n_ii].copy()
+        for p, key in enumerate(keys_reorder):
+            if key not in t2_pno_all:
+                continue
+            n_p = int(npno[p])
+            if n_p == 0:
+                continue
+            t2_pno_all[key] = T2_flat_arr[
+                t2_offsets[p]:t2_offsets[p + 1]].reshape(n_p, n_p).copy()
+        _t_sync = _time.perf_counter() - _t_sync0
+
+        e_cyc = float(out.energy)
+        dE = abs(e_cyc - e_prev) if cycle > cycle_start else float('inf')
+        e_prev = e_cyc
+
+        _dt = _time.perf_counter() - _t_cyc_start
+        print(f'  Cycle {cycle + 1:3d} [class]: dT={dT:.3e}  '
+              f'E_corr={e_cyc:.10f}  dE={dE:.2e}  '
+              f'[{_dt:.2f}s: t1cache={_t_t1cache:.2f} plans={_t_plans:.2f} '
+              f'run_cyc={_t_run:.2f} diis={_t_diis:.2f} sync={_t_sync:.2f}]',
+              flush=True)
+
+        del native_own
+
+        if dT < this_tol:
+            print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (amplitude, class).',
+                  flush=True)
+            return cycle, e_cyc
+        if cycle > 5 and dE < this_tol:
+            print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (energy, dE={dE:.2e}, class).',
+                  flush=True)
+            return cycle, e_cyc
+
+    return max_cycle - 1, e_prev
+
+
+def _OLD_run_remaining_cycles_via_class(
+        cycle_start, max_cycle, this_tol,
+        t1_pno, t2_pno_all,
+        cc_ints, pno_spaces, pair_lmo_idx, F_lmo, eps_lmo, fov_pno,
+        nocc, keys_sorted, S_pno_cache,
+        cc_ints_flat, pair_index, ovL_pno_cache, K_pno_cache,
+        # PySCF caches/state needed for plan extractors:
+        b_tilde_per_ij_pyscf, jiang_C_pyscf, jiang_D_pyscf,
+        # DIIS state:
+        mydiis, diis_start_cycle, strong_pairs, cas_blocks,
+        verbose=True):
     """Drop-in replacement for the remaining cycles after cycle 0.
     Calls the C++ class's run_one_cycle once per iteration; DIIS + energy
     + convergence stay in Python.

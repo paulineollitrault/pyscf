@@ -313,8 +313,8 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
     j_Qk_fps, _, _ = _build_flat_from_per_pair(j_Qk_list, ownership)
     i_Qa_fps, _, _ = _build_flat_from_per_pair(i_Qa_list, ownership)
     j_Qa_fps, _, _ = _build_flat_from_per_pair(j_Qa_list, ownership)
-    T1_in_pair_fps, _, T1_in_pair_offs = _build_flat_from_per_pair(
-        T1_in_pair_list, ownership)
+    T1_in_pair_fps, T1_in_pair_flat_arr, T1_in_pair_offs = (
+        _build_flat_from_per_pair(T1_in_pair_list, ownership))
     K_iajb_fps, _, _      = _build_flat_from_per_pair(K_iajb_list,      ownership)
     K_bar_chem_fps, _, _  = _build_flat_from_per_pair(K_bar_chem_list,  ownership)
     K_bar_ij_fps, _, _    = _build_flat_from_per_pair(K_bar_ij_list,    ownership)
@@ -331,8 +331,8 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
     inputs.i_Qa   = i_Qa_fps
     inputs.j_Qa   = j_Qa_fps
     inputs.T1_in_pair = T1_in_pair_fps
-    T1_in_pair_full_fps, _, _ = _build_flat_from_per_pair(
-        T1_in_pair_full_list, ownership)
+    T1_in_pair_full_fps, T1_in_pair_full_flat_arr, T1_in_pair_full_offs = (
+        _build_flat_from_per_pair(T1_in_pair_full_list, ownership))
     inputs.T1_in_pair_full = T1_in_pair_full_fps
     inputs.K_iajb = K_iajb_fps
     inputs.K_bar_chem     = K_bar_chem_fps
@@ -435,6 +435,11 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
         'i_Qk_list': i_Qk_list,
         'j_Qk_list': j_Qk_list,
         'T1_in_pair_list': T1_in_pair_list,
+        'T1_in_pair_full_list': T1_in_pair_full_list,
+        'T1_in_pair_flat': T1_in_pair_flat_arr,
+        'T1_in_pair_offs': T1_in_pair_offs,
+        'T1_in_pair_full_flat': T1_in_pair_full_flat_arr,
+        'T1_in_pair_full_offs': T1_in_pair_full_offs,
         't2_offsets': t2_offsets,
         'T2_flat': T2_flat,
         'pno_offsets': pno_offsets,
