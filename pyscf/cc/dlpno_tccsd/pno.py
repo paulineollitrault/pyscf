@@ -681,60 +681,222 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     _lmp2_keys = [k for k in initial_pno_data if initial_pno_data[k]['n_pno'] > 0]
     _lmp2_sizes = {k: initial_pno_data[k]['n_pno'] ** 2 for k in _lmp2_keys}
 
+    # ------------------------------------------------------------------
+    # Batched-C plan for inter-pair F-coupling residual update.
+    # Replaces the Python loop that calls S @ T2 @ S.T thousands of times
+    # per LMP2 iteration. Plan-cached: tasks list built once, kernel called
+    # per LMP2 iteration with current T2.
+    # ------------------------------------------------------------------
+    _use_c_lmp2_resid = bool(int(os.environ.get('DLPNO_LMP2_RESIDUAL_C', '1')))
+    _c_resid_plan = None
+    if _use_c_lmp2_resid and _lmp2_keys:
+        import ctypes as _ct_lmp2
+        from pyscf import lib as _lib_lmp2
+        _libcc_lmp2 = _lib_lmp2.load_library('libcc')
+        _libcc_lmp2.DLPNOlmp2_residual_batched.restype = None
+        _libcc_lmp2.DLPNOlmp2_residual_batched.argtypes = [
+            _ct_lmp2.c_void_p, _ct_lmp2.c_void_p, _ct_lmp2.c_void_p,
+            _ct_lmp2.c_void_p, _ct_lmp2.c_void_p, _ct_lmp2.c_void_p,
+            _ct_lmp2.c_void_p, _ct_lmp2.c_void_p, _ct_lmp2.c_void_p,
+            _ct_lmp2.c_void_p, _ct_lmp2.c_void_p,
+            _ct_lmp2.c_int, _ct_lmp2.c_size_t, _ct_lmp2.c_int,
+        ]
+
+        _ordered_keys = list(_lmp2_keys)
+        _pair_idx_lut = {k: p for p, k in enumerate(_ordered_keys)}
+        N_p = len(_ordered_keys)
+        n_pno_arr = np.array(
+            [initial_pno_data[k]['n_pno'] for k in _ordered_keys],
+            dtype=np.int32)
+
+        # T2 flat layout: per-pair (n_pno, n_pno) concatenated.
+        T2_offsets = np.empty(N_p + 1, dtype=np.int64)
+        T2_offsets[0] = 0
+        T2_offsets[1:] = np.cumsum(n_pno_arr.astype(np.int64) ** 2)
+        T2_flat = np.empty(int(T2_offsets[-1]))
+        R_flat = np.empty(int(T2_offsets[-1]))
+
+        # Enumerate tasks per target pair, fill S_flat from pno_S_cache.
+        _task_partner = []
+        _task_F = []
+        _task_S_off = []
+        _task_T = []
+        _S_chunks = []      # collect S arrays in task order
+        _S_offsets_per_task = []
+        _s_total = 0
+        n_tasks_per_pair = np.zeros(N_p, dtype=np.int64)
+
+        for p, key_ij in enumerate(_ordered_keys):
+            i_lmo, j_lmo = key_ij
+            n_p_target = int(n_pno_arr[p])
+            # First condition: F[i,k] > FCUT → use S(ij, kj) and T2[kj]
+            for k in _F_neighbors[i_lmo]:
+                key_kj = (min(k, j_lmo), max(k, j_lmo))
+                if key_kj not in _pair_idx_lut:
+                    continue
+                p_partner = _pair_idx_lut[key_kj]
+                if int(n_pno_arr[p_partner]) == 0:
+                    continue
+                S = pno_S_cache.get((key_ij, key_kj))
+                if S is None:
+                    continue
+                _S_chunks.append(np.ascontiguousarray(S).ravel())
+                _S_offsets_per_task.append(_s_total)
+                _s_total += S.size
+                _task_partner.append(p_partner)
+                _task_F.append(F_lmo[i_lmo, k])
+                _task_T.append(1 if k > j_lmo else 0)
+                n_tasks_per_pair[p] += 1
+            # Second condition: F[k,j] > FCUT → use S(ij, ik) and T2[ik]
+            for k in _F_neighbors[j_lmo]:
+                key_ik = (min(i_lmo, k), max(i_lmo, k))
+                if key_ik not in _pair_idx_lut:
+                    continue
+                p_partner = _pair_idx_lut[key_ik]
+                if int(n_pno_arr[p_partner]) == 0:
+                    continue
+                S = pno_S_cache.get((key_ij, key_ik))
+                if S is None:
+                    continue
+                _S_chunks.append(np.ascontiguousarray(S).ravel())
+                _S_offsets_per_task.append(_s_total)
+                _s_total += S.size
+                _task_partner.append(p_partner)
+                _task_F.append(F_lmo[k, j_lmo])
+                _task_T.append(1 if i_lmo > k else 0)
+                n_tasks_per_pair[p] += 1
+
+        target_task_starts = np.empty(N_p + 1, dtype=np.int64)
+        target_task_starts[0] = 0
+        target_task_starts[1:] = np.cumsum(n_tasks_per_pair)
+
+        S_flat = np.empty(_s_total)
+        for chunk, off in zip(_S_chunks, _S_offsets_per_task):
+            S_flat[off:off + chunk.size] = chunk
+
+        # Per-pair K_pno + D constants for fast per-iter R0 build.
+        K_pno_flat = np.empty(int(T2_offsets[-1]))
+        D_flat = np.empty(int(T2_offsets[-1]))
+        for p, key_ij in enumerate(_ordered_keys):
+            i_l, j_l = key_ij
+            pdata_ = initial_pno_data[key_ij]
+            n_p = int(n_pno_arr[p])
+            e_p = pdata_['e_pno']
+            D = e_p[:, None] + e_p[None, :] - F_lmo[i_l, i_l] - F_lmo[j_l, j_l]
+            K_pno_flat[T2_offsets[p]:T2_offsets[p + 1]] = pdata_['K_pno'].ravel()
+            D_flat[T2_offsets[p]:T2_offsets[p + 1]] = D.ravel()
+
+        _c_resid_plan = {
+            'ordered_keys': _ordered_keys,
+            'n_pno_arr': n_pno_arr,
+            'T2_offsets': T2_offsets,
+            'T2_flat': T2_flat,
+            'R_flat': R_flat,
+            'K_pno_flat': K_pno_flat,
+            'D_flat': D_flat,
+            'target_task_starts': target_task_starts,
+            'task_partner_idx': np.array(_task_partner, dtype=np.int64),
+            'task_F_coeff': np.array(_task_F, dtype=np.float64),
+            'task_S_off': np.array(_S_offsets_per_task, dtype=np.int64),
+            'task_transpose': np.array(_task_T, dtype=np.int8),
+            'S_flat': S_flat,
+            'max_n_pno': int(n_pno_arr.max()) if N_p > 0 else 0,
+            'N_p': N_p,
+            'n_threads': min(16, N_p) if N_p > 0 else 1,
+        }
+        _pno_dbg and print(
+            f'[PNO_DBG] LMP2 residual C plan: {N_p} pairs, '
+            f'{int(target_task_starts[-1])} tasks, '
+            f'S_flat={_s_total*8/1024/1024:.1f} MB',
+            flush=True)
+
     # DIIS setup (matching Psi4 line 700)
     from pyscf.lib.diis import DIIS
     lmp2_diis = DIIS()
     lmp2_diis.space = 8
 
     for lmp2_iter in range(max_lmp2_iter):
-        # Step 1: Compute residuals for ALL pairs
-        # Kept sequential — parallel ThreadPool here oversubscribes MKL
-        # threads (each worker dispatches a 16-thread BLAS call → contention).
-        # The per-pair BLAS calls already saturate cores via MKL parallelism.
+        # Step 1: Compute residuals for ALL pairs.
         _t0 = _pno_time.perf_counter()
         R_all = {}
         r_max = 0.0
-        for key_ij, pdata in initial_pno_data.items():
-            i, j = key_ij
-            n = pdata['n_pno']
-            if n == 0:
-                continue
-            K_pno = pdata['K_pno']
-            e_pno = pdata['e_pno']
-            T2 = T2_pno_all[key_ij]
 
-            D = e_pno[:, None] + e_pno[None, :] - F_lmo[i, i] - F_lmo[j, j]
-            R = K_pno + D * T2
+        if _c_resid_plan is not None:
+            # Pack T2 flat in plan order; build R0 = K_pno + D*T2 in flat.
+            P = _c_resid_plan
+            ordered_keys = P['ordered_keys']
+            T2_flat = P['T2_flat']
+            R_flat = P['R_flat']
+            T2_offsets = P['T2_offsets']
+            n_pno_arr = P['n_pno_arr']
+            for p, key_ij in enumerate(ordered_keys):
+                T2 = T2_pno_all[key_ij]
+                T2_flat[T2_offsets[p]:T2_offsets[p + 1]] = T2.ravel()
+            R_flat[:] = P['K_pno_flat'] + P['D_flat'] * T2_flat
 
-            # Inter-pair Fock coupling (matching Psi4 lines 717-733).
-            # Iterate ONLY the F-neighbors of i / j instead of all nocc —
-            # closes the ~3x scaling gap to Psi4 for LMP2 residual on
-            # large systems.
-            for k in _F_neighbors[i]:
-                key_kj = (min(k, j), max(k, j))
-                if key_kj in initial_pno_data:
-                    S = pno_S_cache.get((key_ij, key_kj))
-                    if S is not None and initial_pno_data[key_kj]['n_pno'] > 0:
-                        T2_kj = T2_pno_all.get(key_kj)
-                        if T2_kj is not None:
-                            if k > j:
-                                T2_kj = T2_kj.T
-                            R -= F_lmo[i, k] * S @ T2_kj @ S.T
-            for k in _F_neighbors[j]:
-                if k == j:
+            _libcc_lmp2.DLPNOlmp2_residual_batched(
+                P['target_task_starts'].ctypes.data_as(_ct_lmp2.c_void_p),
+                P['task_partner_idx'].ctypes.data_as(_ct_lmp2.c_void_p),
+                P['task_F_coeff'].ctypes.data_as(_ct_lmp2.c_void_p),
+                P['task_S_off'].ctypes.data_as(_ct_lmp2.c_void_p),
+                P['task_transpose'].ctypes.data_as(_ct_lmp2.c_void_p),
+                n_pno_arr.ctypes.data_as(_ct_lmp2.c_void_p),
+                T2_flat.ctypes.data_as(_ct_lmp2.c_void_p),
+                T2_offsets.ctypes.data_as(_ct_lmp2.c_void_p),
+                P['S_flat'].ctypes.data_as(_ct_lmp2.c_void_p),
+                R_flat.ctypes.data_as(_ct_lmp2.c_void_p),
+                T2_offsets.ctypes.data_as(_ct_lmp2.c_void_p),
+                int(P['max_n_pno']),
+                int(P['N_p']),
+                int(P['n_threads']),
+            )
+
+            for p, key_ij in enumerate(ordered_keys):
+                n = int(n_pno_arr[p])
+                R = R_flat[T2_offsets[p]:T2_offsets[p + 1]].reshape(n, n).copy()
+                R_all[key_ij] = R
+                rmx = float(np.max(np.abs(R)))
+                if rmx > r_max:
+                    r_max = rmx
+        else:
+            for key_ij, pdata in initial_pno_data.items():
+                i, j = key_ij
+                n = pdata['n_pno']
+                if n == 0:
                     continue
-                key_ik = (min(i, k), max(i, k))
-                if key_ik in initial_pno_data:
-                    S = pno_S_cache.get((key_ij, key_ik))
-                    if S is not None and initial_pno_data[key_ik]['n_pno'] > 0:
-                        T2_ik = T2_pno_all.get(key_ik)
-                        if T2_ik is not None:
-                            if i > k:
-                                T2_ik = T2_ik.T
-                            R -= F_lmo[k, j] * S @ T2_ik @ S.T
+                K_pno = pdata['K_pno']
+                e_pno = pdata['e_pno']
+                T2 = T2_pno_all[key_ij]
 
-            R_all[key_ij] = R
-            r_max = max(r_max, np.max(np.abs(R)))
+                D = (e_pno[:, None] + e_pno[None, :]
+                     - F_lmo[i, i] - F_lmo[j, j])
+                R = K_pno + D * T2
+
+                for k in _F_neighbors[i]:
+                    key_kj = (min(k, j), max(k, j))
+                    if key_kj in initial_pno_data:
+                        S = pno_S_cache.get((key_ij, key_kj))
+                        if S is not None and initial_pno_data[key_kj]['n_pno'] > 0:
+                            T2_kj = T2_pno_all.get(key_kj)
+                            if T2_kj is not None:
+                                if k > j:
+                                    T2_kj = T2_kj.T
+                                R -= F_lmo[i, k] * S @ T2_kj @ S.T
+                for k in _F_neighbors[j]:
+                    if k == j:
+                        continue
+                    key_ik = (min(i, k), max(i, k))
+                    if key_ik in initial_pno_data:
+                        S = pno_S_cache.get((key_ij, key_ik))
+                        if S is not None and initial_pno_data[key_ik]['n_pno'] > 0:
+                            T2_ik = T2_pno_all.get(key_ik)
+                            if T2_ik is not None:
+                                if i > k:
+                                    T2_ik = T2_ik.T
+                                R -= F_lmo[k, j] * S @ T2_ik @ S.T
+
+                R_all[key_ij] = R
+                r_max = max(r_max, np.max(np.abs(R)))
 
         _t_p2b_residual += _pno_time.perf_counter() - _t0
         _t0 = _pno_time.perf_counter()

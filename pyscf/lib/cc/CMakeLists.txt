@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+enable_language(CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 add_library(cc SHARED
   ccsd_pack.c ccsd_grad.c ccsd_t.c ccsd_t_lambda.c uccsd_t.c
   dlpno_foo_dressed.c dlpno_per_i.c dlpno_partner.c
@@ -23,7 +27,10 @@ add_library(cc SHARED
   dlpno_partners_centerQ.c dlpno_s_pno.c
   dlpno_u_for_triple.c dlpno_triple_local_df.c
   dlpno_triple_tno.c dlpno_triples_full.c
-  dlpno_w3_full.c dlpno_triples_orch.c)
+  dlpno_w3_full.c dlpno_triples_orch.c
+  dlpno_g_tilde_plan.c
+  dlpno_lmp2_residual.c
+  dlpno_ccsd_solver.cpp)
 add_dependencies(cc np_helper ao2mo)
 
 set_target_properties(cc PROPERTIES
