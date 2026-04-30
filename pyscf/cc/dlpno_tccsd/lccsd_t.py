@@ -1784,6 +1784,16 @@ def _run_triples_omp(valid_triples,
     if _prof:
         _t_arena = _t.perf_counter()
         print(f'  [PYTHON_PROF] global pair arena build: {_t_arena - _t_start:.2f}s', flush=True)
+    # Pre-compute per-LMO domain-partner set:
+    #   partners[i] = {m : (min(m,i), max(m,i)) in _domain_set}
+    # This turns the per-triple `for m in range(nocc_lmo)` scan into
+    # a 3-way set intersection of bounded size (each partner set is the
+    # F-coupling neighbourhood of one LMO).
+    _partners = [set() for _ in range(nocc_lmo)]
+    for (a, b) in _domain_set:
+        _partners[a].add(b)
+        _partners[b].add(a)
+
     # Build per-triple arena.
     ijk_list = np.asarray(valid_triples, dtype=np.int64).reshape(n_triples, 3)
     tp_lists = []      # triple_paos for each triple
@@ -1836,12 +1846,9 @@ def _run_triples_omp(valid_triples,
         triple_paos = np.array(sorted(pao_set), dtype=np.int64)
         tp_lists.append(triple_paos)
 
-        # triple_domain
+        # triple_domain = partners[i] ∩ partners[j] ∩ partners[k]
         triple_domain = sorted(
-            m for m in range(nocc_lmo)
-            if (min(m, i), max(m, i)) in _domain_set
-            and (min(m, j), max(m, j)) in _domain_set
-            and (min(m, k), max(m, k)) in _domain_set)
+            _partners[i] & _partners[j] & _partners[k])
         td_lists.append(np.asarray(triple_domain, dtype=np.int64))
         n_dom = len(triple_domain)
         m_dom_arr[t] = n_dom
