@@ -787,6 +787,27 @@ struct RunCycleInputs {
     const int *c_term_target_pair_idx_ji;
     const int *d_term_target_pair_idx_ij;
     const int *d_term_target_pair_idx_ji;
+
+    // -- Native C_tilde / D_tilde Phase 2 build (t3+t4 plans). ---
+    // c_t3_plan / c_t4_plan: extend C_tilde Phase 1 (already in C++ via
+    //   run_phase_c_tilde_ph1_into) with Phase 2 contributions.
+    // d_t3_plan / d_t4_plan: same for D_tilde.
+    // Per-item scatter table (length plan->N): ordered-pair index that
+    //   the kernel's tile is added to in C_tilde_flat / D_tilde_flat.
+    const T3Inputs *c_t3_plan;
+    const T4Inputs *c_t4_plan;
+    const T3Inputs *d_t3_plan;
+    const T4Inputs *d_t4_plan;
+    const int *c_t3_target_ord_idx;
+    const int *c_t4_target_ord_idx;
+    const int *d_t3_target_ord_idx;
+    const int *d_t4_target_ord_idx;
+    // CD ct_flat / dt_flat native-gather: per-CD-item ordered-pair index
+    // into C_tilde_flat / D_tilde_flat.  When provided, run_one_cycle
+    // builds ct_flat / dt_flat from class's natively-built C_tilde_flat /
+    // D_tilde_flat at the start of CD step (replacing PySCF dict gather).
+    const int *c_term_ct_ord_pair_idx;
+    const int *d_term_dt_ord_pair_idx;
 };
 
 struct RunCycleOutputs {
@@ -1212,6 +1233,63 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     dt_out.D_tilde.data    = D_tilde_flat.data();
     dt_out.D_tilde.offsets = ord_npno2_off.data();
     run_phase_d_tilde_ph1_into(&dt_out);
+
+    // ------------------------------------------------------------------
+    // Phase 6b: C_tilde / D_tilde Phase 2 (t3 + t4 contributions).
+    // Each plan runs against C_tilde_flat (Phase 1 already in there) or
+    // D_tilde_flat, accumulating per-item tiles to the targeted ordered
+    // pair's slot.  PySCF residual.py:_run_t34_batched scatter is += tile
+    // (sign absorbed in the kernel via -T1l for t3; t4_scale for t4).
+    auto _scatter_t3_into = [&](const T3Inputs *t3p, const int *targets,
+                                  std::vector<double> &dst_flat) {
+        if (t3p == nullptr || targets == nullptr) return;
+        const int N_t = t3p->N;
+        const int64_t *tile_off = (const int64_t *)t3p->tile_off;
+        const int *n_ki_arr = (const int *)t3p->n_ki_arr;
+        std::vector<double> tiles((size_t)tile_off[N_t], 0.0);
+        T3Outputs out_t3;
+        out_t3.tiles_flat = tiles.data();
+        run_phase_t3_into(t3p, &out_t3);
+        // Per item, add tile to dst_flat at target ordered-pair offset.
+        for (int n = 0; n < N_t; ++n) {
+            const int o = targets[n];
+            if (o < 0) continue;
+            const int n_ki = n_ki_arr[n];
+            const int64_t tile_size = (int64_t)n_ki * n_ki;
+            const int64_t t_start = tile_off[n];
+            const int64_t d_off = ord_npno2_off[o];
+            for (int64_t e = 0; e < tile_size; ++e) {
+                dst_flat[d_off + e] += tiles[t_start + e];
+            }
+        }
+    };
+    auto _scatter_t4_into = [&](const T4Inputs *t4p, const int *targets,
+                                  std::vector<double> &dst_flat) {
+        if (t4p == nullptr || targets == nullptr) return;
+        const int N_t = t4p->N;
+        const int64_t *tile_off = (const int64_t *)t4p->tile_off;
+        const int *n_ki_arr = (const int *)t4p->n_ki_arr;
+        std::vector<double> tiles((size_t)tile_off[N_t], 0.0);
+        T4Outputs out_t4;
+        out_t4.tiles_flat = tiles.data();
+        run_phase_t4_into(t4p, &out_t4);
+        for (int n = 0; n < N_t; ++n) {
+            const int o = targets[n];
+            if (o < 0) continue;
+            const int n_ki = n_ki_arr[n];
+            const int64_t tile_size = (int64_t)n_ki * n_ki;
+            const int64_t t_start = tile_off[n];
+            const int64_t d_off = ord_npno2_off[o];
+            for (int64_t e = 0; e < tile_size; ++e) {
+                dst_flat[d_off + e] += tiles[t_start + e];
+            }
+        }
+    };
+    _scatter_t3_into(plans->c_t3_plan, plans->c_t3_target_ord_idx, C_tilde_flat);
+    _scatter_t4_into(plans->c_t4_plan, plans->c_t4_target_ord_idx, C_tilde_flat);
+    _scatter_t3_into(plans->d_t3_plan, plans->d_t3_target_ord_idx, D_tilde_flat);
+    _scatter_t4_into(plans->d_t4_plan, plans->d_t4_target_ord_idx, D_tilde_flat);
+
     // ------------------------------------------------------------------
     // Phase 7: G_tilde — initialize to Fkj (Psi4 convention); skip
     // plan-cached inner if plan absent.
@@ -1518,14 +1596,36 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             std::vector<double> flat_D_ji_buf((size_t)R2_total, 0.0);
 
             // C side.
-            const CTermInputs *c_plan = plans->c_term_plan;
-            const int N_c = c_plan->N;
-            const int64_t *c_tile_off = (const int64_t *)c_plan->tile_off;
+            const CTermInputs *c_plan_orig = plans->c_term_plan;
+            const int N_c = c_plan_orig->N;
+            const int64_t *c_tile_off = (const int64_t *)c_plan_orig->tile_off;
             std::vector<double> c_tiles_buf((size_t)c_tile_off[N_c], 0.0);
+            // If c_term_ct_ord_pair_idx is provided, build ct_flat from
+            // class's native C_tilde_flat (post-Phase 2).  Otherwise use
+            // the user-provided ct_flat (from PySCF dict gather).
+            CTermInputs c_plan = *c_plan_orig;
+            std::vector<double> ct_flat_local;
+            if (plans->c_term_ct_ord_pair_idx != nullptr) {
+                const int64_t *c_ct_off = (const int64_t *)c_plan_orig->ct_off;
+                const int *c_n_ct = (const int *)c_plan_orig->n_ct_arr;
+                ct_flat_local.assign((size_t)c_ct_off[N_c], 0.0);
+                for (int n = 0; n < N_c; ++n) {
+                    const int o = plans->c_term_ct_ord_pair_idx[n];
+                    if (o < 0) continue;
+                    const int n_ct = c_n_ct[n];
+                    const int64_t src = ord_npno2_off[o];
+                    const int64_t dst = c_ct_off[n];
+                    const int64_t sz = (int64_t)n_ct * n_ct;
+                    for (int64_t e = 0; e < sz; ++e) {
+                        ct_flat_local[dst + e] = C_tilde_flat[src + e];
+                    }
+                }
+                c_plan.ct_flat = ct_flat_local.data();
+            }
             CTermOutputs c_out;
             c_out.tiles_flat = c_tiles_buf.data();
-            run_phase_c_term_into(c_plan, &c_out);
-            const int *c_n_pno = (const int *)c_plan->n_pno_arr;
+            run_phase_c_term_into(&c_plan, &c_out);
+            const int *c_n_pno = (const int *)c_plan_orig->n_pno_arr;
             for (int n = 0; n < N_c; ++n) {
                 const int npno_n = c_n_pno[n];
                 const int p_ij = plans->c_term_target_pair_idx_ij[n];
@@ -1546,14 +1646,33 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             }
 
             // D side.
-            const DTermInputs *d_plan = plans->d_term_plan;
-            const int N_d = d_plan->N;
-            const int64_t *d_tile_off = (const int64_t *)d_plan->tile_off;
+            const DTermInputs *d_plan_orig = plans->d_term_plan;
+            const int N_d = d_plan_orig->N;
+            const int64_t *d_tile_off = (const int64_t *)d_plan_orig->tile_off;
             std::vector<double> d_tiles_buf((size_t)d_tile_off[N_d], 0.0);
+            DTermInputs d_plan = *d_plan_orig;
+            std::vector<double> dt_flat_local;
+            if (plans->d_term_dt_ord_pair_idx != nullptr) {
+                const int64_t *d_dt_off = (const int64_t *)d_plan_orig->dt_off;
+                const int *d_n_B = (const int *)d_plan_orig->n_B_arr;
+                dt_flat_local.assign((size_t)d_dt_off[N_d], 0.0);
+                for (int n = 0; n < N_d; ++n) {
+                    const int o = plans->d_term_dt_ord_pair_idx[n];
+                    if (o < 0) continue;
+                    const int n_B = d_n_B[n];
+                    const int64_t src = ord_npno2_off[o];
+                    const int64_t dst = d_dt_off[n];
+                    const int64_t sz = (int64_t)n_B * n_B;
+                    for (int64_t e = 0; e < sz; ++e) {
+                        dt_flat_local[dst + e] = D_tilde_flat[src + e];
+                    }
+                }
+                d_plan.dt_flat = dt_flat_local.data();
+            }
             DTermOutputs d_out;
             d_out.tiles_flat = d_tiles_buf.data();
-            run_phase_d_term_into(d_plan, &d_out);
-            const int *d_n_pno = (const int *)d_plan->n_pno_arr;
+            run_phase_d_term_into(&d_plan, &d_out);
+            const int *d_n_pno = (const int *)d_plan_orig->n_pno_arr;
             for (int n = 0; n < N_d; ++n) {
                 const int npno_n = d_n_pno[n];
                 const int p_ij = plans->d_term_target_pair_idx_ij[n];

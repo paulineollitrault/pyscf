@@ -804,6 +804,18 @@ class PyRunCycleInputs(ctypes.Structure):
         ('c_term_target_pair_idx_ji', ctypes.c_void_p),
         ('d_term_target_pair_idx_ij', ctypes.c_void_p),
         ('d_term_target_pair_idx_ji', ctypes.c_void_p),
+        # Native C_tilde / D_tilde Phase 2 build (t3 + t4 plans).
+        ('c_t3_plan',                 ctypes.POINTER(PyT3Inputs)),
+        ('c_t4_plan',                 ctypes.POINTER(PyT4Inputs)),
+        ('d_t3_plan',                 ctypes.POINTER(PyT3Inputs)),
+        ('d_t4_plan',                 ctypes.POINTER(PyT4Inputs)),
+        ('c_t3_target_ord_idx',       ctypes.c_void_p),
+        ('c_t4_target_ord_idx',       ctypes.c_void_p),
+        ('d_t3_target_ord_idx',       ctypes.c_void_p),
+        ('d_t4_target_ord_idx',       ctypes.c_void_p),
+        # Per-CD-item ordered-pair index for native ct_flat/dt_flat gather.
+        ('c_term_ct_ord_pair_idx',    ctypes.c_void_p),
+        ('d_term_dt_ord_pair_idx',    ctypes.c_void_p),
     ]
 
 
@@ -5061,6 +5073,128 @@ def validate_run_one_cycle_with_per_kl(
     return d_R1
 
 
+def _build_t34_plan(plan_obj, side, t1_cache, t2_pno_all, ord_idx_lookup,
+                      nocc):
+    """Extract t3+t4 plans for a given Phase 2 plan object (either
+    compute_C_tilde_batched or build_D_tilde_batched cache value).
+
+    Returns dict with t3_struct, t4_struct, t3_target_ord, t4_target_ord
+    + ownership list.  side: 'c' or 'd' (purely for naming).
+    """
+    from pyscf.cc.dlpno_tccsd.residual import (
+        _get_or_build_t34_batched_view)
+    from pyscf.cc.dlpno_tccsd._cd_gather_cy import (
+        gather_t2_with_transpose, gather_u_from_t2)
+
+    bv = _get_or_build_t34_batched_view(plan_obj, t1_cache, t2_pno_all)
+    own = []
+    pairs_by_n_ki = plan_obj['pairs_by_n_ki']
+
+    def _slot_to_ord(n_ki_n, slot_n):
+        if n_ki_n not in pairs_by_n_ki:
+            return -1
+        if slot_n >= len(pairs_by_n_ki[n_ki_n]):
+            return -1
+        k, i = pairs_by_n_ki[n_ki_n][slot_n]
+        # Class's ord index = ord_idx_lookup[a_ord * nocc + b_ord] where
+        # the ordered pair convention is (a, b) = i, k (R1 owner first).
+        # But t34 plans iterate over Psi4 'all_pairs' as ORDERED (k, i)
+        # with k being the FIRST in the tuple from all_pairs.  Our class's
+        # ordered_pair_i_idx is the FIRST index per ordered pair.
+        return ord_idx_lookup.get((k, i), -1)
+
+    # ----- t3 plan struct -----
+    t3_N = bv['t3_N']
+    t3_struct = None
+    t3_target_ord = None
+    if t3_N > 0:
+        t3_struct = PyT3Inputs()
+        t3_struct.N         = int(t3_N)
+        t3_struct.n_kl_arr  = bv['t3_n_kl'].ctypes.data
+        t3_struct.n_ki_arr  = bv['t3_n_ki'].ctypes.data
+        t3_struct.K_off     = bv['t3_K_off'].ctypes.data
+        t3_struct.S_off     = bv['t3_S_off'].ctypes.data
+        t3_struct.t1i_off   = bv['t3_t1i_off'].ctypes.data
+        t3_struct.T1l_off   = bv['t3_T1l_off'].ctypes.data
+        t3_struct.tile_off  = bv['t3_tile_off'].ctypes.data
+        t3_struct.K_flat    = bv['t3_K_flat'].ctypes.data
+        t3_struct.S_flat    = bv['t3_S_flat'].ctypes.data
+        t3_struct.t1_flat   = t1_cache._buffer.ctypes.data
+        t3_struct.max_n_kl  = int(bv['t3_n_kl'].max(initial=1))
+        t3_struct.max_n_ki  = int(bv['t3_n_ki'].max(initial=1))
+        t3_target_ord = np.empty(t3_N, dtype=np.int32)
+        for n in range(t3_N):
+            n_ki_n, slot_n = bv['t3_target_slot'][n]
+            t3_target_ord[n] = _slot_to_ord(n_ki_n, slot_n)
+        own.append(t3_target_ord)
+        own.extend([bv['t3_n_kl'], bv['t3_n_ki'], bv['t3_K_off'],
+                    bv['t3_S_off'], bv['t3_t1i_off'], bv['t3_T1l_off'],
+                    bv['t3_tile_off'], bv['t3_K_flat'], bv['t3_S_flat']])
+
+    # ----- t4 plan struct -----
+    t4_N = bv['t4_N']
+    t4_struct = None
+    t4_target_ord = None
+    if t4_N > 0:
+        # Per-iter t2_flat / u_flat gather.  side='d' uses u (anti-sym),
+        # side='c' uses raw t2.  The plan_obj has 't4_use_u' flag.
+        t4_use_u = (side == 'd')
+        t2_flat = np.empty(int(bv['t4_t2_off'][-1]))
+        if t4_use_u:
+            gather_u_from_t2(
+                t4_N, bv['t4_n_li'],
+                bv['t4_t2_canon_off'], bv['t4_t2_trans_arr'],
+                bv['t4_t2_off'], t2_pno_all._buffer, t2_flat,
+                min(64, t4_N))
+        else:
+            gather_t2_with_transpose(
+                t4_N, bv['t4_n_li'],
+                bv['t4_t2_canon_off'], bv['t4_t2_trans_arr'],
+                bv['t4_t2_off'], t2_pno_all._buffer, t2_flat,
+                min(64, t4_N))
+        own.append(t2_flat)
+
+        # t4_scale: -0.5 for C_tilde, +0.5 for D_tilde.
+        t4_scale = +0.5 if side == 'd' else -0.5
+
+        t4_struct = PyT4Inputs()
+        t4_struct.N             = int(t4_N)
+        t4_struct.n_ki_arr      = bv['t4_n_ki'].ctypes.data
+        t4_struct.n_li_arr      = bv['t4_n_li'].ctypes.data
+        t4_struct.n_kl_arr      = bv['t4_n_kl'].ctypes.data
+        t4_struct.S_ki_li_off   = bv['t4_S_ki_li_off'].ctypes.data
+        t4_struct.t2_off        = bv['t4_t2_off'].ctypes.data
+        t4_struct.S_li_kl_off   = bv['t4_S_li_kl_off'].ctypes.data
+        t4_struct.K_off         = bv['t4_K_off'].ctypes.data
+        t4_struct.S_kl_ki_off   = bv['t4_S_kl_ki_off'].ctypes.data
+        t4_struct.tile_off      = bv['t4_tile_off'].ctypes.data
+        t4_struct.S_ki_li_flat  = bv['t4_S_ki_li_flat'].ctypes.data
+        t4_struct.S_li_kl_flat  = bv['t4_S_li_kl_flat'].ctypes.data
+        t4_struct.K_flat        = bv['t4_K_flat'].ctypes.data
+        t4_struct.S_kl_ki_flat  = bv['t4_S_kl_ki_flat'].ctypes.data
+        t4_struct.t2_flat       = t2_flat.ctypes.data
+        t4_struct.scale         = float(t4_scale)
+        t4_struct.max_n_ki      = int(bv['t4_n_ki'].max(initial=1))
+        t4_struct.max_n_li      = int(bv['t4_n_li'].max(initial=1))
+        t4_struct.max_n_kl      = int(bv['t4_n_kl'].max(initial=1))
+        t4_target_ord = np.empty(t4_N, dtype=np.int32)
+        for n in range(t4_N):
+            n_ki_n, slot_n = bv['t4_target_slot'][n]
+            t4_target_ord[n] = _slot_to_ord(n_ki_n, slot_n)
+        own.append(t4_target_ord)
+        own.extend([bv['t4_n_ki'], bv['t4_n_li'], bv['t4_n_kl'],
+                    bv['t4_S_ki_li_off'], bv['t4_S_li_kl_off'],
+                    bv['t4_K_off'], bv['t4_S_kl_ki_off'],
+                    bv['t4_tile_off'], bv['t4_S_ki_li_flat'],
+                    bv['t4_S_li_kl_flat'], bv['t4_K_flat'],
+                    bv['t4_S_kl_ki_flat']])
+
+    return {
+        't3_struct': t3_struct, 't4_struct': t4_struct,
+        't3_target_ord': t3_target_ord, 't4_target_ord': t4_target_ord,
+    }, own
+
+
 def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                               pno_spaces, b_tilde_per_ij, C_tilde_cache,
                               D_tilde_cache, n_canon_pairs):
@@ -5331,7 +5465,69 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
         'c_plan': c_plan_struct, 'd_plan': d_plan_struct,
         'c_target_ij': c_target_ij_arr, 'c_target_ji': c_target_ji_arr,
         'd_target_ij': d_target_ij_arr, 'd_target_ji': d_target_ji_arr,
+        'cd_bv': bv if cd_plan is not None else None,
     }, own
+
+
+def _add_t34_plans_to_natives(natives, native_own, t1_cache, t2_pno_all,
+                                ord_idx_lookup, key_to_p, nocc):
+    """Augment natives dict + ownership with c_t3/c_t4/d_t3/d_t4 plans
+    + per-CD-item ord_pair_idx for native ct_flat/dt_flat gather.
+
+    Requires natives['cd_bv'] (the CD batched view, used to map
+    c_ct_keys / d_dt_keys to ordered pair indices).
+    """
+    from pyscf.cc.dlpno_tccsd.residual import (
+        compute_C_tilde_batched, build_D_tilde_batched)
+
+    # ----- C_tilde t3+t4 -----
+    c_cache = getattr(compute_C_tilde_batched, '_plan_cache', None)
+    if c_cache:
+        c_plan_obj = next(iter(c_cache.values()))
+        c_t34, c_t34_own = _build_t34_plan(
+            c_plan_obj, 'c', t1_cache, t2_pno_all, ord_idx_lookup, nocc)
+        native_own.extend(c_t34_own)
+        natives['c_t3_struct'] = c_t34['t3_struct']
+        natives['c_t4_struct'] = c_t34['t4_struct']
+        natives['c_t3_target_ord'] = c_t34['t3_target_ord']
+        natives['c_t4_target_ord'] = c_t34['t4_target_ord']
+
+    # ----- D_tilde t3+t4 -----
+    d_cache = getattr(build_D_tilde_batched, '_plan_cache', None)
+    if d_cache:
+        d_plan_obj = next(iter(d_cache.values()))
+        d_t34, d_t34_own = _build_t34_plan(
+            d_plan_obj, 'd', t1_cache, t2_pno_all, ord_idx_lookup, nocc)
+        native_own.extend(d_t34_own)
+        natives['d_t3_struct'] = d_t34['t3_struct']
+        natives['d_t4_struct'] = d_t34['t4_struct']
+        natives['d_t3_target_ord'] = d_t34['t3_target_ord']
+        natives['d_t4_target_ord'] = d_t34['t4_target_ord']
+
+    # ----- Per-CD-item ord_pair_idx for native ct_flat/dt_flat gather. ---
+    bv = natives.get('cd_bv')
+    if bv is not None:
+        c_N = bv['c_N']
+        if c_N > 0:
+            c_ct_ord_pair_idx = np.empty(c_N, dtype=np.int32)
+            for n in range(c_N):
+                k, i = bv['c_ct_keys'][n]  # ordered pair (k, i)
+                c_ct_ord_pair_idx[n] = ord_idx_lookup.get((k, i), -1)
+            native_own.append(c_ct_ord_pair_idx)
+            natives['c_ct_ord_pair_idx'] = c_ct_ord_pair_idx
+
+        d_N = bv['d_N']
+        if d_N > 0:
+            d_dt_ord_pair_idx = np.empty(d_N, dtype=np.int32)
+            for n in range(d_N):
+                # bv['d_dt_keys'] holds the ordered pair (k, i) keys for
+                # D_tilde lookups (matches bv['c_ct_keys'] semantics).
+                k, i = bv['d_dt_keys'][n]
+                d_dt_ord_pair_idx[n] = ord_idx_lookup.get((k, i), -1)
+            native_own.append(d_dt_ord_pair_idx)
+            natives['d_dt_ord_pair_idx'] = d_dt_ord_pair_idx
+
+    return natives, native_own
 
 
 def validate_run_one_cycle_full_with_external_R2(
@@ -5597,6 +5793,17 @@ def validate_run_one_cycle_full_with_external_R2(
             t2_pno_all_old, key_to_p, keys_reorder, pno_spaces,
             b_tilde_per_ij_pyscf, jiang_C_pyscf, jiang_D_pyscf, n_pairs)
 
+        # Build ord_idx_lookup: (a, b) ordered tuple -> ordered-pair idx.
+        ord_idx_lookup = {}
+        for o in range(int(aux['ordered_pair_i_idx'].size)):
+            a = int(aux['ordered_pair_i_idx'][o])
+            b = int(aux['ordered_pair_k_idx'][o])
+            ord_idx_lookup[(a, b)] = o
+        # Add t3+t4 plans + CD ord_pair_idx for native C_tilde/D_tilde build.
+        natives, native_own = _add_t34_plans_to_natives(
+            natives, native_own, t1_cache, t2_pno_all_old,
+            ord_idx_lookup, key_to_p, nocc)
+
         # Build a fresh inputs without R2_external; reuse aux's T1/T2.
         # (Reset T1/T2 to old state first.)
         aux['T1_flat'][:] = T1_snapshot
@@ -5652,6 +5859,29 @@ def validate_run_one_cycle_full_with_external_R2(
                 natives['d_target_ij'].ctypes.data)
             plans_native.d_term_target_pair_idx_ji = (
                 natives['d_target_ji'].ctypes.data)
+
+        # t3+t4 plans for C_tilde / D_tilde Phase 2 native build.
+        for k_struct, k_target, attr in [
+                ('c_t3_struct', 'c_t3_target_ord', 'c_t3'),
+                ('c_t4_struct', 'c_t4_target_ord', 'c_t4'),
+                ('d_t3_struct', 'd_t3_target_ord', 'd_t3'),
+                ('d_t4_struct', 'd_t4_target_ord', 'd_t4')]:
+            s = natives.get(k_struct)
+            t = natives.get(k_target)
+            if s is not None:
+                setattr(plans_native, f'{attr}_plan', ctypes.pointer(s))
+                setattr(plans_native, f'{attr}_target_ord_idx',
+                        t.ctypes.data if t is not None else None)
+            else:
+                setattr(plans_native, f'{attr}_plan', None)
+                setattr(plans_native, f'{attr}_target_ord_idx', None)
+        # Per-CD-item ord_pair_idx for native ct_flat/dt_flat gather.
+        plans_native.c_term_ct_ord_pair_idx = (
+            natives['c_ct_ord_pair_idx'].ctypes.data
+            if 'c_ct_ord_pair_idx' in natives else None)
+        plans_native.d_term_dt_ord_pair_idx = (
+            natives['d_dt_ord_pair_idx'].ctypes.data
+            if 'd_dt_ord_pair_idx' in natives else None)
 
         # Disable R2_external to force native path.
         inputs.R2_external = None
