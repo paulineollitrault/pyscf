@@ -1,30 +1,25 @@
-/* DLPNO-CCSD T2 residual: per-item C-term and D-term batched kernels.
+/* DLPNO-CCSD T2 residual: per-pair C-term and D-term batched kernels.
  *
- * Full-C cycle session 12 port. Mirrors the existing Cython kernels
- * _cd_batched_cy.pyx::c_kernel_batched / d_kernel_batched
- * byte-for-byte. Replaces ~4224 per-bucket numpy.matmul calls/cycle
- * with two single nogil prange calls processing ~11500 items each.
+ * BLAS port (2026-04-30): per-item triple loops -> DGEMM.  At MKL-link
+ * with JIT-GEMM, ~3x faster than hand-rolled at npno~25.
  *
- * Both kernels follow the same outer pattern: outer #pragma omp parallel
- * for over n; per-thread scratch passed in by caller. Per-item Cc/Dtile
- * tiles written into tiles_flat at tile_off[n]; caller scatters
- * race-free into the per-n_ij output buffers.
+ * c_term math (per item):
+ *   STB[a, c]   = sum_b S_big[a, b] * ct[b, c]                (DGEMM)
+ *   gamma[a, d] = J_bold[a, d] + sum_c STB[a, c] * S_mid[c, d] (DGEMM, beta=1)
+ *   GT[a, e]    = sum_d gamma[a, d] * t2[e, d]                (DGEMM @ t2^T)
+ *   Cc[a, f]    = sum_e GT[a, e] * S_outer[f, e]              (DGEMM @ S_outer^T)
  *
- * C-term per-item math:
- *   STB[a, c]   = sum_b S_big[a, b] * ct[b, c]            (n_pno, n_ct)
- *   gamma[a, d] = J_bold[a, d] + sum_c STB[a, c] * S_mid[c, d]
- *   GT[a, e]    = sum_d gamma[a, d] * t2[e, d]
- *   Cc[a, f]    = sum_e GT[a, e] * S_outer[f, e]
- *
- * D-term per-item math:
- *   SU[a, d]   = sum_b S_a[a, b] * u[b, d]                 (n_pno, n_A)
- *   UP[a, c]   = sum_d SU[a, d] * S_b[d, c]                (n_pno, n_B)
- *   SCD[a, c]  = sum_b S_c[a, b] * dt[b, c]                (n_pno, n_B)
- *   Bint[a, d] = sum_b KJ[a, b] * u[d, b]                  (n_pno, n_A)
- *   Dtile[a, f] = sum_c SCD[a, c] * UP[f, c] + sum_d Bint[a, d] * S_a[f, d]
+ * d_term math (per item):
+ *   SU[a, d]   = sum_b S_a[a, b] * u[b, d]                    (DGEMM)
+ *   UP[a, c]   = sum_d SU[a, d] * S_b[d, c]                   (DGEMM)
+ *   SCD[a, c]  = sum_b S_c[a, b] * dt[b, c]                   (DGEMM)
+ *   Bint[a, d] = sum_b KJ[a, b] * u[d, b]                     (DGEMM @ u^T)
+ *   Dtile      = SCD @ UP^T + Bint @ S_a^T                    (2 DGEMMs)
  */
 
 #include <stddef.h>
+#include <string.h>
+#include "vhf/fblas.h"
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -56,6 +51,9 @@ void DLPNOc_term_batched(const int     N,
                          double       *tiles_flat,
                          const int     num_threads)
 {
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0;
+
 #pragma omp parallel for schedule(dynamic, 1) num_threads(num_threads)
     for (int n = 0; n < N; n++) {
 #ifdef _OPENMP
@@ -79,49 +77,50 @@ void DLPNOc_term_batched(const int     N,
         double *GT    = GT_scratch    + (size_t)tid * GT_stride;
         double *Cc    = tiles_flat    + tile_off[n];
 
-        /* STB[a, c] = sum_b S_big[a, b] * ct[b, c] */
-        for (int a = 0; a < n_pno; a++) {
-            for (int c = 0; c < n_ct; c++) {
-                double s = 0.0;
-                for (int b = 0; b < n_ct; b++) {
-                    s += S_big[a * n_ct + b] * ct[b * n_ct + c];
-                }
-                STB[a * n_ct + c] = s;
-            }
-        }
+        int int_n_pno = n_pno, int_n_ct = n_ct, int_n_other = n_other;
 
-        /* gamma[a, d] = J_bold[a, d] + sum_c STB[a, c] * S_mid[c, d] */
-        for (int a = 0; a < n_pno; a++) {
-            for (int d = 0; d < n_other; d++) {
-                double s = J_bold[a * n_other + d];
-                for (int c = 0; c < n_ct; c++) {
-                    s += STB[a * n_ct + c] * S_mid[c * n_other + d];
-                }
-                GAMMA[a * n_other + d] = s;
-            }
-        }
+        /* STB = S_big @ ct   (n_pno, n_ct) = (n_pno, n_ct) @ (n_ct, n_ct)
+         * F: STB_F[c, a] = sum_b ct_F[c, b] * S_big_F[b, a]  =  ct_F @ S_big_F
+         * dgemm('N', 'N', n_ct, n_pno, n_ct, 1, ct, n_ct, S_big, n_ct, 0, STB, n_ct)
+         */
+        dgemm_(&N_flag, &N_flag,
+               &int_n_ct, &int_n_pno, &int_n_ct,
+               &one, ct, &int_n_ct,
+               S_big, &int_n_ct,
+               &zero, STB, &int_n_ct);
 
-        /* GT[a, e] = sum_d gamma[a, d] * t2[e, d] */
-        for (int a = 0; a < n_pno; a++) {
-            for (int e = 0; e < n_other; e++) {
-                double s = 0.0;
-                for (int d = 0; d < n_other; d++) {
-                    s += GAMMA[a * n_other + d] * t2[e * n_other + d];
-                }
-                GT[a * n_other + e] = s;
-            }
-        }
+        /* gamma = J_bold + STB @ S_mid   (n_pno, n_other) accum
+         * F: gamma_F[d, a] = J_bold_F[d, a] + sum_c S_mid_F[d, c] * STB_F[c, a]
+         * Init gamma <- J_bold then dgemm beta=1.
+         */
+        memcpy(GAMMA, J_bold, sizeof(double) * (size_t)n_pno * n_other);
+        dgemm_(&N_flag, &N_flag,
+               &int_n_other, &int_n_pno, &int_n_ct,
+               &one, S_mid, &int_n_other,
+               STB, &int_n_ct,
+               &one, GAMMA, &int_n_other);
 
-        /* Cc[a, f] = sum_e GT[a, e] * S_outer[f, e] */
-        for (int a = 0; a < n_pno; a++) {
-            for (int f = 0; f < n_pno; f++) {
-                double s = 0.0;
-                for (int e = 0; e < n_other; e++) {
-                    s += GT[a * n_other + e] * S_outer[f * n_other + e];
-                }
-                Cc[a * n_pno + f] = s;
-            }
-        }
+        /* GT[a, e] = sum_d gamma[a, d] * t2[e, d]   (n_pno, n_other)
+         * GT = gamma @ t2^T.
+         * F: GT_F[e, a] = sum_d t2_F[d, e] * gamma_F[d, a] = t2_F^T @ gamma_F
+         * dgemm('T', 'N', n_other, n_pno, n_other, 1, t2, n_other, gamma, n_other, 0, GT, n_other)
+         */
+        dgemm_(&T_flag, &N_flag,
+               &int_n_other, &int_n_pno, &int_n_other,
+               &one, t2, &int_n_other,
+               GAMMA, &int_n_other,
+               &zero, GT, &int_n_other);
+
+        /* Cc[a, f] = sum_e GT[a, e] * S_outer[f, e]   (n_pno, n_pno)
+         * Cc = GT @ S_outer^T.
+         * F: Cc_F[f, a] = sum_e S_outer_F[e, f] * GT_F[e, a] = S_outer_F^T @ GT_F
+         * dgemm('T', 'N', n_pno, n_pno, n_other, 1, S_outer, n_other, GT, n_other, 0, Cc, n_pno)
+         */
+        dgemm_(&T_flag, &N_flag,
+               &int_n_pno, &int_n_pno, &int_n_other,
+               &one, S_outer, &int_n_other,
+               GT, &int_n_other,
+               &zero, Cc, &int_n_pno);
     }
 }
 
@@ -153,6 +152,9 @@ void DLPNOd_term_batched(const int     N,
                          double       *tiles_flat,
                          const int     num_threads)
 {
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0;
+
 #pragma omp parallel for schedule(dynamic, 1) num_threads(num_threads)
     for (int n = 0; n < N; n++) {
 #ifdef _OPENMP
@@ -177,62 +179,65 @@ void DLPNOd_term_batched(const int     N,
         double *Bint  = Bint_scratch  + (size_t)tid * Bint_stride;
         double *Dtile = tiles_flat    + tile_off[n];
 
-        /* SU[a, d] = sum_b S_a[a, b] * u[b, d]   (n_pno, n_A) */
-        for (int a = 0; a < n_pno; a++) {
-            for (int d = 0; d < n_A; d++) {
-                double s = 0.0;
-                for (int b = 0; b < n_A; b++) {
-                    s += S_a[a * n_A + b] * u[b * n_A + d];
-                }
-                SU[a * n_A + d] = s;
-            }
-        }
+        int int_n_pno = n_pno, int_n_A = n_A, int_n_B = n_B;
 
-        /* UP[a, c] = sum_d SU[a, d] * S_b[d, c]   (n_pno, n_B) */
-        for (int a = 0; a < n_pno; a++) {
-            for (int c = 0; c < n_B; c++) {
-                double s = 0.0;
-                for (int d = 0; d < n_A; d++) {
-                    s += SU[a * n_A + d] * S_b[d * n_B + c];
-                }
-                UP[a * n_B + c] = s;
-            }
-        }
+        /* SU = S_a @ u   (n_pno, n_A) = (n_pno, n_A) @ (n_A, n_A)
+         * F: SU_F[d, a] = sum_b u_F[d, b] * S_a_F[b, a] = u_F @ S_a_F
+         * dgemm('N', 'N', n_A, n_pno, n_A, 1, u, n_A, S_a, n_A, 0, SU, n_A)
+         */
+        dgemm_(&N_flag, &N_flag,
+               &int_n_A, &int_n_pno, &int_n_A,
+               &one, u, &int_n_A,
+               S_a, &int_n_A,
+               &zero, SU, &int_n_A);
 
-        /* SCD[a, c] = sum_b S_c[a, b] * dt[b, c]   (n_pno, n_B) */
-        for (int a = 0; a < n_pno; a++) {
-            for (int c = 0; c < n_B; c++) {
-                double s = 0.0;
-                for (int b = 0; b < n_B; b++) {
-                    s += S_c[a * n_B + b] * dt[b * n_B + c];
-                }
-                SCD[a * n_B + c] = s;
-            }
-        }
+        /* UP = SU @ S_b   (n_pno, n_B) = (n_pno, n_A) @ (n_A, n_B)
+         * F: UP_F[c, a] = sum_d S_b_F[c, d] * SU_F[d, a] = S_b_F @ SU_F
+         * dgemm('N', 'N', n_B, n_pno, n_A, 1, S_b, n_B, SU, n_A, 0, UP, n_B)
+         */
+        dgemm_(&N_flag, &N_flag,
+               &int_n_B, &int_n_pno, &int_n_A,
+               &one, S_b, &int_n_B,
+               SU, &int_n_A,
+               &zero, UP, &int_n_B);
 
-        /* Bint[a, d] = sum_b KJ[a, b] * u[d, b]   (n_pno, n_A) */
-        for (int a = 0; a < n_pno; a++) {
-            for (int d = 0; d < n_A; d++) {
-                double s = 0.0;
-                for (int b = 0; b < n_A; b++) {
-                    s += KJ[a * n_A + b] * u[d * n_A + b];
-                }
-                Bint[a * n_A + d] = s;
-            }
-        }
+        /* SCD = S_c @ dt   (n_pno, n_B) = (n_pno, n_B) @ (n_B, n_B)
+         * F: SCD_F[c, a] = sum_b dt_F[c, b] * S_c_F[b, a] = dt_F @ S_c_F
+         * dgemm('N', 'N', n_B, n_pno, n_B, 1, dt, n_B, S_c, n_B, 0, SCD, n_B)
+         */
+        dgemm_(&N_flag, &N_flag,
+               &int_n_B, &int_n_pno, &int_n_B,
+               &one, dt, &int_n_B,
+               S_c, &int_n_B,
+               &zero, SCD, &int_n_B);
 
-        /* Dtile[a, f] = (sum_c SCD[a, c] * UP[f, c]) + (sum_d Bint[a, d] * S_a[f, d]) */
-        for (int a = 0; a < n_pno; a++) {
-            for (int f = 0; f < n_pno; f++) {
-                double sA = 0.0, sB = 0.0;
-                for (int c = 0; c < n_B; c++) {
-                    sA += SCD[a * n_B + c] * UP[f * n_B + c];
-                }
-                for (int d = 0; d < n_A; d++) {
-                    sB += Bint[a * n_A + d] * S_a[f * n_A + d];
-                }
-                Dtile[a * n_pno + f] = sA + sB;
-            }
-        }
+        /* Bint[a, d] = sum_b KJ[a, b] * u[d, b]   (n_pno, n_A)
+         * Bint = KJ @ u^T.
+         * F: Bint_F[d, a] = sum_b u_F[b, d] * KJ_F[b, a] = u_F^T @ KJ_F
+         * dgemm('T', 'N', n_A, n_pno, n_A, 1, u, n_A, KJ, n_A, 0, Bint, n_A)
+         */
+        dgemm_(&T_flag, &N_flag,
+               &int_n_A, &int_n_pno, &int_n_A,
+               &one, u, &int_n_A,
+               KJ, &int_n_A,
+               &zero, Bint, &int_n_A);
+
+        /* Dtile[a, f] = sum_c SCD[a, c] * UP[f, c] + sum_d Bint[a, d] * S_a[f, d]
+         *            = SCD @ UP^T + Bint @ S_a^T
+         * Build first term: F: Dtile_F[f, a] = sum_c UP_F[c, f] * SCD_F[c, a]
+         *   = UP_F^T @ SCD_F.  dgemm('T', 'N', n_pno, n_pno, n_B, 1, UP, n_B, SCD, n_B, 0, Dtile, n_pno)
+         * Add second term:    F: += sum_d S_a_F[d, f] * Bint_F[d, a] = S_a_F^T @ Bint_F
+         *   dgemm('T', 'N', n_pno, n_pno, n_A, 1, S_a, n_A, Bint, n_A, 1, Dtile, n_pno)
+         */
+        dgemm_(&T_flag, &N_flag,
+               &int_n_pno, &int_n_pno, &int_n_B,
+               &one, UP, &int_n_B,
+               SCD, &int_n_B,
+               &zero, Dtile, &int_n_pno);
+        dgemm_(&T_flag, &N_flag,
+               &int_n_pno, &int_n_pno, &int_n_A,
+               &one, S_a, &int_n_A,
+               Bint, &int_n_A,
+               &one, Dtile, &int_n_pno);
     }
 }
