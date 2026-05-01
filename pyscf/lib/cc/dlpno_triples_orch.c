@@ -500,6 +500,25 @@ typedef struct {
     double *q_vv_ij_sc;     size_t q_vv_ij_sc_cap;
     double *q_vv_jk_sc;     size_t q_vv_jk_sc_cap;
     double *q_vv_ik_sc;     size_t q_vv_ik_sc_cap;
+    /* K_ovvv tensors (3): one per ip slot. Pair mapping:
+     *   ip=0 (i) → pair jk → K_ivvv shape (n_tno, n_tno, n_pno_jk)
+     *   ip=1 (j) → pair ik → K_jvvv shape (n_tno, n_tno, n_pno_ik)
+     *   ip=2 (k) → pair ij → K_kvvv shape (n_tno, n_tno, n_pno_ij)
+     */
+    double *K_ovvv_i_sc;    size_t K_ovvv_i_sc_cap;
+    double *K_ovvv_j_sc;    size_t K_ovvv_j_sc_cap;
+    double *K_ovvv_k_sc;    size_t K_ovvv_k_sc_cap;
+    /* T_pair tensors (3): half-projected pair T2 (one virtual axis still
+     * in pair-PNO basis). Shape (n_tno, n_pno_pair) per pair.
+     *   slot 0: ij → n_pno_ij,  slot 1: jk → n_pno_jk,  slot 2: ik → n_pno_ik.
+     * S_pno_to_tno overlap: shape (n_pno_pair, n_tno) per pair.
+     */
+    double *T_pair_ij_sc;   size_t T_pair_ij_sc_cap;
+    double *T_pair_jk_sc;   size_t T_pair_jk_sc_cap;
+    double *T_pair_ik_sc;   size_t T_pair_ik_sc_cap;
+    double *S_p2t_ij;       size_t S_p2t_ij_cap;
+    double *S_p2t_jk;       size_t S_p2t_jk_cap;
+    double *S_p2t_ik;       size_t S_p2t_ik_cap;
     double *S_slice;        size_t S_slice_cap;
     double *W_pao_tno;      size_t W_pao_tno_cap;
     long *U_off_cache;      size_t U_off_cache_cap;
@@ -986,6 +1005,45 @@ double DLPNOcompute_one_triple_E_T0(
      *   K_ab_cache[ip] (n, n, n) = t.transpose(0, 2, 1) at [a, f, b]
      */
     TOC(t2_block);
+
+    /* K_ovvv builds (Psi4-style restructure, gated on QVV_PAIR).
+     * K_ovvv[ip, a, b, c_pno] = Σ_q ovL_sc[ip, a, q] × q_vv_pair_for_ip[b, c_pno, q]
+     * Per-ip pair mapping (from W3 perm structure):
+     *   ip=0 → pair jk (slot 1)
+     *   ip=1 → pair ik (slot 2)
+     *   ip=2 → pair ij (slot 0)
+     */
+    if (_qvv_pair_enabled) {
+        const int n_pno_ij = n_pno_arr_3[0];
+        const int n_pno_jk = n_pno_arr_3[1];
+        const int n_pno_ik = n_pno_arr_3[2];
+        const int n_pno_for_ip[3] = {n_pno_jk, n_pno_ik, n_pno_ij};
+        ENSURE(K_ovvv_i_sc, double, (size_t)n * (size_t)n * (size_t)n_pno_jk);
+        ENSURE(K_ovvv_j_sc, double, (size_t)n * (size_t)n * (size_t)n_pno_ik);
+        ENSURE(K_ovvv_k_sc, double, (size_t)n * (size_t)n * (size_t)n_pno_ij);
+        double *K_ovvv_for_ip[3] = {
+            tscratch.K_ovvv_i_sc, tscratch.K_ovvv_j_sc, tscratch.K_ovvv_k_sc};
+        const double *q_vv_for_ip[3] = {
+            tscratch.q_vv_jk_sc, tscratch.q_vv_ik_sc, tscratch.q_vv_ij_sc};
+        int int_naux2 = naux_ijk;
+        for (int ip = 0; ip < 3; ip++) {
+            const int n_pno_p = n_pno_for_ip[ip];
+            if (n_pno_p == 0) continue;
+            const double *ovL_ip = ovL_sc + (size_t)ip * n * naux_ijk;
+            int int_N = n * n_pno_p;
+            /* dgemm pattern matches K_ab build:
+             *   K_ovvv (n, n × n_pno) row-major = ovL_ip @ q_vv.T
+             *   q_vv row-major (n × n_pno, naux); ovL_ip row-major (n, naux);
+             *   row-major C(M, N) = A(M, K) @ B^T(N, K).T = A @ B^T:
+             *     dgemm('T','N', N, M, K, 1, B (LDB=K), A (LDA=K), 0, C (LDC=N))
+             * Storage K_ovvv[a, b, c_pno] in flat row-major (n, n, n_pno).
+             */
+            dgemm_(&Tc, &Nc, &int_N, &int_n, &int_naux2,
+                   &one, q_vv_for_ip[ip], &int_naux2,
+                   ovL_ip, &int_naux2,
+                   &zero, K_ovvv_for_ip[ip], &int_N);
+        }
+    }
 
     /* K_ab_cache */
     TIC;
