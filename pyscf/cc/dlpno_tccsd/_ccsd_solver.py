@@ -253,6 +253,7 @@ _libcc.DLPNOcompute_lccsd_phase_t1_fock.argtypes = [
 _libcc.DLPNOt1_fock_batched.restype = None
 _libcc.DLPNOt1_fock_batched.argtypes = (
     [ctypes.c_void_p] * 18                                # 7 (ptr/off) + 4 shape arrays
+    + [ctypes.c_void_p]                                   # is_strong_pair (nullable)
     + [ctypes.c_void_p, ctypes.c_size_t] * 6              # 6 scratch (ptr + stride)
     + [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, # d_flat, Fab, Fab_off
        ctypes.c_size_t, ctypes.c_int])                    # N, num_threads
@@ -1647,6 +1648,7 @@ def _python_reference_t1_fock(inputs, aux):
         e_pno_flat.ctypes.data,  e_pno_off.ctypes.data,
         nlmo_arr.ctypes.data, npno_arr.ctypes.data,
         n_local_arr.ctypes.data, need_dji_arr.ctypes.data,
+        None,  # is_strong_pair: parity test runs over all valid keys
         sc_gamma.ctypes.data, sc_gamma.shape[1],
         sc_Y.ctypes.data,     sc_Y.shape[1],
         sc_Y2.ctypes.data,    sc_Y2.shape[1],

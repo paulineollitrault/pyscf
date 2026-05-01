@@ -666,6 +666,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     # Iterate F-neighbors only (not full nocc) — same set the LMP2
     # residual loop touches. This eliminates O(npairs * nocc) setup
     # scan that was matching every k to F_CUT for every pair.
+    _t_spno_start = _pno_time.perf_counter()
     pno_S_cache = {}
     F_CUT = 1e-5  # Fock coupling threshold
     _F_neigh_pre = [
@@ -673,21 +674,46 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
          if k != ii and abs(F_lmo[ii, k]) > F_CUT]
         for ii in range(nocc_lmo)
     ]
-    for key_ij in initial_pno_data:
+
+    # Pre-compute s1e @ C_pno_k for all k once (reused across all pair_ij
+    # overlap computations). This turns the 3-matmul per-pair pattern
+    # `C_pno_ij.T @ s1e @ C_pno_kj` into a single 2-matmul `C_pno_ij.T @ Z_kj`
+    # where Z_kj = s1e @ C_pno_kj, halving FLOPs and reducing memory traffic.
+    # Skip empty-PNO pairs (npno=0) which would trigger MKL DGEMM LDA warnings.
+    _s1e_C_cache = {k: s1e @ initial_pno_data[k]['C_pno']
+                    for k in initial_pno_data
+                    if initial_pno_data[k]['C_pno'].shape[1] > 0}
+
+    def _spno_one(key_ij):
         i, j = key_ij
         C_pno_ij = initial_pno_data[key_ij]['C_pno']
-        # First condition: F[i,k] > FCUT  →  cache (key_ij, key_kj)
+        out = {}
+        if C_pno_ij.shape[1] == 0:
+            return out
+        C_pno_ij_T = C_pno_ij.T
         for k in _F_neigh_pre[i]:
             key_kj = (min(k, j), max(k, j))
-            if key_kj in initial_pno_data:
-                C_pno_kj = initial_pno_data[key_kj]['C_pno']
-                pno_S_cache[(key_ij, key_kj)] = C_pno_ij.T @ s1e @ C_pno_kj
-        # Second condition: F[k,j] > FCUT  →  cache (key_ij, key_ik)
+            Z_kj = _s1e_C_cache.get(key_kj)
+            if Z_kj is not None:
+                out[(key_ij, key_kj)] = C_pno_ij_T @ Z_kj
         for k in _F_neigh_pre[j]:
             key_ik = (min(i, k), max(i, k))
-            if key_ik in initial_pno_data:
-                C_pno_ik = initial_pno_data[key_ik]['C_pno']
-                pno_S_cache[(key_ij, key_ik)] = C_pno_ij.T @ s1e @ C_pno_ik
+            Z_ik = _s1e_C_cache.get(key_ik)
+            if Z_ik is not None:
+                out[(key_ij, key_ik)] = C_pno_ij_T @ Z_ik
+        return out
+
+    _key_list = list(initial_pno_data.keys())
+    if _pool is not None:
+        _all_outs = list(_pool.map(_spno_one, _key_list))
+    else:
+        _all_outs = [_spno_one(k) for k in _key_list]
+    for _o in _all_outs:
+        pno_S_cache.update(_o)
+    _t_spno_build = _pno_time.perf_counter() - _t_spno_start
+    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
+    _pno_dbg and print(f'[PNO_DBG] pno_S_cache build: {_t_spno_build:.2f}s '
+          f'({len(pno_S_cache)} entries)', flush=True)
 
     # Iterative LMP2 in PNO space with DIIS (matching Psi4 lines 690-802)
     T2_pno_all = {k: d['T2_pno'].copy() for k, d in initial_pno_data.items()}
@@ -719,6 +745,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     # ------------------------------------------------------------------
     _use_c_lmp2_resid = bool(int(os.environ.get('DLPNO_LMP2_RESIDUAL_C', '1')))
     _c_resid_plan = None
+    _t_plan_start = _pno_time.perf_counter()
     if _use_c_lmp2_resid and _lmp2_keys:
         import ctypes as _ct_lmp2
         from pyscf import lib as _lib_lmp2
@@ -731,6 +758,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             _ct_lmp2.c_void_p, _ct_lmp2.c_void_p,
             _ct_lmp2.c_int, _ct_lmp2.c_size_t, _ct_lmp2.c_int,
         ]
+        _t_plan_setup = _pno_time.perf_counter() - _t_plan_start
 
         _ordered_keys = list(_lmp2_keys)
         _pair_idx_lut = {k: p for p, k in enumerate(_ordered_keys)}
@@ -738,6 +766,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         n_pno_arr = np.array(
             [initial_pno_data[k]['n_pno'] for k in _ordered_keys],
             dtype=np.int32)
+        _t_plan_keys = _pno_time.perf_counter() - _t_plan_start - _t_plan_setup
 
         # T2 flat layout: per-pair (n_pno, n_pno) concatenated.
         T2_offsets = np.empty(N_p + 1, dtype=np.int64)
@@ -796,13 +825,21 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                 _task_T.append(1 if i_lmo > k else 0)
                 n_tasks_per_pair[p] += 1
 
+        _t_plan_enum = (_pno_time.perf_counter() - _t_plan_start
+                        - _t_plan_setup - _t_plan_keys)
+
         target_task_starts = np.empty(N_p + 1, dtype=np.int64)
         target_task_starts[0] = 0
         target_task_starts[1:] = np.cumsum(n_tasks_per_pair)
 
-        S_flat = np.empty(_s_total)
-        for chunk, off in zip(_S_chunks, _S_offsets_per_task):
-            S_flat[off:off + chunk.size] = chunk
+        # Vectorised S_flat assembly: np.concatenate is C-implemented and
+        # much faster than per-chunk slice assignment in a Python loop.
+        if _S_chunks:
+            S_flat = np.concatenate(_S_chunks)
+        else:
+            S_flat = np.empty(_s_total)
+        _t_plan_sflat = (_pno_time.perf_counter() - _t_plan_start
+                         - _t_plan_setup - _t_plan_keys - _t_plan_enum)
 
         # Per-pair K_pno + D constants for fast per-iter R0 build.
         K_pno_flat = np.empty(int(T2_offsets[-1]))
@@ -815,6 +852,9 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             D = e_p[:, None] + e_p[None, :] - F_lmo[i_l, i_l] - F_lmo[j_l, j_l]
             K_pno_flat[T2_offsets[p]:T2_offsets[p + 1]] = pdata_['K_pno'].ravel()
             D_flat[T2_offsets[p]:T2_offsets[p + 1]] = D.ravel()
+        _t_plan_kpno = (_pno_time.perf_counter() - _t_plan_start
+                        - _t_plan_setup - _t_plan_keys - _t_plan_enum
+                        - _t_plan_sflat)
 
         _c_resid_plan = {
             'ordered_keys': _ordered_keys,
@@ -837,7 +877,12 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         _pno_dbg and print(
             f'[PNO_DBG] LMP2 residual C plan: {N_p} pairs, '
             f'{int(target_task_starts[-1])} tasks, '
-            f'S_flat={_s_total*8/1024/1024:.1f} MB',
+            f'S_flat={_s_total*8/1024/1024:.1f} MB '
+            f'(setup={_t_plan_setup*1000:.0f}ms '
+            f'keys={_t_plan_keys*1000:.0f}ms '
+            f'enum={_t_plan_enum*1000:.0f}ms '
+            f'sflat={_t_plan_sflat*1000:.0f}ms '
+            f'kpno={_t_plan_kpno*1000:.0f}ms)',
             flush=True)
 
     # DIIS setup (matching Psi4 line 700)
