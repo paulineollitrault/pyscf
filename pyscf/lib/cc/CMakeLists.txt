@@ -26,6 +26,7 @@ add_library(cc SHARED
   dlpno_pair_centerQ.c dlpno_cross_partner.c
   dlpno_partners_centerQ.c dlpno_s_pno.c
   dlpno_u_for_triple.c dlpno_triple_local_df.c
+  dlpno_triple_qvv_pair.c
   dlpno_triple_tno.c dlpno_triples_full.c
   dlpno_w3_full.c dlpno_triples_orch.c
   dlpno_g_tilde_plan.c
