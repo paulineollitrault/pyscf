@@ -194,8 +194,22 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     from concurrent.futures import ThreadPoolExecutor
     _owns_pool = _pool is None
     if _owns_pool:
-        _n_pool = max(1, ncores // 2)
-        _shared_pool = ThreadPoolExecutor(max_workers=_n_pool) if _n_pool > 1 else None
+        # Pool size depends on BLAS config. If caller has pinned BLAS to 1
+        # thread (OMP_NUM_THREADS=1, MKL_NUM_THREADS=1) — typical
+        # apples-to-apples Psi4-equivalent setup — we can use ncores
+        # workers for true parallel pairs. Otherwise BLAS may use up to
+        # ncores threads internally per pair, so half-pool avoids
+        # oversubscription.
+        _omp_n = int(_os.environ.get('OMP_NUM_THREADS', '0') or 0)
+        _mkl_n = int(_os.environ.get('MKL_NUM_THREADS', '0') or 0)
+        _blas_pinned = (_omp_n == 1) and (_mkl_n == 1)
+        if _blas_pinned:
+            _n_pool = max(1, ncores)
+        else:
+            _n_pool = max(1, ncores // 2)
+        _shared_pool = (
+            ThreadPoolExecutor(max_workers=_n_pool) if _n_pool > 1
+            else None)
     else:
         _shared_pool = _pool
 
@@ -315,7 +329,6 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
             ncas, ncas, ncas, ncas)
 
         from pyblock2.driver.core import DMRGDriver, SymmetryTypes
-        import os as _os
         _os.makedirs(dmrg_scratch, exist_ok=True)
 
         nalpha, nbeta = nelec_cas
