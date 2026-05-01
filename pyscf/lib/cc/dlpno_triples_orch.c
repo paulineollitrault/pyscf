@@ -72,6 +72,23 @@ void DLPNObuild_triple_local_DF(
         const double *jhi,
         double *ovL_sc, double *vvL_sc, double *ooL_sc);
 
+/* Per-pair q_vv build (HANDOFF_TRIPLES_VVL_PER_PAIR.md).
+ * Replaces the n_pao_ijk² factor in vvL with n_pao_ijk × n_pno_pair. */
+void DLPNObuild_triple_qvv_pair(
+        const int n_tno,
+        const int n_pao_ijk, const int n_pao_pair, const int n_pno_pair,
+        const int naux_ijk, const int n_centers,
+        const int n_pao_global,
+        const long *triple_paos, const long *pair_paos,
+        const double *X_tno_ijk, const double *X_pno_pair,
+        const long *center_atoms, const long *center_off,
+        const long *local_Q_flat, const long *atom_pos_flat,
+        const long *qab_atom_off, const int *qab_atom_n_pao,
+        const double *qab_atom_flat,
+        const long *riatom_to_paos_ext_dense,
+        const double *jhi,
+        double *q_vv_pair_sc);
+
 void DLPNObuild_U_for_triple(
         const int n_pairs,
         const double *W_pao_tno, const int n_tno, const int nao_pao_total,
@@ -476,6 +493,13 @@ typedef struct {
     double *ovL_sc;         size_t ovL_sc_cap;
     double *vvL_sc;         size_t vvL_sc_cap;
     double *ooL_sc;         size_t ooL_sc_cap;
+    /* Per-pair q_vv slices (Psi4-style restructure to remove n_pao_ijk²
+     * factor in vvL build — see HANDOFF_TRIPLES_VVL_PER_PAIR.md).
+     * Each shape (n_tno, n_pno_pair, naux_ijk). Three pairs (ij, jk, ik).
+     */
+    double *q_vv_ij_sc;     size_t q_vv_ij_sc_cap;
+    double *q_vv_jk_sc;     size_t q_vv_jk_sc_cap;
+    double *q_vv_ik_sc;     size_t q_vv_ik_sc_cap;
     double *S_slice;        size_t S_slice_cap;
     double *W_pao_tno;      size_t W_pao_tno_cap;
     long *U_off_cache;      size_t U_off_cache_cap;
@@ -704,6 +728,76 @@ double DLPNOcompute_one_triple_E_T0(
         qij_atom_flat, qia_atom_flat, qab_atom_flat,
         riatom_to_lmos_ext_dense, riatom_to_paos_ext_dense,
         jhi, ovL_sc, vvL_sc, ooL_sc);
+
+    /* Per-pair q_vv build (Psi4-style restructure scaffold).
+     * Replaces n_pao_ijk² factor in vvL with n_pao_ijk × n_pno_pair.
+     * Built ALONGSIDE vvL_sc; integration with K_ovvv + W3 follows
+     * (see HANDOFF_TRIPLES_VVL_PER_PAIR.md). Gated by env var
+     * DLPNO_TRIPLE_QVV_PAIR=1 — default off until W3 wiring lands.
+     */
+    static int _qvv_pair_enabled = -1;
+    if (_qvv_pair_enabled < 0) {
+        const char *_env = getenv("DLPNO_TRIPLE_QVV_PAIR");
+        _qvv_pair_enabled = (_env && _env[0] == '1') ? 1 : 0;
+    }
+    if (_qvv_pair_enabled) {
+        /* Allocate three scratches: pair (ij)=slot0, (jk)=slot1, (ik)=slot2 */
+        const int n_pno_ij = n_pno_arr_3[0];
+        const int n_pno_jk = n_pno_arr_3[1];
+        const int n_pno_ik = n_pno_arr_3[2];
+        const int n_pao_ij = pair_paos_n_3[0];
+        const int n_pao_jk = pair_paos_n_3[1];
+        const int n_pao_ik = pair_paos_n_3[2];
+        ENSURE(q_vv_ij_sc, double, (size_t)n * (size_t)n_pno_ij * naux_ijk);
+        ENSURE(q_vv_jk_sc, double, (size_t)n * (size_t)n_pno_jk * naux_ijk);
+        ENSURE(q_vv_ik_sc, double, (size_t)n * (size_t)n_pno_ik * naux_ijk);
+        double *q_vv_ij_sc = tscratch.q_vv_ij_sc;
+        double *q_vv_jk_sc = tscratch.q_vv_jk_sc;
+        double *q_vv_ik_sc = tscratch.q_vv_ik_sc;
+        memset(q_vv_ij_sc, 0,
+               sizeof(double) * (size_t)n * (size_t)n_pno_ij * naux_ijk);
+        memset(q_vv_jk_sc, 0,
+               sizeof(double) * (size_t)n * (size_t)n_pno_jk * naux_ijk);
+        memset(q_vv_ik_sc, 0,
+               sizeof(double) * (size_t)n * (size_t)n_pno_ik * naux_ijk);
+
+        const long *pair_paos_ij = pair_paos_flat_3 + pair_paos_off_3[0];
+        const long *pair_paos_jk = pair_paos_flat_3 + pair_paos_off_3[1];
+        const long *pair_paos_ik = pair_paos_flat_3 + pair_paos_off_3[2];
+        const double *X_pno_ij = X_pno_flat_3 + X_pno_off_3[0];
+        const double *X_pno_jk = X_pno_flat_3 + X_pno_off_3[1];
+        const double *X_pno_ik = X_pno_flat_3 + X_pno_off_3[2];
+        if (n_pno_ij > 0 && n_pao_ij > 0) {
+            DLPNObuild_triple_qvv_pair(
+                n, n_pao_ijk, n_pao_ij, n_pno_ij,
+                naux_ijk, n_centers, n_pao_total,
+                triple_paos, pair_paos_ij,
+                X_tno_ijk, X_pno_ij,
+                center_atoms, center_off, local_Q_sorted, atom_pos_sorted,
+                qab_atom_off, qab_atom_n_pao, qab_atom_flat,
+                riatom_to_paos_ext_dense, jhi, q_vv_ij_sc);
+        }
+        if (n_pno_jk > 0 && n_pao_jk > 0) {
+            DLPNObuild_triple_qvv_pair(
+                n, n_pao_ijk, n_pao_jk, n_pno_jk,
+                naux_ijk, n_centers, n_pao_total,
+                triple_paos, pair_paos_jk,
+                X_tno_ijk, X_pno_jk,
+                center_atoms, center_off, local_Q_sorted, atom_pos_sorted,
+                qab_atom_off, qab_atom_n_pao, qab_atom_flat,
+                riatom_to_paos_ext_dense, jhi, q_vv_jk_sc);
+        }
+        if (n_pno_ik > 0 && n_pao_ik > 0) {
+            DLPNObuild_triple_qvv_pair(
+                n, n_pao_ijk, n_pao_ik, n_pno_ik,
+                naux_ijk, n_centers, n_pao_total,
+                triple_paos, pair_paos_ik,
+                X_tno_ijk, X_pno_ik,
+                center_atoms, center_off, local_Q_sorted, atom_pos_sorted,
+                qab_atom_off, qab_atom_n_pao, qab_atom_flat,
+                riatom_to_paos_ext_dense, jhi, q_vv_ik_sc);
+        }
+    }
     TOC(df);
 
     /* W_pao_tno + U cache */
