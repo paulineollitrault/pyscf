@@ -253,7 +253,8 @@ def _iterative_lmp2(pair_data, F_lmo, s1e, nocc_lmo,
 # ---------------------------------------------------------------------------
 
 def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
-              T_CutPNO=1e-7, T_CutPairs=1e-4, S_cut_domain=1e-8,
+              T_CutPNO=1e-7, T_CutPairs=1e-4, T_CutPairs_MP2=1e-6,
+              S_cut_domain=1e-8,
               T_CutEnergy=1.0, T_CutTrace=1.0,
               T_CutPNO_MP2=None, T_CutTrace_MP2=0.9999, T_CutEnergy_MP2=0.999,
               occ_cas_idx=None, C_cas_vir=None, nvir_cas=0, s1e=None,
@@ -620,6 +621,35 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
     _pno_dbg and print(f'[PNO_DBG] Phase 2a: {_pno_time_p1.perf_counter() - _t_p2a_start:.2f}s',
           flush=True)
+
+    # Crude prescreen (Psi4-style): drop pairs whose initial SC-MP2 |e_ij|
+    # is below T_CutPairs_MP2 BEFORE the LMP2 iteration. Currently we
+    # iterate ALL pairs through Phase 2b then classify+drop later in
+    # driver.py. For water-15 that means iterating 2850 pairs when only
+    # 984 would survive — and the LMP2-residual plan-build for the dropped
+    # pairs alone takes ~25s.
+    # Match Psi4 (mp2.cc:compute_pair_energies "Crude Prescreening Step"):
+    # use SC-MP2 e_ij (which we already have) for early elimination.
+    _prescreen_thresh = float(os.environ.get(
+        'DLPNO_LMP2_PRESCREEN_THRESH', str(T_CutPairs_MP2)))
+    _e_mp2_prescreened = 0.0
+    if _prescreen_thresh > 0.0:
+        _to_drop = []
+        for _key, _val in initial_pno_data.items():
+            _ii, _jj = _key
+            _e = float(_val.get('e_ij', 0.0))
+            if abs(_e) < _prescreen_thresh:
+                _to_drop.append(_key)
+                _fac = 1.0 if _ii == _jj else 2.0
+                _e_mp2_prescreened += _fac * _e
+        for _key in _to_drop:
+            del initial_pno_data[_key]
+        if _to_drop:
+            _pno_dbg and print(
+                f'[PNO_DBG] Crude prescreen: dropped {len(_to_drop)} pairs '
+                f'(|e_ij|<{_prescreen_thresh:.1e}), kept {len(initial_pno_data)} '
+                f'(SC-MP2 prescreen energy = {_e_mp2_prescreened:.6e} Eh)',
+                flush=True)
     # ===================================================================
     # Phase 2b: Iterative LMP2 in PNO space
     # (matching Psi4 pno_lmp2_iterations() lines 690-802)
@@ -1161,14 +1191,21 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             weak_pairs.append(key)
             n_pairs_weak += 1
 
+    # Add the SC-MP2 contribution from pairs eliminated by the crude
+    # prescreen (analogous to Psi4's "Crude Prescreening (Eliminated)" step).
+    # These pairs never went through the iterative LMP2 — their initial
+    # SC-MP2 estimate is added to the total to preserve correctness.
+    e_lmp2_total += _e_mp2_prescreened
     log.info('PNO construction complete: %d strong pairs, %d weak pairs',
              n_pairs_strong, n_pairs_weak)
-    log.info('Total LMP2 energy = %.15g', e_lmp2_total)
+    log.info('Total LMP2 energy = %.15g (incl prescreen %.6e)',
+             e_lmp2_total, _e_mp2_prescreened)
     _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
     _pno_dbg and print(f'[PNO_DBG] Phase 3: {_pno_time.perf_counter() - _t_p3_start:.2f}s',
           flush=True)
 
-    return pno_spaces, strong_pairs, weak_pairs, e_lmp2_total
+    return (pno_spaces, strong_pairs, weak_pairs, e_lmp2_total,
+            _e_mp2_prescreened)
 
 
 def classify_cas_pairs(pno_spaces, strong_pairs, occ_cas_idx, vir_cas_idx,

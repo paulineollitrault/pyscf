@@ -406,9 +406,10 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         C_cas_vir = mo_loc[:, vir_cas_idx]  # vir_cas_idx is in full-MO space
         nvir_cas_loc = len(vir_cas_idx)
 
-    pno_spaces, _, _, _ = make_pnos(
+    pno_spaces, _, _, _, e_mp2_prescreened = make_pnos(
         mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         T_CutPNO=T_CutPNO, T_CutPairs=T_CutPairs,
+        T_CutPairs_MP2=T_CutPairs_MP2,
         S_cut_domain=S_cut_domain,
         T_CutEnergy=T_CutEnergy, T_CutTrace=T_CutTrace,
         occ_cas_idx=occ_cas_idx, C_cas_vir=C_cas_vir,
@@ -555,7 +556,13 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # screening (Psi4's "Eliminated Pair dE"). Was always implicitly
     # included before via running CCSD over negligibles; now added back
     # explicitly since we drop them from pno_spaces.
-    e_total = (mf.e_tot + e_tccsd + e_lmp2_weak + e_lmp2_negligible + e_t)
+    # e_mp2_prescreened: SC-MP2 contribution from pairs eliminated at the
+    # crude SC-MP2 prescreen step BEFORE LMP2 iteration (Psi4's
+    # "Crude Prescreening" eliminated pairs).
+    e_total = (mf.e_tot + e_tccsd + e_lmp2_weak + e_lmp2_negligible
+               + e_mp2_prescreened + e_t)
+    print(f'  Crude prescreen SC-MP2 correction: '
+          f'{e_mp2_prescreened:.6e} Eh', flush=True)
 
     print(f'\n  Timings:  localization={_t_loc:.2f}s  '
           f'CCSD={_t_ccsd:.2f}s  (T)={_t_triples:.2f}s  '
@@ -566,6 +573,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         'e_dmrg':       e_dmrg,
         'e_lmp2_weak':  e_lmp2_weak,
         'e_lmp2_negligible': e_lmp2_negligible,
+        'e_mp2_prescreened': e_mp2_prescreened,
         'e_tccsd':      e_tccsd,
         'e_t':          e_t,
         'e_total':      e_total,
