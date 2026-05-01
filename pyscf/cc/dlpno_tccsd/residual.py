@@ -430,40 +430,138 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
             side_total = int(offs[-1]) if n_unique > 0 else 0
             S_side_buf = np.empty(side_total, dtype=np.float64)
 
-            from pyscf.cc.dlpno_tccsd.local_df import (
-                compute_S_pno, compute_S_pno_batched)
-
-            # Pre-contiguous S_pao_full to avoid the per-canon-il
-            # ascontiguousarray call inside the batched kernel.
+            # Single-call C kernel: build all (canon_il, canon_lj) S overlaps
+            # in one OMP-parallel pass. Replaces the per-canon_il pool.map
+            # dispatch (1275+ Python ctypes calls on water-10) with one
+            # ctypes call + thread-internal scratch reuse.
             _S_pao_full_c = np.ascontiguousarray(S_pao_full)
+            _n_pao_total = int(_S_pao_full_c.shape[0])
 
-            def _compute_one_canon_il(canon_il):
-                """Compute S for all (canon_il, canon_lj) partners via the
-                batched C kernel — one DLPNObuild_S_pno_for_pair call instead
-                of N Python np.ix_ + matmul calls."""
+            il_keys = sorted(side_by_canon_il.keys())
+            n_canon_il = len(il_keys)
+
+            # Per-canon-il (key_a) buffers.
+            canon_n_pao_a = np.zeros(n_canon_il, dtype=np.int32)
+            canon_n_pno_a = np.zeros(n_canon_il, dtype=np.int32)
+            _pp_a_lens = np.zeros(n_canon_il, dtype=np.int64)
+            _X_a_lens = np.zeros(n_canon_il, dtype=np.int64)
+            _pp_a_chunks = []
+            _X_a_chunks = []
+            for ii, canon_il in enumerate(il_keys):
                 key_a = canonical_pairs[canon_il]
-                partner_keys = [canonical_pairs[lj]
-                                for lj in side_by_canon_il[canon_il]]
-                S_dict = compute_S_pno_batched(
-                    key_a, partner_keys, pno_spaces, S_pao_full, s1e,
-                    _S_pao_full_c=_S_pao_full_c)
-                results = []
+                pd_a = pno_spaces[key_a]
+                pp_a = np.asarray(pd_a['pair_paos'], dtype=np.int64)
+                X_a = np.ascontiguousarray(pd_a['X_pno'])
+                canon_n_pao_a[ii] = pp_a.size
+                canon_n_pno_a[ii] = X_a.shape[1]
+                _pp_a_lens[ii] = pp_a.size
+                _X_a_lens[ii] = X_a.size
+                _pp_a_chunks.append(pp_a)
+                _X_a_chunks.append(X_a.ravel())
+            canon_pp_a_off = np.empty(n_canon_il + 1, dtype=np.int64)
+            canon_pp_a_off[0] = 0
+            canon_pp_a_off[1:] = np.cumsum(_pp_a_lens)
+            canon_X_a_off = np.empty(n_canon_il + 1, dtype=np.int64)
+            canon_X_a_off[0] = 0
+            canon_X_a_off[1:] = np.cumsum(_X_a_lens)
+            canon_pp_a_flat = (np.concatenate(_pp_a_chunks)
+                               if _pp_a_chunks
+                               else np.zeros(0, dtype=np.int64))
+            canon_X_a_flat = (np.concatenate(_X_a_chunks)
+                              if _X_a_chunks
+                              else np.zeros(0, dtype=np.float64))
+
+            # Per-partner buffers (concatenated across all canon_il in
+            # il_keys order, with each canon_il's partners contiguous).
+            n_total_partners = sum(len(side_by_canon_il[ck])
+                                   for ck in il_keys)
+            partner_n_pao = np.zeros(n_total_partners, dtype=np.int32)
+            partner_n_pno = np.zeros(n_total_partners, dtype=np.int32)
+            _pp_b_lens = np.zeros(n_total_partners, dtype=np.int64)
+            _X_b_lens = np.zeros(n_total_partners, dtype=np.int64)
+            partner_S_out_off = np.zeros(n_total_partners, dtype=np.int64)
+            canon_partner_start = np.empty(n_canon_il + 1, dtype=np.int64)
+            canon_partner_start[0] = 0
+
+            _pp_b_chunks = []
+            _X_b_chunks = []
+            p_idx = 0
+            for ii, canon_il in enumerate(il_keys):
                 for canon_lj in side_by_canon_il[canon_il]:
                     key_b = canonical_pairs[canon_lj]
-                    S = S_dict[key_b]
+                    pd_b = pno_spaces[key_b]
+                    pp_b = np.asarray(pd_b['pair_paos'], dtype=np.int64)
+                    X_b = np.ascontiguousarray(pd_b['X_pno'])
+                    partner_n_pao[p_idx] = pp_b.size
+                    partner_n_pno[p_idx] = X_b.shape[1]
+                    _pp_b_lens[p_idx] = pp_b.size
+                    _X_b_lens[p_idx] = X_b.size
                     u_idx = side_unique_lut[(canon_il, canon_lj)]
-                    results.append((u_idx, S.ravel()))
-                return results
+                    partner_S_out_off[p_idx] = int(side_offsets[u_idx])
+                    _pp_b_chunks.append(pp_b)
+                    _X_b_chunks.append(X_b.ravel())
+                    p_idx += 1
+                canon_partner_start[ii + 1] = p_idx
+            partner_pp_off = np.empty(n_total_partners + 1, dtype=np.int64)
+            partner_pp_off[0] = 0
+            partner_pp_off[1:] = np.cumsum(_pp_b_lens)
+            partner_X_off = np.empty(n_total_partners + 1, dtype=np.int64)
+            partner_X_off[0] = 0
+            partner_X_off[1:] = np.cumsum(_X_b_lens)
+            partner_pp_flat = (np.concatenate(_pp_b_chunks)
+                               if _pp_b_chunks
+                               else np.zeros(0, dtype=np.int64))
+            partner_X_flat = (np.concatenate(_X_b_chunks)
+                              if _X_b_chunks
+                              else np.zeros(0, dtype=np.float64))
 
-            il_keys = list(side_by_canon_il.keys())
-            if _pool is not None:
-                all_results = list(_pool.map(_compute_one_canon_il, il_keys))
-            else:
-                all_results = [_compute_one_canon_il(k) for k in il_keys]
-            for results in all_results:
-                for u_idx, S_flat in results:
-                    off = int(side_offsets[u_idx])
-                    S_side_buf[off:off + S_flat.size] = S_flat
+            max_n_pao_a = int(canon_n_pao_a.max()) if n_canon_il > 0 else 0
+            max_n_pao_b = (int(partner_n_pao.max())
+                           if n_total_partners > 0 else 0)
+            max_n_pno_b = (int(partner_n_pno.max())
+                           if n_total_partners > 0 else 0)
+
+            import ctypes as _ct_san
+            from pyscf import lib as _lib_san
+            _libcc_san = getattr(build_G_tilde, '_libcc_spno_all', None)
+            if _libcc_san is None:
+                _libcc_san = _lib_san.load_library('libcc')
+                _libcc_san.DLPNObuild_S_pno_all.restype = None
+                _libcc_san.DLPNObuild_S_pno_all.argtypes = (
+                    [_ct_san.c_long]                              # n_canon_il
+                    + [_ct_san.c_void_p] * 7                      # 7 canon ptrs
+                    + [_ct_san.c_void_p] * 7                      # 7 partner ptrs
+                    + [_ct_san.c_void_p, _ct_san.c_void_p,        # S_side_buf, S_pao_full
+                       _ct_san.c_long,                            # n_pao_total
+                       _ct_san.c_int, _ct_san.c_int,
+                       _ct_san.c_int, _ct_san.c_int])             # 4 c_int sizes/threads
+                build_G_tilde._libcc_spno_all = _libcc_san
+
+            n_threads_san = min(int(os.cpu_count() or 16), max(1, n_canon_il))
+            _libcc_san.DLPNObuild_S_pno_all(
+                _ct_san.c_long(n_canon_il),
+                canon_n_pao_a.ctypes.data_as(_ct_san.c_void_p),
+                canon_n_pno_a.ctypes.data_as(_ct_san.c_void_p),
+                canon_pp_a_off.ctypes.data_as(_ct_san.c_void_p),
+                canon_pp_a_flat.ctypes.data_as(_ct_san.c_void_p),
+                canon_X_a_off.ctypes.data_as(_ct_san.c_void_p),
+                canon_X_a_flat.ctypes.data_as(_ct_san.c_void_p),
+                canon_partner_start.ctypes.data_as(_ct_san.c_void_p),
+                partner_n_pao.ctypes.data_as(_ct_san.c_void_p),
+                partner_n_pno.ctypes.data_as(_ct_san.c_void_p),
+                partner_pp_off.ctypes.data_as(_ct_san.c_void_p),
+                partner_pp_flat.ctypes.data_as(_ct_san.c_void_p),
+                partner_X_off.ctypes.data_as(_ct_san.c_void_p),
+                partner_X_flat.ctypes.data_as(_ct_san.c_void_p),
+                partner_S_out_off.ctypes.data_as(_ct_san.c_void_p),
+                S_side_buf.ctypes.data_as(_ct_san.c_void_p),
+                _S_pao_full_c.ctypes.data_as(_ct_san.c_void_p),
+                _ct_san.c_long(_n_pao_total),
+                _ct_san.c_int(max_n_pao_a),
+                _ct_san.c_int(max_n_pao_b),
+                _ct_san.c_int(max_n_pno_b),
+                _ct_san.c_int(n_threads_san),
+            )
         else:
             S_side_buf = np.empty(0, dtype=np.float64)
 

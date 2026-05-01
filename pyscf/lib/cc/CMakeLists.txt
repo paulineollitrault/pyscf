@@ -30,6 +30,7 @@ add_library(cc SHARED
   dlpno_w3_full.c dlpno_triples_orch.c
   dlpno_g_tilde_plan.c
   dlpno_g_tilde_enum.c
+  dlpno_s_pno_all.c
   dlpno_lmp2_residual.c
   dlpno_ccsd_solver.cpp)
 add_dependencies(cc np_helper ao2mo)
