@@ -57,8 +57,20 @@ double DLPNOcompute_w3_energy(
         const int occ_denom,
         const int n,
         const int m_dom,
-        const int n_pno_max)
+        const int n_pno_max,
+        /* Per-pair restructure args (HANDOFF_TRIPLES_VVL_PER_PAIR.md).
+         * K_ovvv_arr: 3 pointers (K_ovvv_i/j/k); each (n, n, n_pno_for_ip[ip]).
+         * T_pair_arr: 6 pointers (per perm); each (n, n_pno_for_perm[pidx]).
+         * If K_ovvv_arr == NULL or T_pair_arr == NULL, the original
+         * K_ab_cache + t2_T_all path is used. Else the per-pair Phase 1
+         * is used (skips the n_pno_ijk² factor in vvL build upstream).
+         */
+        const double * const *K_ovvv_arr,
+        const int *n_pno_for_ip,
+        const double * const *T_pair_arr,
+        const int *n_pno_for_perm)
 {
+    const int use_per_pair = (K_ovvv_arr != NULL && T_pair_arr != NULL);
     if (n == 0 || occ_denom == 0) return 0.0;
 
     const char N_ = 'N', T_ = 'T';
@@ -92,18 +104,50 @@ double DLPNOcompute_w3_energy(
         const int ir = p_table_ir[pidx];
         const int iq = p_table_iq[pidx];
 
-        /* base[a, b, c] = Σ_f K_ab[ip, a, b, f] * t2_T[ir, iq, c, f]
-         * Cython invocation:
-         *   dgemm('N','N', n, n*n, n,
-         *         1, t2_T_all[ir, iq], n,
-         *            K_ab_cache[ip],   n,
-         *         0, base_buf,         n)
-         * Reuse the exact same call. */
-        const double *K = K_ab_cache + (size_t)ip * n3;
-        const double *t = t2_T_all + ((size_t)ir * 3 + (size_t)iq) * (size_t)n * (size_t)n;
-        dgemm_(&N_, &N_, &int_n, &int_nn, &int_n,
-               &one, t, &int_n, K, &int_n,
-               &zero, base_buf, &int_n);
+        if (use_per_pair) {
+            /* Per-pair Phase 1:
+             *   base[a, b, c_tno] = Σ_c_pno K_ovvv[ip][a, b, c_pno] × T_pair[pidx][c_tno, c_pno]
+             *
+             * K_ovvv[ip] row-major (n, n × n_pno_pair_ip)
+             * T_pair[pidx] row-major (n, n_pno_pair_pidx)
+             *
+             * Reshape K_ovvv as (n × n, n_pno_pair):
+             *   row-major C(n², n_tno) = K_ovvv (n², n_pno) @ T_pair^T (n_pno, n_tno)
+             *   dgemm pattern (row-major, B^T): dgemm('T','N', n_tno, n²,
+             *     n_pno_pair, 1, T_pair, LDB=n_pno_pair, K_ovvv, LDA=n_pno_pair,
+             *     0, base_buf, LDC=n_tno)
+             *
+             * Memory layout of base_buf: row-major (n², n_tno) — i.e.,
+             * base[a*n² + b*n + c]. Same as the existing code's layout
+             * (n, n²) [a, b*n+c] memory-wise.
+             *
+             * Note: n_pno_for_ip[ip] should equal n_pno_for_perm[pidx]
+             * (both reference the same canonical pair's n_pno).
+             */
+            const double *K_ovvv_ip = K_ovvv_arr[ip];
+            const double *T_pair_pidx = T_pair_arr[pidx];
+            int n_pno_pair = n_pno_for_perm[pidx];
+            if (K_ovvv_ip == NULL || T_pair_pidx == NULL || n_pno_pair == 0) {
+                /* Skip this perm if data missing (keeps us safe; energy
+                 * may drift slightly for empty pairs). */
+                memset(base_buf, 0, sizeof(double) * n3);
+            } else {
+                int int_n_pno = n_pno_pair;
+                int int_n_sq = n * n;
+                dgemm_(&T_, &N_,
+                       &int_n, &int_n_sq, &int_n_pno,
+                       &one, T_pair_pidx, &int_n_pno,
+                       K_ovvv_ip, &int_n_pno,
+                       &zero, base_buf, &int_n);
+            }
+        } else {
+            /* base[a, b, c] = Σ_f K_ab[ip, a, b, f] * t2_T[ir, iq, c, f] */
+            const double *K = K_ab_cache + (size_t)ip * n3;
+            const double *t = t2_T_all + ((size_t)ir * 3 + (size_t)iq) * (size_t)n * (size_t)n;
+            dgemm_(&N_, &N_, &int_n, &int_nn, &int_n,
+                   &one, t, &int_n, K, &int_n,
+                   &zero, base_buf, &int_n);
+        }
 
         /* Permuted accumulate */
         switch (pidx) {

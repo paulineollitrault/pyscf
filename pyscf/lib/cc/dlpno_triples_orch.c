@@ -34,7 +34,11 @@ double DLPNOcompute_w3_energy(
         const double *eps_occ, const double *eps_vir,
         const double *t1_sc,
         const int has_t1, const int occ_denom,
-        const int n, const int m_dom, const int n_pno_max);
+        const int n, const int m_dom, const int n_pno_max,
+        const double * const *K_ovvv_arr,
+        const int *n_pno_for_ip,
+        const double * const *T_pair_arr,
+        const int *n_pno_for_perm);
 
 /* ----- Forward declarations of existing public kernels ----- */
 int DLPNObuild_triple_tno_full(
@@ -508,17 +512,22 @@ typedef struct {
     double *K_ovvv_i_sc;    size_t K_ovvv_i_sc_cap;
     double *K_ovvv_j_sc;    size_t K_ovvv_j_sc_cap;
     double *K_ovvv_k_sc;    size_t K_ovvv_k_sc_cap;
-    /* T_pair tensors (3): half-projected pair T2 (one virtual axis still
-     * in pair-PNO basis). Shape (n_tno, n_pno_pair) per pair.
-     *   slot 0: ij → n_pno_ij,  slot 1: jk → n_pno_jk,  slot 2: ik → n_pno_ik.
-     * S_pno_to_tno overlap: shape (n_pno_pair, n_tno) per pair.
+    /* T_pair_perm tensors (6): half-projected pair T2, one per W3 perm.
+     * Per perm pidx with (iq, ir): canonical pair = (min lmo_iq lmo_ir,
+     * max). T_pair_perm[c_tno, c_pno] = sum_d U_pk[d, c_tno] × T2_or[d, c_pno]
+     * where T2_or = T2_canonical if lmo_ir < lmo_iq else T2_canonical.T.
+     * Shape (n_tno, n_pno_pair). Each pair appears in 2 perms (canonical
+     * + non-canonical orientation).
+     *
+     * Mapping (pidx → pair_slot, orientation):
+     *   pidx=0 (k,j): pair jk, NON-canonical (k>j)
+     *   pidx=1 (j,k): pair jk, canonical
+     *   pidx=2 (k,i): pair ik, NON-canonical
+     *   pidx=3 (i,k): pair ik, canonical
+     *   pidx=4 (j,i): pair ij, NON-canonical
+     *   pidx=5 (i,j): pair ij, canonical
      */
-    double *T_pair_ij_sc;   size_t T_pair_ij_sc_cap;
-    double *T_pair_jk_sc;   size_t T_pair_jk_sc_cap;
-    double *T_pair_ik_sc;   size_t T_pair_ik_sc_cap;
-    double *S_p2t_ij;       size_t S_p2t_ij_cap;
-    double *S_p2t_jk;       size_t S_p2t_jk_cap;
-    double *S_p2t_ik;       size_t S_p2t_ik_cap;
+    double *T_pair_p[6];    size_t T_pair_p_cap[6];
     double *S_slice;        size_t S_slice_cap;
     double *W_pao_tno;      size_t W_pao_tno_cap;
     long *U_off_cache;      size_t U_off_cache_cap;
@@ -1006,6 +1015,61 @@ double DLPNOcompute_one_triple_E_T0(
      */
     TOC(t2_block);
 
+    /* T_pair_perm builds (Psi4-style restructure, 6 per triple, gated).
+     * Per perm pidx, T_pair_perm[c_tno, c_pno_pair] = sum_d U_pk[d, c_tno]
+     *   × T2_or[d, c_pno] where T2_or = T2_canonical (canonical) or
+     *   T2_canonical.T (non-canonical orientation).
+     *
+     * U_pk and T2_canonical are accessed via t2_block_u_pk_idx[pq] for
+     * pq = ir*3 + iq. The transpose flag t2_block_transpose[pq] tells us
+     * if the orientation matches canonical.
+     */
+    if (_qvv_pair_enabled) {
+        /* p_table: (ip, iq, ir) for each perm — matches W3 kernel */
+        const int p_table_iq[6] = {1, 2, 0, 2, 0, 1};
+        const int p_table_ir[6] = {2, 1, 2, 0, 1, 0};
+        for (int pidx = 0; pidx < 6; pidx++) {
+            const int iq = p_table_iq[pidx];
+            const int ir = p_table_ir[pidx];
+            const int pq = ir * 3 + iq;
+            const int u_idx = t2_block_u_pk_idx[pq];
+            if (u_idx < 0) {
+                /* Allocate zero-sized scratch */
+                continue;
+            }
+            const int n_pno_pk = u_pno_n[u_idx];
+            if (n_pno_pk == 0) continue;
+            const int do_transpose = t2_block_transpose[pq];
+
+            /* Allocate scratch */
+            const size_t need = (size_t)n * (size_t)n_pno_pk;
+            if (tscratch.T_pair_p_cap[pidx] < need) {
+                free(tscratch.T_pair_p[pidx]);
+                tscratch.T_pair_p[pidx] = (double *)malloc(
+                    sizeof(double) * (need > 0 ? need : 1));
+                tscratch.T_pair_p_cap[pidx] = need;
+            }
+            double *T_pair = tscratch.T_pair_p[pidx];
+
+            const double *U_pk = U_flat_cache + U_off_cache[u_idx];
+            const double *T2_pk = u_T2_flat + u_T2_off[u_idx];
+            int int_n_pno_pk = n_pno_pk;
+            int int_n_tno = n;
+
+            /* T_pair (n_tno, n_pno_pk) = U.T (n_tno, n_pno_pk) @ T2_or (n_pno_pk, n_pno_pk).
+             * Row-major C(M=n_tno, N=n_pno_pk) = A^T(M, K=n_pno_pk) @ B(K, N).
+             *   dgemm(opT_B, 'T', N, M, K, alpha, B, LDB=N, A, LDA=M, beta, C, LDC=N)
+             *   where opT_B = 'N' for canonical, 'T' for non-canonical.
+             */
+            const char opT_B = do_transpose ? 'T' : 'N';
+            dgemm_(&opT_B, &Tc,
+                   &int_n_pno_pk, &int_n_tno, &int_n_pno_pk,
+                   &one, T2_pk, &int_n_pno_pk,
+                   U_pk, &int_n_tno,
+                   &zero, T_pair, &int_n_pno_pk);
+        }
+    }
+
     /* K_ovvv builds (Psi4-style restructure, gated on QVV_PAIR).
      * K_ovvv[ip, a, b, c_pno] = Σ_q ovL_sc[ip, a, q] × q_vv_pair_for_ip[b, c_pno, q]
      * Per-ip pair mapping (from W3 perm structure):
@@ -1291,7 +1355,36 @@ double DLPNOcompute_one_triple_E_T0(
     /* Call W3 */
     TIC;
     /* Call W3.  Pass U_flat_cache and u_T2_flat directly with per-task
-     * offsets (w3_U_off / w3_T2_off index INTO those buffers). */
+     * offsets (w3_U_off / w3_T2_off index INTO those buffers).
+     *
+     * If QVV_PAIR enabled: also pass K_ovvv_arr + T_pair_arr to use the
+     * per-pair Phase 1 path. Else NULL → original K_ab + t2_T path.
+     */
+    const double *K_ovvv_arr_for_w3[3] = {NULL, NULL, NULL};
+    const double *T_pair_arr_for_w3[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
+    int n_pno_for_ip_arr[3] = {0, 0, 0};
+    int n_pno_for_perm_arr[6] = {0, 0, 0, 0, 0, 0};
+    if (_qvv_pair_enabled) {
+        const int n_pno_ij = n_pno_arr_3[0];
+        const int n_pno_jk = n_pno_arr_3[1];
+        const int n_pno_ik = n_pno_arr_3[2];
+        K_ovvv_arr_for_w3[0] = tscratch.K_ovvv_i_sc;   /* ip=i, pair jk */
+        K_ovvv_arr_for_w3[1] = tscratch.K_ovvv_j_sc;   /* ip=j, pair ik */
+        K_ovvv_arr_for_w3[2] = tscratch.K_ovvv_k_sc;   /* ip=k, pair ij */
+        n_pno_for_ip_arr[0] = n_pno_jk;
+        n_pno_for_ip_arr[1] = n_pno_ik;
+        n_pno_for_ip_arr[2] = n_pno_ij;
+        /* T_pair per perm; sizes match n_pno_for_ip per the W3 perm table */
+        const int p_table_iq[6] = {1, 2, 0, 2, 0, 1};
+        const int p_table_ir[6] = {2, 1, 2, 0, 1, 0};
+        const int n_pno_for_pidx[6] = {
+            n_pno_jk, n_pno_jk, n_pno_ik, n_pno_ik, n_pno_ij, n_pno_ij};
+        for (int pidx = 0; pidx < 6; pidx++) {
+            T_pair_arr_for_w3[pidx] = tscratch.T_pair_p[pidx];
+            n_pno_for_perm_arr[pidx] = n_pno_for_pidx[pidx];
+        }
+        (void)p_table_iq; (void)p_table_ir;   /* in case of future use */
+    }
     double et_ijk = DLPNOcompute_w3_energy(
         K_ab_cache, t2_T_all,
         K_jk, K_ik, K_ij, K_ooov,
@@ -1300,7 +1393,11 @@ double DLPNOcompute_one_triple_E_T0(
         eps_occ_arr, eps_tno,
         t1_lmo,
         has_t1, occ_denom,
-        n, m_dom_size, n_pno_max_w3);
+        n, m_dom_size, n_pno_max_w3,
+        _qvv_pair_enabled ? K_ovvv_arr_for_w3 : NULL,
+        _qvv_pair_enabled ? n_pno_for_ip_arr : NULL,
+        _qvv_pair_enabled ? T_pair_arr_for_w3 : NULL,
+        _qvv_pair_enabled ? n_pno_for_perm_arr : NULL);
     TOC(w3_kernel);
 
     /* All scratch buffers persist in __thread storage — no per-triple free.
