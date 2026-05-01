@@ -252,83 +252,109 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
             if pi_idx is not None:
                 canon_to_S_pi[canon_idx] = pi_idx
 
-        # PASS 1: enumerate valid triples (i, j, l). Defer K_il
-        # computation: just record the (canon_il, i, l) tuples we'll need.
+        # PASS 1: enumerate valid triples (i, j, l) via C kernel.
+        # The Python triple loop was O(nocc^3) with high per-iteration
+        # overhead; the kernel does the same enumeration with native loop
+        # and writes flat output arrays directly.
         _t_loop0 = _gtime.perf_counter()
-        ij_slots = []
-        ij_triple_offsets = [0]
-        # Per-triple deferred records: (canon_il, i, l, S_off, canon_lj,
-        # n_il, n_lj, l_le_j). We'll pack into arrays after the loop.
-        t_canon_il = []
-        t_i_idx = []
-        t_l_idx = []
-        t_S_off = []
-        t_S_sel = []     # 0 = main S buffer, 1 = side buffer (lazy compute)
-        t_canon_lj = []
-        t_n_il = []
-        t_n_lj = []
-        t_l_le_j = []
 
-        # kil_seen: maps (canon_il, i, l) → kil_entry index (allocated lazily)
-        kil_seen = {}
+        # Flatten canon_p_dense into a contiguous (n_canon, nocc) buffer.
+        canon_p_valid = np.zeros(n_canon, dtype=np.int8)
+        canon_p_dense_flat = np.full((n_canon, nocc), -2, dtype=np.int64)
+        for canon_idx in range(n_canon):
+            pd = canon_p_dense[canon_idx]
+            if pd is not None:
+                canon_p_valid[canon_idx] = 1
+                canon_p_dense_flat[canon_idx] = np.asarray(pd, dtype=np.int64)
 
-        for i in range(nocc):
-            for j in range(nocc):
-                for l in range(nocc):
-                    canon_il = canon_lut[i, l]
-                    if canon_il < 0:
-                        continue
-                    canon_lj = canon_lut[l, j]
-                    if canon_lj < 0:
-                        continue
-                    p_dense_il = canon_p_dense[canon_il]
-                    if p_dense_il is None:
-                        continue
-                    if p_dense_il[i] < 0 or p_dense_il[l] < 0:
-                        continue   # K_il would be None in original code
+        # Pre-alloc outputs to nocc^3 upper bound (most are populated).
+        N_t_max = nocc * nocc * nocc
+        t_canon_il_arr = np.empty(N_t_max, dtype=np.int64)
+        t_i_idx_arr = np.empty(N_t_max, dtype=np.int64)
+        t_l_idx_arr = np.empty(N_t_max, dtype=np.int64)
+        t_S_off_arr = np.empty(N_t_max, dtype=np.int64)
+        t_S_sel_arr = np.empty(N_t_max, dtype=np.int8)
+        t_canon_lj_arr = np.empty(N_t_max, dtype=np.int64)
+        t_n_il_arr = np.empty(N_t_max, dtype=np.int32)
+        t_n_lj_arr = np.empty(N_t_max, dtype=np.int32)
+        t_l_le_j_arr = np.empty(N_t_max, dtype=np.int8)
+        ij_triple_offsets_arr = np.empty(nocc * nocc + 1, dtype=np.int64)
+        kil_idx_for_il = np.empty(nocc * nocc, dtype=np.int64)
+        N_t_out = np.zeros(1, dtype=np.int64)
+        kil_count_out = np.zeros(1, dtype=np.int64)
 
-                    if canon_il == canon_lj:
-                        S_off = -1
-                        S_sel = 0
-                    else:
-                        pi_il = canon_to_S_pi[canon_il]
-                        pi_lj = canon_to_S_pi[canon_lj]
-                        if pi_il < 0 or pi_lj < 0:
-                            continue
-                        S_k = S_idx_matrix[pi_il, pi_lj]
-                        if S_k < 0:
-                            # No flat-tier entry — original code calls
-                            # `_s_pno_get` which lazy-computes via
-                            # X_pno + S_pao paths. We capture the
-                            # (canon_il, canon_lj) pair to fill into a
-                            # side buffer after the loop, and mark the
-                            # triple with S_sel=1 for the kernel.
-                            S_off = -3   # placeholder, fixed up below
-                            S_sel = 1
-                        else:
-                            S_off = int(S_offsets_arr[S_k])
-                            S_sel = 0
+        canon_lut_c = np.ascontiguousarray(canon_lut, dtype=np.int64)
+        S_idx_matrix_c = np.ascontiguousarray(S_idx_matrix, dtype=np.int64)
+        S_offsets_arr_c = np.ascontiguousarray(S_offsets_arr, dtype=np.int64)
+        canon_to_S_pi_c = np.ascontiguousarray(canon_to_S_pi, dtype=np.int64)
+        canon_n_pno_c = np.ascontiguousarray(canon_n_pno, dtype=np.int32)
+        n_pi_dim = int(S_idx_matrix_c.shape[0])
 
-                    n_il = int(canon_n_pno[canon_il])
-                    n_lj = int(canon_n_pno[canon_lj])
+        import ctypes as _ct_genum
+        from pyscf import lib as _lib_genum
+        _libcc_genum = getattr(build_G_tilde, '_libcc_enum', None)
+        if _libcc_genum is None:
+            _libcc_genum = _lib_genum.load_library('libcc')
+            _libcc_genum.DLPNObuild_G_tilde_plan_enum.restype = None
+            _libcc_genum.DLPNObuild_G_tilde_plan_enum.argtypes = (
+                [_ct_genum.c_void_p] * 20 + [_ct_genum.c_long] * 2)
+            build_G_tilde._libcc_enum = _libcc_genum
 
-                    # Track unique (canon_il, i, l) for K_il pool.
-                    seen_key = (canon_il, i, l)
-                    if seen_key not in kil_seen:
-                        kil_seen[seen_key] = len(kil_seen)
+        _libcc_genum.DLPNObuild_G_tilde_plan_enum(
+            canon_lut_c.ctypes.data_as(_ct_genum.c_void_p),
+            canon_p_dense_flat.ctypes.data_as(_ct_genum.c_void_p),
+            canon_p_valid.ctypes.data_as(_ct_genum.c_void_p),
+            canon_to_S_pi_c.ctypes.data_as(_ct_genum.c_void_p),
+            S_idx_matrix_c.ctypes.data_as(_ct_genum.c_void_p),
+            S_offsets_arr_c.ctypes.data_as(_ct_genum.c_void_p),
+            canon_n_pno_c.ctypes.data_as(_ct_genum.c_void_p),
+            t_canon_il_arr.ctypes.data_as(_ct_genum.c_void_p),
+            t_i_idx_arr.ctypes.data_as(_ct_genum.c_void_p),
+            t_l_idx_arr.ctypes.data_as(_ct_genum.c_void_p),
+            t_S_off_arr.ctypes.data_as(_ct_genum.c_void_p),
+            t_S_sel_arr.ctypes.data_as(_ct_genum.c_void_p),
+            t_canon_lj_arr.ctypes.data_as(_ct_genum.c_void_p),
+            t_n_il_arr.ctypes.data_as(_ct_genum.c_void_p),
+            t_n_lj_arr.ctypes.data_as(_ct_genum.c_void_p),
+            t_l_le_j_arr.ctypes.data_as(_ct_genum.c_void_p),
+            ij_triple_offsets_arr.ctypes.data_as(_ct_genum.c_void_p),
+            kil_idx_for_il.ctypes.data_as(_ct_genum.c_void_p),
+            N_t_out.ctypes.data_as(_ct_genum.c_void_p),
+            kil_count_out.ctypes.data_as(_ct_genum.c_void_p),
+            _ct_genum.c_long(int(nocc)),
+            _ct_genum.c_long(int(n_pi_dim)),
+        )
 
-                    t_canon_il.append(canon_il)
-                    t_i_idx.append(i)
-                    t_l_idx.append(l)
-                    t_S_off.append(S_off)
-                    t_S_sel.append(S_sel)
-                    t_canon_lj.append(canon_lj)
-                    t_n_il.append(n_il)
-                    t_n_lj.append(n_lj)
-                    t_l_le_j.append(1 if l <= j else 0)
+        N_t = int(N_t_out[0])
+        kil_count = int(kil_count_out[0])
+        # Convert to Python lists for fast per-element indexing in the
+        # downstream dedup loop. (numpy scalar indexing is 5-10x slower
+        # than Python list indexing for small element accesses.)
+        t_canon_il = t_canon_il_arr[:N_t].tolist()
+        t_i_idx = t_i_idx_arr[:N_t].tolist()
+        t_l_idx = t_l_idx_arr[:N_t].tolist()
+        t_S_off = t_S_off_arr[:N_t].tolist()
+        t_S_sel = t_S_sel_arr[:N_t].tolist()
+        t_canon_lj = t_canon_lj_arr[:N_t].tolist()
+        t_n_il = t_n_il_arr[:N_t].tolist()
+        t_n_lj = t_n_lj_arr[:N_t].tolist()
+        t_l_le_j = t_l_le_j_arr[:N_t].tolist()
+        # ij_slots / ij_triple_offsets reconstructed from kernel output.
+        ij_slots = [(int(i), int(j)) for i in range(nocc) for j in range(nocc)]
+        ij_triple_offsets = ij_triple_offsets_arr  # ndarray, indexable
+        # kil_seen-equivalent: kil_idx_for_il is a (nocc, nocc) lookup; the
+        # dict reconstruction is only needed for the K_il_pool build below,
+        # where it's iterated via .items(). Build it once with a vectorised
+        # mask to avoid 125k-iteration Python loop.
+        _kil_dense = kil_idx_for_il.reshape(nocc, nocc)
+        _i_arr, _l_arr = np.where(_kil_dense >= 0)
+        _kil_arr = _kil_dense[_i_arr, _l_arr]
+        kil_seen = {
+            (int(canon_lut[i_lmo, l_lmo]), int(i_lmo), int(l_lmo)):
+            int(kil)
+            for i_lmo, l_lmo, kil in zip(_i_arr, _l_arr, _kil_arr)
+        }
 
-                ij_slots.append((i, j))
-                ij_triple_offsets.append(len(t_canon_il))
         _g_t_loop = _gtime.perf_counter() - _t_loop0
 
         if not t_canon_il:
@@ -374,6 +400,7 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
         # canon_il through the C kernel `DLPNObuild_S_pno_for_pair`,
         # dispatched in parallel via `_pool` across canon_il groups.
         _t_side0 = _gtime.perf_counter()
+        _t_dedup0 = _gtime.perf_counter()
         side_unique_lut = {}
         side_unique_keys = []
         side_by_canon_il = {}
@@ -385,6 +412,7 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                 side_unique_lut[ck] = len(side_unique_keys)
                 side_unique_keys.append(ck)
                 side_by_canon_il.setdefault(ck[0], []).append(ck[1])
+        _g_t_dedup = _gtime.perf_counter() - _t_dedup0
 
         n_unique = len(side_unique_keys)
         side_offsets = np.full(n_unique, -1, dtype=np.int64)
@@ -505,6 +533,7 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
                   f'side_S={len(side_S_lut)} | '
                   f'loop={_g_t_loop*1000:.0f}ms kil={_g_t_kil*1000:.0f}ms '
                   f'side={_g_t_side*1000:.0f}ms '
+                  f'(dedup={_g_t_dedup*1000:.0f}ms) '
                   f'kernel={_g_t_cy*1000:.0f}ms '
                   f'total={_g_t_total*1000:.0f}ms',
                   flush=True)
