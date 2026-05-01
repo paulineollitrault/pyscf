@@ -1035,6 +1035,33 @@ def _build_triple_local_DF(i, j, k, X_tno_ijk, triple_paos, triple_domain,
     return ovL_sc, vvL_sc, ooL_sc
 
 
+# Per-LMO domain-partner sets cache. The (T) per-triple `triple_domain`
+# scan in `_orch_phase1`, `_orch_full`, and `_process_one_triple` was
+# O(nocc_lmo) per triple, which makes (T) wall scale ≈ O(N²) on top of
+# the triple-count growth. Replace with `partners[i] & partners[j] &
+# partners[k]` — a 3-way set intersection of bounded local neighbourhoods.
+# Mirrors the fix applied to `_run_triples_omp` in commit a771bc241; this
+# extends it to the default pool.map path.
+_partners_cache = {}
+
+def _build_partners(domain_set, nocc_lmo):
+    """Return per-LMO partner sets: partners[i] = {m : (m, i) ∈ domain_set}.
+
+    Cached by id(domain_set); the same set is reused across all triples
+    in a (T) pass, so the O(|domain_set|) build runs once.
+    """
+    key = id(domain_set)
+    p = _partners_cache.get(key)
+    if p is not None and len(p) == nocc_lmo:
+        return p
+    p = [set() for _ in range(nocc_lmo)]
+    for (a, b) in domain_set:
+        p[a].add(b)
+        p[b].add(a)
+    _partners_cache[key] = p
+    return p
+
+
 def _orch_phase1(i, j, k, pno_spaces, t2_for_T,
                   C_pao, S_pao_full, F_pao_full,
                   sparse_df, screening, j2c_full, lmo_aux_mask,
@@ -1078,14 +1105,11 @@ def _orch_phase1(i, j, k, pno_spaces, t2_for_T,
     n_pao_ijk = int(triple_paos.size)
     n_pao_total = int(F_pao_full.shape[0])
 
-    # 2. triple_domain
+    # 2. triple_domain — partner-set intersection (was O(nocc_lmo) scan)
     nocc_lmo = lmo_aux_mask.shape[0]
     _domain_set = nonneg_set if nonneg_set is not None else set(t2_for_T.keys())
-    triple_domain = sorted(
-        m for m in range(nocc_lmo)
-        if (min(m, i), max(m, i)) in _domain_set
-        and (min(m, j), max(m, j)) in _domain_set
-        and (min(m, k), max(m, k)) in _domain_set)
+    _p = _build_partners(_domain_set, nocc_lmo)
+    triple_domain = sorted(_p[i] & _p[j] & _p[k])
     triple_domain_arr = np.asarray(triple_domain, dtype=np.int64)
     n_dom = int(triple_domain_arr.size)
 
@@ -1392,13 +1416,10 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
     nocc_lmo = int(F_lmo.shape[0])
     naux_total = int(j2c_full.shape[0])
 
-    # 2. triple_domain
+    # 2. triple_domain — partner-set intersection (was O(nocc_lmo) scan)
     _domain_set = nonneg_set if nonneg_set is not None else set(t2_for_T.keys())
-    triple_domain = sorted(
-        m for m in range(nocc_lmo)
-        if (min(m, i), max(m, i)) in _domain_set
-        and (min(m, j), max(m, j)) in _domain_set
-        and (min(m, k), max(m, k)) in _domain_set)
+    _p = _build_partners(_domain_set, nocc_lmo)
+    triple_domain = sorted(_p[i] & _p[j] & _p[k])
     triple_domain_arr = np.asarray(triple_domain, dtype=np.int64)
     n_dom = int(triple_domain_arr.size)
 
@@ -2181,13 +2202,10 @@ def _process_one_triple(i, j, k,
 
     # Triple-local LMO domain: m contributes to the vooo (A*t2) term only
     # if pairs (m, i), (m, j), (m, k) all survive (non-negligible).
-    _tr_pair = lambda a, b: (min(a, b), max(a, b))
+    # Partner-set intersection (was O(nocc_lmo) scan per triple).
     _domain_set = nonneg_set if nonneg_set is not None else set(t2_for_T.keys())
-    triple_domain = sorted(
-        m for m in range(nocc_lmo)
-        if _tr_pair(m, i) in _domain_set
-        and _tr_pair(m, j) in _domain_set
-        and _tr_pair(m, k) in _domain_set)
+    _p = _build_partners(_domain_set, nocc_lmo)
+    triple_domain = sorted(_p[i] & _p[j] & _p[k])
     _m_pos = {m_global: m_local for m_local, m_global in enumerate(triple_domain)}
 
     eps_occ = np.array([F_lmo[ii, ii] for ii in triple_lmo])
@@ -3115,16 +3133,24 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     # are O(1) per triple (good scaling) or growing with system size (bad).
     if valid_triples:
         _naux_tot = _lmo_aux_mask.shape[1] if _lmo_aux_mask is not None else 0
-        _ss_aux, _ss_dom = [], []
+        _ss_aux, _ss_dom, _ss_pao = [], [], []
+        _p_diag = _build_partners(_tT_set, nocc_lmo)
+        # Pre-convert pao_domains_triple to set-of-ints for fast union.
+        _pao_doms_sets = None
+        if _pao_domains is not None:
+            _pao_doms_sets = [
+                set(int(x) for x in np.asarray(_pao_domains[m]).tolist())
+                if _pao_domains[m] is not None else set()
+                for m in range(nocc_lmo)
+            ]
         for _i, _j, _k in valid_triples:
             if _lmo_aux_mask is not None:
                 _ss_aux.append(int((_lmo_aux_mask[_i] | _lmo_aux_mask[_j]
                                    | _lmo_aux_mask[_k]).sum()))
-            _dom = [m for m in range(nocc_lmo)
-                    if (min(m, _i), max(m, _i)) in _tT_set
-                    and (min(m, _j), max(m, _j)) in _tT_set
-                    and (min(m, _k), max(m, _k)) in _tT_set]
-            _ss_dom.append(len(_dom))
+            _ss_dom.append(len(_p_diag[_i] & _p_diag[_j] & _p_diag[_k]))
+            if _pao_doms_sets is not None:
+                _ss_pao.append(len(_pao_doms_sets[_i] | _pao_doms_sets[_j]
+                                   | _pao_doms_sets[_k]))
         if _ss_aux:
             print(f'  (T) naux_ijk: avg={np.mean(_ss_aux):.1f}/{_naux_tot} '
                   f'({100.0*np.mean(_ss_aux)/max(_naux_tot,1):.1f}%)  '
@@ -3134,6 +3160,34 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
               f'({100.0*np.mean(_ss_dom)/max(nocc_lmo,1):.1f}%)  '
               f'min={min(_ss_dom)}  max={max(_ss_dom)}',
               flush=True)
+        if _ss_pao:
+            print(f'  (T) n_pao_ijk: avg={np.mean(_ss_pao):.1f}  '
+                  f'min={min(_ss_pao)}  max={max(_ss_pao)}',
+                  flush=True)
+
+        # Sample n_tno on up to 30 triples (run TNO build to get n_tno).
+        if (_S_pao_full is not None and _F_pao_full is not None
+                and C_pao is not None):
+            import random as _rnd
+            _rnd.seed(42)
+            _sample = _rnd.sample(valid_triples,
+                                  min(30, len(valid_triples)))
+            _ss_tno = []
+            for (_i, _j, _k) in _sample:
+                try:
+                    _r = _triple_pno_union_psi4(
+                        pno_spaces, _i, _j, _k, C_pao, _S_pao_full,
+                        _F_pao_full, t2_for_T=t2_for_T,
+                        T_CutTNO=T_CutTNO,
+                        pao_domains_triple=_pao_domains)
+                    _ss_tno.append(int(_r[1]))   # n_tno
+                except Exception:
+                    pass
+            if _ss_tno:
+                print(f'  (T) n_tno (sampled {len(_ss_tno)}): '
+                      f'avg={np.mean(_ss_tno):.1f}  min={min(_ss_tno)}  '
+                      f'max={max(_ss_tno)}',
+                      flush=True)
 
     triple_kwargs = dict(
         pno_spaces=pno_spaces, t2_for_T=t2_for_T,
