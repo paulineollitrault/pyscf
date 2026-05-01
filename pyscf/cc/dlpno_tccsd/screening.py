@@ -66,6 +66,7 @@ def classify_pairs(pno_spaces, occ_cas_idx, vir_cas_idx,
 
     e_lmp2_weak = 0.0
     e_lmp2_strong = 0.0
+    e_lmp2_negligible = 0.0   # static SC-MP2 correction from eliminated pairs
 
     for (i, j), data in pno_spaces.items():
         e_ij = data['e_mp2']
@@ -73,6 +74,8 @@ def classify_pairs(pno_spaces, occ_cas_idx, vir_cas_idx,
 
         if abs_e <= T_CutPairs_MP2:
             negligible_pairs.append((i, j))
+            fac = 1.0 if i == j else 2.0
+            e_lmp2_negligible += fac * e_ij
             continue
 
         # CAS pair: both occupied indices in CAS occupied space
@@ -97,10 +100,11 @@ def classify_pairs(pno_spaces, occ_cas_idx, vir_cas_idx,
     log.info('  CAS pairs: %d', len(cas_pairs))
     log.info('  Strong pairs: %d  (LMP2: %.15g)', len(strong_pairs), e_lmp2_strong)
     log.info('  Weak pairs: %d  (LMP2: %.15g)', len(weak_pairs), e_lmp2_weak)
-    log.info('  Negligible pairs: %d', len(negligible_pairs))
+    log.info('  Negligible pairs: %d  (LMP2: %.15g)',
+             len(negligible_pairs), e_lmp2_negligible)
 
     return (cas_pairs, strong_pairs, weak_pairs, negligible_pairs,
-            e_lmp2_weak, e_lmp2_strong)
+            e_lmp2_weak, e_lmp2_strong, e_lmp2_negligible)
 
 
 def get_lmo_frag_list(C_lmo):

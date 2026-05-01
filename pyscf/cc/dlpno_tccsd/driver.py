@@ -421,7 +421,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # ------------------------------------------------------------------
     mo_coeff_ref = mo_loc if no_cas else mc.mo_coeff
     (cas_pairs, strong_pairs, weak_pairs, negligible_pairs,
-     e_lmp2_weak, e_lmp2_strong) = classify_pairs(
+     e_lmp2_weak, e_lmp2_strong, e_lmp2_negligible) = classify_pairs(
         pno_spaces, occ_cas_idx, vir_cas_idx,
         mo_coeff_ref, s1e,
         T_CutPairs=T_CutPairs, T_CutPairs_MP2=T_CutPairs_MP2,
@@ -429,10 +429,27 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
 
     print(f'  Pairs: {len(cas_pairs)} CAS  {len(strong_pairs)} strong  '
           f'{len(weak_pairs)} weak  {len(negligible_pairs)} negligible')
+    print(f'  Eliminated-pair SC-MP2 correction: {e_lmp2_negligible:.6e} Eh',
+          flush=True)
     if strong_pairs:
         pno_counts = [len(pno_spaces[p]['n_pno']) for p in strong_pairs]
         print(f'  Strong-pair PNOs: min={min(pno_counts)}  '
               f'max={max(pno_counts)}  avg={np.mean(pno_counts):.1f}')
+
+    # Filter pno_spaces to drop negligible pairs from CCSD (Psi4 algorithm:
+    # eliminated pairs contribute only the static SC-MP2 term added back to
+    # the final energy below). This shrinks the per-pair iteration set
+    # across all downstream phases (cc_ints, S_pno_cache, C/D/G plans,
+    # cycles) — fixing the N^2 vs Psi4 N^1.43 pair-count scaling gap.
+    # Override with DLPNO_KEEP_NEGLIGIBLE=1 to restore old behavior.
+    _drop_neg_env = not bool(int(
+        _os.environ.get('DLPNO_KEEP_NEGLIGIBLE', '0')))
+    if _drop_neg_env and negligible_pairs:
+        _negl_set = set((min(p), max(p)) for p in negligible_pairs)
+        pno_spaces = {k: v for k, v in pno_spaces.items()
+                       if k not in _negl_set}
+        print(f'  Dropped {len(_negl_set)} negligible pairs from CCSD '
+              f'(kept {len(pno_spaces)} pairs).', flush=True)
 
     # ------------------------------------------------------------------
     # Stage 5: DLPNO-TCCSD
@@ -534,7 +551,11 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # ------------------------------------------------------------------
     # Total energy
     # ------------------------------------------------------------------
-    e_total = mf.e_tot + e_tccsd + e_lmp2_weak + e_t
+    # e_lmp2_negligible: static SC-MP2 correction from pairs eliminated at
+    # screening (Psi4's "Eliminated Pair dE"). Was always implicitly
+    # included before via running CCSD over negligibles; now added back
+    # explicitly since we drop them from pno_spaces.
+    e_total = (mf.e_tot + e_tccsd + e_lmp2_weak + e_lmp2_negligible + e_t)
 
     print(f'\n  Timings:  localization={_t_loc:.2f}s  '
           f'CCSD={_t_ccsd:.2f}s  (T)={_t_triples:.2f}s  '
@@ -544,6 +565,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         'e_hf':         mf.e_tot,
         'e_dmrg':       e_dmrg,
         'e_lmp2_weak':  e_lmp2_weak,
+        'e_lmp2_negligible': e_lmp2_negligible,
         'e_tccsd':      e_tccsd,
         'e_t':          e_t,
         'e_total':      e_total,
