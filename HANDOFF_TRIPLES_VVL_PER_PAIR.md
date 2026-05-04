@@ -210,25 +210,65 @@ re-projection); NEW (Psi4-style) skips it. Both are valid DLPNO-(T).
 Psi4 chose NEW for the `n_pao_ijk² → n_pao_ijk` scaling win at the
 cost of this micro-Hartree-level approximation residual.
 
-### Remaining work (small)
+### Remaining work (DONE — see findings below)
 
-The perf win is currently masked because `vvL_sc` and `K_ab_cache` are
-STILL BUILT in the QVV_PAIR=1 path (the W3 just doesn't use them).
-To realize the predicted water-15 wall reduction (22.4s → ~12s):
+All dead-code paths gated. `DLPNObuild_triple_local_DF` skips vvL when
+passed NULL; orch skips K_ab_cache, t2_block, t2_T_all when QVV_PAIR=1.
 
-1. **Skip `DLPNObuild_triple_local_DF`'s vvL output when QVV_PAIR=1**.
-   Either:
-   - Add a flag to the kernel to skip vvL allocation/fill, OR
-   - Branch in orch and call a vvL-free version of the DF kernel.
-2. **Skip the K_ab_cache build in orch when QVV_PAIR=1** (line ~990 of
-   dlpno_triples_orch.c — wrap in `if (!_qvv_pair_enabled)`).
-3. **Skip the t2_block / t2_T_all builds when QVV_PAIR=1** (line ~860).
-4. **Skip the `if (use_per_pair) { ... } else { ... K_ab path }` else
-   branch entries** in W3 (since K_ab won't be available).
+### FINAL FINDINGS (2026-05-04)
 
-After (1)-(4), make `DLPNO_TRIPLE_QVV_PAIR=1` the default in driver.py.
-Validate water-4 / 8 / 10 / 15 / 22 (T) bit-stable to the new NEW
-anchors above. Verify wall reduction at water-15 (~12s expected).
+**Performance**: at our typical water-cluster sizes, NEW per-pair path
+is **slight regression** vs OLD, NOT the predicted speedup:
+
+| | OLD wall | NEW wall | Δ |
+|---|---|---|---|
+| water-4 (T) | 0.71s | 0.90s | +0.19s |
+| water-10 (T) | 7.10s | 8.20s | +1.10s |
+| water-15 (T) | 22.67s | 26.22s | +3.55s |
+
+The expected `n_pao_ijk² → n_pao_ijk × n_pno_pair` saving in vvL build
+**IS realized** (vvL build now skipped entirely under QVV_PAIR=1) — but
+the offsetting cost is HIGHER:
+- 3 separate q_vv_pair builds (instead of 1 vvL build)
+- 3 K_ovvv builds (replacing 1 K_ab_cache aggregate build)
+- 6 T_pair builds (replacing 9 t2_block + transpose to t2_T_all)
+
+The dgemm count goes UP (12 new blocks vs ~15 old blocks saved, similar
+counts but smaller each). The vvL² → vvL × n_pno_pair factor advantage
+is locally significant (water-15 vvL build alone ~6× cheaper) but is a
+small fraction of total (T) time. Other phases (jhi, ooL, U_cache,
+K_ooov, W3 main loop) don't change.
+
+**Win at much larger N** (water-30+, water-64) where `n_pao_ijk²` becomes
+the absolute dominant term, but at water-15 it's still subdominant.
+
+**Energy**: Psi4-equivalent algorithm differs from OLD path's anchor
+by μEh-level (TNO truncation residual scales with `1 - n_tno/n_pao_ijk`):
+
+| | OLD E(T) | NEW E(T) | Δ |
+|---|---|---|---|
+| water-4 | -0.0129205196 | -0.0129204369 | +83 nEh |
+| water-10 | -0.0323076110 | -0.0323088121 | -1.20 μEh |
+| water-15 | -0.0499725011 | -0.0500279808 | -55 μEh |
+
+This is the genuine algorithmic difference between OLD (computes
+`X_tno @ X_tno^T` projector implicitly) and NEW (Psi4-style, no
+projector). For Psi4 cross-validation, NEW gives Psi4-faithful values.
+For "match our historical anchor" goal, OLD wins.
+
+### Final disposition
+
+`DLPNO_TRIPLE_QVV_PAIR=1` is **available but not default**. The
+infrastructure is fully validated and performance-gated via env var.
+Use cases:
+- Cross-validation against Psi4 published E(T) values
+- Future scaling investigations at water-30+ or larger systems
+- Algorithmic studies of the per-pair vs full-vvL trade-off
+
+To make default-on later, also commit to:
+- New "anchor" energies (post-NEW) for downstream tests
+- Optional: optimize the per-pair kernel to consolidate 3 separate
+  q_vv builds into one (could close the perf gap or surpass OLD)
 
 ### Original (pre-implementation) Steps 1-4:
 

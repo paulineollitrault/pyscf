@@ -77,12 +77,20 @@ void DLPNObuild_triple_local_DF(
     const char N_flag = 'N', T_flag = 'T';
     const double one = 1.0, zero = 0.0;
 
+    /* If vvL_sc is NULL, the per-pair restructure path is in use and
+     * the full (n_tno, n_tno, naux) vvL tensor is not needed. Skip the
+     * n_pao_ijk² gather + dgemm work. (Caller passes NULL when QVV_PAIR=1.)
+     */
+    const int build_vvL = (vvL_sc != NULL);
+
     /* Raw output tensors (filled to zero, then per-center scattered). */
     const size_t ov_sz = (size_t)3 * (size_t)n_tno * (size_t)naux_ijk;
     const size_t vv_sz = (size_t)n_tno * (size_t)n_tno * (size_t)naux_ijk;
     const size_t oo_sz = (size_t)3 * (size_t)n_domain * (size_t)naux_ijk;
     double *ovL_raw = (double *)calloc(ov_sz > 0 ? ov_sz : 1, sizeof(double));
-    double *vvL_raw = (double *)calloc(vv_sz > 0 ? vv_sz : 1, sizeof(double));
+    double *vvL_raw = build_vvL
+        ? (double *)calloc(vv_sz > 0 ? vv_sz : 1, sizeof(double))
+        : NULL;
     double *ooL_raw = (double *)calloc(oo_sz > 0 ? oo_sz : 1, sizeof(double));
 
     /* Scratch buffers reused across centers. We allocate to upper bounds:
@@ -288,8 +296,9 @@ void DLPNObuild_triple_local_DF(
         /* ---- vvL: build qab_stack_cut (nQ_c, nu, nu), then per Q
          *           tmp[u, t] = qab_cut[q, u, :] @ X_Q[:, t]
          *           vvL_q[a, b] = X_Q.T[a, :] @ tmp[:, b]
-         *      and scatter to vvL_raw[a, b, local_Q[q]]. */
-        if (has_qab) {
+         *      and scatter to vvL_raw[a, b, local_Q[q]].
+         *      Skipped when build_vvL=0 (per-pair restructure path). */
+        if (has_qab && build_vvL) {
             /* qab_cut_buf[q, u, v] = qab_A[atom_pos[q], valid_uQ[u], valid_uQ[v]] */
             for (size_t q = 0; q < nQc; q++) {
                 const size_t pg = (size_t)atom_pos[q];
@@ -388,7 +397,7 @@ void DLPNObuild_triple_local_DF(
                ovL_raw,      &int_naux,
                &zero, ovL_sc, &int_naux);
     }
-    if (int_ntno_sq > 0) {
+    if (build_vvL && int_ntno_sq > 0) {
         dgemm_(&N_flag, &N_flag,
                &int_naux, &int_ntno_sq, &int_naux,
                &one, jhi,    &int_naux,
@@ -404,6 +413,6 @@ void DLPNObuild_triple_local_DF(
     }
 
     free(ovL_raw);
-    free(vvL_raw);
+    if (vvL_raw) free(vvL_raw);
     free(ooL_raw);
 }

@@ -734,15 +734,28 @@ double DLPNOcompute_one_triple_E_T0(
                     local_Q_sorted, atom_pos_sorted,
                     center_atoms, center_off, &n_centers);
 
+    /* Per-pair restructure (QVV_PAIR=1): vvL_sc unused — pass NULL to
+     * skip the n_pao_ijk² gather + dgemm work in the DF kernel.
+     * vvL_sc allocation is also skipped to save memory.
+     */
+    static int _qvv_pair_enabled = -1;
+    if (_qvv_pair_enabled < 0) {
+        const char *_env = getenv("DLPNO_TRIPLE_QVV_PAIR");
+        _qvv_pair_enabled = (_env && _env[0] == '1') ? 1 : 0;
+    }
     ENSURE(ovL_sc, double, (size_t)3 * n * naux_ijk);
-    ENSURE(vvL_sc, double, (size_t)n * n * naux_ijk);
+    if (!_qvv_pair_enabled) {
+        ENSURE(vvL_sc, double, (size_t)n * n * naux_ijk);
+    }
     ENSURE(ooL_sc, double, (size_t)3 * (size_t)n_dom * naux_ijk);
     double *ovL_sc = tscratch.ovL_sc;
-    double *vvL_sc = tscratch.vvL_sc;
+    double *vvL_sc = _qvv_pair_enabled ? NULL : tscratch.vvL_sc;
     double *ooL_sc = tscratch.ooL_sc;
     /* DF kernel zeros what it doesn't write; explicit memset for safety */
     memset(ovL_sc, 0, sizeof(double) * (size_t)3 * n * naux_ijk);
-    memset(vvL_sc, 0, sizeof(double) * (size_t)n * n * naux_ijk);
+    if (vvL_sc) {
+        memset(vvL_sc, 0, sizeof(double) * (size_t)n * n * naux_ijk);
+    }
     if (n_dom > 0) {
         memset(ooL_sc, 0, sizeof(double) * (size_t)3 * n_dom * naux_ijk);
     }
@@ -759,15 +772,10 @@ double DLPNOcompute_one_triple_E_T0(
 
     /* Per-pair q_vv build (Psi4-style restructure scaffold).
      * Replaces n_pao_ijk² factor in vvL with n_pao_ijk × n_pno_pair.
-     * Built ALONGSIDE vvL_sc; integration with K_ovvv + W3 follows
-     * (see HANDOFF_TRIPLES_VVL_PER_PAIR.md). Gated by env var
-     * DLPNO_TRIPLE_QVV_PAIR=1 — default off until W3 wiring lands.
+     * Built INSTEAD of vvL_sc when QVV_PAIR=1 (vvL_sc was passed NULL
+     * to the DF kernel above and is unused). Gated by env var
+     * DLPNO_TRIPLE_QVV_PAIR=1.
      */
-    static int _qvv_pair_enabled = -1;
-    if (_qvv_pair_enabled < 0) {
-        const char *_env = getenv("DLPNO_TRIPLE_QVV_PAIR");
-        _qvv_pair_enabled = (_env && _env[0] == '1') ? 1 : 0;
-    }
     if (_qvv_pair_enabled) {
         /* Allocate three scratches: pair (ij)=slot0, (jk)=slot1, (ik)=slot2 */
         const int n_pno_ij = n_pno_arr_3[0];
@@ -889,10 +897,17 @@ double DLPNOcompute_one_triple_E_T0(
      *   block = U_pk.T @ tmp  (n_tno × n_tno)
      *   if lmo_p > lmo_q: transpose block.
      */
-    ENSURE(t2_block, double, (size_t)9 * n * n);
-    double *t2_block = tscratch.t2_block;
-    memset(t2_block, 0, sizeof(double) * (size_t)9 * n * n);
-    {
+    /* Skip t2_block when QVV_PAIR=1 — replaced by per-perm T_pair builds.
+     * t2_block_u_pk_idx is still consulted by the T_pair build loop for
+     * canonical pair lookups + transpose flags.
+     */
+    double *t2_block = NULL;
+    if (!_qvv_pair_enabled) {
+        ENSURE(t2_block, double, (size_t)9 * n * n);
+        t2_block = tscratch.t2_block;
+        memset(t2_block, 0, sizeof(double) * (size_t)9 * n * n);
+    }
+    if (!_qvv_pair_enabled) {
         /* Find max n_pno across t2_block u_pks for scratch sizing */
         int max_npno_t2b = 0;
         for (int pq = 0; pq < 9; pq++) {
@@ -1109,11 +1124,12 @@ double DLPNOcompute_one_triple_E_T0(
         }
     }
 
-    /* K_ab_cache */
+    /* K_ab_cache — skipped when QVV_PAIR=1 (W3 uses K_ovvv instead). */
     TIC;
-    ENSURE(K_ab_cache, double, (size_t)3 * n * n * n);
-    double *K_ab_cache = tscratch.K_ab_cache;
-    {
+    double *K_ab_cache = NULL;
+    if (!_qvv_pair_enabled) {
+        ENSURE(K_ab_cache, double, (size_t)3 * n * n * n);
+        K_ab_cache = tscratch.K_ab_cache;
         ENSURE(t_tmp, double, (size_t)n * n * n);
         double *t_tmp = tscratch.t_tmp;
         int int_naux = naux_ijk;
@@ -1295,17 +1311,21 @@ double DLPNOcompute_one_triple_E_T0(
      */
     TOC(K_for_V);
 
-    /* t2_T_all + W3 marshalling */
+    /* t2_T_all + W3 marshalling. Skipped when QVV_PAIR=1 (T_pair_perm
+     * tensors replace t2_T_all in W3 Phase 1). */
     TIC;
-    ENSURE(t2_T_all, double, (size_t)9 * n * n);
-    double *t2_T_all = tscratch.t2_T_all;
-    for (int ir = 0; ir < 3; ir++) {
-        for (int iq = 0; iq < 3; iq++) {
-            const double *src = t2_block + (size_t)(ir * 3 + iq) * n * n;
-            double *dst = t2_T_all + (size_t)(ir * 3 + iq) * n * n;
-            for (int a = 0; a < n; a++) {
-                for (int b = 0; b < n; b++) {
-                    dst[(size_t)a * n + b] = src[(size_t)b * n + a];
+    double *t2_T_all = NULL;
+    if (!_qvv_pair_enabled) {
+        ENSURE(t2_T_all, double, (size_t)9 * n * n);
+        t2_T_all = tscratch.t2_T_all;
+        for (int ir = 0; ir < 3; ir++) {
+            for (int iq = 0; iq < 3; iq++) {
+                const double *src = t2_block + (size_t)(ir * 3 + iq) * n * n;
+                double *dst = t2_T_all + (size_t)(ir * 3 + iq) * n * n;
+                for (int a = 0; a < n; a++) {
+                    for (int b = 0; b < n; b++) {
+                        dst[(size_t)a * n + b] = src[(size_t)b * n + a];
+                    }
                 }
             }
         }
