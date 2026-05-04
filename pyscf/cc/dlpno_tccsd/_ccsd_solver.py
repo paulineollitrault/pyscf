@@ -5237,13 +5237,20 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             if ps is None:
                 continue
             # Build per-item target canonical pair index.
-            tgt = np.full(ps.N, -1, dtype=np.int32)
-            pairs_by_n_ij = g_plan['pairs_by_n_ij']
-            for n in range(ps.N):
-                n_ij_n, slot_n = target_slots[n]
-                if n_ij_n in pairs_by_n_ij:
-                    pyscf_pair = pairs_by_n_ij[n_ij_n][slot_n]
-                    tgt[n] = key_to_p.get(pyscf_pair, -1)
+            # Target array is cycle-invariant (depends only on plan
+            # structure + key_to_p). Cache on g_plan dict.
+            cache_k = f'_g_target_{suffix}_cached'
+            if cache_k in g_plan:
+                tgt = g_plan[cache_k]
+            else:
+                tgt = np.full(ps.N, -1, dtype=np.int32)
+                pairs_by_n_ij = g_plan['pairs_by_n_ij']
+                for n in range(ps.N):
+                    n_ij_n, slot_n = target_slots[n]
+                    if n_ij_n in pairs_by_n_ij:
+                        pyscf_pair = pairs_by_n_ij[n_ij_n][slot_n]
+                        tgt[n] = key_to_p.get(pyscf_pair, -1)
+                g_plan[cache_k] = tgt
             own.append(tgt)
             own.extend(po)
             if side == 'ik':
@@ -5438,17 +5445,25 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             c_plan_struct.max_n_pno   = int(bv['c_n_pno'].max(initial=1))
             c_plan_struct.max_n_ct    = int(bv['c_n_ct'].max(initial=1))
             c_plan_struct.max_n_other = int(bv['c_n_other'].max(initial=1))
-            c_target_ij_arr = np.full(c_N, -1, dtype=np.int32)
-            c_target_ji_arr = np.full(c_N, -1, dtype=np.int32)
-            c_n_pno_arr = bv['c_n_pno']
-            c_target_ij_off = bv['c_target_off_ij']
-            c_target_ji_off = bv['c_target_off_ji']
-            for n in range(c_N):
-                np_n = int(c_n_pno_arr[n])
-                if c_target_ij_off[n] >= 0:
-                    c_target_ij_arr[n] = _off_to_pair(c_target_ij_off[n], np_n)
-                if c_target_ji_off[n] >= 0:
-                    c_target_ji_arr[n] = _off_to_pair(c_target_ji_off[n], np_n)
+            # Target arrays are cycle-invariant (depend only on plan
+            # structure). Cache on bv after first build.
+            if 'c_target_ij_arr_cached' in bv:
+                c_target_ij_arr = bv['c_target_ij_arr_cached']
+                c_target_ji_arr = bv['c_target_ji_arr_cached']
+            else:
+                c_target_ij_arr = np.full(c_N, -1, dtype=np.int32)
+                c_target_ji_arr = np.full(c_N, -1, dtype=np.int32)
+                c_n_pno_arr = bv['c_n_pno']
+                c_target_ij_off = bv['c_target_off_ij']
+                c_target_ji_off = bv['c_target_off_ji']
+                for n in range(c_N):
+                    np_n = int(c_n_pno_arr[n])
+                    if c_target_ij_off[n] >= 0:
+                        c_target_ij_arr[n] = _off_to_pair(c_target_ij_off[n], np_n)
+                    if c_target_ji_off[n] >= 0:
+                        c_target_ji_arr[n] = _off_to_pair(c_target_ji_off[n], np_n)
+                bv['c_target_ij_arr_cached'] = c_target_ij_arr
+                bv['c_target_ji_arr_cached'] = c_target_ji_arr
             own.extend([ct_flat, t2_flat, c_target_ij_arr, c_target_ji_arr])
 
         # D side.
@@ -5489,17 +5504,23 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             d_plan_struct.max_n_pno = int(bv['d_n_pno'].max(initial=1))
             d_plan_struct.max_n_A   = int(bv['d_n_A'].max(initial=1))
             d_plan_struct.max_n_B   = int(bv['d_n_B'].max(initial=1))
-            d_target_ij_arr = np.full(d_N, -1, dtype=np.int32)
-            d_target_ji_arr = np.full(d_N, -1, dtype=np.int32)
-            d_n_pno_arr = bv['d_n_pno']
-            d_target_ij_off = bv['d_target_off_ij']
-            d_target_ji_off = bv['d_target_off_ji']
-            for n in range(d_N):
-                np_n = int(d_n_pno_arr[n])
-                if d_target_ij_off[n] >= 0:
-                    d_target_ij_arr[n] = _off_to_pair(d_target_ij_off[n], np_n)
-                if d_target_ji_off[n] >= 0:
-                    d_target_ji_arr[n] = _off_to_pair(d_target_ji_off[n], np_n)
+            if 'd_target_ij_arr_cached' in bv:
+                d_target_ij_arr = bv['d_target_ij_arr_cached']
+                d_target_ji_arr = bv['d_target_ji_arr_cached']
+            else:
+                d_target_ij_arr = np.full(d_N, -1, dtype=np.int32)
+                d_target_ji_arr = np.full(d_N, -1, dtype=np.int32)
+                d_n_pno_arr = bv['d_n_pno']
+                d_target_ij_off = bv['d_target_off_ij']
+                d_target_ji_off = bv['d_target_off_ji']
+                for n in range(d_N):
+                    np_n = int(d_n_pno_arr[n])
+                    if d_target_ij_off[n] >= 0:
+                        d_target_ij_arr[n] = _off_to_pair(d_target_ij_off[n], np_n)
+                    if d_target_ji_off[n] >= 0:
+                        d_target_ji_arr[n] = _off_to_pair(d_target_ji_off[n], np_n)
+                bv['d_target_ij_arr_cached'] = d_target_ij_arr
+                bv['d_target_ji_arr_cached'] = d_target_ji_arr
             own.extend([u_flat, dt_flat, d_target_ij_arr, d_target_ji_arr])
 
     return {
