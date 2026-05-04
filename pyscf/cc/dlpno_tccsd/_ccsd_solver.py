@@ -5277,37 +5277,67 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             n_ij = bucket['n_ij']
             n_kl = bucket['n_kl']
             N_b = len(bucket['kl_keys'])
-            T_arr = np.empty((N_b, n_kl, n_kl))
-            beta_kl_arr = np.empty(N_b)
-            beta_lk_arr = np.empty(N_b)
-            p_ij_arr    = np.empty(N_b, dtype=np.int32)
-            dense_k_arr = np.empty(N_b, dtype=np.int32)
-            dense_l_arr = np.empty(N_b, dtype=np.int32)
-            for n in range(N_b):
-                T_arr[n] = t2_pno_all[bucket['kl_keys'][n]]
-                key_ij_n, k_n, l_n = bucket['beta_coords'][n]
-                B_tilde = b_tilde_per_ij[key_ij_n]
-                if isinstance(B_tilde, tuple):
-                    B_local, p_dense = B_tilde
-                    dk = int(p_dense[k_n]); dl = int(p_dense[l_n])
-                    beta_kl_arr[n] = B_local[dk, dl]
-                    beta_lk_arr[n] = (0.0 if k_n == l_n
-                                       else B_local[dl, dk])
-                else:
-                    dk = int(k_n); dl = int(l_n)
-                    beta_kl_arr[n] = B_tilde[dk, dl]
-                    beta_lk_arr[n] = (0.0 if k_n == l_n
-                                       else B_tilde[dl, dk])
-                p_ij_arr[n]    = key_to_p.get(key_ij_n, -1)
-                dense_k_arr[n] = dk
-                dense_l_arr[n] = dl
-            S_c = np.ascontiguousarray(bucket['S'])
-            T_c = np.ascontiguousarray(T_arr)
-            K_c = np.ascontiguousarray(bucket['K'])
-            same_c = np.ascontiguousarray(bucket['same']).astype(
-                np.uint8, copy=False)
-            idx_c = np.ascontiguousarray(bucket['item_idx']).astype(
-                np.int64, copy=False)
+            # Cache cycle-invariant arrays on the bucket dict (built once
+            # per CCSD run; bucket survives across cycles via plan_cache).
+            # Per-cycle work is reduced to: T_arr refill + scalar wiring.
+            # Beta arrays are intentionally NOT computed here — the C++
+            # solver refreshes them from B_tilde_flat at the top of
+            # run_one_cycle (lines ~1601-1612 of dlpno_ccsd_solver.cpp),
+            # so any work here is dead.
+            inv = bucket.get('_inv_cache')
+            if inv is None:
+                p_ij_arr    = np.empty(N_b, dtype=np.int32)
+                dense_k_arr = np.empty(N_b, dtype=np.int32)
+                dense_l_arr = np.empty(N_b, dtype=np.int32)
+                for n in range(N_b):
+                    key_ij_n, k_n, l_n = bucket['beta_coords'][n]
+                    B_tilde = b_tilde_per_ij[key_ij_n]
+                    if isinstance(B_tilde, tuple):
+                        _, p_dense = B_tilde
+                        dk = int(p_dense[k_n]); dl = int(p_dense[l_n])
+                    else:
+                        dk = int(k_n); dl = int(l_n)
+                    p_ij_arr[n]    = key_to_p.get(key_ij_n, -1)
+                    dense_k_arr[n] = dk
+                    dense_l_arr[n] = dl
+                # T_buf and beta arrays — allocated once, refilled in place.
+                T_buf       = np.empty((N_b, n_kl, n_kl))
+                beta_kl_arr = np.empty(N_b)
+                beta_lk_arr = np.empty(N_b)
+                S_c = np.ascontiguousarray(bucket['S'])
+                K_c = np.ascontiguousarray(bucket['K'])
+                same_c = np.ascontiguousarray(bucket['same']).astype(
+                    np.uint8, copy=False)
+                idx_c = np.ascontiguousarray(bucket['item_idx']).astype(
+                    np.int64, copy=False)
+                # Pre-resolve the t2_pno_all references for fast per-cycle
+                # refill (saves dict lookups in the hot loop).
+                kl_refs = [t2_pno_all[k] for k in bucket['kl_keys']]
+                inv = {
+                    'T_buf': T_buf, 'beta_kl': beta_kl_arr,
+                    'beta_lk': beta_lk_arr,
+                    'p_ij_arr': p_ij_arr, 'dense_k_arr': dense_k_arr,
+                    'dense_l_arr': dense_l_arr,
+                    'S_c': S_c, 'K_c': K_c, 'same_c': same_c, 'idx_c': idx_c,
+                    'kl_refs': kl_refs,
+                }
+                bucket['_inv_cache'] = inv
+
+            T_buf       = inv['T_buf']
+            beta_kl_arr = inv['beta_kl']
+            beta_lk_arr = inv['beta_lk']
+            p_ij_arr    = inv['p_ij_arr']
+            dense_k_arr = inv['dense_k_arr']
+            dense_l_arr = inv['dense_l_arr']
+            S_c         = inv['S_c']
+            K_c         = inv['K_c']
+            same_c      = inv['same_c']
+            idx_c       = inv['idx_c']
+            # Per-cycle: refill T_buf in place from current t2_pno_all values.
+            kl_refs = inv['kl_refs']
+            for n, src in enumerate(kl_refs):
+                np.copyto(T_buf[n], src)
+            T_c = T_buf  # alias; already contiguous (np.empty default)
             n_pairs_in_group = len(be_plan['pairs_by_n_ij'][n_ij])
             buckets_arr[b_idx].N = int(N_b)
             buckets_arr[b_idx].n_ij = int(n_ij)
