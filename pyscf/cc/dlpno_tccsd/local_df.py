@@ -782,7 +782,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 'partner_calls': 0.0, 'centerQ_inner': 0.0,
                 'partner_enum': 0.0, 'pair_alloc': 0.0,
                 'partner_flat': 0.0, 'flat_scatter': 0.0,
-                'returnpack': 0.0, 'pair_total': 0.0}
+                'returnpack': 0.0, 'pair_total': 0.0,
+                'cQ_pair_kernel': 0.0, 'cQ_partner_kernel': 0.0}
     _dbg_lock = _ccints_threading.Lock()
     def _dbg_add(k, v):
         if _dbg_ccints:
@@ -1087,6 +1088,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     proj_ij = None
                 _proj_ptr = (proj_ij if proj_ij is not None
                              else np.empty(0))
+                _t_pk_start = (_ccints_time.perf_counter()
+                               if _dbg_ccints else 0.0)
                 _libcc_centerQ.DLPNOpair_centerQ_step(
                     _qij_full.ctypes.data_as(_ctypes_cQ.c_void_p),
                     _qia_full.ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1109,6 +1112,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     raw_ab.ctypes.data_as(_ctypes_cQ.c_void_p),
                     _proj_ptr.ctypes.data_as(_ctypes_cQ.c_void_p),
                 )
+                if _dbg_ccints:
+                    _dbg_add('cQ_pair_kernel',
+                             _ccints_time.perf_counter() - _t_pk_start)
             else:
                 # raw_io[local_Q, p_lmos_local] = qij_b[:, i_s, kept]
                 if i_s >= 0 and ext_kept_lmos.size > 0:
@@ -1184,6 +1190,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 _np_full = _qia_full.shape[2]
                 _nao_pao_total = riatom_to_paos_ext_dense.shape[1]
 
+                _t_pn_start = (_ccints_time.perf_counter()
+                               if _dbg_ccints else 0.0)
                 if _kj_flat is not None and do_proj:
                     _libcc_centerQ.DLPNOpartners_centerQ_step(
                         _proj_c.ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1228,6 +1236,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         _ki_flat['raw_cross_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _ki_flat['raw_kv_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                     )
+                if _dbg_ccints:
+                    _dbg_add('cQ_partner_kernel',
+                             _ccints_time.perf_counter() - _t_pn_start)
             else:
                 for k, X_kj, pp_kj, n_kj in kj_data:
                     k_s = int(riatom_to_lmos_ext_dense[centerQ, k])

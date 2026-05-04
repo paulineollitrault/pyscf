@@ -18,15 +18,19 @@
  *   raw_kv_p[local_Q[q], m]
  *       = sum_u qia_b[q, k_s, kj_u_in_Q[u]] * X_k_slice[u, m]
  *
+ * Two DGEMMs per partner replace the scalar (q, b, m, u) loop nest:
+ *   gather proj_ij[:, :, kj_u_in_Q] → proj_gather (nQp, npno, npp_kj)
+ *   DGEMM:  (nQp*npno, npp_kj) @ X_k_slice (npp_kj, n_kj)
+ *           → (nQp*npno, n_kj)  scatter to raw_cross_p
+ *   gather qia[atom_pos, k_s, kj_u_in_Q] → qia_gather (nQp, npp_kj)
+ *   DGEMM:  (nQp, npp_kj) @ X_k_slice (npp_kj, n_kj) → (nQp, n_kj)
+ *           scatter to raw_kv_p
+ *
  * The kernel is serial (one pair at a time); outer parallelism stays
- * over pairs via the Python ThreadPoolExecutor. partner_apply (C) was
- * already serial-per-call too, so this only collapses Python wrappers,
- * not concurrency. Same compute as
- * pyscf/lib/cc/dlpno_partner.c::DLPNOpartner_apply repeated per
- * partner.
+ * over pairs via the Python ThreadPoolExecutor.
  *
  * Skips partners with npp_kj == 0 (empty PAO intersection at this
- * centerQ). The output offsets for skipped partners are still written
+ * centerQ). Output offsets for skipped partners are still written
  * with whatever was there — caller must zero-init the raw_cross /
  * raw_kv buffers once per pair before the centerQ loop (they are
  * accumulators across centerQ).
@@ -45,6 +49,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vhf/fblas.h"
 
 void DLPNOpartners_centerQ_step(
         const double *proj_ij,                /* (nQp, npno, np_full) */
@@ -79,6 +84,28 @@ void DLPNOpartners_centerQ_step(
     const size_t qia_q  = nl * np_full;
     const size_t qia_l  = np_full;
 
+    static const char N_flag = 'N';
+    static const double one = 1.0;
+    static const double zero = 0.0;
+
+    /* Reusable scratch — sized by max n_pao_k across partners (cheap upper
+     * bound; alloc once per call). proj_gather/qia_gather/X_slice/cross_loc/
+     * kv_loc capacities grow to fit largest partner. */
+    long *kj_u_in_pair = NULL;
+    long *kj_u_in_Q    = NULL;
+    long  cap_pao = 0;
+
+    double *X_slice    = NULL;
+    long    cap_X      = 0;
+    double *proj_gather = NULL;
+    long    cap_proj    = 0;
+    double *cross_loc  = NULL;
+    long    cap_cross  = 0;
+    double *qia_gather = NULL;
+    long    cap_qiag   = 0;
+    double *kv_loc     = NULL;
+    long    cap_kv     = 0;
+
     for (int p = 0; p < n_partners; p++) {
         const long n_kj = partner_n_kj[p];
         if (n_kj <= 0) continue;
@@ -89,10 +116,13 @@ void DLPNOpartners_centerQ_step(
         const long k_global = partner_k_arr[p];
         const long k_s = riatom_to_lmos_dense_at[k_global];
 
-        /* Build kj_u_in_pair, kj_u_in_Q on heap (stack VLAs are problematic
-         * for OMP-clean code; n_pao_k ≤ ~150 so this malloc is cheap). */
-        long *kj_u_in_pair = (long *)malloc(sizeof(long) * (size_t)n_pao_k);
-        long *kj_u_in_Q    = (long *)malloc(sizeof(long) * (size_t)n_pao_k);
+        if (n_pao_k > cap_pao) {
+            free(kj_u_in_pair); free(kj_u_in_Q);
+            cap_pao = n_pao_k;
+            kj_u_in_pair = (long *)malloc(sizeof(long) * (size_t)cap_pao);
+            kj_u_in_Q    = (long *)malloc(sizeof(long) * (size_t)cap_pao);
+        }
+
         long npp_kj = 0;
         for (long u = 0; u < n_pao_k; u++) {
             const long pao_global = pp_k[u];
@@ -103,16 +133,17 @@ void DLPNOpartners_centerQ_step(
                 npp_kj++;
             }
         }
-        if (npp_kj == 0) {
-            free(kj_u_in_pair); free(kj_u_in_Q);
-            continue;
-        }
+        if (npp_kj == 0) continue;
 
         /* X_k_slice (npp_kj, n_kj) — gather rows of X_k. */
-        double *X_k_slice = (double *)malloc(
-            sizeof(double) * (size_t)npp_kj * (size_t)n_kj);
+        const long need_X = npp_kj * n_kj;
+        if (need_X > cap_X) {
+            free(X_slice);
+            cap_X = need_X;
+            X_slice = (double *)malloc(sizeof(double) * (size_t)cap_X);
+        }
         for (long u = 0; u < npp_kj; u++) {
-            memcpy(X_k_slice + (size_t)u * (size_t)n_kj,
+            memcpy(X_slice + (size_t)u * (size_t)n_kj,
                    X_k + (size_t)kj_u_in_pair[u] * (size_t)n_kj,
                    sizeof(double) * (size_t)n_kj);
         }
@@ -120,55 +151,105 @@ void DLPNOpartners_centerQ_step(
         double *raw_cross_p = raw_cross_flat + partner_cross_off[p];
         double *raw_kv_p    = raw_kv_flat    + partner_kv_off[p];
 
-        /* raw_cross_p[local_Q[q], b, m] = sum_u proj_ij[q, b, kj_u_in_Q[u]]
-         *                                * X_k_slice[u, m]
-         *
-         * Memory layout reminder:
-         *   raw_cross_p has shape (n_local_total, npno, n_kj) — write only the
-         *   local_Q[q] rows; other rows untouched (caller pre-zeroed once per pair).
+        /* ---- raw_cross via DGEMM ----
+         * Gather proj_ij[q, b, kj_u_in_Q[u]] → proj_gather (nQp, npno, npp_kj)
+         * Then cross_loc(nQp*npno, n_kj) = proj_gather(nQp*npno, npp_kj)
+         *                                   @ X_slice(npp_kj, n_kj)
+         * In Fortran column-major DGEMM:
+         *   M=n_kj, N=nQp*npno, K=npp_kj
+         *   A = X_slice(n_kj, npp_kj)  [row-major (npp_kj,n_kj) == col-major (n_kj,npp_kj)]
+         *   B = proj_gather(npp_kj, nQp*npno) [row-major (nQp*npno,npp_kj)]
+         *   C = cross_loc(n_kj, nQp*npno)     [row-major (nQp*npno,n_kj)]
          */
-        const size_t cross_row_stride = npno * (size_t)n_kj;
-        const size_t cross_b_stride   = (size_t)n_kj;
+        const long need_proj = (long)nQp * (long)npno * npp_kj;
+        if (need_proj > cap_proj) {
+            free(proj_gather);
+            cap_proj = need_proj;
+            proj_gather = (double *)malloc(sizeof(double) * (size_t)cap_proj);
+        }
+        const long need_cross_loc = (long)nQp * (long)npno * n_kj;
+        if (need_cross_loc > cap_cross) {
+            free(cross_loc);
+            cap_cross = need_cross_loc;
+            cross_loc = (double *)malloc(sizeof(double) * (size_t)cap_cross);
+        }
+        /* Gather: tight inner loop over u (contiguous in dest). */
         for (size_t q = 0; q < nQp; q++) {
-            const size_t row = (size_t)local_Q[q];
             const double *proj_q_ptr = proj_ij + q * proj_q;
-            double *cross_row_ptr = raw_cross_p + row * cross_row_stride;
+            double *pg_q = proj_gather + q * npno * (size_t)npp_kj;
             for (size_t b = 0; b < npno; b++) {
                 const double *proj_qb = proj_q_ptr + b * proj_b;
-                double *cross_qb = cross_row_ptr + b * cross_b_stride;
-                for (long m = 0; m < n_kj; m++) {
-                    double s = 0.0;
-                    for (long u = 0; u < npp_kj; u++) {
-                        s += proj_qb[kj_u_in_Q[u]]
-                             * X_k_slice[(size_t)u * (size_t)n_kj + (size_t)m];
-                    }
-                    cross_qb[m] = s;
+                double *pg_qb = pg_q + b * (size_t)npp_kj;
+                for (long u = 0; u < npp_kj; u++) {
+                    pg_qb[u] = proj_qb[kj_u_in_Q[u]];
                 }
             }
         }
+        {
+            int M = (int)n_kj;
+            int N = (int)(nQp * npno);
+            int K = (int)npp_kj;
+            int lda = M, ldb = K, ldc = M;
+            dgemm_(&N_flag, &N_flag, &M, &N, &K,
+                   &one, X_slice, &lda,
+                   proj_gather, &ldb,
+                   &zero, cross_loc, &ldc);
+        }
+        /* Scatter cross_loc[q, b, m] → raw_cross_p[local_Q[q], b, m]. */
+        const size_t cross_row_stride = npno * (size_t)n_kj;
+        for (size_t q = 0; q < nQp; q++) {
+            const size_t row = (size_t)local_Q[q];
+            memcpy(raw_cross_p + row * cross_row_stride,
+                   cross_loc + q * cross_row_stride,
+                   sizeof(double) * cross_row_stride);
+        }
 
-        /* raw_kv_p[local_Q[q], m] = sum_u qia[atom_pos[q], k_s, kj_u_in_Q[u]]
-         *                          * X_k_slice[u, m] */
+        /* ---- raw_kv via DGEMM ----
+         * Gather qia[atom_pos[q], k_s, kj_u_in_Q[u]] → qia_gather (nQp, npp_kj)
+         * Then kv_loc(nQp, n_kj) = qia_gather(nQp, npp_kj) @ X_slice(npp_kj, n_kj)
+         */
         if (k_s >= 0) {
+            const long need_qiag = (long)nQp * npp_kj;
+            if (need_qiag > cap_qiag) {
+                free(qia_gather);
+                cap_qiag = need_qiag;
+                qia_gather = (double *)malloc(sizeof(double) * (size_t)cap_qiag);
+            }
+            const long need_kv = (long)nQp * n_kj;
+            if (need_kv > cap_kv) {
+                free(kv_loc);
+                cap_kv = need_kv;
+                kv_loc = (double *)malloc(sizeof(double) * (size_t)cap_kv);
+            }
             for (size_t q = 0; q < nQp; q++) {
-                const size_t row = (size_t)local_Q[q];
-                const size_t pg  = (size_t)atom_pos[q];
+                const size_t pg = (size_t)atom_pos[q];
                 const double *qia_qk = qia_atom_full + pg * qia_q
                                        + (size_t)k_s * qia_l;
-                double *kv_row = raw_kv_p + row * (size_t)n_kj;
-                for (long m = 0; m < n_kj; m++) {
-                    double s = 0.0;
-                    for (long u = 0; u < npp_kj; u++) {
-                        s += qia_qk[kj_u_in_Q[u]]
-                             * X_k_slice[(size_t)u * (size_t)n_kj + (size_t)m];
-                    }
-                    kv_row[m] = s;
+                double *qg_q = qia_gather + q * (size_t)npp_kj;
+                for (long u = 0; u < npp_kj; u++) {
+                    qg_q[u] = qia_qk[kj_u_in_Q[u]];
                 }
             }
+            {
+                int M = (int)n_kj;
+                int N = (int)nQp;
+                int K = (int)npp_kj;
+                int lda = M, ldb = K, ldc = M;
+                dgemm_(&N_flag, &N_flag, &M, &N, &K,
+                       &one, X_slice, &lda,
+                       qia_gather, &ldb,
+                       &zero, kv_loc, &ldc);
+            }
+            for (size_t q = 0; q < nQp; q++) {
+                const size_t row = (size_t)local_Q[q];
+                memcpy(raw_kv_p + row * (size_t)n_kj,
+                       kv_loc + q * (size_t)n_kj,
+                       sizeof(double) * (size_t)n_kj);
+            }
         }
-
-        free(kj_u_in_pair);
-        free(kj_u_in_Q);
-        free(X_k_slice);
     }
+
+    free(kj_u_in_pair); free(kj_u_in_Q);
+    free(X_slice); free(proj_gather); free(cross_loc);
+    free(qia_gather); free(kv_loc);
 }
