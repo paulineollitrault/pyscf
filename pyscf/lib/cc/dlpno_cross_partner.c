@@ -6,20 +6,24 @@
  * dispatches per CCSD run on water-10 (≈6s wall).
  *
  * Per partner k (single-side; called once per side: kj and ki):
- *   cross_fitted[q, a, m] = sum_p jhi[q, p] * raw_cross[k][p, a, m]
- *   J_kj[a, m]            = sum_q q_io[q, k_loc] * cross_fitted[q, a, m]
- *   q_kv[q, m]            = sum_p jhi[q, p] * raw_kv[k][p, m]
- *   K_kj[a, m]            = sum_q q_iv[q, a] * q_kv[q, m]
+ *   alpha[q] = sum_p jhi[q, p] * q_io[p, k_loc]   (= jhi @ q_ik, jhi sym)
+ *   J_kj[a, m] = sum_p alpha[p] * raw_cross[k][p, a, m]
+ *              = (raw_cross[k] viewed as (n_local, npno*n_kj))^T @ alpha
+ *   K_kj[a, m] = sum_p Z_iv[a, p] * raw_kv[k][p, m]   (Z_iv = q_iv^T @ jhi)
  *
  * The kernel processes all partners on one side in one C call. Outer
  * parallelism stays over pairs via the Python ThreadPoolExecutor; this
- * kernel is serial. Per-partner work uses BLAS (dgemm) via vhf/fblas.h.
+ * kernel is serial. Per-partner work uses BLAS (dgemv/dgemm) via vhf/fblas.h.
  *
- * Hoisted optimisation vs the line-by-line Python:
- *   - Precompute Z = q_iv^T @ jhi  (npno × n_local) once (caller's job).
- *     Then K_kj[k] = Z @ raw_kv[k]   (one dgemm per partner, instead of
+ * Hoisted optimisations vs the line-by-line Python:
+ *   - Precompute Z_iv = q_iv^T @ jhi  (npno × n_local) once (caller's job).
+ *     Then K_kj[k] = Z_iv @ raw_kv[k]   (one dgemm per partner, instead of
  *     two: jhi @ raw_kv  +  q_iv.T @ result).
- *   This is the only algebraic shortcut; everything else mirrors Python.
+ *   - Hoist alpha = jhi @ q_ik out of the (npno*n_kj) axis: J_kj is
+ *     a single DGEMV on raw_cross_p (n_local, npno*n_kj) instead of a
+ *     full DGEMM on jhi @ raw_cross_p followed by a DGEMV — saves the
+ *     intermediate (n_local, npno*n_kj) materialisation and reduces
+ *     FLOPs by ~npno*n_kj×.
  *
  * Flat-buffer layout (built by Python wrapper per pair, used once
  * per cc_ints build per pair):
@@ -48,7 +52,7 @@ void DLPNOcross_partner_assemble(
         const double  *raw_cross_flat,
         const long    *raw_kv_off,
         const double  *raw_kv_flat,
-        const double  *jhi,           /* (n_local, n_local) */
+        const double  *jhi,           /* (n_local, n_local), symmetric */
         const double  *q_io,          /* (n_local, nlmo_p) */
         const double  *Z_iv,          /* (npno, n_local) — q_iv^T @ jhi, precomputed */
         const long    *J_out_off,
@@ -61,17 +65,17 @@ void DLPNOcross_partner_assemble(
 {
     if (n_partners <= 0) return;
 
-    const char N_flag = 'N', T_flag = 'T';
-    const double one = 1.0, zero = 0.0;
-    const int int_one = 1;
+    static const char N_flag = 'N';
+    static const double one = 1.0, zero = 0.0;
+    static const int int_one = 1;
     const int int_n_local = (int)n_local;
     const int int_npno = (int)npno;
+    const int incx_qio = (int)nlmo_p;
 
-    /* Per-thread scratch:
-     * cross_fitted (n_local * npno * n_kj_k_max) — biggest
-     * jhi_q_ik    (n_local) — q_ik @ jhi, per partner
-     * Allocated per partner since n_kj varies. Cheap mallocs; this kernel
-     * is the per-pair serial inner from a multi-pair OMP parent. */
+    /* Per-partner alpha vector (n_local). Single allocation reused; jhi is the
+     * same across partners but q_ik = q_io[:, k_loc] varies per partner. */
+    double *alpha = (double *)malloc(sizeof(double) * n_local);
+
     for (int p = 0; p < n_partners; p++) {
         const long n_kj = partner_n_kj[p];
         const long k_loc = partner_k_loc[p];
@@ -83,62 +87,39 @@ void DLPNOcross_partner_assemble(
         double       *J_out_p     = J_out_flat     + J_out_off[p];
         double       *K_out_p     = K_out_flat     + K_out_off[p];
 
-        const size_t cross_size = n_local * npno * (size_t)n_kj;
-        const size_t kv_size    = n_local * (size_t)n_kj;
-        double *cross_fitted = (double *)malloc(sizeof(double) * cross_size);
-        double *q_kv         = (double *)malloc(sizeof(double) * kv_size);
+        /* alpha = jhi @ q_ik (n_local).  q_ik is q_io[:, k_loc] — column of
+         * row-major q_io (n_local, nlmo_p), accessed via vector with stride
+         * nlmo_p starting at q_io[k_loc]. jhi is symmetric so jhi @ q_ik
+         * == jhi^T @ q_ik; we use the row-major-friendly form
+         * dgemv('N', n_local, n_local) treating jhi as col-major
+         * (n_local, n_local) — same numerical result by symmetry. */
+        dgemv_(&N_flag, &int_n_local, &int_n_local,
+               &one, jhi, &int_n_local,
+               q_io + (size_t)k_loc, &incx_qio,
+               &zero, alpha, &int_one);
 
-        /* cross_fitted (n_local, npno*n_kj) = jhi (n_local, n_local) @ raw_cross_p_flat
-         * Row-major: C[m, n] = sum_k A[m, k] * B[k, n]
-         * Col-major dgemm: dgemm('N','N', N_, M_, K_, 1, B, N_, A, K_, 0, C, N_)
-         * with M=n_local, K=n_local, N=npno*n_kj
+        /* J_kj[a*n_kj + m] = sum_p alpha[p] * raw_cross_p[p, a*n_kj + m]
+         *                  = raw_cross_p^T @ alpha
+         *
+         * raw_cross_p is row-major (n_local, npno*n_kj). Treating it as
+         * col-major (npno*n_kj, n_local), the operation y = A @ x with
+         * A = raw_cross_p_col, x = alpha, y = J_out_p
+         * → dgemv('N', npno*n_kj, n_local, ...).
          */
         const int N_cross = (int)((size_t)int_npno * (size_t)int_n_kj);
-        dgemm_(&N_flag, &N_flag,
-               &N_cross, &int_n_local, &int_n_local,
-               &one, raw_cross_p, &N_cross,
-               jhi, &int_n_local,
-               &zero, cross_fitted, &N_cross);
-
-        /* J_kj[a, m] = sum_q q_io[q, k_loc] * cross_fitted[q, a*n_kj + m]
-         * Treating cross_fitted as (n_local, npno*n_kj):
-         *   J_flat[am] = sum_q q_io[q, k_loc] * cross_fitted[q, am]
-         * This is a dgemv: y = A^T @ x with A = cross_fitted (n_local, npno*n_kj),
-         *                                  x = q_io[:, k_loc] (n_local,)
-         * Col-major: dgemv('N', npno*n_kj, n_local, 1, A_col, npno*n_kj, x, 1, 0, y, 1)
-         * We need q_io_col_k = the k_loc-th column of q_io (row-major (n_local, nlmo_p)
-         * → col-major (nlmo_p, n_local)): in row-major, column k_loc has stride nlmo_p
-         * starting at q_io[k_loc]. We can pass it as a vec with incx = nlmo_p.
-         */
-        const int incx_qio = (int)nlmo_p;
         dgemv_(&N_flag, &N_cross, &int_n_local,
-               &one, cross_fitted, &N_cross,
-               q_io + (size_t)k_loc, &incx_qio,
+               &one, raw_cross_p, &N_cross,
+               alpha, &int_one,
                &zero, J_out_p, &int_one);
 
-        /* q_kv (n_local, n_kj) = jhi (n_local, n_local) @ raw_kv_p (n_local, n_kj) */
-        dgemm_(&N_flag, &N_flag,
-               &int_n_kj, &int_n_local, &int_n_local,
-               &one, raw_kv_p, &int_n_kj,
-               jhi, &int_n_local,
-               &zero, q_kv, &int_n_kj);
-
-        /* K_kj (npno, n_kj) = Z_iv (npno, n_local) @ q_kv (n_local, n_kj)
-         * Recall Z_iv = q_iv^T @ jhi (precomputed by caller, since jhi is sym).
-         * Wait — Python has K = q_iv.T @ jhi @ raw_kv_kj[k]
-         *                  = (q_iv.T @ jhi) @ raw_kv_kj[k]
-         *                  = Z_iv @ raw_kv_kj[k]
-         * So we can skip the q_kv intermediate and just use Z_iv @ raw_kv_p directly.
-         * But we computed q_kv above for clarity; it's equivalent because jhi is symmetric.
-         * For the output we use Z_iv @ raw_kv_p (one matmul).
-         */
+        /* K_kj (npno, n_kj) = Z_iv (npno, n_local) @ raw_kv_p (n_local, n_kj).
+         * (Original Python: K = q_iv.T @ jhi @ raw_kv, fused via Z_iv.)  */
         dgemm_(&N_flag, &N_flag,
                &int_n_kj, &int_npno, &int_n_local,
                &one, raw_kv_p, &int_n_kj,
                Z_iv, &int_n_local,
                &zero, K_out_p, &int_n_kj);
-
-        free(cross_fitted);
-        free(q_kv);
     }
+
+    free(alpha);
 }
