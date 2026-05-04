@@ -5411,13 +5411,26 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
         c_N = bv['c_N']
         if c_N > 0:
             # Gather ct_flat + t2_flat per cycle.
-            ct_flat = np.zeros(int(bv['c_ct_off'][-1]))
-            for n in range(c_N):
-                ct_val = (C_tilde_cache.get(bv['c_ct_keys'][n])
-                          if C_tilde_cache is not None else None)
-                if ct_val is not None and ct_val.shape[0] == int(bv['c_n_ct'][n]):
-                    ct_flat[bv['c_ct_off'][n]:bv['c_ct_off'][n + 1]] = (
-                        ct_val.ravel())
+            # ct_flat scratch buffer is cycle-invariant in size; keep it in
+            # bv so we don't reallocate every cycle. Likewise cache the
+            # offsets/sizes as Python ints so the inner refill loop avoids
+            # numpy.int64 box-unbox overhead.
+            if 'c_ct_flat_buf' not in bv:
+                bv['c_ct_flat_buf'] = np.zeros(int(bv['c_ct_off'][-1]))
+                bv['_c_ct_off_int'] = [int(x) for x in bv['c_ct_off']]
+                bv['_c_n_ct_int']   = [int(x) for x in bv['c_n_ct']]
+            ct_flat = bv['c_ct_flat_buf']
+            ct_flat.fill(0.0)
+            _c_ct_off_int = bv['_c_ct_off_int']
+            _c_n_ct_int   = bv['_c_n_ct_int']
+            _c_ct_keys    = bv['c_ct_keys']
+            if C_tilde_cache is not None:
+                _ctc_get = C_tilde_cache.get
+                for n in range(c_N):
+                    ct_val = _ctc_get(_c_ct_keys[n])
+                    if ct_val is not None and ct_val.shape[0] == _c_n_ct_int[n]:
+                        ct_flat[_c_ct_off_int[n]:_c_ct_off_int[n + 1]] = (
+                            ct_val.ravel())
             t2_flat = np.empty(int(bv['c_t2_off'][-1]))
             gather_t2_with_transpose(
                 c_N, bv['c_n_other'],
@@ -5475,14 +5488,22 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                 bv['d_t2_canon_off'], bv['d_t2_trans_arr'],
                 bv['d_u_off'], t2_pno_all._buffer, u_flat,
                 min(64, d_N))
-            dt_flat = np.zeros(int(bv['d_dt_off'][-1]))
-            for n in range(d_N):
-                dk = bv['d_dt_keys'][n]
-                dt_val = (D_tilde_cache.get(dk)
-                          if D_tilde_cache is not None else None)
-                if dt_val is not None:
-                    dt_flat[bv['d_dt_off'][n]:bv['d_dt_off'][n + 1]] = (
-                        dt_val.ravel())
+            # Same caching pattern as ct_flat: persistent buffer + Python-int
+            # offset list to skip numpy box-unbox per item.
+            if 'd_dt_flat_buf' not in bv:
+                bv['d_dt_flat_buf'] = np.zeros(int(bv['d_dt_off'][-1]))
+                bv['_d_dt_off_int'] = [int(x) for x in bv['d_dt_off']]
+            dt_flat = bv['d_dt_flat_buf']
+            dt_flat.fill(0.0)
+            _d_dt_off_int = bv['_d_dt_off_int']
+            _d_dt_keys    = bv['d_dt_keys']
+            if D_tilde_cache is not None:
+                _dtc_get = D_tilde_cache.get
+                for n in range(d_N):
+                    dt_val = _dtc_get(_d_dt_keys[n])
+                    if dt_val is not None:
+                        dt_flat[_d_dt_off_int[n]:_d_dt_off_int[n + 1]] = (
+                            dt_val.ravel())
             d_plan_struct = PyDTermInputs()
             d_plan_struct.N         = int(d_N)
             d_plan_struct.n_pno_arr = bv['d_n_pno'].ctypes.data
