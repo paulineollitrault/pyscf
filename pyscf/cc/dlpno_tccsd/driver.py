@@ -215,7 +215,12 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         _mkl_n = int(_os.environ.get('MKL_NUM_THREADS', '0') or 0)
         _blas_pinned = (_omp_n == 1) and (_mkl_n == 1)
         if _blas_pinned:
-            _n_pool = max(1, ncores)
+            # Empirical sweet spot on EC2 64-core: pool=32 beats pool=64 by
+            # ~2s on water-15 CCSD. Above ~32 workers, malloc contention +
+            # brief GIL holds in numpy dispatch start to dominate. Cap at
+            # 32 unless caller overrides via env DLPNO_POOL_MAX_WORKERS.
+            _pool_cap = int(_os.environ.get('DLPNO_POOL_MAX_WORKERS', '32'))
+            _n_pool = max(1, min(ncores, _pool_cap))
         else:
             _n_pool = max(1, ncores // 2)
         _shared_pool = (
