@@ -3116,7 +3116,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             strong_pair_keys = list(t2_for_T.keys())
             screening = _build_screen(
                 mf.mol, _auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
-                T_CUT_MKN=T_CUT_MKN, T_CUT_CLMO=_T_CUT_CLMO, C_pao=C_pao)
+                T_CUT_MKN=T_CUT_MKN, T_CUT_CLMO=_T_CUT_CLMO, C_pao=C_pao,
+                _pool=_pool)
             _bi("_build_screen")
             # Pass the shared thread pool so the per-aux-shell loop runs
             # parallel. Without this, _build_sparse iterates serially over
