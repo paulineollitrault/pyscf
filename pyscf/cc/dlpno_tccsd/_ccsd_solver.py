@@ -5154,7 +5154,12 @@ def _build_t34_plan(plan_obj, side, t1_cache, t2_pno_all, ord_idx_lookup,
         # Per-iter t2_flat / u_flat gather.  side='d' uses u (anti-sym),
         # side='c' uses raw t2.  The plan_obj has 't4_use_u' flag.
         t4_use_u = (side == 'd')
-        t2_flat = np.empty(int(bv['t4_t2_off'][-1]))
+        # Cache t2_flat buffer on bv (size cycle-invariant).
+        if '_t4_t2_flat_buf' in bv:
+            t2_flat = bv['_t4_t2_flat_buf']
+        else:
+            t2_flat = np.empty(int(bv['t4_t2_off'][-1]))
+            bv['_t4_t2_flat_buf'] = t2_flat
         if t4_use_u:
             gather_u_from_t2(
                 t4_N, bv['t4_n_li'],
@@ -5442,7 +5447,12 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                     if ct_val is not None and ct_val.shape[0] == _c_n_ct_int[n]:
                         ct_flat[_c_ct_off_int[n]:_c_ct_off_int[n + 1]] = (
                             ct_val.ravel())
-            t2_flat = np.empty(int(bv['c_t2_off'][-1]))
+            # Cache t2_flat scratch buffer on bv (size cycle-invariant).
+            if '_c_t2_flat_buf' in bv:
+                t2_flat = bv['_c_t2_flat_buf']
+            else:
+                t2_flat = np.empty(int(bv['c_t2_off'][-1]))
+                bv['_c_t2_flat_buf'] = t2_flat
             gather_t2_with_transpose(
                 c_N, bv['c_n_other'],
                 bv['c_t2_canon_off'], bv['c_t2_trans_arr'],
@@ -5493,7 +5503,12 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
         # D side.
         d_N = bv['d_N']
         if d_N > 0:
-            u_flat = np.empty(int(bv['d_u_off'][-1]))
+            # Cache u_flat scratch buffer (size cycle-invariant).
+            if '_d_u_flat_buf' in bv:
+                u_flat = bv['_d_u_flat_buf']
+            else:
+                u_flat = np.empty(int(bv['d_u_off'][-1]))
+                bv['_d_u_flat_buf'] = u_flat
             gather_u_from_t2(
                 d_N, bv['d_n_A'],
                 bv['d_t2_canon_off'], bv['d_t2_trans_arr'],
@@ -7083,8 +7098,13 @@ def _extract_g_term_plan(t2_pno_all, key_to_p, side='ik'):
     pyscf_t2_buffer = t2_pno_all._buffer
 
     # Build per-iter t2_flat by gather (mimics _run_g_term_batched).
+    # Cache the t2_flat buffer on side_bv (same size every cycle).
     from pyscf.cc.dlpno_tccsd._cd_gather_cy import gather_t2_with_transpose
-    t2_flat = np.empty(int(side_bv['t2_off'][-1]))
+    if '_t2_flat_buf' in side_bv:
+        t2_flat = side_bv['_t2_flat_buf']
+    else:
+        t2_flat = np.empty(int(side_bv['t2_off'][-1]))
+        side_bv['_t2_flat_buf'] = t2_flat
     gather_t2_with_transpose(
         N, side_bv['n_ik'],
         side_bv['t2_canon_off'], side_bv['t2_trans_arr'],
