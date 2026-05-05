@@ -5131,10 +5131,16 @@ def _build_t34_plan(plan_obj, side, t1_cache, t2_pno_all, ord_idx_lookup,
         t3_struct.t1_flat   = t1_cache._buffer.ctypes.data
         t3_struct.max_n_kl  = int(bv['t3_n_kl'].max(initial=1))
         t3_struct.max_n_ki  = int(bv['t3_n_ki'].max(initial=1))
-        t3_target_ord = np.empty(t3_N, dtype=np.int32)
-        for n in range(t3_N):
-            n_ki_n, slot_n = bv['t3_target_slot'][n]
-            t3_target_ord[n] = _slot_to_ord(n_ki_n, slot_n)
+        # t3_target_ord is cycle-invariant (depends only on plan structure
+        # + ord_idx_lookup). Cache on bv.
+        if 't3_target_ord_cached' in bv:
+            t3_target_ord = bv['t3_target_ord_cached']
+        else:
+            t3_target_ord = np.empty(t3_N, dtype=np.int32)
+            for n in range(t3_N):
+                n_ki_n, slot_n = bv['t3_target_slot'][n]
+                t3_target_ord[n] = _slot_to_ord(n_ki_n, slot_n)
+            bv['t3_target_ord_cached'] = t3_target_ord
         own.append(t3_target_ord)
         own.extend([bv['t3_n_kl'], bv['t3_n_ki'], bv['t3_K_off'],
                     bv['t3_S_off'], bv['t3_t1i_off'], bv['t3_T1l_off'],
@@ -5186,10 +5192,15 @@ def _build_t34_plan(plan_obj, side, t1_cache, t2_pno_all, ord_idx_lookup,
         t4_struct.max_n_ki      = int(bv['t4_n_ki'].max(initial=1))
         t4_struct.max_n_li      = int(bv['t4_n_li'].max(initial=1))
         t4_struct.max_n_kl      = int(bv['t4_n_kl'].max(initial=1))
-        t4_target_ord = np.empty(t4_N, dtype=np.int32)
-        for n in range(t4_N):
-            n_ki_n, slot_n = bv['t4_target_slot'][n]
-            t4_target_ord[n] = _slot_to_ord(n_ki_n, slot_n)
+        # t4_target_ord cycle-invariant — cache on bv.
+        if 't4_target_ord_cached' in bv:
+            t4_target_ord = bv['t4_target_ord_cached']
+        else:
+            t4_target_ord = np.empty(t4_N, dtype=np.int32)
+            for n in range(t4_N):
+                n_ki_n, slot_n = bv['t4_target_slot'][n]
+                t4_target_ord[n] = _slot_to_ord(n_ki_n, slot_n)
+            bv['t4_target_ord_cached'] = t4_target_ord
         own.append(t4_target_ord)
         own.extend([bv['t4_n_ki'], bv['t4_n_li'], bv['t4_n_kl'],
                     bv['t4_S_ki_li_off'], bv['t4_S_li_kl_off'],
@@ -5597,25 +5608,35 @@ def _add_t34_plans_to_natives(natives, native_own, t1_cache, t2_pno_all,
         natives['d_t4_target_ord'] = d_t34['t4_target_ord']
 
     # ----- Per-CD-item ord_pair_idx for native ct_flat/dt_flat gather. ---
+    # Both arrays are cycle-invariant (depend only on bv keys + ord_idx_lookup);
+    # cache on bv.
     bv = natives.get('cd_bv')
     if bv is not None:
         c_N = bv['c_N']
         if c_N > 0:
-            c_ct_ord_pair_idx = np.empty(c_N, dtype=np.int32)
-            for n in range(c_N):
-                k, i = bv['c_ct_keys'][n]  # ordered pair (k, i)
-                c_ct_ord_pair_idx[n] = ord_idx_lookup.get((k, i), -1)
+            if 'c_ct_ord_pair_idx_cached' in bv:
+                c_ct_ord_pair_idx = bv['c_ct_ord_pair_idx_cached']
+            else:
+                c_ct_ord_pair_idx = np.empty(c_N, dtype=np.int32)
+                for n in range(c_N):
+                    k, i = bv['c_ct_keys'][n]  # ordered pair (k, i)
+                    c_ct_ord_pair_idx[n] = ord_idx_lookup.get((k, i), -1)
+                bv['c_ct_ord_pair_idx_cached'] = c_ct_ord_pair_idx
             native_own.append(c_ct_ord_pair_idx)
             natives['c_ct_ord_pair_idx'] = c_ct_ord_pair_idx
 
         d_N = bv['d_N']
         if d_N > 0:
-            d_dt_ord_pair_idx = np.empty(d_N, dtype=np.int32)
-            for n in range(d_N):
-                # bv['d_dt_keys'] holds the ordered pair (k, i) keys for
-                # D_tilde lookups (matches bv['c_ct_keys'] semantics).
-                k, i = bv['d_dt_keys'][n]
-                d_dt_ord_pair_idx[n] = ord_idx_lookup.get((k, i), -1)
+            if 'd_dt_ord_pair_idx_cached' in bv:
+                d_dt_ord_pair_idx = bv['d_dt_ord_pair_idx_cached']
+            else:
+                d_dt_ord_pair_idx = np.empty(d_N, dtype=np.int32)
+                for n in range(d_N):
+                    # bv['d_dt_keys'] holds the ordered pair (k, i) keys for
+                    # D_tilde lookups (matches bv['c_ct_keys'] semantics).
+                    k, i = bv['d_dt_keys'][n]
+                    d_dt_ord_pair_idx[n] = ord_idx_lookup.get((k, i), -1)
+                bv['d_dt_ord_pair_idx_cached'] = d_dt_ord_pair_idx
             native_own.append(d_dt_ord_pair_idx)
             natives['d_dt_ord_pair_idx'] = d_dt_ord_pair_idx
 
