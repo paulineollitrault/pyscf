@@ -574,7 +574,8 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                                t1_cache=None, _pool=None,
                                Fij_bar_precomputed=None,
                                Fij_bar_precomputed_keys=None,
-                               cc_ints_flat=None, pair_index=None):
+                               cc_ints_flat=None, pair_index=None,
+                               _plan_only=False):
     """T1 residual EXACTLY matching Psi4's structure (DePrince Eqs 19-22).
 
     R[i, a_ii] = Fai[i,a_ii] + A[i,a] + C[i,a] - B[i,a] - A2[i,a]
@@ -1261,6 +1262,12 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     _ba_work = _pkl_plan['_ba_work']
     _per_task_plan = _pkl_plan['_per_task_plan']
     _batched_plan = _pkl_plan['_batched_plan']
+
+    # Plan-only fast path: caller (CCSD MONO PACK-ONCE setup) needs the
+    # cached plan but discards the residual itself. Skip the actual
+    # computation — saves ~1.0s of one-time setup on water-15.
+    if _plan_only:
+        return {}
 
     def _per_kl(arg_with_plan):
         plan = arg_with_plan

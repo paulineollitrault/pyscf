@@ -5687,11 +5687,15 @@ def run_remaining_cycles_via_class(
     _t_setup0 = _time.perf_counter()
     if hasattr(_compute_t1_residual_psi4, '_per_kl_plan_cache'):
         _compute_t1_residual_psi4._per_kl_plan_cache.clear()
+    # Plan-only call: builds + caches _per_kl_plan_cache without running
+    # the residual computation itself (we discard the result anyway).
+    # Saves ~1.0s of one-time setup on water-15.
     _compute_t1_residual_psi4(
         t1_pno, t2_pno_all, pno_spaces, fov_pno, F_lmo, eps_lmo, nocc,
         S_pno_cache, cc_ints, ovL_pno_cache=ovL_pno_cache,
         pair_lmo_idx=pair_lmo_idx, t1_cache=None, _pool=None,
-        cc_ints_flat=cc_ints_flat, pair_index=pair_index)
+        cc_ints_flat=cc_ints_flat, pair_index=pair_index,
+        _plan_only=True)
     t1_cache = build_t1_cache(t1_pno, _pi, S_pno_cache, pno_spaces)
     _all_keys = sorted(t2_pno_all.keys())
     inputs, ownership, key_to_p, aux = pack_for_t1_ints(
