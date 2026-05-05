@@ -816,7 +816,7 @@ _CC_INTS_FLAT_FIELDS_2D = (
 )
 
 
-def flatten_cc_ints_fields(cc_ints, pair_index):
+def flatten_cc_ints_fields(cc_ints, pair_index, _pool=None):
     """Replace per-pair tensor fields in ``cc_ints`` with flat-buffer views.
 
     For each of the 12 tensor fields listed above, build one
@@ -828,12 +828,18 @@ def flatten_cc_ints_fields(cc_ints, pair_index):
     The ``cc_ints`` dict is mutated in place.  Nested dicts, scalars,
     and metadata fields are left untouched.
 
+    If ``_pool`` is provided, the 12 fields are flattened in parallel —
+    each field is independent (different sub-dict keys) and the inner
+    numpy copy releases the GIL.
+
     Parameters
     ----------
     cc_ints : dict
         ``{pair_key: per_pair_dict | None}`` as produced by
         ``compute_cc_integrals_sparse``.
     pair_index : PairIndex
+    _pool : concurrent.futures.Executor, optional
+        Thread pool for parallel per-field flatten.
 
     Returns
     -------
@@ -841,45 +847,49 @@ def flatten_cc_ints_fields(cc_ints, pair_index):
         For each flattened field, the shared flat store exposing
         ``.buffer`` / ``.offsets`` / ``.shapes`` for Cython consumers.
     """
-    # Precompute the set of pair keys whose entry is present and non-None,
-    # indexed by canonical pair_idx.  Missing / None pairs get
-    # zero-shaped slots in the flat buffer.
-    flat_stores = {}
+    canonical_keys = pair_index.canonical_keys
 
-    for rank, field_list in (
-        (3, _CC_INTS_FLAT_FIELDS_3D),
-        (2, _CC_INTS_FLAT_FIELDS_2D),
-    ):
+    def _flatten_one_field(field, rank):
         zero_shape = (0,) * rank
-        for field in field_list:
-            def shape_fn(p, field=field, zero_shape=zero_shape):
-                key = pair_index.canonical_keys[p]
-                entry = cc_ints.get(key)
-                if entry is None:
-                    return zero_shape
-                arr = entry.get(field)
-                if arr is None:
-                    return zero_shape
-                return tuple(arr.shape)
 
-            store = FlatTensorStore(pair_index, shape_fn=shape_fn)
+        def shape_fn(p, field=field, zero_shape=zero_shape):
+            key = canonical_keys[p]
+            entry = cc_ints.get(key)
+            if entry is None:
+                return zero_shape
+            arr = entry.get(field)
+            if arr is None:
+                return zero_shape
+            return tuple(arr.shape)
 
-            # Seed the buffer + replace each entry's ndarray with a view.
-            # Processed pair-by-pair so the old ndarray's refcount drops
-            # to zero as soon as we overwrite the dict slot, keeping the
-            # memory peak at ~ total_size_of_field + one pair's data.
-            for p, key in enumerate(pair_index.canonical_keys):
-                entry = cc_ints.get(key)
-                if entry is None:
-                    continue
-                arr = entry.get(field)
-                if arr is None:
-                    continue
-                store[key] = arr             # copy into flat buffer
-                entry[field] = store.at(p)   # replace with view
-            flat_stores[field] = store
+        store = FlatTensorStore(pair_index, shape_fn=shape_fn)
 
-    return flat_stores
+        # Seed the buffer + replace each entry's ndarray with a view.
+        # Processed pair-by-pair so the old ndarray's refcount drops
+        # to zero as soon as we overwrite the dict slot.
+        for p, key in enumerate(canonical_keys):
+            entry = cc_ints.get(key)
+            if entry is None:
+                continue
+            arr = entry.get(field)
+            if arr is None:
+                continue
+            store[key] = arr             # copy into flat buffer
+            entry[field] = store.at(p)   # replace with view
+        return field, store
+
+    tasks = (
+        [(f, 3) for f in _CC_INTS_FLAT_FIELDS_3D]
+        + [(f, 2) for f in _CC_INTS_FLAT_FIELDS_2D]
+    )
+
+    if _pool is not None and len(tasks) > 1:
+        results = list(_pool.map(
+            lambda ft: _flatten_one_field(ft[0], ft[1]), tasks))
+    else:
+        results = [_flatten_one_field(f, r) for f, r in tasks]
+
+    return dict(results)
 
 
 # ----------------------------------------------------------------------

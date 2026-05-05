@@ -1843,7 +1843,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # buffer.  The `_cc_ints_flat` handle is kept around for Phase 4's
     # Cython kernels (``.buffer`` / ``.offsets`` / ``.shapes``).
     _t_flat = _time_cc.perf_counter()
-    _cc_ints_flat = flatten_cc_ints_fields(_cc_ints, _pair_index)
+    _cc_ints_flat = flatten_cc_ints_fields(_cc_ints, _pair_index, _pool=_pool)
     print(f'  [cc_ints_flat] {len(_cc_ints_flat)} fields flattened, '
           f'{_time_cc.perf_counter() - _t_flat:.2f}s '
           f'total_buffer={sum(s.buffer.size for s in _cc_ints_flat.values())*8/2**20:.1f} MB',
