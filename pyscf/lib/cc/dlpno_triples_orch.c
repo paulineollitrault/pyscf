@@ -1279,23 +1279,8 @@ double DLPNOcompute_one_triple_E_T0(
             const double *U_rr = U_flat_cache + U_off_cache[u_idx];
             /* t1_lmo[r, a] = sum_p U_rr[p, a] * t1_r[p]
              * row-major: out (n,) = U_rr.T (n, n_pno) @ t1_r (n_pno,)
-             * Use dgemv_ — simpler. */
-            int int_n_pno = n_pno;
-            extern void dgemv_(const char *, const int *, const int *,
-                                const double *, const double *, const int *,
-                                const double *, const int *,
-                                const double *, double *, const int *);
-            int one_inc = 1;
-            const char Tc_v = 'T';
-            dgemv_(&Tc_v, &int_n_pno, &int_n,
-                   &one, U_rr, &int_n_pno,
-                   t1_r, &one_inc,
-                   &zero, t1_lmo + (size_t)r * n, &one_inc);
-            /* Wait — dgemv computes y = α op(A) x + β y.  The row-major
-             * U_rr as col-major (n_tno, n_pno)? With LDA, etc., it's confusing.
-             *
-             * Simpler approach: hand-roll the matvec.
-             */
+             * Hand-rolled matvec (avoids a dgemv_ that mis-handled n_pno=0
+             * and crashed MKL with "Parameter 6" errors at water-22+). */
             for (int a = 0; a < n; a++) {
                 double s = 0.0;
                 for (int p = 0; p < n_pno; p++) {
@@ -1535,9 +1520,14 @@ double DLPNOcompute_E_T0_omp(
             desired_threads = atoi(omp_env);
         }
         if (desired_threads <= 0) {
-            /* Auto: cap at 16, or to min(omp_max, hw_cores/4) heuristic. */
-            const int omp_max = omp_get_max_threads();
-            desired_threads = omp_max < 16 ? omp_max : 16;
+            /* Auto: pin to 16 unconditionally. We deliberately ignore
+             * omp_get_max_threads() because callers commonly set
+             * OMP_NUM_THREADS=1 to keep MKL single-threaded — that
+             * would collapse our parallel-for to 1 thread and serialize
+             * the entire (T) phase (Phase B wall == CPU sum, the
+             * smoking-gun symptom of this bug). 16 was empirically
+             * the sweet spot before; >16 oversubscribes BLAS+NUMA. */
+            desired_threads = 16;
         }
         omp_set_num_threads(desired_threads);
     }
