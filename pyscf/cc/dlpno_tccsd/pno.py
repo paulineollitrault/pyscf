@@ -316,26 +316,85 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     # implement blocked (occ,domain) approach. Here we use the simple incore path.
     if hasattr(mf, 'with_df') and mf.with_df is not None:
         log.info('Building LMO/PAO DF 3-index integrals...')
+        import time as _t_pno_pre
+        _pno_pre_prof = bool(int(os.environ.get('DLPNO_PNO_PRE_PROF', '0')))
+        def _pmark_pre(label, t0):
+            if _pno_pre_prof:
+                print(f'  [PNO-PRE] {label}: '
+                      f'{_t_pno_pre.perf_counter() - t0:.2f}s', flush=True)
+        _t = _t_pno_pre.perf_counter()
         ovL = _build_ovL(mf.with_df, C_lmo, C_pao, max_memory=mf.max_memory)
+        _pmark_pre('_build_ovL', _t)
         # ovL[i, a, L]: i = LMO index, a = PAO index (global), L = aux index
         use_df = True
         # Also build raw 3-center integrals for local DF K (matching Psi4)
+        _t = _t_pno_pre.perf_counter()
         _auxmol = mf.with_df.auxmol
         _naux = _auxmol.nao_nr()
         _pmol = mf.mol + _auxmol
         _shls = (0, mf.mol.nbas, 0, mf.mol.nbas,
                  mf.mol.nbas, mf.mol.nbas + _auxmol.nbas)
         _raw_3c = _pmol.intor('int3c2e', shls_slice=_shls)  # (nao, nao, naux)
+        _pmark_pre("intor('int3c2e')", _t)
+        _t = _t_pno_pre.perf_counter()
         _j2c = _auxmol.intor('int2c2e')  # (naux, naux) Coulomb metric
-        # Precompute raw_3c @ C_pao for half-transform
-        _raw_half_pao = np.tensordot(_raw_3c, C_pao, axes=([1], [0]))  # (nao, naux, npao)
+        _pmark_pre("intor('int2c2e')", _t)
+        # Precompute raw_3c @ C_pao for half-transform.
+        # _raw_3c is (nao, nao, naux); we contract its axis-1 with C_pao
+        # axis-0 → output (nao, naux, npao).  np.tensordot reduces to
+        # ONE single-threaded BLAS dgemm here (~3 s on water-15) because
+        # MKL is pinned to 1 thread by DLPNO_POOL_PIN_BLAS.  Split the
+        # output's leading u-axis across the shared pool so each worker
+        # processes a thin slab; this releases the GIL inside the BLAS
+        # call and yields ~30× speedup on water-15.
+        _t = _t_pno_pre.perf_counter()
+        nao_loc = _raw_3c.shape[0]
+        _naux_loc = _raw_3c.shape[2]
+        _npao_loc = C_pao.shape[1]
+        _raw_half_pao = np.empty((nao_loc, _naux_loc, _npao_loc),
+                                  dtype=_raw_3c.dtype)
+        if _pool is not None and nao_loc > 16:
+            n_workers = 32
+            chunk = max(1, (nao_loc + n_workers - 1) // n_workers)
+            ranges = [(s, min(s + chunk, nao_loc))
+                       for s in range(0, nao_loc, chunk)]
+            def _slab_half(rng):
+                s, e = rng
+                # _raw_3c[s:e]: (n, nao, naux); contract axis 1 with C_pao
+                # axis 0 → (n, naux, npao).
+                _raw_half_pao[s:e] = np.tensordot(
+                    _raw_3c[s:e], C_pao, axes=([1], [0]))
+            list(_pool.map(_slab_half, ranges))
+        else:
+            _raw_half_pao[:] = np.tensordot(
+                _raw_3c, C_pao, axes=([1], [0]))
         del _raw_3c
+        _pmark_pre('tensordot raw_3c @ C_pao', _t)
         # Hoist the LMO contraction out of the per-pair Phase 1 loop.
-        # _raw_lmo_pao[i, Q, b] = sum_u C_lmo[u, i] * _raw_half_pao[u, Q, b]
-        # Each pair then slices columns instead of fancy-indexing the full
-        # (nao, naux, npao) tensor (which copies ~115 MB per pair on water10).
-        _raw_lmo_pao = np.tensordot(
-            C_lmo, _raw_half_pao, axes=([0], [0]))  # (nocc_lmo, naux, npao)
+        # _raw_lmo_pao[i, Q, b] = sum_u C_lmo[u, i] * _raw_half_pao[u, Q, b].
+        # Same parallelisation: split the output occupied axis i across the
+        # pool so each worker drives one BLAS call (much smaller than the
+        # half-transform — typically ~0.3 s — but free win).
+        _t = _t_pno_pre.perf_counter()
+        _nocc_lmo_loc = C_lmo.shape[1]
+        _raw_lmo_pao = np.empty((_nocc_lmo_loc, _naux_loc, _npao_loc),
+                                 dtype=_raw_half_pao.dtype)
+        if _pool is not None and _nocc_lmo_loc > 8:
+            n_workers = 16
+            chunk = max(1, (_nocc_lmo_loc + n_workers - 1) // n_workers)
+            ranges = [(s, min(s + chunk, _nocc_lmo_loc))
+                       for s in range(0, _nocc_lmo_loc, chunk)]
+            def _slab_lmo(rng):
+                s, e = rng
+                # C_lmo[:, s:e] is (nao, n); contract its axis-0 with
+                # _raw_half_pao axis-0 → (n, naux, npao).
+                _raw_lmo_pao[s:e] = np.tensordot(
+                    C_lmo[:, s:e], _raw_half_pao, axes=([0], [0]))
+            list(_pool.map(_slab_lmo, ranges))
+        else:
+            _raw_lmo_pao[:] = np.tensordot(
+                C_lmo, _raw_half_pao, axes=([0], [0]))
+        _pmark_pre('tensordot C_lmo @ raw_half_pao', _t)
     else:
         log.info('Building LMO/PAO exact 4-index integrals (no density fitting)...')
         from pyscf import ao2mo as _ao2mo_mod
@@ -361,28 +420,38 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     # (asymmetric split based on diagonal weights, NOT a row sum)
     _lmo_aux_mask = None
     if use_df and s1e is not None:
+        _t_mkn = _t_pno_pre.perf_counter()
         _ao_labels = mf.mol.ao_labels(fmt=False)
         _atom_ids = np.array([lbl[0] for lbl in _ao_labels])
         _aux_atom_ids = np.array([lbl[0] for lbl in _auxmol.ao_labels(fmt=False)])
         _T_CutMKN = 1e-3
         _natm = mf.mol.natm
-        _lmo_aux_mask = []
-        for ii in range(nocc_lmo):
+        _atom_id_masks = [(_atom_ids == a) for a in range(_natm)]
+        def _mkn_per_lmo(ii):
             c_i = C_lmo[:, ii]
             P_i = s1e * c_i[:, None] * c_i[None, :]
             p_diag = np.diag(P_i)
             sum_diag = p_diag[:, None] + p_diag[None, :]
             with np.errstate(divide='ignore', invalid='ignore'):
-                w_u = np.where(sum_diag > 1e-15, p_diag[:, None] / sum_diag, 0.0)
-                w_v = np.where(sum_diag > 1e-15, p_diag[None, :] / sum_diag, 0.0)
-            contrib_u = P_i * w_u   # contribution to atom of row index u
-            contrib_v = P_i * w_v   # contribution to atom of col index v
-            mkn_pop = np.zeros(_natm)
+                w_u = np.where(sum_diag > 1e-15,
+                               p_diag[:, None] / sum_diag, 0.0)
+                w_v = np.where(sum_diag > 1e-15,
+                               p_diag[None, :] / sum_diag, 0.0)
+            contrib_u = P_i * w_u
+            contrib_v = P_i * w_v
+            mkn_pop = np.empty(_natm)
             for a in range(_natm):
-                mask_a = (_atom_ids == a)
-                mkn_pop[a] = np.sum(contrib_u[mask_a, :]) + np.sum(contrib_v[:, mask_a])
-            _lmo_aux_mask.append(
-                np.isin(_aux_atom_ids, np.where(np.abs(mkn_pop) > _T_CutMKN)[0]))
+                m = _atom_id_masks[a]
+                mkn_pop[a] = (np.sum(contrib_u[m, :])
+                              + np.sum(contrib_v[:, m]))
+            return np.isin(
+                _aux_atom_ids,
+                np.where(np.abs(mkn_pop) > _T_CutMKN)[0])
+        if _pool is not None and nocc_lmo > 1:
+            _lmo_aux_mask = list(_pool.map(_mkn_per_lmo, range(nocc_lmo)))
+        else:
+            _lmo_aux_mask = [_mkn_per_lmo(ii) for ii in range(nocc_lmo)]
+        _pmark_pre('Mulliken aux loop', _t_mkn)
 
     pno_spaces = {}
     strong_pairs = []
@@ -495,6 +564,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
           f'orth={_p1_sub["orth"]:.1f} df={_p1_sub["df"]:.1f} '
           f'solve={_p1_sub["solve"]:.1f} eigh={_p1_sub["eigh"]:.1f} '
           f'mp2={_p1_sub["mp2"]:.1f}', flush=True)
+    _t_p1_collect = _pno_time_p1.perf_counter()
     _t_p2a_start = _pno_time_p1.perf_counter()
     # ===================================================================
     # Phase 2a: Build INITIAL PNOs from direct SC-MP2 T2

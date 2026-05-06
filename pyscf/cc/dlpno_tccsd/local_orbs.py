@@ -12,6 +12,7 @@ Primary template: Ye & Berkelbach lnocc/lno.py (pyscf-forge lnocc branch)
 PAO construction translated from Jiang/psi4 dlpnobase.cc setup_orbitals()
 """
 
+import os
 import numpy as np
 from functools import reduce
 from pyscf import lib, lo
@@ -241,23 +242,32 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
         ni = numint.NumInt()
         doi_iu = np.zeros((nocc_lmo, nao))
 
-        # Evaluate AO values on grid in blocks
-        for ao_val, mask, weight, coords in ni.block_loop(mol, grids, nao):
-            # ao_val: (npts, nao) AO values at grid points
-            # weight: (npts,) quadrature weights
-            npts = ao_val.shape[0]
-
-            # LMO values at grid points: phi_i(r) = sum_mu C_lmo[mu,i] * chi_mu(r)
-            lmo_vals = ao_val @ C_lmo  # (npts, nocc)
-            # PAO values at grid points: phi_u(r) = sum_mu C_pao[mu,u] * chi_mu(r)
-            pao_vals = ao_val @ C_pao  # (npts, nao)
-
-            # Square and weight: w(r) * |phi_i(r)|^2 and |phi_u(r)|^2
-            lmo_sq_w = lmo_vals ** 2 * weight[:, None]  # (npts, nocc)
-            pao_sq = pao_vals ** 2  # (npts, nao)
-
-            # Accumulate DOI^2 = sum_r w(r) |phi_i(r)|^2 |phi_u(r)|^2
-            doi_iu += lmo_sq_w.T @ pao_sq  # (nocc, nao)
+        # Evaluate AO values on grid in blocks.  Per-block work is dominated
+        # by three single-thread matmuls (`ao_val @ C_lmo`, `ao_val @ C_pao`,
+        # `lmo_sq_w.T @ pao_sq`) — under DLPNO_POOL_PIN_BLAS each matmul
+        # runs on 1 thread, which makes this the largest single-CPU stretch
+        # in make_paos (~4 s on water-22).  Lift the BLAS thread cap for
+        # the duration of the loop so each matmul uses all cores.
+        try:
+            from threadpoolctl import threadpool_limits as _tpl
+        except ImportError:
+            _tpl = None
+        _ctx_mgr = (_tpl(limits=int(os.environ.get('DLPNO_GRID_BLAS', '32')))
+                    if _tpl is not None else None)
+        try:
+            if _ctx_mgr is not None:
+                _ctx_mgr.__enter__()
+            for ao_val, mask, weight, coords in ni.block_loop(mol, grids, nao):
+                # ao_val: (npts, nao) AO values at grid points
+                # weight: (npts,) quadrature weights
+                lmo_vals = ao_val @ C_lmo
+                pao_vals = ao_val @ C_pao
+                lmo_sq_w = lmo_vals ** 2 * weight[:, None]
+                pao_sq = pao_vals ** 2
+                doi_iu += lmo_sq_w.T @ pao_sq
+        finally:
+            if _ctx_mgr is not None:
+                _ctx_mgr.__exit__(None, None, None)
 
         doi_iu = np.sqrt(doi_iu)
 
