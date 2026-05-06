@@ -514,12 +514,25 @@ def _preload_df_integrals(with_df):
     triangular format, ready for _ao2mo.nr_e2.  Reading the HDF5 file
     once up-front makes all subsequent integral transforms thread-safe
     and eliminates redundant I/O.
+
+    Pre-allocates the destination and copies chunks straight into it —
+    the previous chunks-list + np.vstack roundtrip doubled the memory
+    traffic (chunk → list → final array) and the vstack ran serial in
+    Python, costing ~0.5 s on water-22 and scaling N^2 with system size.
     """
     naux = with_df.get_naoaux()
-    chunks = []
+    Lpq_full = None
+    p1 = 0
     for Lpq in with_df.loop():
-        chunks.append(Lpq.copy())
-    return np.vstack(chunks)   # (naux, nao_pair)
+        nL = Lpq.shape[0]
+        if Lpq_full is None:
+            # First chunk reveals nao_pair (size of axis 1).
+            Lpq_full = np.empty((naux, Lpq.shape[1]), dtype=Lpq.dtype)
+        Lpq_full[p1:p1 + nL] = Lpq
+        p1 += nL
+    if Lpq_full is None:
+        return np.zeros((0, 0), dtype=np.float64)
+    return Lpq_full
 
 
 def _build_ovL_tno(Lpq_full, C_lmo, C_tno, lmo_indices):
@@ -3059,8 +3072,10 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                 _bi_prev = now
 
             # --- lmo_aux_mask: per-LMO Mulliken-weighted aux-atom mask ---
-            mask_rows = []
-            for ii in range(nocc_lmo):
+            # Parallel over LMOs via shared pool — pre-cache atom-id masks
+            # once outside the per-LMO worker so each task is GIL-light.
+            _atom_id_masks_t = [(_atom_ids == _a) for _a in range(_natm)]
+            def _t_mkn_per_lmo(ii):
                 c_i = C_lmo[:, ii]
                 P_i = s1e * c_i[:, None] * c_i[None, :]
                 p_diag = np.diag(P_i)
@@ -3072,14 +3087,18 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                                    p_diag[None, :] / sum_diag, 0.0)
                 contrib_u = P_i * w_u
                 contrib_v = P_i * w_v
-                mkn_pop = np.zeros(_natm)
+                mkn_pop = np.empty(_natm)
                 for _a in range(_natm):
-                    mask_a = (_atom_ids == _a)
-                    mkn_pop[_a] = (np.sum(contrib_u[mask_a, :])
-                                   + np.sum(contrib_v[:, mask_a]))
-                mask_rows.append(
-                    np.isin(_aux_atom_ids,
-                            np.where(np.abs(mkn_pop) > T_CUT_MKN)[0]))
+                    m = _atom_id_masks_t[_a]
+                    mkn_pop[_a] = (np.sum(contrib_u[m, :])
+                                   + np.sum(contrib_v[:, m]))
+                return np.isin(
+                    _aux_atom_ids,
+                    np.where(np.abs(mkn_pop) > T_CUT_MKN)[0])
+            if _pool is not None and nocc_lmo > 1:
+                mask_rows = list(_pool.map(_t_mkn_per_lmo, range(nocc_lmo)))
+            else:
+                mask_rows = [_t_mkn_per_lmo(ii) for ii in range(nocc_lmo)]
             lmo_aux_mask = np.array(mask_rows)
             _bi("lmo_aux_mask (Mulliken)")
 
@@ -3135,21 +3154,33 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             qab_stack = [None] * _natm
             ri_lmos_ext = screening['riatom_to_lmos_ext']
             ri_paos_ext = screening['riatom_to_paos_ext']
-            for A in range(_natm):
+            # Per-atom np.stack is independent per atom; the stacks become
+            # ~3 s combined on water-42 if serial (~1 s on water-22 ×4).
+            # Pool-parallel by atom; writes target distinct list slots.
+            _qij_ref = sparse_df['qij']
+            _qia_ref = sparse_df['qia']
+            _qab_ref = sparse_df['qab']
+            def _stack_one_atom(A):
                 Qs_A = aux_at_atom_list[A]
                 if len(Qs_A) == 0:
-                    continue
+                    return None, None, None
                 nl_A = len(ri_lmos_ext[A])
                 np_A = len(ri_paos_ext[A])
-                if nl_A > 0:
-                    qij_stack[A] = np.stack(
-                        [sparse_df['qij'][Q] for Q in Qs_A])
-                if nl_A > 0 and np_A > 0:
-                    qia_stack[A] = np.stack(
-                        [sparse_df['qia'][Q] for Q in Qs_A])
-                if np_A > 0:
-                    qab_stack[A] = np.stack(
-                        [sparse_df['qab'][Q] for Q in Qs_A])
+                qij_A = (np.stack([_qij_ref[Q] for Q in Qs_A])
+                         if nl_A > 0 else None)
+                qia_A = (np.stack([_qia_ref[Q] for Q in Qs_A])
+                         if (nl_A > 0 and np_A > 0) else None)
+                qab_A = (np.stack([_qab_ref[Q] for Q in Qs_A])
+                         if np_A > 0 else None)
+                return qij_A, qia_A, qab_A
+            if _pool is not None and _natm > 1:
+                _stack_results = list(_pool.map(_stack_one_atom, range(_natm)))
+            else:
+                _stack_results = [_stack_one_atom(A) for A in range(_natm)]
+            for A, (q_ij, q_ia, q_ab) in enumerate(_stack_results):
+                qij_stack[A] = q_ij
+                qia_stack[A] = q_ia
+                qab_stack[A] = q_ab
             aux_pos_in_atom = -np.ones(naux_total, dtype=np.int64)
             for A in range(_natm):
                 for pos, Q in enumerate(aux_at_atom_list[A]):
@@ -3193,7 +3224,10 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             qij_flat = np.empty(int(qij_off[-1]), dtype=np.float64)
             qia_flat = np.empty(int(qia_off[-1]), dtype=np.float64)
             qab_flat = np.empty(int(qab_off[-1]), dtype=np.float64)
-            for A in range(_natm):
+            # Per-atom flat copy: each atom writes a disjoint slab of each
+            # flat array — independent. Pool-parallel for the same reason
+            # the np.stack loop above is.
+            def _flat_one_atom(A):
                 if qij_stack[A] is not None:
                     qij_flat[qij_off[A]:qij_off[A + 1]] = (
                         np.ascontiguousarray(qij_stack[A]).ravel())
@@ -3203,6 +3237,11 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                 if qab_stack[A] is not None:
                     qab_flat[qab_off[A]:qab_off[A + 1]] = (
                         np.ascontiguousarray(qab_stack[A]).ravel())
+            if _pool is not None and _natm > 1:
+                list(_pool.map(_flat_one_atom, range(_natm)))
+            else:
+                for A in range(_natm):
+                    _flat_one_atom(A)
             sparse_df['qij_atom_flat'] = qij_flat
             sparse_df['qia_atom_flat'] = qia_flat
             sparse_df['qab_atom_flat'] = qab_flat

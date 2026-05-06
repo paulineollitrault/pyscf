@@ -195,16 +195,18 @@ def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
 
     # --- per-aux-atom Boughton-Pulay refit C_lmo ---
     SC_lmo = s1e @ C_lmo   # (nao, nocc)
-    c_refit = []
-    for a in range(natm):
+    def _c_refit_one_atom(a):
         bfs1 = riatom_to_bfs1[a]
         lmos = riatom_to_lmos_ext[a]
         if len(bfs1) == 0 or len(lmos) == 0:
-            c_refit.append(np.zeros((len(bfs1), len(lmos))))
-            continue
+            return np.zeros((len(bfs1), len(lmos)))
         S_aa = s1e[np.ix_(bfs1, bfs1)]
         rhs = SC_lmo[bfs1][:, lmos]
-        c_refit.append(np.linalg.solve(S_aa, rhs))
+        return np.linalg.solve(S_aa, rhs)
+    if _pool is not None and natm > 1:
+        c_refit = list(_pool.map(_c_refit_one_atom, range(natm)))
+    else:
+        c_refit = [_c_refit_one_atom(a) for a in range(natm)]
 
     return {
         'natm': natm, 'nao': nao, 'nocc': nocc,
@@ -681,17 +683,28 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     qij_atom = [None] * natm
     qia_atom = [None] * natm
     qab_atom = [None] * natm
-    for A in range(natm):
+    # Per-atom np.stack of qij/qia/qab columns is independent across atoms.
+    # Match the lccsd_t.py path that pool-parallelises the same shape; on
+    # water-22 the serial loop was ~0.5 s and scales O(N²).
+    def _stack_atom(A):
         Qs = aux_at_atom[A]
         if len(Qs) == 0:
-            continue
+            return None, None, None
         nl = len(riatom_to_lmos_ext[A])
         np_ = len(riatom_to_paos_ext[A])
         if nl == 0 or np_ == 0:
-            continue
-        qij_atom[A] = np.stack([qij[Q] for Q in Qs])    # (nQA, nl, nl)
-        qia_atom[A] = np.stack([qia[Q] for Q in Qs])    # (nQA, nl, np)
-        qab_atom[A] = np.stack([qab[Q] for Q in Qs])    # (nQA, np, np)
+            return None, None, None
+        return (np.stack([qij[Q] for Q in Qs]),
+                np.stack([qia[Q] for Q in Qs]),
+                np.stack([qab[Q] for Q in Qs]))
+    if _pool is not None and natm > 1:
+        _stacks = list(_pool.map(_stack_atom, range(natm)))
+    else:
+        _stacks = [_stack_atom(A) for A in range(natm)]
+    for A, (qj, qa, qb) in enumerate(_stacks):
+        qij_atom[A] = qj
+        qia_atom[A] = qa
+        qab_atom[A] = qb
     # Map global Q → position within its atom's Q-stack
     aux_pos_in_atom = -np.ones(naux, dtype=np.int64)
     for A in range(natm):
