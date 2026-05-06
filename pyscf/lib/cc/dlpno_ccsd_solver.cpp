@@ -108,6 +108,15 @@ extern "C" void DLPNObe_kernel(
     size_t N, size_t n_ij, size_t n_kl,
     int num_threads);
 
+extern "C" void DLPNObe_kernel_v3(
+    const double *S, const double *T, const double *K,
+    const double *beta_kl, const double *beta_lk,
+    const unsigned char *same,
+    const long *idx,
+    double *out_B, double *out_E,
+    size_t N, size_t n_ij, size_t n_kl,
+    int num_threads, size_t n_slots);
+
 extern "C" void DLPNOc_term_batched(
     int N,
     const int  *n_pno_arr, const int *n_ct_arr, const int *n_other_arr,
@@ -1312,7 +1321,9 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
         std::vector<double> tiles((size_t)tile_off[N_t], 0.0);
         T3Outputs out_t3;
         out_t3.tiles_flat = tiles.data();
+        auto _t3_t0 = _clock::now();
         run_phase_t3_into(t3p, &out_t3);
+        auto _t3_t1 = _clock::now();
         // Per item, add tile to dst_flat at target ordered-pair offset.
         for (int n = 0; n < N_t; ++n) {
             const int o = targets[n];
@@ -1325,6 +1336,14 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 dst_flat[d_off + e] += tiles[t_start + e];
             }
         }
+        auto _t3_t2 = _clock::now();
+        if (std::getenv("DLPNO_CCSD_PROFILE_P6B") != nullptr
+                && std::getenv("DLPNO_CCSD_PROFILE_P6B")[0] != '0') {
+            double dt_compute = std::chrono::duration<double>(_t3_t1 - _t3_t0).count();
+            double dt_scatter = std::chrono::duration<double>(_t3_t2 - _t3_t1).count();
+            fprintf(stderr, "[P6B-T3] N=%d compute=%.4fs scatter=%.4fs\n",
+                    N_t, dt_compute, dt_scatter);
+        }
     };
     auto _scatter_t4_into = [&](const T4Inputs *t4p, const int *targets,
                                   std::vector<double> &dst_flat) {
@@ -1335,7 +1354,9 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
         std::vector<double> tiles((size_t)tile_off[N_t], 0.0);
         T4Outputs out_t4;
         out_t4.tiles_flat = tiles.data();
+        auto _t4_t0 = _clock::now();
         run_phase_t4_into(t4p, &out_t4);
+        auto _t4_t1 = _clock::now();
         for (int n = 0; n < N_t; ++n) {
             const int o = targets[n];
             if (o < 0) continue;
@@ -1347,11 +1368,44 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 dst_flat[d_off + e] += tiles[t_start + e];
             }
         }
+        auto _t4_t2 = _clock::now();
+        if (std::getenv("DLPNO_CCSD_PROFILE_P6B") != nullptr
+                && std::getenv("DLPNO_CCSD_PROFILE_P6B")[0] != '0') {
+            double dt_compute = std::chrono::duration<double>(_t4_t1 - _t4_t0).count();
+            double dt_scatter = std::chrono::duration<double>(_t4_t2 - _t4_t1).count();
+            fprintf(stderr, "[P6B-T4] N=%d compute=%.4fs scatter=%.4fs\n",
+                    N_t, dt_compute, dt_scatter);
+        }
+    };
+    // Per-sub-phase timing for p6b (set DLPNO_CCSD_PROFILE_P6B=1).
+    const bool _profile_p6b = (std::getenv("DLPNO_CCSD_PROFILE_P6B") != nullptr
+                                 && std::getenv("DLPNO_CCSD_PROFILE_P6B")[0] != '0');
+    auto _p6b_start = _clock::now();
+    auto _p6b_lap = [&](const char *label, int N_tasks, int max_n) {
+        if (_profile_p6b) {
+            auto now = _clock::now();
+            double dt = std::chrono::duration<double>(now - _p6b_start).count();
+            fprintf(stderr, "[P6B] %s N_tasks=%d max_n=%d dt=%.4fs\n",
+                    label, N_tasks, max_n, dt);
+            _p6b_start = now;
+        }
     };
     _scatter_t3_into(plans->c_t3_plan, plans->c_t3_target_ord_idx, C_tilde_flat);
+    _p6b_lap("c_t3",
+             plans->c_t3_plan ? plans->c_t3_plan->N : 0,
+             0);
     _scatter_t4_into(plans->c_t4_plan, plans->c_t4_target_ord_idx, C_tilde_flat);
+    _p6b_lap("c_t4",
+             plans->c_t4_plan ? plans->c_t4_plan->N : 0,
+             0);
     _scatter_t3_into(plans->d_t3_plan, plans->d_t3_target_ord_idx, D_tilde_flat);
+    _p6b_lap("d_t3",
+             plans->d_t3_plan ? plans->d_t3_plan->N : 0,
+             0);
     _scatter_t4_into(plans->d_t4_plan, plans->d_t4_target_ord_idx, D_tilde_flat);
+    _p6b_lap("d_t4",
+             plans->d_t4_plan ? plans->d_t4_plan->N : 0,
+             0);
     _tick(&_t_p6b);
 
     // ------------------------------------------------------------------
@@ -1568,6 +1622,9 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             // B_tilde_flat (sized nlmo×nlmo per pair) from current T1;
             // mirror the dict extraction using p_ij_arr / dense_k_arr /
             // dense_l_arr (LMO-domain indices into the pair's nlmo basis).
+            // Each bucket's beta_kl/beta_lk arrays are distinct memory; the
+            // refresh is read-only on shared B_tilde_flat → trivially parallel.
+            #pragma omp parallel for schedule(dynamic, 1)
             for (int b = 0; b < plans->be_n_buckets; ++b) {
                 const BEInputs *bucket = &plans->be_plan_buckets[b];
                 if (bucket->p_ij_arr == nullptr) continue;
@@ -1588,6 +1645,18 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             }
 
             // Per bucket: find n_ij group, run kernel with offset output.
+            //
+            // BE-kernel-v2 (per-target accumulation): the v1 kernel
+            // materialised one (n_ij × n_ij) tile per item then did a
+            // serial scatter-add into the group's flat output, costing
+            // ~17 MB / bucket × ~30 buckets / cycle of memory traffic on
+            // water-22.  v2 groups items by their target slot idx[n] and
+            // accumulates each item's STB @ S^T directly into the output
+            // slot via dgemm beta=1.  Slots are disjoint so OMP runs
+            // race-free over targets.  Set DLPNO_BE_V1=1 to fall back.
+            const bool _be_use_v2 =
+                (std::getenv("DLPNO_BE_V1") == nullptr
+                 || std::getenv("DLPNO_BE_V1")[0] == '0');
             for (int b = 0; b < plans->be_n_buckets; ++b) {
                 const BEInputs *bucket = &plans->be_plan_buckets[b];
                 int g = -1;
@@ -1601,7 +1670,24 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 BEOutputs out;
                 out.out_B = flat_B.data() + group_off;
                 out.out_E = flat_E.data() + group_off;
-                run_phase_be_into(bucket, &out);
+                if (_be_use_v2) {
+                    int num_threads = 1;
+#ifdef _OPENMP
+                    num_threads = std::min(omp_get_max_threads(), 16);
+                    if (bucket->N > 0 && num_threads > bucket->N)
+                        num_threads = bucket->N;
+#endif
+                    DLPNObe_kernel_v3(
+                        bucket->S, bucket->T, bucket->K,
+                        bucket->beta_kl, bucket->beta_lk,
+                        bucket->same, bucket->idx,
+                        out.out_B, out.out_E,
+                        (size_t)bucket->N, (size_t)bucket->n_ij,
+                        (size_t)bucket->n_kl, num_threads,
+                        (size_t)bucket->n_slots);
+                } else {
+                    run_phase_be_into(bucket, &out);
+                }
             }
             // BE per-pair scatter is fused below (Phase B).
         }

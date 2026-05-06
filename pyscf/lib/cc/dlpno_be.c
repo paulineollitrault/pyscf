@@ -204,3 +204,181 @@ void DLPNObe_kernel(const double      *S,           /* (N, n_ij, n_kl) */
     free(Bc);
     free(Ec);
 }
+
+/* DLPNObe_kernel_v3 — per-target accumulation variant.
+ *
+ * Same math as DLPNObe_kernel (per-item TT_minus/TT_plus/TB/UK/STB/SUK build,
+ * Bc = STB @ S^T, Ec = SUK @ S^T).  Difference: instead of materialising
+ * per-item Bc/Ec into a global (N x out_stride) buffer and then doing a
+ * sequential scatter, we group items by their target slot `idx[n]` and
+ * accumulate the final dgemm directly into the destination slot with
+ * BLAS beta=1.  Since slots are disjoint memory, OMP parallelism over
+ * targets is race-free without locks.
+ *
+ * Memory savings vs v1:
+ *   v1: 2 * N * n_ij^2 * 8 bytes  (Bc + Ec at once)
+ *   v2: 2 * num_threads * n_ij^2 * 8 bytes  (per-thread scratch only)
+ *
+ * On water-22 with N≈1850 max-bucket and n_ij=24 the v1 buffer reaches
+ * ~17 MB per bucket (~100 MB across all buckets per pass).  Eliminating
+ * that traffic is the bulk of the win — the FLOP count is unchanged.
+ *
+ * Caller contract:
+ *   * `idx` may collide across items; this routine groups items with the
+ *     same idx and processes each group on a single thread.
+ *   * `out_B` / `out_E` are caller-zeroed (or pre-existing accumulators).
+ */
+void DLPNObe_kernel_v3(const double      *S,
+                       const double      *T,
+                       const double      *K,
+                       const double      *beta_kl,
+                       const double      *beta_lk,
+                       const unsigned char *same,
+                       const long        *idx,
+                       double            *out_B,
+                       double            *out_E,
+                       const size_t       N,
+                       const size_t       n_ij,
+                       const size_t       n_kl,
+                       const int          num_threads,
+                       const size_t       n_slots)
+{
+    if (N == 0) return;
+
+    const size_t S_stride  = n_ij * n_kl;
+    const size_t TK_stride = n_kl * n_kl;
+    const size_t out_stride = n_ij * n_ij;
+
+    /* Build per-target item buckets in O(N + n_slots) time.  Items with
+     * the same idx[n] become contiguous in `sorted_n`. */
+    long *bucket_count = (long *)calloc(n_slots, sizeof(long));
+    long *bucket_off   = (long *)malloc(sizeof(long) * (n_slots + 1));
+    long *sorted_n     = (long *)malloc(sizeof(long) * N);
+    for (size_t n = 0; n < N; n++) {
+        bucket_count[idx[n]]++;
+    }
+    bucket_off[0] = 0;
+    for (size_t s = 0; s < n_slots; s++) {
+        bucket_off[s + 1] = bucket_off[s] + bucket_count[s];
+        bucket_count[s] = 0;
+    }
+    for (size_t n = 0; n < N; n++) {
+        long s = idx[n];
+        sorted_n[bucket_off[s] + bucket_count[s]] = (long)n;
+        bucket_count[s]++;
+    }
+    free(bucket_count);
+
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0;
+    int int_n_ij = (int)n_ij, int_n_kl = (int)n_kl;
+
+#pragma omp parallel num_threads(num_threads)
+    {
+        /* Per-thread scratch — sized to one item, NOT N. */
+        double *TT_minus = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *TT_plus  = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *TB       = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *UK       = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *STB      = (double *)malloc(sizeof(double) * n_ij * n_kl);
+        double *SUK      = (double *)malloc(sizeof(double) * n_ij * n_kl);
+
+#pragma omp for schedule(dynamic, 1)
+        for (size_t s = 0; s < n_slots; s++) {
+            const long b_lo = bucket_off[s];
+            const long b_hi = bucket_off[s + 1];
+            if (b_lo == b_hi) continue;
+
+            double *out_Bt = out_B + s * out_stride;
+            double *out_Et = out_E + s * out_stride;
+
+            for (long bi = b_lo; bi < b_hi; bi++) {
+                const size_t n = (size_t)sorted_n[bi];
+                const double bkl = beta_kl[n];
+                const double blk = beta_lk[n];
+                const unsigned char sm = same[n];
+
+                const double *Sn = S + n * S_stride;
+                const double *Tn = T + n * TK_stride;
+                const double *Kn = K + n * TK_stride;
+
+                /* TT_minus[b, d] = 2 T[b, d] - T[d, b] */
+                for (size_t b = 0; b < n_kl; b++) {
+                    for (size_t d = 0; d < n_kl; d++) {
+                        TT_minus[b * n_kl + d] = 2.0 * Tn[b * n_kl + d]
+                                                  - Tn[d * n_kl + b];
+                    }
+                }
+
+                if (sm) {
+                    for (size_t e = 0; e < TK_stride; e++) {
+                        TB[e] = bkl * Tn[e];
+                    }
+                } else {
+                    for (size_t b = 0; b < n_kl; b++) {
+                        for (size_t c = 0; c < n_kl; c++) {
+                            TB[b * n_kl + c] = bkl * Tn[b * n_kl + c]
+                                              + blk * Tn[c * n_kl + b];
+                        }
+                    }
+                    for (size_t b = 0; b < n_kl; b++) {
+                        for (size_t d = 0; d < n_kl; d++) {
+                            TT_plus[b * n_kl + d] = 2.0 * Tn[d * n_kl + b]
+                                                     - Tn[b * n_kl + d];
+                        }
+                    }
+                }
+
+                /* UK = TT_minus @ K^T  (BLAS: K^T @ TT_minus in F-view) */
+                dgemm_(&T_flag, &N_flag,
+                       &int_n_kl, &int_n_kl, &int_n_kl,
+                       &one, Kn, &int_n_kl,
+                       TT_minus, &int_n_kl,
+                       &zero, UK, &int_n_kl);
+
+                if (!sm) {
+                    /* UK += TT_plus @ K */
+                    dgemm_(&N_flag, &N_flag,
+                           &int_n_kl, &int_n_kl, &int_n_kl,
+                           &one, Kn, &int_n_kl,
+                           TT_plus, &int_n_kl,
+                           &one, UK, &int_n_kl);
+                }
+
+                /* STB = S @ TB ; SUK = S @ UK */
+                dgemm_(&N_flag, &N_flag,
+                       &int_n_kl, &int_n_ij, &int_n_kl,
+                       &one, TB, &int_n_kl,
+                       Sn, &int_n_kl,
+                       &zero, STB, &int_n_kl);
+                dgemm_(&N_flag, &N_flag,
+                       &int_n_kl, &int_n_ij, &int_n_kl,
+                       &one, UK, &int_n_kl,
+                       Sn, &int_n_kl,
+                       &zero, SUK, &int_n_kl);
+
+                /* Accumulate directly into out_Bt / out_Et with beta=1. */
+                dgemm_(&T_flag, &N_flag,
+                       &int_n_ij, &int_n_ij, &int_n_kl,
+                       &one, Sn, &int_n_kl,
+                       STB, &int_n_kl,
+                       &one, out_Bt, &int_n_ij);
+                dgemm_(&T_flag, &N_flag,
+                       &int_n_ij, &int_n_ij, &int_n_kl,
+                       &one, Sn, &int_n_kl,
+                       SUK, &int_n_kl,
+                       &one, out_Et, &int_n_ij);
+            }
+        }
+
+        free(TT_minus);
+        free(TT_plus);
+        free(TB);
+        free(UK);
+        free(STB);
+        free(SUK);
+    }
+
+    free(bucket_off);
+    free(sorted_n);
+}
