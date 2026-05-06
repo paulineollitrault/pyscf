@@ -5668,7 +5668,7 @@ def run_remaining_cycles_via_class(
         b_tilde_per_ij_pyscf, jiang_C_pyscf, jiang_D_pyscf,
         # DIIS state:
         mydiis, diis_start_cycle, strong_pairs, cas_blocks,
-        verbose=True):
+        verbose=True, _pool=None):
     """Pack-once optimized drop-in cycle driver.
 
     SolverInputs and per_kl plan are packed ONCE at function entry; per
@@ -5685,6 +5685,12 @@ def run_remaining_cycles_via_class(
 
     # ---- ONE-TIME setup ----
     _t_setup0 = _time.perf_counter()
+    _pack_prof = bool(int(os.environ.get('DLPNO_PACK_PROF', '0')))
+    def _pmark(label, t0):
+        if _pack_prof:
+            print(f'  [PACK-PROF] {label}: '
+                  f'{_time.perf_counter() - t0:.3f}s', flush=True)
+    _t = _time.perf_counter()
     if hasattr(_compute_t1_residual_psi4, '_per_kl_plan_cache'):
         _compute_t1_residual_psi4._per_kl_plan_cache.clear()
     # Plan-only call: builds + caches _per_kl_plan_cache without running
@@ -5696,12 +5702,17 @@ def run_remaining_cycles_via_class(
         pair_lmo_idx=pair_lmo_idx, t1_cache=None, _pool=None,
         cc_ints_flat=cc_ints_flat, pair_index=pair_index,
         _plan_only=True)
+    _pmark('t1_residual plan_only', _t)
+    _t = _time.perf_counter()
     t1_cache = build_t1_cache(t1_pno, _pi, S_pno_cache, pno_spaces)
+    _pmark('build_t1_cache', _t)
+    _t = _time.perf_counter()
     _all_keys = sorted(t2_pno_all.keys())
     inputs, ownership, key_to_p, aux = pack_for_t1_ints(
         cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
         F_lmo, eps_lmo, fov_pno, nocc, _all_keys,
-        t2_pno_all=t2_pno_all, S_pno_cache=S_pno_cache)
+        t2_pno_all=t2_pno_all, S_pno_cache=S_pno_cache, _pool=_pool)
+    _pmark('pack_for_t1_ints', _t)
     keys_reorder = aux['keys_sorted']
     n_pairs = len(keys_reorder)
     npno = aux['n_pno_per_pair']
@@ -5721,6 +5732,7 @@ def run_remaining_cycles_via_class(
     inputs.is_strong_pair = is_strong_arr.ctypes.data
 
     # per_kl plan extracted once.
+    _t = _time.perf_counter()
     from pyscf.cc.dlpno_tccsd._ccsd_solver import (
         _extract_per_kl_plan, _extract_g_tilde_plan)
     plan_struct, plan_own = _extract_per_kl_plan(_compute_t1_residual_psi4)
@@ -5729,6 +5741,7 @@ def run_remaining_cycles_via_class(
     plan_struct.t2_buffer       = t2_pno_all._buffer.ctypes.data
     plan_struct.t1_cache_buffer = t1_cache._buffer.ctypes.data
     g_plan_struct, g_plan_own = _extract_g_tilde_plan(key_to_p)
+    _pmark('extract per_kl + g_tilde plans', _t)
 
     # Strong-pair mask (cycle-invariant).  For DIIS we emit T1 (nocc slots)
     # + T2 over STRONG pairs (matching PySCF DIIS vector layout).
@@ -5827,6 +5840,25 @@ def run_remaining_cycles_via_class(
     #  c_term_ct_ord_pair_idx / d_term_dt_ord_pair_idx — no Python
     #  refresh needed.)
     e_prev = float('-inf')
+
+    # Inside `run_one_cycle` every C-kernel reads `omp_get_max_threads()`
+    # to set its team size.  When the driver runs with
+    # `OMP_NUM_THREADS=1` (so the Python pool can dispatch cc_ints /
+    # S_pno builds without OMP oversubscription), this returns 1 and
+    # every class kernel runs SINGLE-THREADED.  The pool is idle while
+    # the class iterates, so it's safe (and a big win) to bump the OMP
+    # team inside the cycle loop only.  On water-22 baseline per-cycle
+    # wall = 5.0 s; with OMP=16 each phase's BLAS dgemms parallelise
+    # and per-cycle drops by O(2-4×).
+    try:
+        from threadpoolctl import threadpool_limits as _tpl
+    except ImportError:
+        _tpl = None
+    _omp_n = int(os.environ.get('DLPNO_CCSD_CYCLE_OMP', '16'))
+    _omp_ctx = (_tpl(limits=_omp_n, user_api='openmp')
+                 if _tpl is not None and _omp_n > 1 else None)
+    if _omp_ctx is not None:
+        _omp_ctx.__enter__()
 
     for cycle in range(cycle_start, max_cycle):
         _t_cyc_start = _time.perf_counter()
@@ -6004,12 +6036,18 @@ def run_remaining_cycles_via_class(
         if dT < this_tol:
             print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (amplitude, class).',
                   flush=True)
+            if _omp_ctx is not None:
+                _omp_ctx.__exit__(None, None, None)
             return cycle, e_cyc
         if cycle > 5 and dE < this_tol:
             print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (energy, dE={dE:.2e}, class).',
                   flush=True)
+            if _omp_ctx is not None:
+                _omp_ctx.__exit__(None, None, None)
             return cycle, e_cyc
 
+    if _omp_ctx is not None:
+        _omp_ctx.__exit__(None, None, None)
     return max_cycle - 1, e_prev
 
 
