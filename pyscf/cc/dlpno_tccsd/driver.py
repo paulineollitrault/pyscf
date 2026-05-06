@@ -397,15 +397,20 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # Stage 3: PAO + PNO construction
     # ------------------------------------------------------------------
     print('  Stage 3: PAO + PNO construction...', flush=True)
+    import time as _time_s3
+    _t_s3_0 = _time_s3.perf_counter()
 
     s1e = mf.get_ovlp()
     mf_or_mc = mf if no_cas else mc
     # Use grid-based DOI to match Psi4 (Jiang Eq 58 PAO-based DOI gives
     # much larger domains and is not compatible with Psi4's truncation).
     _with_df = getattr(mf, 'with_df', None)
+    _t_paos = _time_s3.perf_counter()
     C_pao, pao_domains, S_pao, F_pao, doi_iu = make_paos(
         mf_or_mc, C_lmo, T_CutDO=T_CutDO, s1e=s1e, with_df=_with_df,
         doi_method='grid')
+    print(f'  [STAGE3-PROF] make_paos: {_time_s3.perf_counter() - _t_paos:.2f}s',
+          flush=True)
 
     nlmo = C_lmo.shape[1]
     domain_sizes = [len(pao_domains[i]) for i in range(nlmo)]
@@ -422,6 +427,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         C_cas_vir = mo_loc[:, vir_cas_idx]  # vir_cas_idx is in full-MO space
         nvir_cas_loc = len(vir_cas_idx)
 
+    _t_pnos = _time_s3.perf_counter()
     pno_spaces, _, _, _, e_mp2_prescreened = make_pnos(
         mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         T_CutPNO=T_CutPNO, T_CutPairs=T_CutPairs,
@@ -432,10 +438,15 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         nvir_cas=nvir_cas_loc, s1e=s1e,
         _pool=_shared_pool,
         verbose=verbose)
+    print(f'  [STAGE3-PROF] make_pnos: {_time_s3.perf_counter() - _t_pnos:.2f}s',
+          flush=True)
+    print(f'  [STAGE3-PROF] Stage 3 total: '
+          f'{_time_s3.perf_counter() - _t_s3_0:.2f}s', flush=True)
 
     # ------------------------------------------------------------------
     # Stage 4: Pair screening
     # ------------------------------------------------------------------
+    _t_s4 = _time_s3.perf_counter()
     mo_coeff_ref = mo_loc if no_cas else mc.mo_coeff
     (cas_pairs, strong_pairs, weak_pairs, negligible_pairs,
      e_lmp2_weak, e_lmp2_strong, e_lmp2_negligible) = classify_pairs(
@@ -443,6 +454,8 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         mo_coeff_ref, s1e,
         T_CutPairs=T_CutPairs, T_CutPairs_MP2=T_CutPairs_MP2,
         verbose=verbose)
+    print(f'  [STAGE4-PROF] classify_pairs: '
+          f'{_time_s3.perf_counter() - _t_s4:.2f}s', flush=True)
 
     print(f'  Pairs: {len(cas_pairs)} CAS  {len(strong_pairs)} strong  '
           f'{len(weak_pairs)} weak  {len(negligible_pairs)} negligible')

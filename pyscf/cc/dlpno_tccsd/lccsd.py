@@ -1714,25 +1714,42 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         # Then: keep atom A if abs(mkn_pop[A]) > T_CUT_MKN  (absolute, NOT
         # normalized by total — this was a bug in our previous version that
         # used normalized q_iA = pop_atom / total).
-        _lmo_aux_mask = []  # per-LMO boolean mask over aux functions
-        _lmo_atom_set = []  # per-LMO set of atoms with Mulliken pop
-        for i in range(nocc):
+        import time as _t_mkn_mod
+        _t_mkn0 = _t_mkn_mod.perf_counter()
+        # Per-LMO Mulliken aux domain — pool-parallel over nocc.
+        # Each task is read-only on shared inputs (s1e, C_lmo, _atom_ids,
+        # _aux_atom_ids) and returns a (mask, atom_set) tuple. Same pattern as
+        # local_df.build_screening_maps._per_lmo. ~1-2s saved on water-15.
+        _atom_id_masks = [(_atom_ids == a) for a in range(_natm)]
+        def _mulliken_per_lmo(i):
             c_i = C_lmo[:, i]
             P_i = s1e * c_i[:, None] * c_i[None, :]
             p_diag = np.diag(P_i)
             sum_diag = p_diag[:, None] + p_diag[None, :]
             with np.errstate(divide='ignore', invalid='ignore'):
-                w_u = np.where(sum_diag > 1e-15, p_diag[:, None] / sum_diag, 0.0)
-                w_v = np.where(sum_diag > 1e-15, p_diag[None, :] / sum_diag, 0.0)
+                w_u = np.where(sum_diag > 1e-15,
+                               p_diag[:, None] / sum_diag, 0.0)
+                w_v = np.where(sum_diag > 1e-15,
+                               p_diag[None, :] / sum_diag, 0.0)
             contrib_u = P_i * w_u
             contrib_v = P_i * w_v
-            mkn_pop = np.zeros(_natm)
+            mkn_pop = np.empty(_natm)
             for a in range(_natm):
-                mask_a = (_atom_ids == a)
-                mkn_pop[a] = np.sum(contrib_u[mask_a, :]) + np.sum(contrib_v[:, mask_a])
+                m = _atom_id_masks[a]
+                mkn_pop[a] = (np.sum(contrib_u[m, :])
+                              + np.sum(contrib_v[:, m]))
             atoms_in = np.where(np.abs(mkn_pop) > T_CutMKN)[0]
-            _lmo_aux_mask.append(np.isin(_aux_atom_ids, atoms_in))
-            _lmo_atom_set.append(set(atoms_in.tolist()))
+            return (np.isin(_aux_atom_ids, atoms_in),
+                    set(atoms_in.tolist()))
+        if _pool is not None and nocc > 1:
+            _mkn_results = list(_pool.map(_mulliken_per_lmo, range(nocc)))
+        else:
+            _mkn_results = [_mulliken_per_lmo(i) for i in range(nocc)]
+        _lmo_aux_mask = [r[0] for r in _mkn_results]
+        _lmo_atom_set = [r[1] for r in _mkn_results]
+        if int(os.environ.get('DLPNO_CCSD_PROF', '0')):
+            print(f'  [CCSD-PROF] Mulliken loop (nocc={nocc}): '
+                  f'{_t_mkn_mod.perf_counter() - _t_mkn0:.2f}s', flush=True)
 
         # Pair aux domain = union of LMO i and LMO j aux domains
         # Include ALL pairs in pno_spaces (strong + weak + diagonal)
@@ -1749,21 +1766,33 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         # full pno_spaces — is what makes this domain actually local:
         # for water chains, including negligible pairs leaves every pair
         # with domain = full nocc.
-        pair_lmo_idx = {}
+        _t_plmo0 = _t_mkn_mod.perf_counter()
         _negligible_set = set(
             (min(p), max(p)) for p in (negligible_pairs or []))
         _non_negligible_set = {k for k in t2_pno_all.keys()
                                 if k not in _negligible_set}
-        for key in _all_keys_init:
+        # Per-LMO non-negligible neighborhood: replaces the inner
+        # set-membership test (`(min(i,m), max(i,m)) in _non_negligible_set`)
+        # with one bool array indexing — turns the O(P × nocc) pair-domain
+        # build from ~50k Python set lookups into a vectorized AND.
+        _i_neighbors = [np.zeros(nocc, dtype=bool) for _ in range(nocc)]
+        for (a, b) in _non_negligible_set:
+            _i_neighbors[a][b] = True
+            _i_neighbors[b][a] = True
+        def _build_pair_lmo_idx(key):
             i, j = key
-            domain_lmos = []
-            for m in range(nocc):
-                key_im = (min(i, m), max(i, m))
-                key_jm = (min(j, m), max(j, m))
-                if (key_im in _non_negligible_set
-                        and key_jm in _non_negligible_set):
-                    domain_lmos.append(m)
-            pair_lmo_idx[key] = np.array(domain_lmos)
+            both = _i_neighbors[i] & _i_neighbors[j]
+            return key, np.where(both)[0]
+        if _pool is not None and len(_all_keys_init) > 1:
+            pair_lmo_idx = dict(_pool.map(_build_pair_lmo_idx,
+                                          _all_keys_init))
+        else:
+            pair_lmo_idx = dict(_build_pair_lmo_idx(key)
+                                for key in _all_keys_init)
+        if int(os.environ.get('DLPNO_CCSD_PROF', '0')):
+            print(f'  [CCSD-PROF] pair_lmo_idx build (npairs={len(_all_keys_init)}): '
+                  f'{_t_mkn_mod.perf_counter() - _t_plmo0:.2f}s',
+                  flush=True)
         _plens = np.array([len(v) for v in pair_lmo_idx.values()])
         print(f"  Pair LMO domains: mean={_plens.mean():.1f}  "
               f"max={_plens.max()} (of nocc={nocc})",
@@ -1838,10 +1867,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         PairIndex, FlatTensorStore, assert_consistent_with_dicts,
         flatten_cc_ints_fields,
     )
+    _stage5_prof = bool(int(os.environ.get('DLPNO_STAGE5_PROF', '0')))
+    _t_pi = _time_cc.perf_counter()
     _pair_index = PairIndex(
         list(t2_pno_all.keys()), pno_spaces, pair_lmo_idx, nocc)
     assert_consistent_with_dicts(
         _pair_index, pno_spaces, pair_lmo_idx)
+    if _stage5_prof:
+        print(f'  [STAGE5-PROF] PairIndex+assert: '
+              f'{_time_cc.perf_counter() - _t_pi:.3f}s', flush=True)
     print(f'  [pair_index] {_pair_index!r}', flush=True)
 
     # Phase 2e: flatten the 12 tensor fields of cc_ints onto shared
@@ -1866,10 +1900,14 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # Phase 2c: flatten the (n_pno, n_pno) amplitude / K_pno dicts.
     _pair_t2_shape = lambda p: (int(_pair_index.n_pno[p]),
                                 int(_pair_index.n_pno[p]))
+    _t_fts = _time_cc.perf_counter()
     t2_pno_all = FlatTensorStore.from_dict(
         _pair_index, t2_pno_all, shape_fn=_pair_t2_shape)
     K_pno_cache = FlatTensorStore.from_dict(
         _pair_index, K_pno_cache, shape_fn=_pair_t2_shape)
+    if _stage5_prof:
+        print(f'  [STAGE5-PROF] FlatTensorStore from_dict (t2+K): '
+              f'{_time_cc.perf_counter() - _t_fts:.3f}s', flush=True)
 
     # Pre-compute PNO overlap matrices S_pno_cache[(key_ij, key_kl)].
     #
@@ -2875,7 +2913,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     fov_pno, nocc, keys_sorted, S_pno_cache,
                     _cc_ints_flat, _pair_index, ovL_pno_cache, K_pno_cache,
                     _B_tilde_per_ij, _jiang_C, _jiang_D,
-                    mydiis, diis_start_cycle, strong_pairs, cas_blocks)
+                    mydiis, diis_start_cycle, strong_pairs, cas_blocks,
+                    _pool=_pool)
                 break
         else:
             if boot_step == n_bootstrap - 1:

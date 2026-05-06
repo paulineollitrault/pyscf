@@ -65,7 +65,7 @@ def _reorder_diag_first(keys_sorted_real, nocc):
 
 def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
                      F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
-                     t2_pno_all=None, S_pno_cache=None):
+                     t2_pno_all=None, S_pno_cache=None, _pool=None):
     """Build a PySolverInputs covering t1_ints-phase requirements only.
 
     Returns (inputs, ownership, key_to_p, aux) where ``ownership`` is a
@@ -163,65 +163,79 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
     K_tilde_chem_i_list = [None] * n_canon
     K_tilde_chem_j_list = [None] * n_canon
 
-    for p, key in enumerate(keys_sorted):
+    # Per-pair packing.  Each pair's work is independent (read-only access
+    # to shared cc_ints / t1_cache / pno_spaces; writes go to per-pair list
+    # slots assigned by index).  Dispatched via shared _pool when given —
+    # eliminates ~1.0s serial Python on water-15 (`pack_for_t1_ints`
+    # was previously the largest single-CPU stretch in Stage 5 setup).
+    def _pack_one_pair(p):
+        key = keys_sorted[p]
         ci = cc_ints.get(key)
         nlmo_p = int(pair_lmo_lens[p])
         npno_p = int(n_pno_per_pair[p])
         if ci is None:
-            # Pair not covered; fill with zeros of the right shape.
-            Qma_list[p]  = np.zeros((1, nlmo_p, npno_p), dtype=np.float64)
-            Qab_list[p]  = np.zeros((1, npno_p, npno_p), dtype=np.float64)
-            i_Qa_list[p] = np.zeros((1, npno_p), dtype=np.float64)
-            j_Qa_list[p] = np.zeros((1, npno_p), dtype=np.float64)
-            i_Qk_list[p] = np.zeros((1, nlmo_p), dtype=np.float64)
-            j_Qk_list[p] = np.zeros((1, nlmo_p), dtype=np.float64)
-            T1_in_pair_list[p] = np.zeros((nlmo_p, npno_p), dtype=np.float64)
-            T1_in_pair_full_list[p] = np.zeros((nocc, npno_p), dtype=np.float64)
-            K_iajb_list[p]     = np.zeros((npno_p, npno_p), dtype=np.float64)
-            K_bar_chem_list[p] = np.zeros((nlmo_p, npno_p), dtype=np.float64)
-            K_bar_ij_list[p]   = np.zeros((nlmo_p, npno_p), dtype=np.float64)
-            K_bar_ji_list[p]   = np.zeros((nlmo_p, npno_p), dtype=np.float64)
-            K_tilde_chem_i_list[p] = np.zeros((npno_p, npno_p * npno_p),
-                                               dtype=np.float64)
-            K_tilde_chem_j_list[p] = np.zeros((npno_p, npno_p * npno_p),
-                                               dtype=np.float64)
-            continue
-        Qma_list[p]  = np.ascontiguousarray(ci['Qma'])
-        Qab_list[p]  = np.ascontiguousarray(ci['Qab'])
-        i_Qa_list[p] = np.ascontiguousarray(ci['i_Qa'])
-        j_Qa_list[p] = np.ascontiguousarray(ci['j_Qa'])
-        i_Qk_list[p] = np.ascontiguousarray(ci['i_Qk'])
-        j_Qk_list[p] = np.ascontiguousarray(ci['j_Qk'])
-        # T1_in_pair[p] = t1_cache[key] restricted to pair_lmo_idx[key] rows.
+            return (
+                np.zeros((1, nlmo_p, npno_p), dtype=np.float64),  # Qma
+                np.zeros((1, npno_p, npno_p), dtype=np.float64),  # Qab
+                np.zeros((1, npno_p),       dtype=np.float64),    # i_Qa
+                np.zeros((1, npno_p),       dtype=np.float64),    # j_Qa
+                np.zeros((1, nlmo_p),       dtype=np.float64),    # i_Qk
+                np.zeros((1, nlmo_p),       dtype=np.float64),    # j_Qk
+                np.zeros((nlmo_p, npno_p),  dtype=np.float64),    # T1_in_pair
+                np.zeros((nocc,  npno_p),   dtype=np.float64),    # T1_in_pair_full
+                np.zeros((npno_p, npno_p),  dtype=np.float64),    # K_iajb
+                np.zeros((nlmo_p, npno_p),  dtype=np.float64),    # K_bar_chem
+                np.zeros((nlmo_p, npno_p),  dtype=np.float64),    # K_bar_ij
+                np.zeros((nlmo_p, npno_p),  dtype=np.float64),    # K_bar_ji
+                np.zeros((npno_p, npno_p * npno_p), dtype=np.float64),
+                np.zeros((npno_p, npno_p * npno_p), dtype=np.float64),
+            )
         ll = pair_lmo_lists[p]
-        T1_in_pair_list[p] = np.ascontiguousarray(
+        Qma = np.ascontiguousarray(ci['Qma'])
+        Qab = np.ascontiguousarray(ci['Qab'])
+        i_Qa = np.ascontiguousarray(ci['i_Qa'])
+        j_Qa = np.ascontiguousarray(ci['j_Qa'])
+        i_Qk = np.ascontiguousarray(ci['i_Qk'])
+        j_Qk = np.ascontiguousarray(ci['j_Qk'])
+        T1_in_pair = np.ascontiguousarray(
             t1_cache[key][np.asarray(ll, dtype=np.intp)])
-        # T1_in_pair_full[p] = full nocc rows of t1_cache[key] (Stage 4).
-        T1_in_pair_full_list[p] = np.ascontiguousarray(t1_cache[key])
-        # K_iajb (per pair, (npno, npno)).
-        if 'K_iajb' in ci:
-            K_iajb_list[p] = np.ascontiguousarray(ci['K_iajb'])
-        else:
-            K_iajb_list[p] = np.zeros((npno_p, npno_p), dtype=np.float64)
-        # K_bar variants (per pair, (nlmo_p, npno_p)).
-        K_bar_chem_list[p] = (np.ascontiguousarray(ci['K_bar_chem'])
-                              if 'K_bar_chem' in ci
-                              else np.zeros((nlmo_p, npno_p), dtype=np.float64))
-        K_bar_ij_list[p]   = (np.ascontiguousarray(ci['K_bar_ij'])
-                              if 'K_bar_ij' in ci
-                              else np.zeros((nlmo_p, npno_p), dtype=np.float64))
-        K_bar_ji_list[p]   = (np.ascontiguousarray(ci['K_bar_ji'])
-                              if 'K_bar_ji' in ci
-                              else np.zeros((nlmo_p, npno_p), dtype=np.float64))
-        # K_tilde_chem variants (per pair, (npno, npno²) row-major).
-        K_tilde_chem_i_list[p] = (np.ascontiguousarray(ci['K_tilde_chem_i'])
-                                   if 'K_tilde_chem_i' in ci
-                                   else np.zeros((npno_p, npno_p * npno_p),
-                                                  dtype=np.float64))
-        K_tilde_chem_j_list[p] = (np.ascontiguousarray(ci['K_tilde_chem_j'])
-                                   if 'K_tilde_chem_j' in ci
-                                   else np.zeros((npno_p, npno_p * npno_p),
-                                                  dtype=np.float64))
+        T1_in_pair_full = np.ascontiguousarray(t1_cache[key])
+        K_iajb = (np.ascontiguousarray(ci['K_iajb'])
+                  if 'K_iajb' in ci
+                  else np.zeros((npno_p, npno_p), dtype=np.float64))
+        K_bar_chem = (np.ascontiguousarray(ci['K_bar_chem'])
+                      if 'K_bar_chem' in ci
+                      else np.zeros((nlmo_p, npno_p), dtype=np.float64))
+        K_bar_ij = (np.ascontiguousarray(ci['K_bar_ij'])
+                    if 'K_bar_ij' in ci
+                    else np.zeros((nlmo_p, npno_p), dtype=np.float64))
+        K_bar_ji = (np.ascontiguousarray(ci['K_bar_ji'])
+                    if 'K_bar_ji' in ci
+                    else np.zeros((nlmo_p, npno_p), dtype=np.float64))
+        K_tilde_chem_i = (np.ascontiguousarray(ci['K_tilde_chem_i'])
+                          if 'K_tilde_chem_i' in ci
+                          else np.zeros((npno_p, npno_p * npno_p),
+                                         dtype=np.float64))
+        K_tilde_chem_j = (np.ascontiguousarray(ci['K_tilde_chem_j'])
+                          if 'K_tilde_chem_j' in ci
+                          else np.zeros((npno_p, npno_p * npno_p),
+                                         dtype=np.float64))
+        return (Qma, Qab, i_Qa, j_Qa, i_Qk, j_Qk,
+                T1_in_pair, T1_in_pair_full, K_iajb,
+                K_bar_chem, K_bar_ij, K_bar_ji,
+                K_tilde_chem_i, K_tilde_chem_j)
+
+    # Per-pair packing: serial. The work is mostly numpy view checks via
+    # ascontiguousarray (~4 ms total at water-15) — pool dispatch overhead
+    # dominates parallel attempts, so we keep this straight Python.
+    _results = [_pack_one_pair(p) for p in range(n_canon)]
+    for p, r in enumerate(_results):
+        (Qma_list[p], Qab_list[p], i_Qa_list[p], j_Qa_list[p],
+         i_Qk_list[p], j_Qk_list[p],
+         T1_in_pair_list[p], T1_in_pair_full_list[p],
+         K_iajb_list[p], K_bar_chem_list[p],
+         K_bar_ij_list[p], K_bar_ji_list[p],
+         K_tilde_chem_i_list[p], K_tilde_chem_j_list[p]) = r
 
     # ------------------------------------------------------------------
     # Scalar / per-occupied buffers: F_lmo, eps_lmo, foo (zero), fov_flat,
@@ -355,27 +369,41 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
         n_blocks = n_canon * n_canon
         S_pno_offsets = np.zeros(n_blocks + 1, dtype=np.int64)
         S_blocks = []
-        for p_a in range(n_canon):
-            for p_b in range(n_canon):
-                idx = p_a * n_canon + p_b
-                key_a = keys_sorted[p_a]
-                key_b = keys_sorted[p_b]
-                S_ab = None
-                try:
-                    S_ab = S_pno_cache.get((key_a, key_b), None)
-                except (KeyError, AttributeError):
-                    S_ab = None
-                if S_ab is None:
-                    S_pno_offsets[idx + 1] = S_pno_offsets[idx]
-                    continue
-                size = int(S_ab.size)
-                expected = int(n_pno_per_pair[p_a]) * int(n_pno_per_pair[p_b])
-                if size != expected:
-                    S_pno_offsets[idx + 1] = S_pno_offsets[idx]
-                    continue
-                S_pno_offsets[idx + 1] = S_pno_offsets[idx] + size
-                S_blocks.append(np.ascontiguousarray(S_ab,
-                                                     dtype=np.float64).ravel())
+        # Sparse layout: only iterate the keys actually present in
+        # S_pno_cache. The dense (n_canon × n_canon) loop visited 854² =
+        # 729k pairs on water-15, of which only ~184k are populated; the
+        # rest were dict-misses with serial Python overhead, dominating
+        # PACK-ONCE setup. We now batch the entries in cache-key order
+        # and let the outer flat-offsets fill from the sparse hits only.
+        if hasattr(S_pno_cache, 'iter_keys'):
+            cache_iter = S_pno_cache.iter_keys()
+        else:
+            cache_iter = list(S_pno_cache.keys()) if hasattr(
+                S_pno_cache, 'keys') else []
+        sizes = np.zeros(n_blocks, dtype=np.int64)
+        kv_pairs = []
+        for cache_key in cache_iter:
+            key_a, key_b = cache_key
+            p_a = key_to_p.get(key_a, -1)
+            p_b = key_to_p.get(key_b, -1)
+            if p_a < 0 or p_b < 0:
+                continue
+            S_ab = S_pno_cache.get(cache_key)
+            if S_ab is None:
+                continue
+            expected = int(n_pno_per_pair[p_a]) * int(n_pno_per_pair[p_b])
+            if int(S_ab.size) != expected:
+                continue
+            idx = p_a * n_canon + p_b
+            sizes[idx] = expected
+            kv_pairs.append((idx, S_ab))
+        # Build cumulative offsets from sizes vector.
+        S_pno_offsets[1:] = np.cumsum(sizes)
+        # Concatenate populated blocks in idx-sorted order.
+        kv_pairs.sort(key=lambda kv: kv[0])
+        for idx, S_ab in kv_pairs:
+            S_blocks.append(np.ascontiguousarray(
+                S_ab, dtype=np.float64).ravel())
         if S_blocks:
             S_pno_data = np.concatenate(S_blocks)
         else:
