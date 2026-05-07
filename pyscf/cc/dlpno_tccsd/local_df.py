@@ -83,6 +83,11 @@ def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
             paoatoms_i = np.array(sorted(indexed_atoms), dtype=int)
 
         # (3) lmo_to_riatoms: aux atoms via Mulliken population.
+        # Hoist the (P*w_u) / (P*w_v) products out of the per-atom loop —
+        # the previous formulation recomputed the (nao, nao) tensor on each
+        # atom iteration, blowing up to O(natm * nao²) = O(N³) per LMO and
+        # O(N⁴) overall (97s on water-42, 68% of cc_ints wall).
+        # Now: O(nao²) once per LMO + O(nao) per-atom row/col reduction.
         c = C_lmo[:, i]
         P = s1e * c[:, None] * c[None, :]
         pd = np.diag(P)
@@ -90,10 +95,15 @@ def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
         with np.errstate(divide='ignore', invalid='ignore'):
             w_u = np.where(sd > 1e-15, pd[:, None] / sd, 0.0)
             w_v = np.where(sd > 1e-15, pd[None, :] / sd, 0.0)
+        Pwu = P * w_u
+        Pwv = P * w_v
+        # row_sum_u[μ] = sum_ν Pwu[μ, ν]; col_sum_v[ν] = sum_μ Pwv[μ, ν]
+        row_sum_u = Pwu.sum(axis=1)
+        col_sum_v = Pwv.sum(axis=0)
         pop = np.zeros(natm)
         for a in range(natm):
             m = atom_ids == a
-            pop[a] = np.sum((P * w_u)[m, :]) + np.sum((P * w_v)[:, m])
+            pop[a] = row_sum_u[m].sum() + col_sum_v[m].sum()
         riatoms_i = np.where(np.abs(pop) > T_CUT_MKN)[0]
 
         return atoms_i, paoatoms_i, riatoms_i
