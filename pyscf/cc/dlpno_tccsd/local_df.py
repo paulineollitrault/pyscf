@@ -867,18 +867,21 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         raw_ab = np.zeros((n_local, npno, npno))
         raw_pair = np.zeros(n_local)
         # When _use_centerQ_c, the per-partner raw_cross / raw_kv arrays
-        # live in flat buffers (built once per pair) so the C
+        # live in flat buffers (built once per pair below) so the C
         # partners_centerQ kernel writes into them directly across centerQ
         # iterations and the cross_partner kernel reads them without a
         # dict→flat conversion. The Python fallback keeps dicts.
-        raw_cross_kj = {k: np.zeros((n_local, npno, n_kj))
-                        for k, _, n_kj in kj_partners}
-        raw_kv_kj = {k: np.zeros((n_local, n_kj))
-                     for k, _, n_kj in kj_partners}
-        raw_cross_ji = {k: np.zeros((n_local, npno, n_ki))
-                        for k, _, n_ki in ki_partners}
-        raw_kv_ki = {k: np.zeros((n_local, n_ki))
-                     for k, _, n_ki in ki_partners}
+        if _use_centerQ_c:
+            raw_cross_kj = raw_kv_kj = raw_cross_ji = raw_kv_ki = None
+        else:
+            raw_cross_kj = {k: np.zeros((n_local, npno, n_kj))
+                            for k, _, n_kj in kj_partners}
+            raw_kv_kj = {k: np.zeros((n_local, n_kj))
+                         for k, _, n_kj in kj_partners}
+            raw_cross_ji = {k: np.zeros((n_local, npno, n_ki))
+                            for k, _, n_ki in ki_partners}
+            raw_kv_ki = {k: np.zeros((n_local, n_ki))
+                         for k, _, n_ki in ki_partners}
         if _dbg_ccints:
             _dbg_add('pair_alloc',
                      _ccints_time.perf_counter() - _t_alloc_start)
@@ -1288,34 +1291,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         if _dbg_ccints:
             _dbg_add('centerQ_loop',
                      _ccints_time.perf_counter() - _t_centerQ_start)
-        # If we used the C partners_centerQ kernel, copy the per-pair flat
-        # raw_cross_*_flat / raw_kv_*_flat buffers back into the per-k
-        # dicts that the cross_partner phase consumes.  Cheap: O(npno*n_kj)
-        # per partner; partner counts are small.
-        _t_scatter_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
-        if _use_centerQ_c and _kj_flat is not None:
-            cross_off = _kj_flat['cross_off']; kv_off = _kj_flat['kv_off']
-            cross_flat = _kj_flat['raw_cross_flat']; kv_flat = _kj_flat['raw_kv_flat']
-            for p, (k, _key, n_kj) in enumerate(kj_partners):
-                raw_cross_kj[k] = cross_flat[
-                    cross_off[p]:cross_off[p + 1]
-                ].reshape(n_local, npno, n_kj).copy()
-                raw_kv_kj[k] = kv_flat[
-                    kv_off[p]:kv_off[p + 1]
-                ].reshape(n_local, n_kj).copy()
-        if _use_centerQ_c and _ki_flat is not None:
-            cross_off = _ki_flat['cross_off']; kv_off = _ki_flat['kv_off']
-            cross_flat = _ki_flat['raw_cross_flat']; kv_flat = _ki_flat['raw_kv_flat']
-            for p, (k, _key, n_ki) in enumerate(ki_partners):
-                raw_cross_ji[k] = cross_flat[
-                    cross_off[p]:cross_off[p + 1]
-                ].reshape(n_local, npno, n_ki).copy()
-                raw_kv_ki[k] = kv_flat[
-                    kv_off[p]:kv_off[p + 1]
-                ].reshape(n_local, n_ki).copy()
-        if _dbg_ccints:
-            _dbg_add('flat_scatter',
-                     _ccints_time.perf_counter() - _t_scatter_start)
+        # C path: skip flat→dict scatter — _run_one_side reads the flat
+        # buffers directly. Python fallback already wrote into the dicts.
         _t_jhi_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
         # Apply local J^{-1/2}
         j2c_local = j2c[np.ix_(aux_idx, aux_idx)]
@@ -1375,39 +1352,29 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             q_io_c = np.ascontiguousarray(q_io)
             q_jo_c = np.ascontiguousarray(q_jo)
 
-            def _run_one_side(partners, raw_cross_dict, raw_kv_dict,
+            def _run_one_side(partners, flat_buf,
                               q_io_or_jo_c, Z_iv_or_jv):
                 """Process all partners on one side (kj or ki) in one C call.
+                Reads raw_cross/raw_kv directly from the per-pair flat
+                buffer populated by DLPNOpartners_centerQ_step — no
+                dict→flat scatter required.
+
                 Returns (J_dict, K_dict) keyed by k (global LMO index)."""
-                if not partners:
+                if not partners or flat_buf is None:
                     return {}, {}
                 n_partners = len(partners)
-                k_arr   = np.empty(n_partners, dtype=np.int64)
                 k_loc_arr = np.empty(n_partners, dtype=np.int64)
-                n_kj_arr  = np.empty(n_partners, dtype=np.int64)
-                cross_sizes = np.empty(n_partners, dtype=np.int64)
-                kv_sizes    = np.empty(n_partners, dtype=np.int64)
-                JK_sizes    = np.empty(n_partners, dtype=np.int64)
+                n_kj_arr  = flat_buf['n_kj_arr']
+                JK_sizes  = np.empty(n_partners, dtype=np.int64)
                 for p, (k, _key, n_kj) in enumerate(partners):
-                    k_arr[p] = k
                     k_loc_arr[p] = int(p_lmos_dense[k])
-                    n_kj_arr[p] = n_kj
-                    cross_sizes[p] = n_local * npno * n_kj
-                    kv_sizes[p]    = n_local * n_kj
-                    JK_sizes[p]    = npno * n_kj
-                cross_off = np.empty(n_partners + 1, dtype=np.int64); cross_off[0] = 0
-                cross_off[1:] = np.cumsum(cross_sizes)
-                kv_off = np.empty(n_partners + 1, dtype=np.int64); kv_off[0] = 0
-                kv_off[1:] = np.cumsum(kv_sizes)
+                    JK_sizes[p]  = npno * n_kj
+                cross_off = flat_buf['cross_off']
+                kv_off    = flat_buf['kv_off']
                 JK_off = np.empty(n_partners + 1, dtype=np.int64); JK_off[0] = 0
                 JK_off[1:] = np.cumsum(JK_sizes)
-                raw_cross_flat = np.empty(int(cross_off[-1]))
-                raw_kv_flat    = np.empty(int(kv_off[-1]))
-                for p, (k, _key, _n_kj) in enumerate(partners):
-                    raw_cross_flat[cross_off[p]:cross_off[p + 1]] = (
-                        raw_cross_dict[k].ravel())
-                    raw_kv_flat[kv_off[p]:kv_off[p + 1]] = (
-                        raw_kv_dict[k].ravel())
+                raw_cross_flat = flat_buf['raw_cross_flat']
+                raw_kv_flat    = flat_buf['raw_kv_flat']
                 J_out_flat = np.empty(int(JK_off[-1]))
                 K_out_flat = np.empty(int(JK_off[-1]))
                 _libcc_centerQ.DLPNOcross_partner_assemble(
@@ -1436,9 +1403,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 return J_dict, K_dict
 
             J_kj_byk, K_kj_byk = _run_one_side(
-                kj_partners, raw_cross_kj, raw_kv_kj, q_io_c, Z_iv)
+                kj_partners, _kj_flat, q_io_c, Z_iv)
             J_ki_byk, K_ki_byk = _run_one_side(
-                ki_partners, raw_cross_ji, raw_kv_ki, q_jo_c, Z_jv)
+                ki_partners, _ki_flat, q_jo_c, Z_jv)
             J_ij_kj      = {(key, k): J_kj_byk[k] for k in J_kj_byk}
             K_ij_kj_dict = {(key, k): K_kj_byk[k] for k in K_kj_byk}
             J_ji_ki      = {(key, k): J_ki_byk[k] for k in J_ki_byk}
