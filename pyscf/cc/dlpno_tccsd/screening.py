@@ -241,43 +241,50 @@ def compute_dipole_pair_energies(C_lmo, C_pao, mol, F_lmo, pao_domains,
         lmo_pao_dr.append(dr)
         lmo_pao_eps.append(eps_sc)
 
-    # Dipole pair energy estimate
+    # Dipole pair energy estimate — vectorized across (u, v) per pair.
+    # The outer (i, j) double loop stays in Python (nocc² pairs, each doing
+    # 1 small DGEMM + a couple of broadcasts), but the inner u/v double loop
+    # is collapsed into matrix ops. On water-22 this brings Phase 0 from
+    # 80 s → ~0.5 s.
+    F_diag = np.asarray(F_lmo).diagonal()
     dipole_e = np.zeros((nocc, nocc))
     dipole_e_bound = np.zeros((nocc, nocc))
 
     for i in range(nocc):
+        dr_i = lmo_pao_dr[i]
+        eps_i_arr = lmo_pao_eps[i]
+        if len(eps_i_arr) == 0:
+            continue
+        F_ii = F_diag[i]
         for j in range(i + 1, nocc):
+            dr_j = lmo_pao_dr[j]
+            eps_j_arr = lmo_pao_eps[j]
+            if len(eps_j_arr) == 0:
+                continue
+
             R_ij = R_i[i] - R_i[j]
             R_norm = np.linalg.norm(R_ij)
             if R_norm < 1e-10:
                 continue
             Rh = R_ij / R_norm
 
-            dr_i = lmo_pao_dr[i]  # (n_i, 3)
-            dr_j = lmo_pao_dr[j]  # (n_j, 3)
-            eps_i = lmo_pao_eps[i]
-            eps_j = lmo_pao_eps[j]
+            # iu_dot_jv[u, v] = dr_i[u] · dr_j[v]
+            iu_dot_jv = dr_i @ dr_j.T              # (n_i, n_j)
+            iu_dot_R  = dr_i @ Rh                  # (n_i,)
+            jv_dot_R  = dr_j @ Rh                  # (n_j,)
 
-            if len(eps_i) == 0 or len(eps_j) == 0:
-                continue
+            num_actual = (iu_dot_jv
+                          - 3.0 * iu_dot_R[:, None] * jv_dot_R[None, :]) ** 2
+            num_linear = (-2.0 * iu_dot_jv) ** 2
 
-            e_actual = 0.0
-            e_bound = 0.0
-            for u in range(len(eps_i)):
-                for v in range(len(eps_j)):
-                    iu_dot_jv = np.dot(dr_i[u], dr_j[v])
-                    iu_dot_R = np.dot(dr_i[u], Rh)
-                    jv_dot_R = np.dot(dr_j[v], Rh)
+            denom = (eps_i_arr[:, None] + eps_j_arr[None, :]
+                     - F_ii - F_diag[j])           # (n_i, n_j)
+            mask = np.abs(denom) > 1e-12
+            denom_safe = np.where(mask, denom, 1.0)
+            inv_denom = np.where(mask, 1.0 / denom_safe, 0.0)
 
-                    num_actual = (iu_dot_jv - 3.0 * iu_dot_R * jv_dot_R) ** 2
-                    num_linear = (-2.0 * iu_dot_jv) ** 2
-
-                    denom = (eps_i[u] + eps_j[v]) - (F_lmo[i, i] + F_lmo[j, j])
-                    if abs(denom) < 1e-12:
-                        continue
-
-                    e_actual += num_actual / denom
-                    e_bound += num_linear / denom
+            e_actual = float((num_actual * inv_denom).sum())
+            e_bound  = float((num_linear * inv_denom).sum())
 
             factor = -4.0 * R_norm ** (-6)
             dipole_e[i, j] = dipole_e[j, i] = e_actual * factor

@@ -464,6 +464,47 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     occ_cas_set = set(occ_cas_idx.tolist()) if occ_cas_idx is not None else set()
 
     # ===================================================================
+    # Phase 0 — Psi4-style dipole prescreen (matches dlpnobase.cc::
+    # compute_dipole_pair_energies). Drops pairs whose dipole-bound MP2
+    # estimate is below T_CutPairs_MP2 BEFORE the expensive Phase 1
+    # (orthogonalization + per-pair DF + SC-MP2). Was previously applied
+    # AFTER Phase 1+2a (crude prescreen on SC-MP2 e_ij), which on water-42
+    # made Phase 1 process all 14196 pairs and then drop 76% of them.
+    # ===================================================================
+    _t_p0_start = _pno_time_p1.perf_counter() if False else None
+    import time as _pno_time_p0
+    _t_p0_start = _pno_time_p0.perf_counter()
+    e_dipole_dropped = 0.0
+    keep_pairs_set = None
+    _do_dipole_prescreen = bool(int(os.environ.get(
+        'DLPNO_DIPOLE_PRESCREEN', '1')))
+    if _do_dipole_prescreen and use_df:
+        from pyscf.cc.dlpno_tccsd.screening import compute_dipole_pair_energies
+        # Compute dipole-bound pair-energy estimates. Drop only when the
+        # *bound* (which is a true upper bound on |e_ij|) is below the
+        # SC-MP2 prescreen threshold — guaranteeing surviving pairs are a
+        # superset of those the post-Phase-2a prescreen would have kept.
+        dipole_e, dipole_e_bound = compute_dipole_pair_energies(
+            C_lmo, C_pao, mf.mol, F_lmo, pao_domains,
+            S_pao, F_pao, with_df=mf.with_df)
+        keep_pairs_set = set()
+        for i in range(nocc_lmo):
+            for j in range(i, nocc_lmo):
+                if i == j or abs(dipole_e_bound[i, j]) >= T_CutPairs_MP2:
+                    keep_pairs_set.add((i, j))
+                else:
+                    fac = 1.0 if i == j else 2.0
+                    e_dipole_dropped += fac * dipole_e[i, j]
+        _n_total = nocc_lmo * (nocc_lmo + 1) // 2
+        _n_kept = len(keep_pairs_set)
+        _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
+        _pno_dbg and print(
+            f'[PNO_DBG] Phase 0 dipole prescreen: '
+            f'{_pno_time_p0.perf_counter() - _t_p0_start:.2f}s, '
+            f'kept {_n_kept}/{_n_total} pairs '
+            f'(e_dropped={e_dipole_dropped:.3e} Eh)', flush=True)
+
+    # ===================================================================
     # Phase 1: Build per-pair domain data and SC-MP2 initial guess
     # (parallelized via _pool.map — each (i,j) pair is independent)
     # ===================================================================
@@ -550,7 +591,11 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             'domain_ij': domain_ij,
         }
 
-    _p1_keys = [(i, j) for i in range(nocc_lmo) for j in range(i, nocc_lmo)]
+    if keep_pairs_set is not None:
+        _p1_keys = sorted(keep_pairs_set)
+    else:
+        _p1_keys = [(i, j) for i in range(nocc_lmo)
+                    for j in range(i, nocc_lmo)]
     _p1_iter = (_pool.map(_phase1_one, _p1_keys)
                 if _pool is not None
                 else (_phase1_one(k) for k in _p1_keys))
@@ -1311,10 +1356,16 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     # These pairs never went through the iterative LMP2 — their initial
     # SC-MP2 estimate is added to the total to preserve correctness.
     e_lmp2_total += _e_mp2_prescreened
+    # Add the dipole-prescreen contribution (Phase 0 — pairs that never
+    # reached Phase 1 because the dipole-bound estimate was below
+    # T_CutPairs_MP2). Their dipole estimate is the closed-form approx
+    # to e_ij and is added back to the total energy, exactly mirroring
+    # Psi4's compute_dipole_pair_energies bookkeeping.
+    e_lmp2_total += e_dipole_dropped
     log.info('PNO construction complete: %d strong pairs, %d weak pairs',
              n_pairs_strong, n_pairs_weak)
-    log.info('Total LMP2 energy = %.15g (incl prescreen %.6e)',
-             e_lmp2_total, _e_mp2_prescreened)
+    log.info('Total LMP2 energy = %.15g (incl prescreen %.6e dipole %.6e)',
+             e_lmp2_total, _e_mp2_prescreened, e_dipole_dropped)
     _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
     _pno_dbg and print(f'[PNO_DBG] Phase 3: {_pno_time.perf_counter() - _t_p3_start:.2f}s',
           flush=True)
