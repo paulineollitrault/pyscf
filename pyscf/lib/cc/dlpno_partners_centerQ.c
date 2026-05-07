@@ -52,12 +52,13 @@
 #include "vhf/fblas.h"
 
 void DLPNOpartners_centerQ_step(
-        const double *proj_ij,                /* (nQp, npno, np_full) */
+        const double *proj_ij,                /* (nQp, npno, n_red) */
         const double *qia_atom_full,          /* (nQ_at_atom, nl, np_full) */
         const long   *atom_pos,               /* (nQp,) */
         const long   *local_Q,                /* (nQp,) */
         const long   *riatom_to_paos_dense_at,/* (nao_pao_total,) */
         const long   *riatom_to_lmos_dense_at,/* (nocc,) */
+        const long   *pair_used_inv,          /* (np_full,) full→red pos or -1 */
         const int     n_partners,
         const long   *partner_k_arr,
         const long   *partner_n_kj,
@@ -74,13 +75,15 @@ void DLPNOpartners_centerQ_step(
         const size_t  n_local,
         const size_t  nao_pao_total,
         const size_t  nocc,
+        const size_t  n_red,
         double       *raw_cross_flat,
         double       *raw_kv_flat)
 {
     if (n_partners == 0 || nQp == 0) return;
 
-    const size_t proj_q = npno * np_full;
-    const size_t proj_b = np_full;
+    /* proj_ij is (nQp, npno, n_red); qia is (nQ, nl, np_full). */
+    const size_t proj_q = npno * n_red;
+    const size_t proj_b = n_red;
     const size_t qia_q  = nl * np_full;
     const size_t qia_l  = np_full;
 
@@ -90,9 +93,12 @@ void DLPNOpartners_centerQ_step(
 
     /* Reusable scratch — sized by max n_pao_k across partners (cheap upper
      * bound; alloc once per call). proj_gather/qia_gather/X_slice/cross_loc/
-     * kv_loc capacities grow to fit largest partner. */
-    long *kj_u_in_pair = NULL;
-    long *kj_u_in_Q    = NULL;
+     * kv_loc capacities grow to fit largest partner.
+     * kj_u_in_Q_full is the position in [0, np_full) (used for qia gather);
+     * kj_u_in_Q_red  is the position in [0, n_red)  (used for proj_ij gather). */
+    long *kj_u_in_pair   = NULL;
+    long *kj_u_in_Q_full = NULL;
+    long *kj_u_in_Q_red  = NULL;
     long  cap_pao = 0;
 
     double *X_slice    = NULL;
@@ -117,21 +123,25 @@ void DLPNOpartners_centerQ_step(
         const long k_s = riatom_to_lmos_dense_at[k_global];
 
         if (n_pao_k > cap_pao) {
-            free(kj_u_in_pair); free(kj_u_in_Q);
+            free(kj_u_in_pair); free(kj_u_in_Q_full); free(kj_u_in_Q_red);
             cap_pao = n_pao_k;
-            kj_u_in_pair = (long *)malloc(sizeof(long) * (size_t)cap_pao);
-            kj_u_in_Q    = (long *)malloc(sizeof(long) * (size_t)cap_pao);
+            kj_u_in_pair   = (long *)malloc(sizeof(long) * (size_t)cap_pao);
+            kj_u_in_Q_full = (long *)malloc(sizeof(long) * (size_t)cap_pao);
+            kj_u_in_Q_red  = (long *)malloc(sizeof(long) * (size_t)cap_pao);
         }
 
         long npp_kj = 0;
         for (long u = 0; u < n_pao_k; u++) {
             const long pao_global = pp_k[u];
             const long pos = riatom_to_paos_dense_at[pao_global];
-            if (pos >= 0) {
-                kj_u_in_pair[npp_kj] = u;
-                kj_u_in_Q[npp_kj]    = pos;
-                npp_kj++;
-            }
+            if (pos < 0) continue;
+            const long pos_red = pair_used_inv[pos];
+            /* pp_k ⊆ pair_used by construction so pos_red ≥ 0; defensive guard. */
+            if (pos_red < 0) continue;
+            kj_u_in_pair[npp_kj]   = u;
+            kj_u_in_Q_full[npp_kj] = pos;
+            kj_u_in_Q_red[npp_kj]  = pos_red;
+            npp_kj++;
         }
         if (npp_kj == 0) continue;
 
@@ -181,7 +191,7 @@ void DLPNOpartners_centerQ_step(
                 const double *proj_qb = proj_q_ptr + b * proj_b;
                 double *pg_qb = pg_q + b * (size_t)npp_kj;
                 for (long u = 0; u < npp_kj; u++) {
-                    pg_qb[u] = proj_qb[kj_u_in_Q[u]];
+                    pg_qb[u] = proj_qb[kj_u_in_Q_red[u]];
                 }
             }
         }
@@ -227,7 +237,7 @@ void DLPNOpartners_centerQ_step(
                                        + (size_t)k_s * qia_l;
                 double *qg_q = qia_gather + q * (size_t)npp_kj;
                 for (long u = 0; u < npp_kj; u++) {
-                    qg_q[u] = qia_qk[kj_u_in_Q[u]];
+                    qg_q[u] = qia_qk[kj_u_in_Q_full[u]];
                 }
             }
             {
@@ -249,7 +259,7 @@ void DLPNOpartners_centerQ_step(
         }
     }
 
-    free(kj_u_in_pair); free(kj_u_in_Q);
+    free(kj_u_in_pair); free(kj_u_in_Q_full); free(kj_u_in_Q_red);
     free(X_slice); free(proj_gather); free(cross_loc);
     free(qia_gather); free(kv_loc);
 }

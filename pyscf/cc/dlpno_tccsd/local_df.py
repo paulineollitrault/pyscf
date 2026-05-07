@@ -768,8 +768,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             [_ctypes_cQ.c_void_p] * 3                     # qij/qia/qab atom-full
             + [_ctypes_cQ.c_void_p, _ctypes_cQ.c_void_p]   # local_Q, atom_pos
             + [_ctypes_cQ.c_int, _ctypes_cQ.c_int]         # i_s, j_s
-            + [_ctypes_cQ.c_void_p] * 4                    # ij_u_in_Q, ext_kept_pos/lmos, X_ij
-            + [_ctypes_cQ.c_size_t] * 8                    # shapes
+            + [_ctypes_cQ.c_void_p] * 5                    # ij_u_in_Q, ext_kept_pos/lmos, X_ij, pair_used_in_Q
+            + [_ctypes_cQ.c_size_t] * 9                    # shapes (incl n_red)
             + [_ctypes_cQ.c_void_p] * 8)                   # outputs
         _libcc_centerQ.DLPNOcross_partner_assemble.restype = None
         _libcc_centerQ.DLPNOcross_partner_assemble.argtypes = (
@@ -778,10 +778,10 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             + [_ctypes_cQ.c_size_t] * 3)
         _libcc_centerQ.DLPNOpartners_centerQ_step.restype = None
         _libcc_centerQ.DLPNOpartners_centerQ_step.argtypes = (
-            [_ctypes_cQ.c_void_p] * 6            # proj, qia_atom, atom_pos, local_Q, paos_dense, lmos_dense
+            [_ctypes_cQ.c_void_p] * 7            # proj, qia_atom, atom_pos, local_Q, paos_dense, lmos_dense, pair_used_inv
             + [_ctypes_cQ.c_int]                  # n_partners
             + [_ctypes_cQ.c_void_p] * 8           # 8 flat partner arrays
-            + [_ctypes_cQ.c_size_t] * 7           # nQp..nocc
+            + [_ctypes_cQ.c_size_t] * 8           # nQp..nocc, n_red
             + [_ctypes_cQ.c_void_p] * 2)          # raw_cross_flat, raw_kv_flat
 
     # === DBG_CCINTS section timers (read DLPNO_CCINTS_DBG=1) ===
@@ -1006,6 +1006,19 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             pp_ki = np.asarray(pno_spaces[key_ki]['pair_paos'])
             ki_data.append((k, X_ki, pp_ki, n_ki))
 
+        # Pair's "used PAO" set: union of pair_paos over self + all partners.
+        # proj_ij_out only needs columns at PAOs in this set (the rest are
+        # never read by the partner kernel). For water-22 this collapses
+        # np_full ≈ 487 to n_red ≈ 150-250 — eliminating per-pair O(N) cost
+        # in proj_ij build.
+        _pair_used_pieces = [pair_paos_ij]
+        for _k, _X, _pp, _n in kj_data:
+            _pair_used_pieces.append(_pp)
+        for _k, _X, _pp, _n in ki_data:
+            _pair_used_pieces.append(_pp)
+        pair_used_pao_global = np.unique(np.concatenate(
+            _pair_used_pieces).astype(np.int64))
+
         if _stats_ccints:
             n_partners = len(kj_data) + len(ki_data)
             sum_n_kj = sum(d[3] for d in kj_data) + sum(d[3] for d in ki_data)
@@ -1096,8 +1109,22 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 _np_full_c = int(_qab_full.shape[1])
                 _npp_c = int(len(ij_u_in_Q))
                 _n_kept_c = int(_ekp.size)
-                if _npp_c > 0:
-                    proj_ij = np.empty((_nQp_c, npno, _np_full_c))
+                # Per-centerQ pair_used_in_Q: positions in [0, np_full)
+                # for the global PAOs in pair_used_pao_global. Sorted.
+                # pair_used_inv: full→red position map (length np_full).
+                _full_pos_for_used = riatom_to_paos_ext_dense[
+                    centerQ, pair_used_pao_global]
+                _used_mask = _full_pos_for_used >= 0
+                _pair_used_in_Q = np.sort(
+                    _full_pos_for_used[_used_mask]).astype(np.int64)
+                _n_red_c = int(_pair_used_in_Q.size)
+                _pair_used_inv = np.full(
+                    _np_full_c, -1, dtype=np.int64)
+                if _n_red_c > 0:
+                    _pair_used_inv[_pair_used_in_Q] = np.arange(
+                        _n_red_c, dtype=np.int64)
+                if _npp_c > 0 and _n_red_c > 0:
+                    proj_ij = np.empty((_nQp_c, npno, _n_red_c))
                 else:
                     proj_ij = None
                 _proj_ptr = (proj_ij if proj_ij is not None
@@ -1115,8 +1142,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     _ekp.ctypes.data_as(_ctypes_cQ.c_void_p),
                     _ekl.ctypes.data_as(_ctypes_cQ.c_void_p),
                     _X_slice.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _pair_used_in_Q.ctypes.data_as(_ctypes_cQ.c_void_p),
                     _nQp_c, _nl_c, _np_full_c,
-                    npno, _npp_c, _n_kept_c, n_local, nlmo_p,
+                    npno, _npp_c, _n_kept_c, n_local, nlmo_p, _n_red_c,
                     raw_io.ctypes.data_as(_ctypes_cQ.c_void_p),
                     raw_jo.ctypes.data_as(_ctypes_cQ.c_void_p),
                     raw_iv.ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1214,6 +1242,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         local_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _paos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _lmos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _pair_used_inv.ctypes.data_as(_ctypes_cQ.c_void_p),
                         len(kj_partners),
                         _kj_flat['k_arr'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _kj_flat['n_kj_arr'].ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1224,7 +1253,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         _kj_flat['cross_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _kj_flat['kv_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _nQp, npno, _np_full, _nl_at,
-                        n_local, _nao_pao_total, nocc,
+                        n_local, _nao_pao_total, nocc, _n_red_c,
                         _kj_flat['raw_cross_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _kj_flat['raw_kv_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                     )
@@ -1236,6 +1265,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         local_Q_long.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _paos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _lmos_dense_at.ctypes.data_as(_ctypes_cQ.c_void_p),
+                        _pair_used_inv.ctypes.data_as(_ctypes_cQ.c_void_p),
                         len(ki_partners),
                         _ki_flat['k_arr'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _ki_flat['n_kj_arr'].ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1246,7 +1276,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         _ki_flat['cross_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _ki_flat['kv_off'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _nQp, npno, _np_full, _nl_at,
-                        n_local, _nao_pao_total, nocc,
+                        n_local, _nao_pao_total, nocc, _n_red_c,
                         _ki_flat['raw_cross_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _ki_flat['raw_kv_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                     )

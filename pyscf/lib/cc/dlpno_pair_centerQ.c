@@ -50,6 +50,7 @@ void DLPNOpair_centerQ_step(
         const long   *ext_kept_pos,
         const long   *ext_kept_lmos,
         const double *X_ij_slice,
+        const long   *pair_used_in_Q,  /* (n_red,) PAO positions used by pair */
         const size_t  nQp,
         const size_t  nl,
         const size_t  np_full,
@@ -58,6 +59,7 @@ void DLPNOpair_centerQ_step(
         const size_t  n_kept,
         const size_t  n_local,
         const size_t  nlmo_p,
+        const size_t  n_red,           /* reduced proj_ij column count */
         double       *raw_io,
         double       *raw_jo,
         double       *raw_iv,
@@ -83,7 +85,10 @@ void DLPNOpair_centerQ_step(
     const size_t ma_lmo = npno;
     const size_t ab_row = npno * npno;
     const size_t X_row  = npno;
-    const size_t proj_q = npno * np_full;
+    /* proj_ij_out is (nQp, npno, n_red): only PAOs needed by some
+     * partner are kept. n_red ≤ np_full; with n_red=np_full and
+     * pair_used_in_Q=identity, this matches the legacy behavior. */
+    const size_t proj_q = npno * n_red;
 
     const int has_i = (i_s >= 0);
     const int has_j = (j_s >= 0);
@@ -303,36 +308,39 @@ void DLPNOpair_centerQ_step(
     }
 
     /* ------------------------------------------------------------------
-     * Step 5: proj_ij_out[q, a, v] = sum_u X[u, a] * qab[q, ij_u_in_Q[u], v]
-     * Per Q: gather qab[ij_u_in_Q[u], :] to (npp_ij, np_full), then
-     *   proj[a, v] = X.T @ qab_gather  (npno, np_full)
+     * Step 5: proj_ij_out[q, a, v_red] = sum_u X[u, a] * qab[q, ij_u_in_Q[u], pair_used_in_Q[v_red]]
+     * Per Q: gather qab[ij_u_in_Q[u], pair_used_in_Q[v_red]] → (npp_ij, n_red),
+     *        then proj[a, v_red] = X.T @ qab_gather  (npno, n_red)
+     *
+     * n_red ≤ np_full collapses the v axis to only the PAOs that some
+     * partner actually consumes downstream — eliminates the O(N) np_full
+     * dependency in proj_ij build. The DLPNOpartners_centerQ_step kernel
+     * then reads proj_ij at red positions via pair_used_inv.
      * ------------------------------------------------------------------ */
-    {
-        int int_np_full = (int)np_full;
-        double *qab_row_gather = (double *)malloc(sizeof(double) * npp_ij * np_full);
+    if (n_red > 0) {
+        int int_n_red = (int)n_red;
+        double *qab_row_gather = (double *)malloc(sizeof(double) * npp_ij * n_red);
 
         for (size_t q = 0; q < nQp; q++) {
             const size_t pg = (size_t)atom_pos[q];
             const double *qab_q_ptr = qab_b + pg * qab_q;
 
-            /* qab_row_gather[u, v] = qab[ij_u_in_Q[u], v] */
+            /* qab_row_gather[u, v_red] = qab[ij_u_in_Q[u], pair_used_in_Q[v_red]] */
             for (size_t u = 0; u < npp_ij; u++) {
-                memcpy(qab_row_gather + u * np_full,
-                       qab_q_ptr + (size_t)ij_u_in_Q[u] * qab_u,
-                       sizeof(double) * np_full);
+                const double *src_row = qab_q_ptr + (size_t)ij_u_in_Q[u] * qab_u;
+                double *dst_row = qab_row_gather + u * n_red;
+                for (size_t vr = 0; vr < n_red; vr++) {
+                    dst_row[vr] = src_row[pair_used_in_Q[vr]];
+                }
             }
 
-            /* proj[a, v] = sum_u X[u, a] * qab_row_gather[u, v]   = X^T @ qab_row_gather
-             * F: proj_F[v, a] = sum_u qab_row_gather_F[v, u] * X_F[a, u]
-             *                 = qab_row_gather_F @ X_F^T
-             * dgemm('N', 'T', np_full, npno, npp_ij, 1, qab_row_gather, np_full,
-             *       X, npno, 0, proj_ij_out + q*proj_q, np_full)
-             */
+            /* dgemm('N', 'T', n_red, npno, npp_ij, 1, qab_row_gather, n_red,
+             *       X, npno, 0, proj_ij_out + q*proj_q, n_red) */
             dgemm_(&N_flag, &T_flag,
-                   &int_np_full, &int_npno, &int_npp_ij,
-                   &one, qab_row_gather, &int_np_full,
+                   &int_n_red, &int_npno, &int_npp_ij,
+                   &one, qab_row_gather, &int_n_red,
                    X_ij_slice, &int_npno,
-                   &zero, proj_ij_out + q * proj_q, &int_np_full);
+                   &zero, proj_ij_out + q * proj_q, &int_n_red);
         }
 
         free(qab_row_gather);
