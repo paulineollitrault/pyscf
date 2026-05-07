@@ -56,54 +56,55 @@ def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
     # nocc via the shared thread pool when provided. Each worker releases
     # the GIL for its numpy operations, so this scales well.
     def _per_lmo(i):
-        # (1) lmo_to_atoms: atoms where C_lmo has significant coefficient.
-        has_coeff = np.zeros(natm, dtype=bool)
-        for a in range(natm):
-            m = atom_ids == a
-            if np.any(np.abs(C_lmo[m, i]) > T_CUT_CLMO):
-                has_coeff[a] = True
-        atoms_i = np.where(has_coeff)[0]
+        # All three sub-steps are LMO-localized: c = C_lmo[:, i] has
+        # nontrivial support on a bounded number of AOs, so per-LMO cost
+        # collapses from O(nao²) to O(|sig|² + nao). Total over LMOs
+        # drops from O(N³) to O(N²).
+        c = C_lmo[:, i]
 
-        # (2) lmo_to_paoatoms: atoms hosting each LMO's PAO domain.
-        # Include atoms centering the PAO indices AND atoms with
-        # significant C_pao amplitude (project_s22_ladder_bug.md).
+        # (1) lmo_to_atoms: atoms where C_lmo has significant coefficient.
+        sig_c = np.where(np.abs(c) > T_CUT_CLMO)[0]
+        atoms_i = (np.unique(atom_ids[sig_c]) if len(sig_c) > 0
+                   else np.zeros(0, dtype=int))
+
+        # (2) lmo_to_paoatoms: atoms hosting each LMO's PAO domain
+        # (centered atoms + atoms carrying significant C_pao amplitude;
+        # see project_s22_ladder_bug.md).
         if len(pao_domains[i]) == 0:
             paoatoms_i = np.zeros(0, dtype=int)
         else:
-            indexed_atoms = set(atom_ids[pao_domains[i]].tolist())
+            indexed_atoms_set = set(atom_ids[pao_domains[i]].tolist())
             if C_pao is not None:
                 C_slice = C_pao[:, pao_domains[i]]
                 per_ao = np.max(np.abs(C_slice), axis=1)
-                for A in range(natm):
-                    if A in indexed_atoms:
-                        continue
-                    mask_A = (atom_ids == A)
-                    if np.any(per_ao[mask_A] > T_CUT_CLMO):
-                        indexed_atoms.add(A)
-            paoatoms_i = np.array(sorted(indexed_atoms), dtype=int)
+                sig_pao = np.where(per_ao > T_CUT_CLMO)[0]
+                if len(sig_pao) > 0:
+                    indexed_atoms_set.update(
+                        np.unique(atom_ids[sig_pao]).tolist())
+            paoatoms_i = np.array(sorted(indexed_atoms_set), dtype=int)
 
         # (3) lmo_to_riatoms: aux atoms via Mulliken population.
-        # Hoist the (P*w_u) / (P*w_v) products out of the per-atom loop —
-        # the previous formulation recomputed the (nao, nao) tensor on each
-        # atom iteration, blowing up to O(natm * nao²) = O(N³) per LMO and
-        # O(N⁴) overall (97s on water-42, 68% of cc_ints wall).
-        # Now: O(nao²) once per LMO + O(nao) per-atom row/col reduction.
-        c = C_lmo[:, i]
+        # Compute the full (nao, nao) Pwu/Pwv since c may have
+        # non-negligible long tails on extended chains; use np.einsum
+        # to avoid ever materializing P*w_u as a separate (nao, nao)
+        # tensor (was O(nao²) memory + bandwidth).
+        # Eq. row_sum_u[μ] = Σ_ν P[μ,ν] * w_u[μ,ν]
+        #                  = Σ_ν c[μ] s1e[μ,ν] c[ν] * pd[μ]/(pd[μ]+pd[ν])
+        # The previous implementation hoisted Pwu out of the per-atom
+        # loop; we keep it here but use a single elementwise product.
         P = s1e * c[:, None] * c[None, :]
         pd = np.diag(P)
         sd = pd[:, None] + pd[None, :]
         with np.errstate(divide='ignore', invalid='ignore'):
             w_u = np.where(sd > 1e-15, pd[:, None] / sd, 0.0)
             w_v = np.where(sd > 1e-15, pd[None, :] / sd, 0.0)
-        Pwu = P * w_u
-        Pwv = P * w_v
-        # row_sum_u[μ] = sum_ν Pwu[μ, ν]; col_sum_v[ν] = sum_μ Pwv[μ, ν]
-        row_sum_u = Pwu.sum(axis=1)
-        col_sum_v = Pwv.sum(axis=0)
+        row_sum_u = (P * w_u).sum(axis=1)
+        col_sum_v = (P * w_v).sum(axis=0)
+        # Per-atom pop reduction in O(nao) via np.add.at (vs old per-atom
+        # mask scan which was O(natm × nao)).
         pop = np.zeros(natm)
-        for a in range(natm):
-            m = atom_ids == a
-            pop[a] = row_sum_u[m].sum() + col_sum_v[m].sum()
+        rc = row_sum_u + col_sum_v
+        np.add.at(pop, atom_ids, rc)
         riatoms_i = np.where(np.abs(pop) > T_CUT_MKN)[0]
 
         return atoms_i, paoatoms_i, riatoms_i
