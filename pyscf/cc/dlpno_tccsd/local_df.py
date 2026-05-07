@@ -763,6 +763,11 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         import ctypes as _ctypes_cQ
         from pyscf import lib as _pyscflib_cQ
         _libcc_centerQ = _pyscflib_cQ.load_library('libcc')
+        _libcc_centerQ.DLPNOcompute_pair_used.restype = _ctypes_cQ.c_long
+        _libcc_centerQ.DLPNOcompute_pair_used.argtypes = (
+            [_ctypes_cQ.c_void_p, _ctypes_cQ.c_void_p,
+             _ctypes_cQ.c_size_t, _ctypes_cQ.c_size_t,
+             _ctypes_cQ.c_void_p, _ctypes_cQ.c_void_p])
         _libcc_centerQ.DLPNOpair_centerQ_step.restype = None
         _libcc_centerQ.DLPNOpair_centerQ_step.argtypes = (
             [_ctypes_cQ.c_void_p] * 3                     # qij/qia/qab atom-full
@@ -1109,20 +1114,22 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 _np_full_c = int(_qab_full.shape[1])
                 _npp_c = int(len(ij_u_in_Q))
                 _n_kept_c = int(_ekp.size)
-                # Per-centerQ pair_used_in_Q: positions in [0, np_full)
-                # for the global PAOs in pair_used_pao_global. Sorted.
-                # pair_used_inv: full→red position map (length np_full).
-                _full_pos_for_used = riatom_to_paos_ext_dense[
-                    centerQ, pair_used_pao_global]
-                _used_mask = _full_pos_for_used >= 0
-                _pair_used_in_Q = np.sort(
-                    _full_pos_for_used[_used_mask]).astype(np.int64)
-                _n_red_c = int(_pair_used_in_Q.size)
-                _pair_used_inv = np.full(
-                    _np_full_c, -1, dtype=np.int64)
-                if _n_red_c > 0:
-                    _pair_used_inv[_pair_used_in_Q] = np.arange(
-                        _n_red_c, dtype=np.int64)
+                # Per-centerQ pair_used_in_Q + pair_used_inv via C helper —
+                # avoids per-iteration Python work serialised on the GIL.
+                _riatom_to_paos_dense_at = np.ascontiguousarray(
+                    riatom_to_paos_ext_dense[centerQ], dtype=np.int64)
+                _pair_used_in_Q = np.empty(
+                    pair_used_pao_global.size, dtype=np.int64)
+                _pair_used_inv = np.empty(_np_full_c, dtype=np.int64)
+                _n_red_c = int(_libcc_centerQ.DLPNOcompute_pair_used(
+                    _riatom_to_paos_dense_at.ctypes.data_as(
+                        _ctypes_cQ.c_void_p),
+                    pair_used_pao_global.ctypes.data_as(
+                        _ctypes_cQ.c_void_p),
+                    pair_used_pao_global.size, _np_full_c,
+                    _pair_used_in_Q.ctypes.data_as(_ctypes_cQ.c_void_p),
+                    _pair_used_inv.ctypes.data_as(_ctypes_cQ.c_void_p)))
+                _pair_used_in_Q = _pair_used_in_Q[:_n_red_c]
                 if _npp_c > 0 and _n_red_c > 0:
                     proj_ij = np.empty((_nQp_c, npno, _n_red_c))
                 else:

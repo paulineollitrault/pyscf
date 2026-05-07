@@ -38,6 +38,46 @@
 #include <string.h>
 #include "vhf/fblas.h"
 
+static int _dlpno_cmp_long(const void *a, const void *b) {
+    long la = *(const long *)a;
+    long lb = *(const long *)b;
+    return (la > lb) - (la < lb);
+}
+
+/* Per-(pair, centerQ) helper to build pair_used_in_Q (sorted positions
+ * in [0, np_full) for the global PAOs in pair_used_pao_global) and
+ * pair_used_inv (np_full → red index, -1 elsewhere). Releases the GIL
+ * via ctypes; replaces the per-centerQ Python loop, which was ~22 s
+ * stalled on the GIL on water-42. */
+long DLPNOcompute_pair_used(
+        const long *riatom_to_paos_dense_at,
+        const long *pair_used_pao_global,
+        const size_t n_pair_used,
+        const size_t np_full,
+        long *pair_used_in_Q,
+        long *pair_used_inv)
+{
+    for (size_t i = 0; i < np_full; i++) pair_used_inv[i] = -1;
+
+    long n_red = 0;
+    for (size_t u = 0; u < n_pair_used; u++) {
+        const long pao_global = pair_used_pao_global[u];
+        const long pos = riatom_to_paos_dense_at[pao_global];
+        if (pos >= 0) {
+            pair_used_in_Q[n_red++] = pos;
+        }
+    }
+
+    if (n_red > 1)
+        qsort(pair_used_in_Q, (size_t)n_red, sizeof(long), _dlpno_cmp_long);
+
+    for (long i = 0; i < n_red; i++) {
+        pair_used_inv[pair_used_in_Q[i]] = i;
+    }
+
+    return n_red;
+}
+
 void DLPNOpair_centerQ_step(
         const double *qij_atom_full,   /* (nQ_at_atom, nl, nl) */
         const double *qia_atom_full,   /* (nQ_at_atom, nl, np_full) */
