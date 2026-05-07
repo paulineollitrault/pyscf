@@ -2957,6 +2957,41 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
 # Scalable coupled LCCSD (old Psi4-style: superseded by _run_dlpno_lccsd)
 # ---------------------------------------------------------------------------
 
+def _clear_dlpno_caches():
+    """Drop all function-attribute caches built up across DLPNO runs.
+
+    Several batched residual builders (compute_G_term_batched,
+    compute_C_tilde_batched, compute_CD_terms_batched, compute_B_tilde,
+    compute_ladder, ...) cache their plan structures on the function
+    object itself, keyed by ``tuple(sorted(t2_pno_all.keys()))``. The
+    plan stores references to numpy arrays (S matrices etc.) from the
+    *first* run. When a second run happens in the same Python process
+    with the same pair structure (e.g. running multiple S22 dimers, or
+    a CP-corrected interaction-energy triple), the second run's
+    plan-cache hit returns iter-0 references — corrupting iter-1
+    results by tens of mEh.
+
+    Call this at the start of every fresh DLPNO computation. Production
+    callers (run_dlpno_ccsd_t / run_lccsd) clear automatically.
+    """
+    from pyscf.cc.dlpno_tccsd import residual, local_df, lccsd_t
+    for mod in (residual, local_df, lccsd_t):
+        for name in dir(mod):
+            obj = getattr(mod, name, None)
+            if not callable(obj):
+                continue
+            for attr in list(getattr(obj, '__dict__', {}).keys()):
+                if (attr.startswith('_plan_cache')
+                        or attr.startswith('_ph1_plan')
+                        or attr in ('_iter', '_counts', '_term_times',
+                                    '_dump_done')):
+                    delattr(obj, attr)
+    # lccsd_t._partners_cache is keyed by id(set) and could collide
+    # across runs if Python reuses ids; safest to clear.
+    if hasattr(lccsd_t, '_partners_cache'):
+        lccsd_t._partners_cache.clear()
+
+
 def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
               t1_cas, t2_cas, occ_cas_idx, vir_cas_idx,
               mo_coeff_cas, s1e=None,
@@ -3012,6 +3047,13 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
 
     n_total = len(strong_pairs)
     print(f'  LCCSD: solving {n_total} strong pairs (ncores={ncores})...', flush=True)
+
+    # Drop function-attribute plan caches from any prior DLPNO run in
+    # this Python process. See _clear_dlpno_caches docstring — without
+    # this, sequential calls (e.g. S22 CP-corrected interaction
+    # energies) reuse iter-0's S/N/plan references and produce
+    # corrupted energies tens of mEh off.
+    _clear_dlpno_caches()
 
     e_tccsd, t2_pno_all, t1_pno = _run_dlpno_lccsd(
         mf, C_lmo, pno_spaces, strong_pairs,
