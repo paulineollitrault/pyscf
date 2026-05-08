@@ -512,10 +512,6 @@ def get_local_ovL(cc_ints, pair_key, lmo_idx):
     # Qma reduced to (n_local, nlmo_p, npno); translate global lmo_idx.
     lmo_in_p = int(ci['p_lmos_dense'][lmo_idx])
     if lmo_in_p < 0:
-        if int(os.environ.get('DLPNO_DEBUG_OOD', '0')):
-            _c = getattr(get_local_ovL, '_ood', {})
-            _c[(pair_key, lmo_idx)] = _c.get((pair_key, lmo_idx), 0) + 1
-            get_local_ovL._ood = _c
         return None
     return ci['Qma'][:, lmo_in_p, :].T  # (npno, n_local)
 
@@ -532,10 +528,6 @@ def get_local_ooL_vec(cc_ints, k, l, pair_key):
     # i_Qk/j_Qk reduced to (n_local, nlmo_p); translate global k -> p_dense.
     k_red = int(ci['p_lmos_dense'][k])
     if k_red < 0:
-        if int(os.environ.get('DLPNO_DEBUG_OOD', '0')):
-            _c = getattr(get_local_ooL_vec, '_ood', {})
-            _c[(pair_key, k, l)] = _c.get((pair_key, k, l), 0) + 1
-            get_local_ooL_vec._ood = _c
         return None
     if l == i_lmo:
         return ci['i_Qk'][:, k_red]
@@ -565,10 +557,6 @@ def get_local_K(cc_ints, pair_key, lmo1, lmo2):
         p_dense = ci['p_lmos_dense']
         l1, l2 = int(p_dense[lmo1]), int(p_dense[lmo2])
         if l1 < 0 or l2 < 0:
-            if int(os.environ.get('DLPNO_DEBUG_OOD', '0')):
-                _c = getattr(get_local_K, '_ood', {})
-                _c[(pair_key, lmo1, lmo2)] = _c.get((pair_key, lmo1, lmo2), 0) + 1
-                get_local_K._ood = _c
             return None
         # ovL_lmo[Q, a] = Qma[Q, lmo, a]; K[a,b] = Σ_Q ovL1[Q,a]*ovL2[Q,b]
         K = Qma[:, l1, :].T @ Qma[:, l2, :]
@@ -800,38 +788,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             + [_ctypes_cQ.c_size_t] * 8           # nQp..nocc, n_red
             + [_ctypes_cQ.c_void_p] * 2)          # raw_cross_flat, raw_kv_flat
 
-    # === DBG_CCINTS section timers (read DLPNO_CCINTS_DBG=1) ===
-    import time as _ccints_time
-    import threading as _ccints_threading
-    _dbg_ccints = bool(int(os.environ.get('DLPNO_CCINTS_DBG', '0')))
-    _dbg_acc = {'setup': 0.0, 'centerQ_loop': 0.0, 'jhi_eigh': 0.0,
-                'jhi_apply': 0.0, 'final_KJ': 0.0, 'cross_kj': 0.0,
-                'partner_calls': 0.0, 'centerQ_inner': 0.0,
-                'partner_enum': 0.0, 'pair_alloc': 0.0,
-                'partner_flat': 0.0, 'flat_scatter': 0.0,
-                'returnpack': 0.0, 'pair_total': 0.0,
-                'cQ_pair_kernel': 0.0, 'cQ_partner_kernel': 0.0}
-    _dbg_lock = _ccints_threading.Lock()
-    def _dbg_add(k, v):
-        if _dbg_ccints:
-            with _dbg_lock:
-                _dbg_acc[k] += v
-
-    # === Per-pair scaling stats (read DLPNO_CCINTS_STATS=1) ===
-    _stats_ccints = bool(int(os.environ.get('DLPNO_CCINTS_STATS', '0')))
-    _stats_lock = _ccints_threading.Lock()
-    _stats_pairs = []   # list of dicts: {npno, n_local, nlmo_p,
-                        #                 ncenters, n_partners, work}
-
     def _process_pair(key):
         """Build cc_ints[key] entry. Pure function — safe for thread parallel."""
-        _t_pair_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
-        try:
-            return _process_pair_inner(key)
-        finally:
-            if _dbg_ccints:
-                _dbg_add('pair_total',
-                         _ccints_time.perf_counter() - _t_pair_start)
+        return _process_pair_inner(key)
 
     def _process_pair_inner(key):
         if key not in pair_aux_idx:
@@ -850,7 +809,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         n_local = len(aux_idx)
         if n_local == 0:
             return key, None
-        _t_pe_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
+        _t_pe_start = 0.0
         if pair_lmo_idx is not None and key in pair_lmo_idx:
             _k_iter = pair_lmo_idx[key]
         else:
@@ -869,15 +828,12 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 Xp = pno_spaces[key_ki].get('X_pno')
                 if Xp is not None and Xp.shape[1] > 0:
                     ki_partners.append((k, key_ki, Xp.shape[1]))
-        if _dbg_ccints:
-            _dbg_add('partner_enum',
-                     _ccints_time.perf_counter() - _t_pe_start)
 
         # Pre-fit accumulators.  raw_io/raw_jo/raw_ma's LMO axis is set
         # to ``nocc`` below once we know which LMOs actually get
         # populated from the centerQ stacks (the union of
         # riatom_to_lmos_ext over all of this pair's aux centers).
-        _t_alloc_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
+        _t_alloc_start = 0.0
         raw_iv = np.zeros((n_local, npno))
         raw_jv = np.zeros((n_local, npno))
         raw_ab = np.zeros((n_local, npno, npno))
@@ -898,9 +854,6 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                             for k, _, n_ki in ki_partners}
             raw_kv_ki = {k: np.zeros((n_local, n_ki))
                          for k, _, n_ki in ki_partners}
-        if _dbg_ccints:
-            _dbg_add('pair_alloc',
-                     _ccints_time.perf_counter() - _t_alloc_start)
 
         # Session: per-pair flat partner buffers for the C centerQ
         # partners kernel.  Built once per pair (iteration-invariant since
@@ -952,7 +905,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     'raw_cross_flat': raw_cross_flat,
                     'raw_kv_flat': raw_kv_flat,
                 }
-            _t_pf_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
+            _t_pf_start = 0.0
             _kj_pdat = [(k, pno_spaces[key]['X_pno'],
                          np.asarray(pno_spaces[key]['pair_paos']), n_kj)
                         for k, key, n_kj in kj_partners]
@@ -961,9 +914,6 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         for k, key, n_ki in ki_partners]
             _kj_flat = _build_partner_flat(_kj_pdat, len(kj_partners))
             _ki_flat = _build_partner_flat(_ki_pdat, len(ki_partners))
-            if _dbg_ccints:
-                _dbg_add('partner_flat',
-                         _ccints_time.perf_counter() - _t_pf_start)
 
         pair_paos_ij = np.asarray(pair_paos_ij)
 
@@ -1035,27 +985,8 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         pair_used_pao_global = np.unique(np.concatenate(
             _pair_used_pieces).astype(np.int64))
 
-        if _stats_ccints:
-            n_partners = len(kj_data) + len(ki_data)
-            sum_n_kj = sum(d[3] for d in kj_data) + sum(d[3] for d in ki_data)
-            np_full_avg = (sum(qab_atom[c].shape[1]
-                               for c in unique_centers
-                               if qab_atom[c] is not None)
-                           / max(1, len(unique_centers)))
-            with _stats_lock:
-                _stats_pairs.append({
-                    'i': int(i), 'j': int(j),
-                    'npno': int(npno),
-                    'n_local': int(n_local),
-                    'nlmo_p': int(nlmo_p),
-                    'ncenters': int(len(unique_centers)),
-                    'n_partners': int(n_partners),
-                    'sum_n_kj': int(sum_n_kj),
-                    'np_avg': float(np_full_avg),
-                    'n_pao_pair': int(len(pair_paos_ij)),
-                })
 
-        _t_centerQ_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
+        _t_centerQ_start = 0.0
         for centerQ in unique_centers:
             ext_lmos = riatom_to_lmos_ext[centerQ]
             if len(ext_lmos) == 0 or qij_atom[centerQ] is None:
@@ -1147,8 +1078,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     proj_ij = None
                 _proj_ptr = (proj_ij if proj_ij is not None
                              else np.empty(0))
-                _t_pk_start = (_ccints_time.perf_counter()
-                               if _dbg_ccints else 0.0)
+                _t_pk_start = 0.0
                 _libcc_centerQ.DLPNOpair_centerQ_step(
                     _qij_full.ctypes.data_as(_ctypes_cQ.c_void_p),
                     _qia_full.ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1172,9 +1102,6 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     raw_ab.ctypes.data_as(_ctypes_cQ.c_void_p),
                     _proj_ptr.ctypes.data_as(_ctypes_cQ.c_void_p),
                 )
-                if _dbg_ccints:
-                    _dbg_add('cQ_pair_kernel',
-                             _ccints_time.perf_counter() - _t_pk_start)
             else:
                 # raw_io[local_Q, p_lmos_local] = qij_b[:, i_s, kept]
                 if i_s >= 0 and ext_kept_lmos.size > 0:
@@ -1250,8 +1177,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 _np_full = _qia_full.shape[2]
                 _nao_pao_total = riatom_to_paos_ext_dense.shape[1]
 
-                _t_pn_start = (_ccints_time.perf_counter()
-                               if _dbg_ccints else 0.0)
+                _t_pn_start = 0.0
                 if _kj_flat is not None and do_proj:
                     _libcc_centerQ.DLPNOpartners_centerQ_step(
                         _proj_c.ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1298,9 +1224,6 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         _ki_flat['raw_cross_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _ki_flat['raw_kv_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                     )
-                if _dbg_ccints:
-                    _dbg_add('cQ_partner_kernel',
-                             _ccints_time.perf_counter() - _t_pn_start)
             else:
                 for k, X_kj, pp_kj, n_kj in kj_data:
                     k_s = int(riatom_to_lmos_ext_dense[centerQ, k])
@@ -1336,12 +1259,9 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         do_proj,
                     )
 
-        if _dbg_ccints:
-            _dbg_add('centerQ_loop',
-                     _ccints_time.perf_counter() - _t_centerQ_start)
         # C path: skip flat→dict scatter — _run_one_side reads the flat
         # buffers directly. Python fallback already wrote into the dicts.
-        _t_jhi_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
+        _t_jhi_start = 0.0
         # Apply local J^{-1/2}
         j2c_local = j2c[np.ix_(aux_idx, aux_idx)]
         eigvals, eigvecs = np.linalg.eigh(j2c_local)
@@ -1364,10 +1284,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         q_jo = q_jo_pfit
         Qma  = Qma_pfit
 
-        if _dbg_ccints:
-            _dbg_add('jhi_apply',
-                     _ccints_time.perf_counter() - _t_jhi_start)
-        _t_finalKJ_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
+        _t_finalKJ_start = 0.0
         K_iajb = q_iv.T @ q_jv
         # K_mnij removed: dead code (built but never read by any consumer).
         # K_bar_ij/ji/chem all reduced on the p_lmos axis: (nlmo_p, npno).
@@ -1382,10 +1299,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         K_tilde_chem_i = np.ascontiguousarray(q_iv.T @ Qab_flat)
         K_tilde_chem_j = np.ascontiguousarray(q_jv.T @ Qab_flat)
 
-        if _dbg_ccints:
-            _dbg_add('final_KJ',
-                     _ccints_time.perf_counter() - _t_finalKJ_start)
-        _t_cross_start = _ccints_time.perf_counter() if _dbg_ccints else 0.0
+        _t_cross_start = 0.0
 
         # === Cross-partner final J/K assembly: native-C path under
         # DLPNO_C_CYCLE=1 (DLPNOcross_partner_assemble in
@@ -1481,9 +1395,6 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 q_kv_ki = jhi @ raw_kv_ki[k]
                 K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki
 
-        if _dbg_ccints:
-            _dbg_add('cross_kj',
-                     _ccints_time.perf_counter() - _t_cross_start)
         return key, {
             'K_iajb': K_iajb,
             'K_bar_ij': K_bar_ij,
@@ -1527,50 +1438,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             cc_ints[k] = entry
     _t_pool_wall = _ccints_setup_time.perf_counter() - _t_pool_start
 
-    if _dbg_ccints:
-        _items = sorted(_dbg_acc.items(), key=lambda kv: -kv[1])
-        _summary = ' '.join(f'{n}={v:.2f}s' for n, v in _items if v > 0.0)
-        print(f"[CCINTS_DBG] (n_pairs={len(keys)}) {_summary}", flush=True)
-        print(f"[CCINTS_DBG] OUTER walls: screening={_t_screening:.2f}s "
-              f"sparse_arrays={_t_sparse:.2f}s atom_stacks={_t_atom_stacks:.2f}s "
-              f"pool_dispatch={_t_pool_wall:.2f}s", flush=True)
 
-    if _stats_ccints and _stats_pairs:
-        _np = len(_stats_pairs)
-        def _avg(field):
-            return sum(p[field] for p in _stats_pairs) / _np
-        def _max(field):
-            return max(p[field] for p in _stats_pairs)
-        def _sum(field):
-            return sum(p[field] for p in _stats_pairs)
-        # Per-pair work proxies (units of FLOPs ~ leading O()):
-        # phase A (centerQ loop): ncenters * (n_partners*npno*np_avg + npno*nlmo_p*np_avg)
-        # phase B (final KJ): n_local * npno^2 * nlmo_p
-        # phase C (cross_kj): n_partners * n_local * npno * sum_n_kj
-        wA = sum(p['ncenters'] * (p['n_partners'] * p['npno'] * p['np_avg']
-                                  + p['npno'] * p['nlmo_p'] * p['np_avg'])
-                 for p in _stats_pairs)
-        wB = sum(p['n_local'] * p['npno']**2 * p['nlmo_p']
-                 for p in _stats_pairs)
-        wC = sum(p['n_partners'] * p['n_local'] * p['npno'] * p['sum_n_kj']
-                 / max(1, p['n_partners'])
-                 for p in _stats_pairs)
-        print(f"[CCINTS_STATS] n_pairs={_np}", flush=True)
-        print(f"  per-pair avg: npno={_avg('npno'):.1f} "
-              f"n_local={_avg('n_local'):.1f} "
-              f"nlmo_p={_avg('nlmo_p'):.1f} "
-              f"ncenters={_avg('ncenters'):.1f} "
-              f"n_partners={_avg('n_partners'):.1f} "
-              f"sum_n_kj={_avg('sum_n_kj'):.1f}", flush=True)
-        print(f"  per-pair max: npno={_max('npno')} "
-              f"n_local={_max('n_local')} "
-              f"nlmo_p={_max('nlmo_p')} "
-              f"ncenters={_max('ncenters')} "
-              f"n_partners={_max('n_partners')}", flush=True)
-        print(f"  totals: n_local_sum={_sum('n_local')} "
-              f"nlmo_p_sum={_sum('nlmo_p')} "
-              f"partners_sum={_sum('n_partners')}", flush=True)
-        print(f"  workA={wA:.2e} workB={wB:.2e} workC={wC:.2e}", flush=True)
 
     # Debug: zero p_lmos\pair_lmo_idx rows in selected cc_ints fields, to
     # localize which consumer(s) drift the energy when those rows go away.

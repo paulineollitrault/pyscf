@@ -767,7 +767,6 @@ def _build_partners(domain_set, nocc_lmo):
     return p
 
 
-_ORCH_PROF_LOCK = __import__('threading').Lock()
 # Lock for protecting the global pair arena build from cache-races.
 # Without it, all 32 pool threads see `_pair_arena = None` on their first
 # call and each redundantly rebuilds (32 × ~1.5s = ~48s of wasted work
@@ -822,43 +821,6 @@ def _build_pair_arena(_gak, pno_spaces, t2_for_T):
     return (_gak, pair_to_idx, g_pao_n, g_pno_n,
             g_pp_off, g_pp_flat, g_X_off, g_X_flat,
             g_T2_off, g_T2_flat)
-_ORCH_PROF = {
-    's1_triple_paos_dom': 0.0,
-    's2_pair_arena': 0.0,
-    's3_u_pks': 0.0,
-    's4_global_arena_cache_lookup': 0.0,
-    's5_per_triple_offsets': 0.0,
-    's6_t2_block_setup': 0.0,
-    's7_t1d_eps_setup': 0.0,
-    's8_w3_setup': 0.0,
-    's9_lmo_pao_dense': 0.0,
-    's10_ctypes_marshalling': 0.0,
-    's11_C_call': 0.0,
-    'total_calls': 0.0,
-    'total_wall': 0.0,
-}
-
-def _orch_prof_reset():
-    with _ORCH_PROF_LOCK:
-        for k in _ORCH_PROF:
-            _ORCH_PROF[k] = 0.0
-
-def _orch_prof_print():
-    with _ORCH_PROF_LOCK:
-        snap = dict(_ORCH_PROF)
-    n = max(1, int(snap['total_calls']))
-    items = sorted([(k, v) for k, v in snap.items()
-                    if k not in ('total_calls', 'total_wall')],
-                   key=lambda kv: -kv[1])
-    print(f"[ORCH_PROF] {int(snap['total_calls'])} calls, total CPU sum "
-          f"{sum(v for k,v in snap.items() if k not in ('total_calls','total_wall')):.2f}s",
-          flush=True)
-    for k, v in items:
-        if v > 0.01:
-            print(f"  {k:<32} {v:>7.2f}s  ({v/n*1e3:>6.2f} ms/call)",
-                  flush=True)
-
-
 def _orch_full(i, j, k, pno_spaces, t2_for_T,
                 C_pao, S_pao_full, F_pao_full, F_lmo,
                 sparse_df, screening, j2c_full, lmo_aux_mask,
@@ -871,8 +833,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
     Returns et_ijk.
     """
     import time as _orch_time
-    _prof_enabled = bool(int(os.environ.get('DLPNO_ORCH_PROF', '0')))
-    _t_start = _orch_time.perf_counter() if _prof_enabled else 0.0
+    _t_start = 0.0
     ij = (min(i, j), max(i, j))
     ik = (min(i, k), max(i, k))
     jk = (min(j, k), max(j, k))
@@ -907,7 +868,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
     triple_domain = sorted(_p[i] & _p[j] & _p[k])
     triple_domain_arr = np.asarray(triple_domain, dtype=np.int64)
     n_dom = int(triple_domain_arr.size)
-    _t_s1 = _orch_time.perf_counter() if _prof_enabled else 0.0
+    _t_s1 = 0.0
 
     # 3. 3-pair arena
     keys_3 = [ij, jk, ik]
@@ -944,7 +905,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
                     else np.empty(0, dtype=np.float64))
     T2_flat_3 = (np.concatenate(T2_lists) if any(x.size for x in T2_lists)
                  else np.empty(0, dtype=np.float64))
-    _t_s2 = _orch_time.perf_counter() if _prof_enabled else 0.0
+    _t_s2 = 0.0
 
     # 4. u_pks list — covers (r,m), (r,r), (r,r2) for r in [i,j,k], m in domain
     triple_lmo = [i, j, k]
@@ -969,7 +930,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
 
     if n_u_pks == 0:
         return 0.0
-    _t_s3 = _orch_time.perf_counter() if _prof_enabled else 0.0
+    _t_s3 = 0.0
 
     # Global pair arena — cached across triples within a CCSD run.
     # Eliminates the per-triple ~2 MB X_pno/T2 marshalling that was the
@@ -989,7 +950,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
      g_pao_n, g_pno_n,
      g_pp_off, g_pp_flat, g_X_off, g_X_flat,
      g_T2_off, g_T2_flat) = gcache
-    _t_s4 = _orch_time.perf_counter() if _prof_enabled else 0.0
+    _t_s4 = 0.0
 
     # Per-triple: just look up offsets into the global arena.  No data copy.
     u_pao_n = np.empty(n_u_pks, dtype=np.int32)
@@ -1091,7 +1052,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
     (_, F_pao_c, S_pao_c, j2c_c, aux_atom_ids, aux_pos_in_atom,
      lmo_dense_c, pao_dense_c, lmo_aux_mask_c) = cached
     triple_paos_c = np.ascontiguousarray(triple_paos, dtype=np.int64)
-    _t_s10 = _orch_time.perf_counter() if _prof_enabled else 0.0
+    _t_s10 = 0.0
 
     # 9. ctypes setup + call
     import ctypes as _ct
@@ -1182,18 +1143,6 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
         float(T_CutTNO), float(1e-8),
         0, None, None,  # pre_n_tno=0 (compute TNO internally)
     )
-    if _prof_enabled:
-        _t_end = _orch_time.perf_counter()
-        with _ORCH_PROF_LOCK:
-            _ORCH_PROF['s1_triple_paos_dom']            += _t_s1 - _t_start
-            _ORCH_PROF['s2_pair_arena']                  += _t_s2 - _t_s1
-            _ORCH_PROF['s3_u_pks']                       += _t_s3 - _t_s2
-            # s4 + s5 lumped (cache hit path is fast)
-            _ORCH_PROF['s4_global_arena_cache_lookup']  += _t_s4 - _t_s3
-            _ORCH_PROF['s5_per_triple_offsets']         += _t_s10 - _t_s4
-            _ORCH_PROF['s11_C_call']                     += _t_end - _t_s10
-            _ORCH_PROF['total_calls']                    += 1
-            _ORCH_PROF['total_wall']                     += _t_end - _t_start
     return float(et)
 
 
@@ -1210,8 +1159,8 @@ def _run_triples_omp(valid_triples,
     for the entire triples list.  Replaces pool.map dispatch.
     """
     import time as _t
-    _prof = (os.environ.get('DLPNO_TRIPLE_PROF', '0') == '1')
-    _t_start = _t.perf_counter() if _prof else 0.0
+    _prof = (False)
+    _t_start = 0.0
     n_triples = len(valid_triples)
     if n_triples == 0:
         return np.zeros(0)
@@ -1269,9 +1218,6 @@ def _run_triples_omp(valid_triples,
      g_pp_off, g_pp_flat, g_X_off, g_X_flat,
      g_T2_off, g_T2_flat) = gcache
 
-    if _prof:
-        _t_arena = _t.perf_counter()
-        print(f'  [PYTHON_PROF] global pair arena build: {_t_arena - _t_start:.2f}s', flush=True)
     # Pre-compute per-LMO domain-partner set:
     #   partners[i] = {m : (min(m,i), max(m,i)) in _domain_set}
     # This turns the per-triple `for m in range(nocc_lmo)` scan into
@@ -1418,9 +1364,6 @@ def _run_triples_omp(valid_triples,
         dij = int(i == j); djk = int(j == k); dik = int(i == k)
         occ_denom_arr[t] = 1 + dij + djk + dik + 2 * dij * djk * dik
 
-    if _prof:
-        _t_pertriple = _t.perf_counter()
-        print(f'  [PYTHON_PROF] per-triple arena build (loop): {_t_pertriple - _t_arena:.2f}s', flush=True)
     # Flatten variable-length per-triple data
     tp_off = np.zeros(n_triples + 1, dtype=np.int64)
     tp_off[1:] = np.cumsum([a.size for a in tp_lists])
@@ -1508,9 +1451,6 @@ def _run_triples_omp(valid_triples,
         )
         _run_triples_omp._libcc = _libcc
 
-    if _prof:
-        _t_flat = _t.perf_counter()
-        print(f'  [PYTHON_PROF] flatten + ctypes setup: {_t_flat - _t_pertriple:.2f}s', flush=True)
     et_per_triple = np.zeros(n_triples, dtype=np.float64)
     _libcc.DLPNOcompute_E_T0_omp(
         int(n_triples),
@@ -1565,10 +1505,6 @@ def _run_triples_omp(valid_triples,
         float(T_CutTNO), float(1e-8),
         et_per_triple.ctypes.data_as(_ct.c_void_p),
     )
-    if _prof:
-        _t_end = _t.perf_counter()
-        print(f'  [PYTHON_PROF] C call (DLPNOcompute_E_T0_omp): {_t_end - _t_flat:.2f}s', flush=True)
-        print(f'  [PYTHON_PROF] _run_triples_omp TOTAL: {_t_end - _t_start:.2f}s', flush=True)
     return et_per_triple
 
 
@@ -1679,17 +1615,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     """
     log = logger.new_logger(mf, verbose)
     import time as _time
-    _tp_enabled = bool(int(os.environ.get('DLPNO_T_PROF', '0')))
-    _tp_t0 = _time.perf_counter()
-    _tp_prev = _tp_t0
     def _tp(label):
-        nonlocal _tp_prev
-        if not _tp_enabled:
-            return
-        now = _time.perf_counter()
-        print(f"[T-PROF] {label:<36} {now - _tp_prev:>7.2f}s  (cum {now - _tp_t0:.2f}s)",
-              flush=True)
-        _tp_prev = now
+        pass
 
     if not hasattr(mf, 'with_df') or mf.with_df is None:
         import warnings
@@ -1826,15 +1753,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             """Build lmo_aux_mask, pao_domains, screening, and sparse_df stacks
             at the given thresholds. Mirrors Psi4 triples_sparsity(prescreening).
             """
-            _bi_t0 = _time.perf_counter()
-            _bi_prev = _bi_t0
             def _bi(step):
-                nonlocal _bi_prev
-                if not _tp_enabled:
-                    return
-                now = _time.perf_counter()
-                print(f"[T-PROF/{label}] {step:<28} {now - _bi_prev:>7.2f}s", flush=True)
-                _bi_prev = now
+                pass
 
             # --- lmo_aux_mask: per-LMO Mulliken-weighted aux-atom mask ---
             # Parallel over LMOs via shared pool — pre-cache atom-id masks
@@ -2255,8 +2175,6 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     log.info('E(T) screened-back = %.15g', e_t_screened)
     log.info('E(T) external = %.15g', e_t)
 
-    if bool(int(os.environ.get('DLPNO_ORCH_PROF', '0'))):
-        _orch_prof_print()
 
     return e_t
 

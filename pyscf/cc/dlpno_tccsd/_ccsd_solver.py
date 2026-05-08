@@ -1590,11 +1590,8 @@ def run_remaining_cycles_via_class(
 
     # ---- ONE-TIME setup ----
     _t_setup0 = _time.perf_counter()
-    _pack_prof = bool(int(os.environ.get('DLPNO_PACK_PROF', '0')))
     def _pmark(label, t0):
-        if _pack_prof:
-            print(f'  [PACK-PROF] {label}: '
-                  f'{_time.perf_counter() - t0:.3f}s', flush=True)
+        pass
     _t = _time.perf_counter()
     if hasattr(_compute_t1_residual_psi4, '_per_kl_plan_cache'):
         _compute_t1_residual_psi4._per_kl_plan_cache.clear()

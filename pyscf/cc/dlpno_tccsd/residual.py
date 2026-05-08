@@ -544,16 +544,6 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
         )
         _g_t_cy = _gtime.perf_counter() - _t_cy0
 
-        if int(os.environ.get('DLPNO_GTILDE_PLAN_DBG', '0')):
-            _g_t_total = _gtime.perf_counter() - _g_t0
-            print(f'  [G_TILDE_PLAN_C] N_t={N_t} kil_pool={kil_count} '
-                  f'side_S={len(side_S_lut)} | '
-                  f'loop={_g_t_loop*1000:.0f}ms kil={_g_t_kil*1000:.0f}ms '
-                  f'side={_g_t_side*1000:.0f}ms '
-                  f'(dedup={_g_t_dedup*1000:.0f}ms) '
-                  f'kernel={_g_t_cy*1000:.0f}ms '
-                  f'total={_g_t_total*1000:.0f}ms',
-                  flush=True)
 
         ij_i_arr = np.array([s[0] for s in ij_slots], dtype=np.int32)
         ij_j_arr = np.array([s[1] for s in ij_slots], dtype=np.int32)

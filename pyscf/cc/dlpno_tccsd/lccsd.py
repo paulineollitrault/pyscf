@@ -1724,9 +1724,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _mkn_results = [_mulliken_per_lmo(i) for i in range(nocc)]
         _lmo_aux_mask = [r[0] for r in _mkn_results]
         _lmo_atom_set = [r[1] for r in _mkn_results]
-        if int(os.environ.get('DLPNO_CCSD_PROF', '0')):
-            print(f'  [CCSD-PROF] Mulliken loop (nocc={nocc}): '
-                  f'{_t_mkn_mod.perf_counter() - _t_mkn0:.2f}s', flush=True)
 
         # Pair aux domain = union of LMO i and LMO j aux domains
         # Include ALL pairs in pno_spaces (strong + weak + diagonal)
@@ -1766,10 +1763,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         else:
             pair_lmo_idx = dict(_build_pair_lmo_idx(key)
                                 for key in _all_keys_init)
-        if int(os.environ.get('DLPNO_CCSD_PROF', '0')):
-            print(f'  [CCSD-PROF] pair_lmo_idx build (npairs={len(_all_keys_init)}): '
-                  f'{_t_mkn_mod.perf_counter() - _t_plmo0:.2f}s',
-                  flush=True)
         _plens = np.array([len(v) for v in pair_lmo_idx.values()])
         print(f"  Pair LMO domains: mean={_plens.mean():.1f}  "
               f"max={_plens.max()} (of nocc={nocc})",
@@ -1828,8 +1821,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         _pool=_pool)
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
-    if int(os.environ.get('DLPNO_STOP_AFTER_CCINTS', '0')):
-        raise SystemExit('STOP_AFTER_CCINTS')
     _t_post_ccints = _time_cc.perf_counter()
 
     # ------------------------------------------------------------------
@@ -1844,15 +1835,11 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         PairIndex, FlatTensorStore, assert_consistent_with_dicts,
         flatten_cc_ints_fields,
     )
-    _stage5_prof = bool(int(os.environ.get('DLPNO_STAGE5_PROF', '0')))
     _t_pi = _time_cc.perf_counter()
     _pair_index = PairIndex(
         list(t2_pno_all.keys()), pno_spaces, pair_lmo_idx, nocc)
     assert_consistent_with_dicts(
         _pair_index, pno_spaces, pair_lmo_idx)
-    if _stage5_prof:
-        print(f'  [STAGE5-PROF] PairIndex+assert: '
-              f'{_time_cc.perf_counter() - _t_pi:.3f}s', flush=True)
     print(f'  [pair_index] {_pair_index!r}', flush=True)
 
     # Phase 2e: flatten the 12 tensor fields of cc_ints onto shared
@@ -1882,9 +1869,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         _pair_index, t2_pno_all, shape_fn=_pair_t2_shape)
     K_pno_cache = FlatTensorStore.from_dict(
         _pair_index, K_pno_cache, shape_fn=_pair_t2_shape)
-    if _stage5_prof:
-        print(f'  [STAGE5-PROF] FlatTensorStore from_dict (t2+K): '
-              f'{_time_cc.perf_counter() - _t_fts:.3f}s', flush=True)
 
     # Pre-compute PNO overlap matrices S_pno_cache[(key_ij, key_kl)].
     #

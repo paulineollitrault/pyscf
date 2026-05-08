@@ -317,11 +317,8 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     if hasattr(mf, 'with_df') and mf.with_df is not None:
         log.info('Building LMO/PAO DF 3-index integrals...')
         import time as _t_pno_pre
-        _pno_pre_prof = bool(int(os.environ.get('DLPNO_PNO_PRE_PROF', '0')))
         def _pmark_pre(label, t0):
-            if _pno_pre_prof:
-                print(f'  [PNO-PRE] {label}: '
-                      f'{_t_pno_pre.perf_counter() - t0:.2f}s', flush=True)
+            pass
         _t = _t_pno_pre.perf_counter()
         ovL = _build_ovL(mf.with_df, C_lmo, C_pao, max_memory=mf.max_memory)
         _pmark_pre('_build_ovL', _t)
@@ -497,12 +494,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                     e_dipole_dropped += fac * dipole_e[i, j]
         _n_total = nocc_lmo * (nocc_lmo + 1) // 2
         _n_kept = len(keep_pairs_set)
-        _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
-        _pno_dbg and print(
-            f'[PNO_DBG] Phase 0 dipole prescreen: '
-            f'{_pno_time_p0.perf_counter() - _t_p0_start:.2f}s, '
-            f'kept {_n_kept}/{_n_total} pairs '
-            f'(e_dropped={e_dipole_dropped:.3e} Eh)', flush=True)
 
     # ===================================================================
     # Phase 1: Build per-pair domain data and SC-MP2 initial guess
@@ -603,12 +594,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         if data is not None:
             pair_domain_data[ij] = data
 
-    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
-    _pno_dbg and print(f'[PNO_DBG] Phase 1: {_pno_time_p1.perf_counter() - _t_p1_start:.2f}s '
-          f'CPU sum={sum(_p1_sub.values()):.1f}s '
-          f'orth={_p1_sub["orth"]:.1f} df={_p1_sub["df"]:.1f} '
-          f'solve={_p1_sub["solve"]:.1f} eigh={_p1_sub["eigh"]:.1f} '
-          f'mp2={_p1_sub["mp2"]:.1f}', flush=True)
     _t_p1_collect = _pno_time_p1.perf_counter()
     _t_p2a_start = _pno_time_p1.perf_counter()
     # ===================================================================
@@ -733,9 +718,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     for ij, val in _p2a_iter:
         initial_pno_data[ij] = val
 
-    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
-    _pno_dbg and print(f'[PNO_DBG] Phase 2a: {_pno_time_p1.perf_counter() - _t_p2a_start:.2f}s',
-          flush=True)
 
     # Crude prescreen (Psi4-style): drop pairs whose initial SC-MP2 |e_ij|
     # is below T_CutPairs_MP2 BEFORE the LMP2 iteration. Currently we
@@ -759,12 +741,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                 _e_mp2_prescreened += _fac * _e
         for _key in _to_drop:
             del initial_pno_data[_key]
-        if _to_drop:
-            _pno_dbg and print(
-                f'[PNO_DBG] Crude prescreen: dropped {len(_to_drop)} pairs '
-                f'(|e_ij|<{_prescreen_thresh:.1e}), kept {len(initial_pno_data)} '
-                f'(SC-MP2 prescreen energy = {_e_mp2_prescreened:.6e} Eh)',
-                flush=True)
     # ===================================================================
     # Phase 2b: Iterative LMP2 in PNO space
     # (matching Psi4 pno_lmp2_iterations() lines 690-802)
@@ -826,9 +802,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     for _o in _all_outs:
         pno_S_cache.update(_o)
     _t_spno_build = _pno_time.perf_counter() - _t_spno_start
-    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
-    _pno_dbg and print(f'[PNO_DBG] pno_S_cache build: {_t_spno_build:.2f}s '
-          f'({len(pno_S_cache)} entries)', flush=True)
 
     # Iterative LMP2 in PNO space with DIIS (matching Psi4 lines 690-802)
     T2_pno_all = {k: d['T2_pno'].copy() for k, d in initial_pno_data.items()}
@@ -989,16 +962,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             'N_p': N_p,
             'n_threads': min(16, N_p) if N_p > 0 else 1,
         }
-        _pno_dbg and print(
-            f'[PNO_DBG] LMP2 residual C plan: {N_p} pairs, '
-            f'{int(target_task_starts[-1])} tasks, '
-            f'S_flat={_s_total*8/1024/1024:.1f} MB '
-            f'(setup={_t_plan_setup*1000:.0f}ms '
-            f'keys={_t_plan_keys*1000:.0f}ms '
-            f'enum={_t_plan_enum*1000:.0f}ms '
-            f'sflat={_t_plan_sflat*1000:.0f}ms '
-            f'kpno={_t_plan_kpno*1000:.0f}ms)',
-            flush=True)
 
     # DIIS setup (matching Psi4 line 700)
     from pyscf.lib.diis import DIIS
@@ -1140,10 +1103,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
 
     log.info('L-MP2 correlation energy = %.15g', e_curr_lmp2)
     _t_p2b = _pno_time.perf_counter() - _t_p2b_start
-    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
-    _pno_dbg and print(f'[PNO_DBG] Phase 2b: {_t_p2b:.2f}s '
-          f'(residual={_t_p2b_residual:.2f} jacobi={_t_p2b_jacobi:.2f} '
-          f'diis={_t_p2b_diis:.2f} energy={_t_p2b_energy:.2f})', flush=True)
 
     # ===================================================================
     # Phase 3: Recompute PNOs from converged PNO-LMP2 amplitudes
@@ -1366,9 +1325,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
              n_pairs_strong, n_pairs_weak)
     log.info('Total LMP2 energy = %.15g (incl prescreen %.6e dipole %.6e)',
              e_lmp2_total, _e_mp2_prescreened, e_dipole_dropped)
-    _pno_dbg = bool(int(os.environ.get('DLPNO_PNO_DBG', '0')))
-    _pno_dbg and print(f'[PNO_DBG] Phase 3: {_pno_time.perf_counter() - _t_p3_start:.2f}s',
-          flush=True)
 
     return (pno_spaces, strong_pairs, weak_pairs, e_lmp2_total,
             _e_mp2_prescreened)
