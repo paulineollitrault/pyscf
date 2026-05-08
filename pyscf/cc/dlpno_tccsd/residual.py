@@ -892,7 +892,7 @@ def compute_G_term_batched(strong_keys, t2_pno_all, pno_spaces,
                           S_pao_full=None, s1e=None, _pool=None):
     """Batched per-pair G_term (T2 residual Eq 81 Fock-oo coupling).
 
-    Replaces the per-k inner loop inside compute_residual_v2 with one
+    Replaces the per-k inner loop inside compute_residual with one
     batched matmul per (n_ij, n_ik) shape bucket across all strong
     pairs.  Plan is built once per CCSD run (structure only depends on
     pair domains + PNO shapes) and cached as a function attribute.
@@ -2313,141 +2313,14 @@ def compute_all_df_terms_local(t1_pno, fov_pno, t2_pno_all, pno_spaces,
 
 
 # =========================================================================
-# Batched B and E terms — moved out of per-pair compute_residual_v2 so
+# Batched B and E terms — moved out of per-pair compute_residual so
 # that the many small S @ t2 @ S.T ops can be vectorised into batched BLAS.
 # =========================================================================
 
 
-def compute_B_E_batched(strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
-                        cc_ints, B_tilde_per_ij, pair_lmo_idx, nocc, _pool=None,
-                        S_pao_full=None, s1e=None):
-    """Compute B and E-contribution dicts for all strong pairs, batched.
-
-    B_ij = Σ_{kl ∈ domain_ij²} β[k,l] · S_{kl→ij} @ t2_kl @ S_{kl→ij}.T
-           + (l≠k:) β[l,k] · S_{kl→ij} @ t2_kl.T @ S_{kl→ij}.T
-
-    E_contrib_ij = Σ_{kl ∈ domain_ij²} S_{kl→ij} @ (u_kl @ K_kl.T
-                                       + (k≠l: (2t2_kl.T - t2_kl) @ K_kl))
-                                       @ S_{kl→ij}.T
-
-    where u_kl = 2 t2_kl - t2_kl.T.  Both terms share identical projection
-    structure; batching them together halves the BLAS overhead relative
-    to two separate loops.
-
-    ``B_tilde_per_ij`` is a dict keyed by strong pair: each entry is the
-    pair's (nocc, nocc) B_tilde matrix.
-
-    Returns:
-        B_all: dict key_ij → (n_ij, n_ij) B term
-        E_contrib_all: dict key_ij → (n_ij, n_ij) E subtracted contribution
-    """
-    B_all = {}
-    E_all = {}
-    _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
-
-    def _per_ij(key_ij):
-        i, j = key_ij
-        n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
-        if n_ij == 0:
-            return key_ij, np.zeros((n_ij, n_ij)), np.zeros((n_ij, n_ij))
-
-        # Psi4-layout B_tilde: tuple (B_local (nlmo,nlmo), p_dense (nocc,) -> k_ij).
-        B_tilde_entry = B_tilde_per_ij[key_ij]
-        if isinstance(B_tilde_entry, tuple):
-            B_local, p_dense = B_tilde_entry
-            _btilde_lookup = lambda k, l: B_local[p_dense[k], p_dense[l]]
-        else:
-            _btilde_lookup = lambda k, l: B_tilde_entry[k, l]
-        domain = (set(int(x) for x in pair_lmo_idx[key_ij])
-                  if pair_lmo_idx is not None and key_ij in pair_lmo_idx
-                  else set(range(nocc)))
-
-        # --- Gather phase: collect pointers only (no per-kl math). ---
-        # Bucket by n_kl so each bucket is a uniform-shape batched contraction.
-        # Each entry carries (S, t2, K, beta_kl, beta_lk, same) where same = (k==l).
-        buckets = {}  # n_kl -> list of (S, t2, K, beta_kl, beta_lk, same)
-        for key_kl, t2_kl in t2_pno_all.items():
-            if t2_kl is None or t2_kl.shape[0] == 0:
-                continue
-            k, l = key_kl
-            if k not in domain or l not in domain:
-                continue
-            S = _s_pno_get(key_ij, key_kl)
-            if S is None:
-                continue
-            K_kl = get_local_K(cc_ints, key_kl, k, l)
-            if K_kl is None:
-                continue
-            same = (k == l)
-            beta_kl = _btilde_lookup(k, l)
-            beta_lk = 0.0 if same else _btilde_lookup(l, k)
-            n_kl = t2_kl.shape[0]
-            buckets.setdefault(n_kl, []).append(
-                (S, t2_kl, K_kl, beta_kl, beta_lk, same))
-
-        if not buckets:
-            return key_ij, np.zeros((n_ij, n_ij)), np.zeros((n_ij, n_ij))
-
-        # --- Batched phase: stack, then do per-bucket batched operations. ---
-        # This replaces ~n_kept per-element numpy calls (which dominated at
-        # small PNO size via BLAS-dispatch overhead) with O(1) big BLAS calls.
-        B_sum = np.zeros((n_ij, n_ij))
-        E_sum = np.zeros((n_ij, n_ij))
-        for n_kl, items in buckets.items():
-            N = len(items)
-            S_arr = np.empty((N, n_ij, n_kl))
-            T_arr = np.empty((N, n_kl, n_kl))
-            K_arr = np.empty((N, n_kl, n_kl))
-            b_kl_arr = np.empty(N)
-            b_lk_arr = np.empty(N)
-            same_arr = np.zeros(N, dtype=bool)
-            for n, (S, t2, K, bkl, blk, same) in enumerate(items):
-                S_arr[n] = S
-                T_arr[n] = t2
-                K_arr[n] = K
-                b_kl_arr[n] = bkl
-                b_lk_arr[n] = blk
-                same_arr[n] = same
-
-            T_T = T_arr.transpose(0, 2, 1)
-
-            # TB[n] = β_kl·t2_n (for k==l)  OR  β_kl·t2_n + β_lk·t2_n.T (k!=l)
-            TB = b_kl_arr[:, None, None] * T_arr
-            if (~same_arr).any():
-                TB = TB + b_lk_arr[:, None, None] * T_T
-
-            # UK[n] = u·K.T (for k==l)  OR  u·K.T + (2 t2.T - t2)·K (k!=l)
-            u = 2.0 * T_arr - T_T                        # (N, n_kl, n_kl)
-            UK = np.matmul(u, K_arr.transpose(0, 2, 1))  # (N, n_kl, n_kl)
-            if (~same_arr).any():
-                v = 2.0 * T_T - T_arr
-                vk = np.matmul(v, K_arr)
-                vk[same_arr] = 0.0
-                UK = UK + vk
-
-            # B_sum += Σ_n S_n @ TB_n @ S_n.T  (batched)
-            S_T = S_arr.transpose(0, 2, 1)
-            B_sum += np.matmul(np.matmul(S_arr, TB), S_T).sum(axis=0)
-            E_sum += np.matmul(np.matmul(S_arr, UK), S_T).sum(axis=0)
-
-        return key_ij, B_sum, E_sum
-
-    if _pool is not None:
-        for key, B, E in _pool.map(_per_ij, list(strong_keys)):
-            B_all[key] = B
-            E_all[key] = E
-    else:
-        for key in strong_keys:
-            key, B, E = _per_ij(key)
-            B_all[key] = B
-            E_all[key] = E
-
-    return B_all, E_all
-
-
 def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
                    cc_ints, _s_pno_get, nocc):
-    """One-time plan for compute_B_E_batched_v2.
+    """One-time plan for compute_B_E_batched.
 
     Enumerates every (ij, kl) item — ij ∈ strong_keys, kl with k,l in
     ij's LMO domain and t2_kl present — and pre-stacks the cycle-
@@ -2572,7 +2445,7 @@ def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
     }
 
 
-def compute_B_E_batched_v2(
+def compute_B_E_batched(
         strong_keys, t2_pno_all, pno_spaces, S_pno_cache,
         cc_ints, B_tilde_per_ij, pair_lmo_idx, nocc, _pool=None,
         S_pao_full=None, s1e=None, omp_threads=None):
@@ -2597,10 +2470,10 @@ def compute_B_E_batched_v2(
     _s_pno_get = _s_pno_getter(S_pno_cache, pno_spaces, S_pao_full, s1e)
 
     plan_key = (tuple(sorted(strong_keys)), tuple(sorted(t2_pno_all.keys())))
-    _cache_attr = getattr(compute_B_E_batched_v2, '_plan_cache', None)
+    _cache_attr = getattr(compute_B_E_batched, '_plan_cache', None)
     if _cache_attr is None:
         _cache_attr = {}
-        compute_B_E_batched_v2._plan_cache = _cache_attr
+        compute_B_E_batched._plan_cache = _cache_attr
     plan = _cache_attr.get(plan_key)
     if plan is None:
         plan = _build_be_plan(
@@ -2647,14 +2520,14 @@ def compute_B_E_batched_v2(
                 # Session 14a fast path: all per-item gathers fold into C.
                 import ctypes as _ct
                 from pyscf import lib as _pyscflib
-                _libcc = getattr(compute_B_E_batched_v2, '_libcc_v2', None)
+                _libcc = getattr(compute_B_E_batched, '_libcc_v2', None)
                 if _libcc is None:
                     _libcc = _pyscflib.load_library('libcc')
                     _libcc.DLPNObe_kernel_v2.restype = None
                     _libcc.DLPNObe_kernel_v2.argtypes = (
                         [_ct.c_void_p] * 11
                         + [_ct.c_size_t] * 3 + [_ct.c_int])
-                    compute_B_E_batched_v2._libcc_v2 = _libcc
+                    compute_B_E_batched._libcc_v2 = _libcc
                 _libcc.DLPNObe_kernel_v2(
                     bucket['S'].ctypes.data_as(_ct.c_void_p),
                     t2_pno_all._buffer.ctypes.data_as(_ct.c_void_p),
@@ -2691,13 +2564,13 @@ def compute_B_E_batched_v2(
             # Same N×(n_ij,n_kl) layout as the Cython kernel.
             import ctypes as _ct
             from pyscf import lib as _pyscflib
-            _libcc = getattr(compute_B_E_batched_v2, '_libcc', None)
+            _libcc = getattr(compute_B_E_batched, '_libcc', None)
             if _libcc is None:
                 _libcc = _pyscflib.load_library('libcc')
                 _libcc.DLPNObe_kernel.restype = None
                 _libcc.DLPNObe_kernel.argtypes = (
                     [_ct.c_void_p] * 9 + [_ct.c_size_t] * 3 + [_ct.c_int])
-                compute_B_E_batched_v2._libcc = _libcc
+                compute_B_E_batched._libcc = _libcc
             S_c = np.ascontiguousarray(bucket['S'])
             T_c = np.ascontiguousarray(T_arr)
             K_c = np.ascontiguousarray(bucket['K'])
@@ -2742,7 +2615,7 @@ def compute_B_E_batched_v2(
 # =========================================================================
 # C and D dressed contractions: plan-cached + Cython kernels (Phase 5e).
 #
-# These are the two biggest remaining CPU bins inside compute_residual_v2
+# These are the two biggest remaining CPU bins inside compute_residual
 # (C ~11s CPU/iter, D ~16s CPU/iter at water8).  The per-(ij, k, side)
 # items are structurally uniform once bucketed by shape, so the gather/
 # scatter plan is cycle-invariant and can be cached; only ct/dt and t2
@@ -2756,7 +2629,7 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
     """Plan for compute_CD_terms_batched.
 
     Enumerates every (key_ij, k, side) item that the reference C/D
-    blocks of compute_residual_v2 iterate over (residual.py lines
+    blocks of compute_residual iterate over (residual.py lines
     2200-2334), groups them by shape, and pre-stacks all constant
     tensors (S projections, J_bold for C, 2*K-J for D).
 
@@ -3858,11 +3731,11 @@ def compute_CD_terms_batched(
         K_ij_kj_all, K_coul_cache,
         pair_lmo_idx, nocc,
         S_pao_full=None, s1e=None, omp_threads=None):
-    """Plan-cached batched build of the compute_residual_v2 C and D terms.
+    """Plan-cached batched build of the compute_residual C and D terms.
 
     For each strong pair key_ij, returns two (n_pno, n_pno) tiles —
     ``C_term[key_ij]`` and ``D_term[key_ij]`` — that a caller can hand
-    to ``compute_residual_v2`` via ``C_term_override`` and
+    to ``compute_residual`` via ``C_term_override`` and
     ``D_term_override``, bypassing the per-pair Python k-loop.
 
     The C-term symmetrization is:
@@ -3941,7 +3814,7 @@ def compute_CD_terms_batched(
 # =========================================================================
 
 
-def compute_residual_v2(
+def compute_residual(
         i, j, t2_pno_all, pno_spaces, nocc,
         F_lmo, s1e, with_df, eps_lmo,
         # Pre-built intermediates (built once per iteration):
@@ -4030,9 +3903,9 @@ def compute_residual_v2(
 
     # === Symmetric buffer (K̃, A, B, E) ===
     R_sym = np.zeros((n_pno, n_pno))
-    _DEBUG_PTERM = getattr(compute_residual_v2, '_debug_pterm', False) or \
-                   getattr(compute_residual_v2, '_debug_pterm_all', False)
-    _ITER = getattr(compute_residual_v2, '_iter', 0)
+    _DEBUG_PTERM = getattr(compute_residual, '_debug_pterm', False) or \
+                   getattr(compute_residual, '_debug_pterm_all', False)
+    _ITER = getattr(compute_residual, '_iter', 0)
 
     def _rms(M):
         return float(np.sqrt(np.mean(M*M)))
@@ -4335,7 +4208,7 @@ def compute_residual_v2(
     _pt['G'] = _time.perf_counter() - _t0
 
     # Dump per-term timings into a module-level aggregator (optional)
-    _accum = getattr(compute_residual_v2, '_term_times', None)
+    _accum = getattr(compute_residual, '_term_times', None)
     if _accum is not None:
         for k_, v_ in _pt.items():
             _accum[k_] = _accum.get(k_, 0.0) + v_
@@ -4347,8 +4220,8 @@ def compute_residual_v2(
         print(f"  PTERM iter {_ITER} pair({i},{j}): G_ij_unsym_rms={_rms(G_ij):.12f} G_ji_unsym_rms={_rms(G_ji):.12f}")
         R_total = R_sym + Rn_ij
         print(f"  PTERM iter {_ITER} pair({i},{j}): Rn={_rms(Rn_ij):.12f} R_total={_rms(R_total):.12f}")
-    if _DEBUG_PTERM and not getattr(compute_residual_v2, '_dump_done', False) and \
-       not getattr(compute_residual_v2, '_debug_pterm_all', False):
+    if _DEBUG_PTERM and not getattr(compute_residual, '_dump_done', False) and \
+       not getattr(compute_residual, '_debug_pterm_all', False):
         if i == 0 and j == 0:
             print(f"  DUMP_R2 pair(0,0) npno={n_pno}")
             for a in range(min(n_pno, 5)):
@@ -4366,7 +4239,7 @@ def compute_residual_v2(
             print(f"  DUMP_EPNO pair(0,0)")
             for a in range(min(n_pno, 10)):
                 print(f"  DUMP_EPNO[{a}]={e_pno[a]:.15e}")
-            compute_residual_v2._dump_done = True
+            compute_residual._dump_done = True
 
     # === R_final = R_sym + Rn (already fully P̂-symmetrized) ===
     return R_sym + Rn_ij

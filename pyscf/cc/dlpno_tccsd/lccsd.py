@@ -567,7 +567,7 @@ def _project_t1_to_pair(t1_pno, i, key_kl, S_pno_cache, pno_spaces):
     return np.zeros(pno_spaces[key_kl]['C_pno'].shape[1])
 
 
-def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
+def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                                fov_pno, F_lmo, eps_lmo,
                                nocc, S_pno_cache, cc_ints,
                                ovL_pno_cache=None, pair_lmo_idx=None,
@@ -643,8 +643,8 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             continue
         r1_pno[i] = np.zeros(n_ii)
 
-    _dbg_r1 = getattr(_compute_t1_residual_psi4, '_debug_r1_dump', False)
-    _r1_iter = getattr(_compute_t1_residual_psi4, '_iter', 0)
+    _dbg_r1 = getattr(_compute_t1_residual, '_debug_r1_dump', False)
+    _r1_iter = getattr(_compute_t1_residual, '_iter', 0)
 
     # ===========================================================
     # T1-dressing terms in Psi4's Fai_[i] (ccsd.cc lines 1631-1712)
@@ -752,7 +752,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     # this is dispatched across `_pool.map` when available.
     # =========================================================================
     import time as _time_perI
-    _per_i_dump = getattr(_compute_t1_residual_psi4, '_per_i_dump_timing', False)
+    _per_i_dump = getattr(_compute_t1_residual, '_per_i_dump_timing', False)
     # stages_cy: Cython kernel call (Stages 1-3 fused); kloop: A+C k-loop
     _per_i_t = {'stages_cy': 0.0, 's4': 0.0, 'kloop': 0.0, 'kloop_n': 0}
 
@@ -947,10 +947,10 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
     # When cc_ints_flat and pair_index are passed (driver path), an
     # additional FLAT plan is built that lets a single batched Cython
     # kernel replace the per-task pool.map dispatch entirely.
-    _pkl_cache_attr = getattr(_compute_t1_residual_psi4, '_per_kl_plan_cache', None)
+    _pkl_cache_attr = getattr(_compute_t1_residual, '_per_kl_plan_cache', None)
     if _pkl_cache_attr is None:
         _pkl_cache_attr = {}
-        _compute_t1_residual_psi4._per_kl_plan_cache = _pkl_cache_attr
+        _compute_t1_residual._per_kl_plan_cache = _pkl_cache_attr
     _pkl_plan_key = (id(cc_ints), id(pno_spaces), id(S_pno_cache),
                      id(pair_lmo_idx), id(t2_pno_all),
                      id(cc_ints_flat), id(pair_index))
@@ -1322,7 +1322,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
         from threadpoolctl import threadpool_limits
         bp = _batched_plan
         # Per-thread scratch — sized for max shapes across all tasks.
-        _bp_scratch = getattr(_compute_t1_residual_psi4,
+        _bp_scratch = getattr(_compute_t1_residual,
                               '_per_kl_batched_scratch', None)
         _NTH = min(64, bp['n_tasks'])
         _max_n_kl = bp['max_n_kl']
@@ -1343,7 +1343,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                 'X': np.empty((_NTH, max(_max_n_ki, 1) * _max_n_kl)),
                 'Z': np.empty((_NTH, max(_max_n_ki, 1) ** 2)),
             }
-            _compute_t1_residual_psi4._per_kl_batched_scratch = _bp_scratch
+            _compute_t1_residual._per_kl_batched_scratch = _bp_scratch
 
         contrib_flat = np.zeros(int(bp['contrib_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
@@ -1352,7 +1352,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
             # scratch as the Cython kernel.
             import ctypes as _ct
             from pyscf import lib as _pyscflib
-            _libcc = getattr(_compute_t1_residual_psi4, '_libcc', None)
+            _libcc = getattr(_compute_t1_residual, '_libcc', None)
             if _libcc is None:
                 _libcc = _pyscflib.load_library('libcc')
                 _libcc.DLPNOper_kl_batched.restype = None
@@ -1363,7 +1363,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
                     + [_ct.c_void_p] * 5                        # static + dynamic flat buffers
                     + [_ct.c_void_p, _ct.c_size_t] * 6          # 6 scratch (ptr, stride)
                     + [_ct.c_void_p, _ct.c_int])                # contrib_flat, num_threads
-                _compute_t1_residual_psi4._libcc = _libcc
+                _compute_t1_residual._libcc = _libcc
             _libcc.DLPNOper_kl_batched(
                 int(bp['n_tasks']), int(_M),
                 bp['n_kl_arr'].ctypes.data_as(_ct.c_void_p),
@@ -2109,16 +2109,16 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _t_cycle_start = _time.perf_counter()
             t2_new = {}
             t1_pno_old = {i: t1_pno[i].copy() for i in range(nocc)}
-            # Tell compute_residual_v2 the current iteration so PTERM dumps
+            # Tell compute_residual the current iteration so PTERM dumps
             # can be filtered/labeled per iter.
-            from pyscf.cc.dlpno_tccsd.residual import compute_residual_v2 as _crv2
+            from pyscf.cc.dlpno_tccsd.residual import compute_residual as _crv2
             _crv2._iter = cycle
             from pyscf.cc.dlpno_tccsd.residual import compute_all_df_terms_local as _cadf
             _cadf._iter = cycle
             _crv2._debug_pterm_all = (cycle <= 2) and getattr(_run_dlpno_lccsd, '_debug_pterm_iters', False)
             # Pass strong-pair set to T1 residual so it can optionally skip
-            _compute_t1_residual_psi4._iter = cycle
-            _compute_t1_residual_psi4._per_i_dump_timing = (cycle == 5)
+            _compute_t1_residual._iter = cycle
+            _compute_t1_residual._per_i_dump_timing = (cycle == 5)
 
             # ---- T1-transformed MOs or bare integrals ----
             if use_t1_transform:
@@ -2322,9 +2322,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # kernel (be_kernel).  Output matches the reference to FP
             # reordering noise (~3e-17); validated side-by-side over
             # many iterations prior to cutover.
-            from pyscf.cc.dlpno_tccsd.residual import compute_B_E_batched_v2
+            from pyscf.cc.dlpno_tccsd.residual import compute_B_E_batched
             _t_be0 = _time.perf_counter()
-            _B_dict, _E_dict = compute_B_E_batched_v2(
+            _B_dict, _E_dict = compute_B_E_batched(
                 keys_sorted, t2_pno_all, pno_spaces, S_pno_cache,
                 _cc_ints, _B_tilde_per_ij, pair_lmo_idx, nocc,
                 _pool=(_fine_pool or _pool),
@@ -2336,7 +2336,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # Batched C and D contractions (Phase 5e).  Precomputes the
             # per-pair C_term and D_term tiles once, across all (ij, k)
             # items at once, bypassing the per-pair k-loop inside
-            # compute_residual_v2. Lever-C pilot of inlining these (2026-04-24)
+            # compute_residual. Lever-C pilot of inlining these (2026-04-24)
             # regressed water10 CCSD 128.5→139.5s (+8.6%): the Cython
             # c_kernel/d_kernel beats the Python inline k-loop despite the
             # extra gather/scatter.  Keep the batched path.
@@ -2351,7 +2351,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _t_cd = _time.perf_counter() - _t_cd0
 
             # Batched G_term: moved out of per-pair residual (profile
-            # showed the per-k inner loop in compute_residual_v2 was
+            # showed the per-k inner loop in compute_residual was
             # 9s CPU/iter at water10, ~82% of residual CPU).  Building
             # a single plan bucketed by (n_ij, n_ik) across all strong
             # pairs turns ~30 small matmuls per pair per iter into a
@@ -2390,7 +2390,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     return key, np.zeros((0, 0))
 
                 from pyscf.cc.dlpno_tccsd.residual import (
-                    compute_residual_v2)
+                    compute_residual)
                 jc = _jiang_cache
 
                 # Per-pair intermediates: use local DF if available
@@ -2452,7 +2452,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _time.perf_counter() - _tb0)
 
                 _tr0 = _time.perf_counter()
-                R_ij = compute_residual_v2(
+                R_ij = compute_residual(
                     i, j, t2_pno_all, pno_spaces, nocc,
                     F_lmo, s1e, with_df, eps_lmo,
                     ovL_bare=ovL_pno_cache,
@@ -2510,8 +2510,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 return key, T2_ij_new, R_ij
 
             r2_all = {}
-            # Enable per-term profiling in compute_residual_v2 for this cycle
-            from pyscf.cc.dlpno_tccsd.residual import compute_residual_v2 as _crv2
+            # Enable per-term profiling in compute_residual for this cycle
+            from pyscf.cc.dlpno_tccsd.residual import compute_residual as _crv2
             _crv2._term_times = {}
             if _pool is not None:
                 for key, T2_ij_new, R_ij in _pool.map(_update_pair, keys_sorted):
@@ -2572,7 +2572,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 else:
                     _t1_fov = fov_pno
             _t1_resid_start = _time.perf_counter()
-            r1_pno = _compute_t1_residual_psi4(
+            r1_pno = _compute_t1_residual(
                 t1_pno, t2_pno_all, pno_spaces, _t1_fov, F_lmo, eps_lmo, nocc,
                 S_pno_cache, _cc_ints, ovL_pno_cache=_t1_ovL,
                 pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache, _pool=_pool,

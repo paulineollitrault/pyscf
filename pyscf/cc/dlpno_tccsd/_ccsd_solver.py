@@ -894,7 +894,7 @@ def _build_flat_pair_store(per_pair_arrays, ownership):
 
 def _build_Fij_bar_full(F_lmo, t2_pno_all, cc_ints, pno_spaces,
                          t1_cache, pair_lmo_idx, nocc):
-    """Mirror PySCF _compute_t1_residual_psi4's Fij_bar dressing (lines
+    """Mirror PySCF _compute_t1_residual's Fij_bar dressing (lines
     681-709).  Builds the FULL T1-dressed F_oo (strong + weak pair
     contributions).  Returns a (nocc, nocc) numpy array.
     """
@@ -923,7 +923,7 @@ def _build_Fkc_per_ordered(cc_ints, t1_pno, t1_cache, S_pno_cache,
                             ordered_pair_i_idx, ordered_pair_k_idx,
                             n_pno_per_pair, i_j_to_ij_2d, nocc):
     """Build Fkc per ORDERED pair (a_ord=i, b_ord=k), mirroring PySCF's
-    fkc_dress inner sum in `_compute_t1_residual_psi4` C term:
+    fkc_dress inner sum in `_compute_t1_residual` C term:
         Fkc[(i, k)] = sum_m S(canon(k,i), canon(i,m)) @ L_iajb[canon(i,m)]
                               @ t1[m]_in_(i,m)
     where i is the R1 owner, k is the partner.  Length npno[canon(k,i)].
@@ -1139,7 +1139,7 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
       CD:     c_term_plan, d_term_plan, target_pair_idx_ij/ji per side
     """
     from pyscf.cc.dlpno_tccsd.residual import (
-        compute_G_term_batched, compute_B_E_batched_v2,
+        compute_G_term_batched, compute_B_E_batched,
         compute_CD_terms_batched, _get_or_build_g_term_batched_view,
         _get_or_build_cd_batched_view)
     from pyscf.cc.dlpno_tccsd._cd_gather_cy import (
@@ -1182,7 +1182,7 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                 g_target_jk_arr = tgt
 
     # ----------------------- BE -----------------------
-    be_cache = getattr(compute_B_E_batched_v2, '_plan_cache', None)
+    be_cache = getattr(compute_B_E_batched, '_plan_cache', None)
     be_plan = next(iter(be_cache.values())) if be_cache else None
     be_plan_buckets_arr = be_unique_n_ij = be_flat_off = None
     be_pair_n_ij_idx_arr = be_pair_slot_arr = None
@@ -1584,7 +1584,7 @@ def run_remaining_cycles_via_class(
     import time as _time
     from pyscf.cc.dlpno_tccsd._ccsd_solver_pack_real import pack_for_t1_ints
     from pyscf.cc.dlpno_tccsd.pair_index import build_t1_cache, PairIndex
-    from pyscf.cc.dlpno_tccsd.lccsd import _compute_t1_residual_psi4
+    from pyscf.cc.dlpno_tccsd.lccsd import _compute_t1_residual
 
     _pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
 
@@ -1593,12 +1593,12 @@ def run_remaining_cycles_via_class(
     def _pmark(label, t0):
         pass
     _t = _time.perf_counter()
-    if hasattr(_compute_t1_residual_psi4, '_per_kl_plan_cache'):
-        _compute_t1_residual_psi4._per_kl_plan_cache.clear()
+    if hasattr(_compute_t1_residual, '_per_kl_plan_cache'):
+        _compute_t1_residual._per_kl_plan_cache.clear()
     # Plan-only call: builds + caches _per_kl_plan_cache without running
     # the residual computation itself (we discard the result anyway).
     # Saves ~1.0s of one-time setup on water-15.
-    _compute_t1_residual_psi4(
+    _compute_t1_residual(
         t1_pno, t2_pno_all, pno_spaces, fov_pno, F_lmo, eps_lmo, nocc,
         S_pno_cache, cc_ints, ovL_pno_cache=ovL_pno_cache,
         pair_lmo_idx=pair_lmo_idx, t1_cache=None, _pool=None,
@@ -1637,7 +1637,7 @@ def run_remaining_cycles_via_class(
     _t = _time.perf_counter()
     from pyscf.cc.dlpno_tccsd._ccsd_solver import (
         _extract_per_kl_plan, _extract_g_tilde_plan)
-    plan_struct, plan_own = _extract_per_kl_plan(_compute_t1_residual_psi4)
+    plan_struct, plan_own = _extract_per_kl_plan(_compute_t1_residual)
     if plan_struct is None:
         raise RuntimeError('per_kl plan unavailable')
     plan_struct.t2_buffer       = t2_pno_all._buffer.ctypes.data
@@ -2093,7 +2093,7 @@ def _extract_g_tilde_plan(key_to_p):
 
 def _extract_per_kl_plan(t1_residual_func):
     """Extract a PyPerKlPlanInputs from the cached `_batched_plan` in
-    `_compute_t1_residual_psi4`.  Caller must have already invoked the
+    `_compute_t1_residual`.  Caller must have already invoked the
     function once (so the cache is populated).  Returns (plan_struct,
     ownership) — ownership keeps the cached numpy arrays alive.
     """

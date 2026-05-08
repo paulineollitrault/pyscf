@@ -740,7 +740,7 @@ def _build_triple_local_DF(i, j, k, X_tno_ijk, triple_paos, triple_domain,
 
 
 # Per-LMO domain-partner sets cache. The (T) per-triple `triple_domain`
-# scan in `_orch_phase1`, `_orch_full`, and `_process_one_triple` was
+# scan in `_orch_phase1`, `_orch`, and `_process_one_triple` was
 # O(nocc_lmo) per triple, which makes (T) wall scale ≈ O(N²) on top of
 # the triple-count growth. Replace with `partners[i] & partners[j] &
 # partners[k]` — a 3-way set intersection of bounded local neighbourhoods.
@@ -777,7 +777,7 @@ def _build_pair_arena(_gak, pno_spaces, t2_for_T):
     """Build the cycle-invariant flat-buffer arena over all pairs.
     Called once per (T) phase (under _ORCH_ARENA_LOCK to prevent races
     between pool threads). Returns the gcache tuple consumed by
-    `_orch_full`.
+    `_orch`.
     """
     all_pks = sorted(pno_spaces.keys())
     pair_to_idx = {pk: idx for idx, pk in enumerate(all_pks)}
@@ -820,7 +820,7 @@ def _build_pair_arena(_gak, pno_spaces, t2_for_T):
     return (_gak, pair_to_idx, g_pao_n, g_pno_n,
             g_pp_off, g_pp_flat, g_X_off, g_X_flat,
             g_T2_off, g_T2_flat)
-def _orch_full(i, j, k, pno_spaces, t2_for_T,
+def _orch(i, j, k, pno_spaces, t2_for_T,
                 C_pao, S_pao_full, F_pao_full, F_lmo,
                 sparse_df, screening, j2c_full, lmo_aux_mask,
                 pao_domains_triple, nonneg_set, T_CutTNO,
@@ -936,15 +936,15 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
     # bottleneck (139 ms/call → expect <30 ms/call).  Per-triple offsets
     # then point INTO the global flat arrays — no data copy.
     _gak = (id(pno_spaces), id(t2_for_T))
-    gcache = getattr(_orch_full, '_pair_arena', None)
+    gcache = getattr(_orch, '_pair_arena', None)
     if gcache is None or gcache[0] != _gak:
         # Double-checked locking: serialize the build so only one thread
         # does it; all others see the cached result.
         with _ORCH_ARENA_LOCK:
-            gcache = getattr(_orch_full, '_pair_arena', None)
+            gcache = getattr(_orch, '_pair_arena', None)
             if gcache is None or gcache[0] != _gak:
                 gcache = _build_pair_arena(_gak, pno_spaces, t2_for_T)
-                _orch_full._pair_arena = gcache
+                _orch._pair_arena = gcache
     (_, pair_to_idx,
      g_pao_n, g_pno_n,
      g_pp_off, g_pp_flat, g_X_off, g_X_flat,
@@ -1002,10 +1002,10 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
             t1_diag_idx[r] = u_pk_to_idx[pk]
     t1_lmo_idx_arr = np.array(triple_lmo, dtype=np.int64)
 
-    # 6. t1 flat (per-LMO) — cached on _orch_full across triples
+    # 6. t1 flat (per-LMO) — cached on _orch across triples
     has_t1 = 1 if t1_pno is not None else 0
     if has_t1:
-        cached_t1 = getattr(_orch_full, '_t1_cache', None)
+        cached_t1 = getattr(_orch, '_t1_cache', None)
         if cached_t1 is None or cached_t1[0] is not t1_pno:
             t1_sizes = np.zeros(nocc_lmo, dtype=np.int64)
             for lmo, vec in t1_pno.items():
@@ -1018,7 +1018,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
                 if vec is not None and vec.size:
                     t1_flat[t1_off[lmo]:t1_off[lmo + 1]] = vec
             cached_t1 = (t1_pno, t1_off, t1_flat)
-            _orch_full._t1_cache = cached_t1
+            _orch._t1_cache = cached_t1
         _, t1_off, t1_flat = cached_t1
     else:
         t1_off = np.zeros(nocc_lmo + 1, dtype=np.int64)
@@ -1034,7 +1034,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
     # 8. Globals — cache across triples (heavy bool→int64 copies otherwise)
     _ck = (id(j2c_full), id(F_pao_full), id(S_pao_full),
            id(lmo_aux_mask), id(sparse_df), id(screening))
-    cached = getattr(_orch_full, '_globals_cache', None)
+    cached = getattr(_orch, '_globals_cache', None)
     if cached is None or cached[0] != _ck:
         cached = (_ck,
                   np.ascontiguousarray(F_pao_full),
@@ -1047,7 +1047,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
                   np.ascontiguousarray(
                       screening['riatom_to_paos_ext_dense'], dtype=np.int64),
                   np.ascontiguousarray(lmo_aux_mask.astype(np.int64)))
-        _orch_full._globals_cache = cached
+        _orch._globals_cache = cached
     (_, F_pao_c, S_pao_c, j2c_c, aux_atom_ids, aux_pos_in_atom,
      lmo_dense_c, pao_dense_c, lmo_aux_mask_c) = cached
     triple_paos_c = np.ascontiguousarray(triple_paos, dtype=np.int64)
@@ -1056,7 +1056,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
     # 9. ctypes setup + call
     import ctypes as _ct
     from pyscf import lib as _pl
-    _libcc = getattr(_orch_full, '_libcc', None)
+    _libcc = getattr(_orch, '_libcc', None)
     if _libcc is None:
         _libcc = _pl.load_library('libcc')
         _libcc.DLPNOcompute_one_triple_E_T0.restype = _ct.c_double
@@ -1086,7 +1086,7 @@ def _orch_full(i, j, k, pno_spaces, t2_for_T,
             + [_ct.c_int]                  # pre_n_tno (0 = compute internally)
             + [_ct.c_void_p] * 2           # pre_X_tno_ijk, pre_eps_tno (NULL)
         )
-        _orch_full._libcc = _libcc
+        _orch._libcc = _libcc
 
     et = _libcc.DLPNOcompute_one_triple_E_T0(
         int(i), int(j), int(k),
@@ -1530,7 +1530,7 @@ def _process_one_triple(i, j, k,
     if (ij not in t2_for_T or ik not in t2_for_T or jk not in t2_for_T):
         return 0.0
 
-    return _orch_full(
+    return _orch(
         i, j, k, pno_spaces, t2_for_T,
         C_pao, S_pao_full, F_pao_full, F_lmo,
         sparse_df, screening, j2c_full, lmo_aux_mask,
