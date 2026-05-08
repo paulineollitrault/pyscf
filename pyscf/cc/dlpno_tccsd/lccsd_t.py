@@ -319,169 +319,94 @@ def _triple_pno_union_psi4(pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
     # Single C kernel call (DLPNO_C_CYCLE=1) folds:
     #   F_orth = X.T @ F_pao[trip,trip] @ X
     #   D_ijk = (1/3) Σ_keys S.T @ D_pair @ S, with S, D_pair built per key
-    if (True
-            and os.environ.get('DLPNO_TRIPLE_TNO_PYTHON', '0') != '1'):
-        # Pack 3-key data into flat buffers for the C kernel.
-        keys_list   = [ij, jk, ik]
-        ij_lmos     = [(i, j), (j, k), (i, k)]
-        n_keys      = 3
-        pair_paos_n = np.zeros(n_keys, dtype=np.int32)
-        n_pno_arr   = np.zeros(n_keys, dtype=np.int32)
-        same_lmo    = np.zeros(n_keys, dtype=np.int32)
-        pp_lists    = []
-        Xpno_lists  = []
-        T2_lists    = []
-        for kk, (key, (ii_l, jj_l)) in enumerate(zip(keys_list, ij_lmos)):
-            X_pno_pair = pno_spaces[key].get('X_pno')
-            pp_pair = np.asarray(pno_spaces[key].get('pair_paos'))
-            if t2_for_T is not None and key in t2_for_T:
-                T2_p = t2_for_T[key]
-            else:
-                T2_p = pno_spaces[key].get('T2_pno')
-            if (X_pno_pair is None or X_pno_pair.shape[1] == 0
-                    or T2_p is None or T2_p.size == 0
-                    or pp_pair.size == 0):
-                pp_lists.append(np.empty(0, dtype=np.int64))
-                Xpno_lists.append(np.empty(0, dtype=np.float64))
-                T2_lists.append(np.empty(0, dtype=np.float64))
-                continue
-            pair_paos_n[kk] = pp_pair.size
-            n_pno_arr[kk]   = X_pno_pair.shape[1]
-            same_lmo[kk]    = 1 if ii_l == jj_l else 0
-            pp_lists.append(np.ascontiguousarray(pp_pair, dtype=np.int64))
-            Xpno_lists.append(
-                np.ascontiguousarray(X_pno_pair, dtype=np.float64).ravel())
-            T2_lists.append(
-                np.ascontiguousarray(T2_p, dtype=np.float64).ravel())
+    # Pack 3-key data into flat buffers for the C kernel.
+    keys_list   = [ij, jk, ik]
+    ij_lmos     = [(i, j), (j, k), (i, k)]
+    n_keys      = 3
+    pair_paos_n = np.zeros(n_keys, dtype=np.int32)
+    n_pno_arr   = np.zeros(n_keys, dtype=np.int32)
+    same_lmo    = np.zeros(n_keys, dtype=np.int32)
+    pp_lists    = []
+    Xpno_lists  = []
+    T2_lists    = []
+    for kk, (key, (ii_l, jj_l)) in enumerate(zip(keys_list, ij_lmos)):
+        X_pno_pair = pno_spaces[key].get('X_pno')
+        pp_pair = np.asarray(pno_spaces[key].get('pair_paos'))
+        if t2_for_T is not None and key in t2_for_T:
+            T2_p = t2_for_T[key]
+        else:
+            T2_p = pno_spaces[key].get('T2_pno')
+        if (X_pno_pair is None or X_pno_pair.shape[1] == 0
+                or T2_p is None or T2_p.size == 0
+                or pp_pair.size == 0):
+            pp_lists.append(np.empty(0, dtype=np.int64))
+            Xpno_lists.append(np.empty(0, dtype=np.float64))
+            T2_lists.append(np.empty(0, dtype=np.float64))
+            continue
+        pair_paos_n[kk] = pp_pair.size
+        n_pno_arr[kk]   = X_pno_pair.shape[1]
+        same_lmo[kk]    = 1 if ii_l == jj_l else 0
+        pp_lists.append(np.ascontiguousarray(pp_pair, dtype=np.int64))
+        Xpno_lists.append(
+            np.ascontiguousarray(X_pno_pair, dtype=np.float64).ravel())
+        T2_lists.append(
+            np.ascontiguousarray(T2_p, dtype=np.float64).ravel())
 
-        pair_paos_off = np.zeros(n_keys + 1, dtype=np.int64)
-        Xpno_off      = np.zeros(n_keys + 1, dtype=np.int64)
-        T2_off        = np.zeros(n_keys + 1, dtype=np.int64)
-        for kk in range(n_keys):
-            pair_paos_off[kk + 1] = pair_paos_off[kk] + pp_lists[kk].size
-            Xpno_off[kk + 1]      = Xpno_off[kk]      + Xpno_lists[kk].size
-            T2_off[kk + 1]        = T2_off[kk]        + T2_lists[kk].size
-        pair_paos_flat = (np.concatenate(pp_lists)   if any(x.size for x in pp_lists)
-                          else np.empty(0, dtype=np.int64))
-        Xpno_flat      = (np.concatenate(Xpno_lists) if any(x.size for x in Xpno_lists)
-                          else np.empty(0, dtype=np.float64))
-        T2_flat        = (np.concatenate(T2_lists)   if any(x.size for x in T2_lists)
-                          else np.empty(0, dtype=np.float64))
+    pair_paos_off = np.zeros(n_keys + 1, dtype=np.int64)
+    Xpno_off      = np.zeros(n_keys + 1, dtype=np.int64)
+    T2_off        = np.zeros(n_keys + 1, dtype=np.int64)
+    for kk in range(n_keys):
+        pair_paos_off[kk + 1] = pair_paos_off[kk] + pp_lists[kk].size
+        Xpno_off[kk + 1]      = Xpno_off[kk]      + Xpno_lists[kk].size
+        T2_off[kk + 1]        = T2_off[kk]        + T2_lists[kk].size
+    pair_paos_flat = (np.concatenate(pp_lists)   if any(x.size for x in pp_lists)
+                      else np.empty(0, dtype=np.int64))
+    Xpno_flat      = (np.concatenate(Xpno_lists) if any(x.size for x in Xpno_lists)
+                      else np.empty(0, dtype=np.float64))
+    T2_flat        = (np.concatenate(T2_lists)   if any(x.size for x in T2_lists)
+                      else np.empty(0, dtype=np.float64))
 
-        F_orth_ijk = np.zeros((npao_can_ijk, npao_can_ijk), dtype=np.float64)
-        D_ijk      = np.zeros((npao_can_ijk, npao_can_ijk), dtype=np.float64)
+    F_orth_ijk = np.zeros((npao_can_ijk, npao_can_ijk), dtype=np.float64)
+    D_ijk      = np.zeros((npao_can_ijk, npao_can_ijk), dtype=np.float64)
 
-        triple_paos_c = np.ascontiguousarray(triple_paos, dtype=np.int64)
-        X_pao_ijk_c   = np.ascontiguousarray(X_pao_ijk)
-        F_pao_c       = np.ascontiguousarray(F_pao_full)
-        S_pao_c       = np.ascontiguousarray(S_pao_full)
+    triple_paos_c = np.ascontiguousarray(triple_paos, dtype=np.int64)
+    X_pao_ijk_c   = np.ascontiguousarray(X_pao_ijk)
+    F_pao_c       = np.ascontiguousarray(F_pao_full)
+    S_pao_c       = np.ascontiguousarray(S_pao_full)
 
-        import ctypes as _ct
-        from pyscf import lib as _pl
-        _libcc_t = getattr(_triple_pno_union_psi4, '_libcc', None)
-        if _libcc_t is None:
-            _libcc_t = _pl.load_library('libcc')
-            _libcc_t.DLPNObuild_triple_tno_body.restype = None
-            _libcc_t.DLPNObuild_triple_tno_body.argtypes = (
-                [_ct.c_int] * 3                # n_pao_ijk, n_pao_can, n_pao_total
-                + [_ct.c_void_p] * 4           # triple_paos, X_pao_ijk, F_pao, S_pao
-                + [_ct.c_int]                  # n_keys
-                + [_ct.c_void_p] * 9           # arrays + outputs
-            )
-            _triple_pno_union_psi4._libcc = _libcc_t
-
-        _libcc_t.DLPNObuild_triple_tno_body(
-            int(triple_paos.size), int(npao_can_ijk), int(F_pao_full.shape[0]),
-            triple_paos_c.ctypes.data_as(_ct.c_void_p),
-            X_pao_ijk_c.ctypes.data_as(_ct.c_void_p),
-            F_pao_c.ctypes.data_as(_ct.c_void_p),
-            S_pao_c.ctypes.data_as(_ct.c_void_p),
-            int(n_keys),
-            pair_paos_n.ctypes.data_as(_ct.c_void_p),
-            pair_paos_off.ctypes.data_as(_ct.c_void_p),
-            pair_paos_flat.ctypes.data_as(_ct.c_void_p),
-            n_pno_arr.ctypes.data_as(_ct.c_void_p),
-            Xpno_off.ctypes.data_as(_ct.c_void_p),
-            Xpno_flat.ctypes.data_as(_ct.c_void_p),
-            T2_off.ctypes.data_as(_ct.c_void_p),
-            T2_flat.ctypes.data_as(_ct.c_void_p),
-            same_lmo.ctypes.data_as(_ct.c_void_p),
-            F_orth_ijk.ctypes.data_as(_ct.c_void_p),
-            D_ijk.ctypes.data_as(_ct.c_void_p),
+    import ctypes as _ct
+    from pyscf import lib as _pl
+    _libcc_t = getattr(_triple_pno_union_psi4, '_libcc', None)
+    if _libcc_t is None:
+        _libcc_t = _pl.load_library('libcc')
+        _libcc_t.DLPNObuild_triple_tno_body.restype = None
+        _libcc_t.DLPNObuild_triple_tno_body.argtypes = (
+            [_ct.c_int] * 3                # n_pao_ijk, n_pao_can, n_pao_total
+            + [_ct.c_void_p] * 4           # triple_paos, X_pao_ijk, F_pao, S_pao
+            + [_ct.c_int]                  # n_keys
+            + [_ct.c_void_p] * 9           # arrays + outputs
         )
-        if os.environ.get('DLPNO_TRIPLE_TNO_DEBUG', '0') == '1':
-            # Recompute via Python and compare.
-            F_dom_py = F_pao_full[np.ix_(triple_paos, triple_paos)]
-            F_py = X_pao_ijk.T @ F_dom_py @ X_pao_ijk
-            S_projs_py = {}
-            for key in (ij, jk, ik):
-                pp_pair = np.asarray(pno_spaces[key]['pair_paos'])
-                X_pno_pair = pno_spaces[key].get('X_pno')
-                if X_pno_pair is None or X_pno_pair.shape[1] == 0:
-                    S_projs_py[key] = None
-                    continue
-                S_pair_triple = S_pao_full[np.ix_(pp_pair, triple_paos)]
-                S_projs_py[key] = X_pno_pair.T @ S_pair_triple @ X_pao_ijk
-            D_py = np.zeros((npao_can_ijk, npao_can_ijk))
-            for key, ii_l, jj_l in [(ij, i, j), (jk, j, k), (ik, i, k)]:
-                S = S_projs_py[key]
-                if S is None:
-                    continue
-                if t2_for_T is not None and key in t2_for_T:
-                    T2_p = t2_for_T[key]
-                else:
-                    T2_p = pno_spaces[key].get('T2_pno')
-                if T2_p is None or T2_p.size == 0:
-                    continue
-                Tt_p = 2.0 * T2_p - T2_p.T
-                Dp = Tt_p @ T2_p.T + Tt_p.T @ T2_p
-                if ii_l == jj_l:
-                    Dp *= 0.5
-                D_py += S.T @ Dp @ S
-            D_py /= 3.0
-            for nm, py, c in (('F_orth', F_py, F_orth_ijk),
-                              ('D_ijk', D_py, D_ijk)):
-                err = float(np.max(np.abs(py - c)))
-                mag = float(np.max(np.abs(py)))
-                rel = err / mag if mag > 0 else 0.0
-                if rel > 1e-8:
-                    raise AssertionError(
-                        f'_triple_pno_union_psi4 C/Python mismatch '
-                        f'(i,j,k)=({i},{j},{k}): {nm} max|Δ|={err:.3e} rel={rel:.3e}')
-    else:
-        # Python reference path.
-        F_dom = F_pao_full[np.ix_(triple_paos, triple_paos)]
-        F_orth_ijk = X_pao_ijk.T @ F_dom @ X_pao_ijk
+        _triple_pno_union_psi4._libcc = _libcc_t
 
-        S_projs = {}
-        for key in (ij, jk, ik):
-            pp_pair = np.asarray(pno_spaces[key]['pair_paos'])
-            X_pno_pair = pno_spaces[key].get('X_pno')
-            if X_pno_pair is None or X_pno_pair.shape[1] == 0:
-                S_projs[key] = None
-                continue
-            S_pair_triple = S_pao_full[np.ix_(pp_pair, triple_paos)]
-            S_projs[key] = X_pno_pair.T @ S_pair_triple @ X_pao_ijk
-
-        D_ijk = np.zeros((npao_can_ijk, npao_can_ijk))
-        for key, ii_lmo, jj_lmo in [(ij, i, j), (jk, j, k), (ik, i, k)]:
-            S = S_projs[key]
-            if S is None:
-                continue
-            if t2_for_T is not None and key in t2_for_T:
-                T2_p = t2_for_T[key]
-            elif pno_spaces[key].get('T2_pno') is not None:
-                T2_p = pno_spaces[key]['T2_pno']
-            else:
-                continue
-            Tt_p = 2.0 * T2_p - T2_p.T
-            D_pair = Tt_p @ T2_p.T + Tt_p.T @ T2_p
-            if ii_lmo == jj_lmo:
-                D_pair *= 0.5
-            D_ijk += S.T @ D_pair @ S
-        D_ijk /= 3.0
-
-    # (5) Diagonalize, sort, truncate
+    _libcc_t.DLPNObuild_triple_tno_body(
+        int(triple_paos.size), int(npao_can_ijk), int(F_pao_full.shape[0]),
+        triple_paos_c.ctypes.data_as(_ct.c_void_p),
+        X_pao_ijk_c.ctypes.data_as(_ct.c_void_p),
+        F_pao_c.ctypes.data_as(_ct.c_void_p),
+        S_pao_c.ctypes.data_as(_ct.c_void_p),
+        int(n_keys),
+        pair_paos_n.ctypes.data_as(_ct.c_void_p),
+        pair_paos_off.ctypes.data_as(_ct.c_void_p),
+        pair_paos_flat.ctypes.data_as(_ct.c_void_p),
+        n_pno_arr.ctypes.data_as(_ct.c_void_p),
+        Xpno_off.ctypes.data_as(_ct.c_void_p),
+        Xpno_flat.ctypes.data_as(_ct.c_void_p),
+        T2_off.ctypes.data_as(_ct.c_void_p),
+        T2_flat.ctypes.data_as(_ct.c_void_p),
+        same_lmo.ctypes.data_as(_ct.c_void_p),
+        F_orth_ijk.ctypes.data_as(_ct.c_void_p),
+        D_ijk.ctypes.data_as(_ct.c_void_p),
+    )
     tno_occ, tno_vecs = np.linalg.eigh(D_ijk)
     order = np.argsort(tno_occ)[::-1]
     tno_occ = tno_occ[order]
@@ -800,8 +725,7 @@ def _zero_cas_t2_amplitudes(t2_pno_all, pno_spaces, occ_cas_idx, C_cas_vir,
 
 
 def _build_triple_local_DF(i, j, k, X_tno_ijk, triple_paos, triple_domain,
-                            sparse_df, screening, j2c_full,
-                            lmo_aux_mask, _force_python=False):
+                            sparse_df, screening, j2c_full, lmo_aux_mask):
     """Psi4-style per-triple DF integrals on a local aux domain.
 
     Mirrors Psi4 DLPNOCCSD_T::compute_lccsd_t0 (triples.cc:667+). Aux Q's
@@ -851,200 +775,84 @@ def _build_triple_local_DF(i, j, k, X_tno_ijk, triple_paos, triple_domain,
                 np.zeros((n_tno, n_tno, 0)),
                 np.zeros((3, n_domain, 0)))
 
-    if (not _force_python
-            and True
-            and os.environ.get('DLPNO_TRIPLE_DF_PYTHON', '0') != '1'):
-        # Local J^{-1/2}: stays in NumPy (LAPACK eigh is already optimal).
-        j_loc = j2c_full[np.ix_(aux_idx, aux_idx)]
-        evals, evecs = np.linalg.eigh(j_loc)
-        keep_e = evals > 1e-14
-        jhi = (evecs[:, keep_e] * (1.0 / np.sqrt(evals[keep_e]))
-               ) @ evecs[:, keep_e].T
-        jhi_c = np.ascontiguousarray(jhi)
-
-        # Per-center metadata: group aux_idx by centerQ.
-        centers_of_aux = aux_atom_ids[aux_idx]                  # (naux_ijk,)
-        atom_pos_all = aux_pos_in_atom[aux_idx]                 # (naux_ijk,)
-        order = np.argsort(centers_of_aux, kind='stable')
-        centers_sorted = centers_of_aux[order]
-        local_Q_sorted = order.astype(np.int64)                 # positions in naux_ijk
-        atom_pos_sorted = atom_pos_all[order].astype(np.int64)
-        unique_centers, first_idx, counts = np.unique(
-            centers_sorted, return_index=True, return_counts=True)
-        center_atoms_arr = unique_centers.astype(np.int64)
-        center_off = np.empty(unique_centers.size + 1, dtype=np.int64)
-        center_off[0] = 0
-        center_off[1:] = np.cumsum(counts.astype(np.int64))
-
-        # Outputs (allocate row-major).
-        ovL_sc = np.zeros((3, n_tno, naux_ijk), dtype=np.float64)
-        vvL_sc = np.zeros((n_tno, n_tno, naux_ijk), dtype=np.float64)
-        ooL_sc = np.zeros((3, n_domain, naux_ijk), dtype=np.float64)
-
-        triple_paos_arr = np.ascontiguousarray(triple_paos, dtype=np.int64)
-        triple_domain_arr = np.ascontiguousarray(triple_domain, dtype=np.int64)
-        X_tno_c = np.ascontiguousarray(X_tno_ijk)
-
-        n_lmo_global = riatom_to_lmos_ext_dense.shape[1]
-        n_pao_global = riatom_to_paos_ext_dense.shape[1]
-        lmos_dense_c = np.ascontiguousarray(
-            riatom_to_lmos_ext_dense, dtype=np.int64)
-        paos_dense_c = np.ascontiguousarray(
-            riatom_to_paos_ext_dense, dtype=np.int64)
-
-        import ctypes as _ct
-        from pyscf import lib as _pl
-        _libcc_tdf = getattr(_build_triple_local_DF, '_libcc', None)
-        if _libcc_tdf is None:
-            _libcc_tdf = _pl.load_library('libcc')
-            _libcc_tdf.DLPNObuild_triple_local_DF.restype = None
-            _libcc_tdf.DLPNObuild_triple_local_DF.argtypes = (
-                [_ct.c_int] * 10                  # i,j,k,n_tno,n_domain,n_pao_ijk,naux_ijk,n_centers,n_lmo_g,n_pao_g
-                + [_ct.c_void_p] * 21
-            )
-            _build_triple_local_DF._libcc = _libcc_tdf
-
-        _libcc_tdf.DLPNObuild_triple_local_DF(
-            int(i), int(j), int(k),
-            int(n_tno), int(n_domain), int(triple_paos_arr.size),
-            int(naux_ijk), int(center_atoms_arr.size),
-            int(n_lmo_global), int(n_pao_global),
-            X_tno_c.ctypes.data_as(_ct.c_void_p),
-            triple_paos_arr.ctypes.data_as(_ct.c_void_p),
-            triple_domain_arr.ctypes.data_as(_ct.c_void_p),
-            center_atoms_arr.ctypes.data_as(_ct.c_void_p),
-            center_off.ctypes.data_as(_ct.c_void_p),
-            local_Q_sorted.ctypes.data_as(_ct.c_void_p),
-            atom_pos_sorted.ctypes.data_as(_ct.c_void_p),
-            sparse_df['qij_atom_off'].ctypes.data_as(_ct.c_void_p),
-            sparse_df['qia_atom_off'].ctypes.data_as(_ct.c_void_p),
-            sparse_df['qab_atom_off'].ctypes.data_as(_ct.c_void_p),
-            sparse_df['qij_atom_n_aux'].ctypes.data_as(_ct.c_void_p),
-            sparse_df['qij_atom_n_lmo'].ctypes.data_as(_ct.c_void_p),
-            sparse_df['qab_atom_n_pao'].ctypes.data_as(_ct.c_void_p),
-            sparse_df['qij_atom_flat'].ctypes.data_as(_ct.c_void_p),
-            sparse_df['qia_atom_flat'].ctypes.data_as(_ct.c_void_p),
-            sparse_df['qab_atom_flat'].ctypes.data_as(_ct.c_void_p),
-            lmos_dense_c.ctypes.data_as(_ct.c_void_p),
-            paos_dense_c.ctypes.data_as(_ct.c_void_p),
-            jhi_c.ctypes.data_as(_ct.c_void_p),
-            ovL_sc.ctypes.data_as(_ct.c_void_p),
-            vvL_sc.ctypes.data_as(_ct.c_void_p),
-            ooL_sc.ctypes.data_as(_ct.c_void_p),
-        )
-        if os.environ.get('DLPNO_TRIPLE_DF_DEBUG', '0') == '1':
-            # Side-by-side: thread-safe — just call back with _force_python=True.
-            py_ovL, py_vvL, py_ooL = _build_triple_local_DF(
-                i, j, k, X_tno_ijk, triple_paos, triple_domain,
-                sparse_df, screening, j2c_full, lmo_aux_mask,
-                _force_python=True)
-            for name, py, c in [('ovL', py_ovL, ovL_sc),
-                                ('vvL', py_vvL, vvL_sc),
-                                ('ooL', py_ooL, ooL_sc)]:
-                if not py.size:
-                    continue
-                err = float(np.max(np.abs(py - c)))
-                mag = float(np.max(np.abs(py)))
-                rel = err / mag if mag > 0 else 0.0
-                if err > 1e-8 and rel > 1e-9:
-                    print(f'  [TRIPLE_DF_DEBUG] (i,j,k)=({i},{j},{k}) {name} '
-                          f'mismatch max|Δ|={err:.3e} rel={rel:.3e} mag={mag:.3e}',
-                          flush=True)
-                    raise AssertionError(
-                        f'_build_triple_local_DF C/Python mismatch: '
-                        f'{name} max|Δ|={err:.3e} rel={rel:.3e}')
-        return ovL_sc, vvL_sc, ooL_sc
-
-    dom_arr = np.asarray(triple_domain, dtype=np.int64)
-    ijk_global = np.array([i, j, k], dtype=np.int64)
-
-    # Raw (pre-metric) tensors
-    ovL_raw = np.zeros((3, n_tno, naux_ijk))
-    vvL_raw = np.zeros((n_tno, n_tno, naux_ijk))
-    ooL_raw = np.zeros((3, n_domain, naux_ijk))
-
-    # Group by center: aux Q's of the same atom share paos_ext/lmos_ext,
-    # so we can do one batched BLAS-3 operation per center.
-    centers_of_aux = aux_atom_ids[aux_idx]
-    unique_centers = np.unique(centers_of_aux)
-
-    for centerQ in unique_centers:
-        centerQ = int(centerQ)
-        mask_c = centers_of_aux == centerQ
-        local_Q = np.where(mask_c)[0]              # (nQ_c,) positions in naux_ijk
-        global_Q = aux_idx[local_Q]                # global aux indices
-        atom_pos = aux_pos_in_atom[global_Q]       # positions within centerQ's stack
-        nQ_c = local_Q.size
-
-        # Occupied-index sparse positions (same for all Q's in this center)
-        i_s = int(riatom_to_lmos_ext_dense[centerQ, i])
-        j_s = int(riatom_to_lmos_ext_dense[centerQ, j])
-        k_s = int(riatom_to_lmos_ext_dense[centerQ, k])
-        occ_sp = (i_s, j_s, k_s)
-
-        # ------------- ooL (qij path, PAO-free) -------------
-        # Slice LMO axes FIRST (nl_c is O(1)), then Q: avoids copying the
-        # (nQ_A, nl_c, nl_c) full stack when atom_pos is a subset.
-        if qij_atom[centerQ] is not None:
-            m_sparse_arr = riatom_to_lmos_ext_dense[centerQ, dom_arr]  # (n_dom,)
-            m_valid_mask = m_sparse_arr >= 0
-            dom_local = np.where(m_valid_mask)[0]       # positions in triple_domain
-            m_sparse_kept = m_sparse_arr[m_valid_mask]  # positions in centerQ's lmo stack
-            if dom_local.size > 0:
-                qij_A = qij_atom[centerQ]               # (nQ_A, nl, nl) — shared
-                for idx in range(3):
-                    occ = occ_sp[idx]
-                    if occ >= 0:
-                        # qij_A[:, occ, m_sparse_kept] — (nQ_A, n_valid), then pick atom_pos
-                        vals_full = qij_A[:, occ, m_sparse_kept]  # (nQ_A, n_valid)
-                        ooL_raw[idx][np.ix_(dom_local, local_Q)] = vals_full[atom_pos].T
-
-        # ------------- ovL & vvL (PAO paths) -------------
-        if qia_atom[centerQ] is None and qab_atom[centerQ] is None:
-            continue
-        # Triple PAO → centerQ's pao stack position (-1 if outside)
-        tp_pos_in_Q = riatom_to_paos_ext_dense[centerQ, triple_paos]  # (npao_ijk,)
-        valid_tp = np.where(tp_pos_in_Q >= 0)[0]        # positions in triple_paos
-        valid_u_Q = tp_pos_in_Q[valid_tp]               # positions in centerQ's pao stack
-        nu = valid_tp.size
-        if nu == 0:
-            continue
-        X_Q = X_tno_ijk[valid_tp]                       # (nu, n_tno) — shared by all Q
-
-        # ovL: slice PAO axis FIRST on the full (nQ_A, nl, np_A) stack so
-        # the (copy-triggering) atom_pos slice sees only (nQ_A, nl, nu)
-        # — scales like nu, not np_A.
-        if qia_atom[centerQ] is not None:
-            qia_A = qia_atom[centerQ]                           # (nQ_A, nl, np_A)
-            qia_A_u = qia_A[:, :, valid_u_Q]                    # (nQ_A, nl, nu)
-            qia_stack_cut = qia_A_u[atom_pos]                   # (nQ_c, nl, nu)
-            for idx in range(3):
-                occ = occ_sp[idx]
-                if occ >= 0:
-                    block = qia_stack_cut[:, occ, :] @ X_Q      # (nQ_c, n_tno)
-                    ovL_raw[idx][:, local_Q] = block.T          # (n_tno, nQ_c)
-
-        # vvL: same trick — PAO-PAO slice first (nu² << np_A²), then Q-slice.
-        if qab_atom[centerQ] is not None:
-            qab_A = qab_atom[centerQ]                           # (nQ_A, np_A, np_A)
-            qab_A_uu = qab_A[:, valid_u_Q[:, None],
-                             valid_u_Q[None, :]]                # (nQ_A, nu, nu)
-            qab_stack_cut = qab_A_uu[atom_pos]                  # (nQ_c, nu, nu)
-            tmp = qab_stack_cut @ X_Q                           # (nQ_c, nu, n_tno)
-            vvL_c = np.matmul(X_Q.T, tmp)                       # (nQ_c, n_tno, n_tno)
-            vvL_raw[:, :, local_Q] = vvL_c.transpose(1, 2, 0)
-
-    # Local J^{-1/2}
+    # Local J^{-1/2}: stays in NumPy (LAPACK eigh is already optimal).
     j_loc = j2c_full[np.ix_(aux_idx, aux_idx)]
     evals, evecs = np.linalg.eigh(j_loc)
     keep_e = evals > 1e-14
     jhi = (evecs[:, keep_e] * (1.0 / np.sqrt(evals[keep_e]))
            ) @ evecs[:, keep_e].T
+    jhi_c = np.ascontiguousarray(jhi)
 
-    ovL_sc = ovL_raw @ jhi
-    vvL_sc = vvL_raw @ jhi
-    ooL_sc = ooL_raw @ jhi
+    # Per-center metadata: group aux_idx by centerQ.
+    centers_of_aux = aux_atom_ids[aux_idx]                  # (naux_ijk,)
+    atom_pos_all = aux_pos_in_atom[aux_idx]                 # (naux_ijk,)
+    order = np.argsort(centers_of_aux, kind='stable')
+    centers_sorted = centers_of_aux[order]
+    local_Q_sorted = order.astype(np.int64)                 # positions in naux_ijk
+    atom_pos_sorted = atom_pos_all[order].astype(np.int64)
+    unique_centers, first_idx, counts = np.unique(
+        centers_sorted, return_index=True, return_counts=True)
+    center_atoms_arr = unique_centers.astype(np.int64)
+    center_off = np.empty(unique_centers.size + 1, dtype=np.int64)
+    center_off[0] = 0
+    center_off[1:] = np.cumsum(counts.astype(np.int64))
 
+    # Outputs (allocate row-major).
+    ovL_sc = np.zeros((3, n_tno, naux_ijk), dtype=np.float64)
+    vvL_sc = np.zeros((n_tno, n_tno, naux_ijk), dtype=np.float64)
+    ooL_sc = np.zeros((3, n_domain, naux_ijk), dtype=np.float64)
+
+    triple_paos_arr = np.ascontiguousarray(triple_paos, dtype=np.int64)
+    triple_domain_arr = np.ascontiguousarray(triple_domain, dtype=np.int64)
+    X_tno_c = np.ascontiguousarray(X_tno_ijk)
+
+    n_lmo_global = riatom_to_lmos_ext_dense.shape[1]
+    n_pao_global = riatom_to_paos_ext_dense.shape[1]
+    lmos_dense_c = np.ascontiguousarray(
+        riatom_to_lmos_ext_dense, dtype=np.int64)
+    paos_dense_c = np.ascontiguousarray(
+        riatom_to_paos_ext_dense, dtype=np.int64)
+
+    import ctypes as _ct
+    from pyscf import lib as _pl
+    _libcc_tdf = getattr(_build_triple_local_DF, '_libcc', None)
+    if _libcc_tdf is None:
+        _libcc_tdf = _pl.load_library('libcc')
+        _libcc_tdf.DLPNObuild_triple_local_DF.restype = None
+        _libcc_tdf.DLPNObuild_triple_local_DF.argtypes = (
+            [_ct.c_int] * 10                  # i,j,k,n_tno,n_domain,n_pao_ijk,naux_ijk,n_centers,n_lmo_g,n_pao_g
+            + [_ct.c_void_p] * 21
+        )
+        _build_triple_local_DF._libcc = _libcc_tdf
+
+    _libcc_tdf.DLPNObuild_triple_local_DF(
+        int(i), int(j), int(k),
+        int(n_tno), int(n_domain), int(triple_paos_arr.size),
+        int(naux_ijk), int(center_atoms_arr.size),
+        int(n_lmo_global), int(n_pao_global),
+        X_tno_c.ctypes.data_as(_ct.c_void_p),
+        triple_paos_arr.ctypes.data_as(_ct.c_void_p),
+        triple_domain_arr.ctypes.data_as(_ct.c_void_p),
+        center_atoms_arr.ctypes.data_as(_ct.c_void_p),
+        center_off.ctypes.data_as(_ct.c_void_p),
+        local_Q_sorted.ctypes.data_as(_ct.c_void_p),
+        atom_pos_sorted.ctypes.data_as(_ct.c_void_p),
+        sparse_df['qij_atom_off'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qia_atom_off'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qab_atom_off'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qij_atom_n_aux'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qij_atom_n_lmo'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qab_atom_n_pao'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qij_atom_flat'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qia_atom_flat'].ctypes.data_as(_ct.c_void_p),
+        sparse_df['qab_atom_flat'].ctypes.data_as(_ct.c_void_p),
+        lmos_dense_c.ctypes.data_as(_ct.c_void_p),
+        paos_dense_c.ctypes.data_as(_ct.c_void_p),
+        jhi_c.ctypes.data_as(_ct.c_void_p),
+        ovL_sc.ctypes.data_as(_ct.c_void_p),
+        vvL_sc.ctypes.data_as(_ct.c_void_p),
+        ooL_sc.ctypes.data_as(_ct.c_void_p),
+    )
     return ovL_sc, vvL_sc, ooL_sc
 
 
@@ -2301,7 +2109,7 @@ def _process_one_triple(i, j, k,
     eps_occ = np.array([F_lmo[ii, ii] for ii in triple_lmo])
 
     # DF integrals: Psi4-style triple-local aux path when available.
-    if _orch_data is not None and os.environ.get('DLPNO_ORCH_PYTHON_DF', '0') != '1':
+    if _orch_data is not None:
         # Already built by the orch C call.
         _, _, _, _, td_orch, ovL_ijk, vvL_sc, ooL_lmo_full, _ = _orch_data
         triple_domain = td_orch
@@ -2331,7 +2139,7 @@ def _process_one_triple(i, j, k,
         _W_pao_tno = S_pao_full[:, triple_paos] @ X_tno_ijk  # (nao_pao, n_tno)
     else:
         _W_pao_tno = None
-    if _orch_data is not None and os.environ.get('DLPNO_ORCH_PYTHON_U', '0') != '1':
+    if _orch_data is not None:
         # Use the U cache from the orchestrator C call.
         _U_cache = _orch_data[8]
     else:
@@ -2344,9 +2152,7 @@ def _process_one_triple(i, j, k,
     # ~60 unique pks needed for this triple, build U for each in C
     # via dgemm(W_sub @ X), populate the dict so subsequent _U_for
     # calls hit the cache.
-    if (_pao_basis and 1
-            and (_orch_data is None
-                 or os.environ.get('DLPNO_ORCH_PYTHON_U', '0') == '1')):
+    if _pao_basis and _orch_data is None:
         # Enumerate unique pks the rest of _process_one_triple will ask
         # for: (m, r) for m ∈ triple_domain ∪ triple_lmo, r ∈ triple_lmo,
         # plus diagonals (r, r) for the T1 path.
@@ -2617,59 +2423,44 @@ def _process_one_triple(i, j, k,
 
         # Native-C W3 kernel (replaces Cython _w3_full_cy.w3_full_kernel).
         # Same math, no GIL re-acquisition during BLAS calls.
-        if os.environ.get('DLPNO_W3_PYTHON', '0') != '1':
-            import ctypes as _ct
-            from pyscf import lib as _pl
-            _libcc_w3 = getattr(_process_one_triple, '_libcc_w3', None)
-            if _libcc_w3 is None:
-                _libcc_w3 = _pl.load_library('libcc')
-                _libcc_w3.DLPNOcompute_w3_energy.restype = _ct.c_double
-                _libcc_w3.DLPNOcompute_w3_energy.argtypes = (
-                    [_ct.c_void_p] * 15       # 15 array/tensor pointers
-                    + [_ct.c_int] * 5         # has_t1, occ_denom, n, m_dom, n_pno_max
-                )
-                _process_one_triple._libcc_w3 = _libcc_w3
-            K_ab_cache_c = np.ascontiguousarray(K_ab_cache)
-            t2_T_all_c   = np.ascontiguousarray(t2_T_all)
-            K_jk_c       = np.ascontiguousarray(K_jk)
-            K_ik_c       = np.ascontiguousarray(K_ik)
-            K_ij_c       = np.ascontiguousarray(K_ij)
-            K_ooov_c     = np.ascontiguousarray(K_ooov)
-            eps_occ_c    = np.ascontiguousarray(eps_occ)
-            eps_tno_c    = np.ascontiguousarray(eps_tno_sc)
-            t1_c         = np.ascontiguousarray(t1_sc_arr)
-            tflags_c = transpose_flags.astype(np.int8, copy=False)
-            return _libcc_w3.DLPNOcompute_w3_energy(
-                K_ab_cache_c.ctypes.data_as(_ct.c_void_p),
-                t2_T_all_c.ctypes.data_as(_ct.c_void_p),
-                K_jk_c.ctypes.data_as(_ct.c_void_p),
-                K_ik_c.ctypes.data_as(_ct.c_void_p),
-                K_ij_c.ctypes.data_as(_ct.c_void_p),
-                K_ooov_c.ctypes.data_as(_ct.c_void_p),
-                U_flat.ctypes.data_as(_ct.c_void_p),
-                U_offsets.ctypes.data_as(_ct.c_void_p),
-                n_pno_arr.ctypes.data_as(_ct.c_void_p),
-                T2_flat.ctypes.data_as(_ct.c_void_p),
-                T2_offsets.ctypes.data_as(_ct.c_void_p),
-                tflags_c.ctypes.data_as(_ct.c_void_p),
-                eps_occ_c.ctypes.data_as(_ct.c_void_p),
-                eps_tno_c.ctypes.data_as(_ct.c_void_p),
-                t1_c.ctypes.data_as(_ct.c_void_p),
-                int(has_t1), int(occ_denom),
-                int(n), int(m_dom), int(n_pno_max),
+        import ctypes as _ct
+        from pyscf import lib as _pl
+        _libcc_w3 = getattr(_process_one_triple, '_libcc_w3', None)
+        if _libcc_w3 is None:
+            _libcc_w3 = _pl.load_library('libcc')
+            _libcc_w3.DLPNOcompute_w3_energy.restype = _ct.c_double
+            _libcc_w3.DLPNOcompute_w3_energy.argtypes = (
+                [_ct.c_void_p] * 15       # 15 array/tensor pointers
+                + [_ct.c_int] * 5         # has_t1, occ_denom, n, m_dom, n_pno_max
             )
-
-        return w3_full_kernel(
-            K_ab_cache, t2_T_all,
-            np.ascontiguousarray(K_jk),
-            np.ascontiguousarray(K_ik),
-            np.ascontiguousarray(K_ij),
-            np.ascontiguousarray(K_ooov),
-            U_flat, U_offsets, n_pno_arr,
-            T2_flat, T2_offsets, transpose_flags,
-            np.ascontiguousarray(eps_occ),
-            np.ascontiguousarray(eps_tno_sc),
-            t1_sc_arr, has_t1, occ_denom,
+            _process_one_triple._libcc_w3 = _libcc_w3
+        K_ab_cache_c = np.ascontiguousarray(K_ab_cache)
+        t2_T_all_c   = np.ascontiguousarray(t2_T_all)
+        K_jk_c       = np.ascontiguousarray(K_jk)
+        K_ik_c       = np.ascontiguousarray(K_ik)
+        K_ij_c       = np.ascontiguousarray(K_ij)
+        K_ooov_c     = np.ascontiguousarray(K_ooov)
+        eps_occ_c    = np.ascontiguousarray(eps_occ)
+        eps_tno_c    = np.ascontiguousarray(eps_tno_sc)
+        t1_c         = np.ascontiguousarray(t1_sc_arr)
+        tflags_c = transpose_flags.astype(np.int8, copy=False)
+        return _libcc_w3.DLPNOcompute_w3_energy(
+            K_ab_cache_c.ctypes.data_as(_ct.c_void_p),
+            t2_T_all_c.ctypes.data_as(_ct.c_void_p),
+            K_jk_c.ctypes.data_as(_ct.c_void_p),
+            K_ik_c.ctypes.data_as(_ct.c_void_p),
+            K_ij_c.ctypes.data_as(_ct.c_void_p),
+            K_ooov_c.ctypes.data_as(_ct.c_void_p),
+            U_flat.ctypes.data_as(_ct.c_void_p),
+            U_offsets.ctypes.data_as(_ct.c_void_p),
+            n_pno_arr.ctypes.data_as(_ct.c_void_p),
+            T2_flat.ctypes.data_as(_ct.c_void_p),
+            T2_offsets.ctypes.data_as(_ct.c_void_p),
+            tflags_c.ctypes.data_as(_ct.c_void_p),
+            eps_occ_c.ctypes.data_as(_ct.c_void_p),
+            eps_tno_c.ctypes.data_as(_ct.c_void_p),
+            t1_c.ctypes.data_as(_ct.c_void_p),
+            int(has_t1), int(occ_denom),
             int(n), int(m_dom), int(n_pno_max),
         )
 
