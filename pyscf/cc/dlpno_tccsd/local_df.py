@@ -753,7 +753,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             nQp, npno, np_full, nl, n_kj, npp, n_local_total,
         )
 
-    # === Native-C centerQ kernel (DLPNO_C_CYCLE=1): replaces the Python
+    # === Native-C centerQ kernel: replaces the Python
     # body of the inner `for centerQ in unique_centers:` loop with a
     # single C call per centerQ. See pyscf/lib/cc/dlpno_pair_centerQ.c.
     _use_centerQ_c = True
@@ -1302,7 +1302,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         _t_cross_start = 0.0
 
         # === Cross-partner final J/K assembly: native-C path under
-        # DLPNO_C_CYCLE=1 (DLPNOcross_partner_assemble in
+        # Native-C kernel (DLPNOcross_partner_assemble in
         # pyscf/lib/cc/dlpno_cross_partner.c). Same math as the per-
         # partner Python loop below; eliminates ~24K Python ctypes
         # dispatches per CCSD run on water-10. ===
@@ -1439,44 +1439,6 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     _t_pool_wall = _ccints_setup_time.perf_counter() - _t_pool_start
 
 
-
-    # Debug: zero p_lmos\pair_lmo_idx rows in selected cc_ints fields, to
-    # localize which consumer(s) drift the energy when those rows go away.
-    # Set env DLPNO_ZERO_EXTRA_LMOS to a comma-separated subset of:
-    #   {Qma, i_Qk, j_Qk, K_bar_chem, K_bar_ij, K_bar_ji, all}
-    _zero_fields_env = os.environ.get('DLPNO_ZERO_EXTRA_LMOS', '')
-    if _zero_fields_env and pair_lmo_idx is not None:
-        _zero_set = set(_zero_fields_env.split(','))
-        if 'all' in _zero_set:
-            _zero_set = {'Qma', 'i_Qk', 'j_Qk',
-                         'K_bar_chem', 'K_bar_ij', 'K_bar_ji'}
-        n_pairs_touched = 0
-        n_extras_total = 0
-        for key, ci in cc_ints.items():
-            if ci is None or key not in pair_lmo_idx:
-                continue
-            pdom = set(int(x) for x in pair_lmo_idx[key])
-            p_lmos_arr = ci['p_lmos']
-            extras = np.array(
-                [i for i, l in enumerate(p_lmos_arr)
-                 if int(l) not in pdom], dtype=np.intp)
-            if extras.size == 0:
-                continue
-            n_pairs_touched += 1
-            n_extras_total += int(extras.size)
-            for fld in _zero_set:
-                if fld == 'Qma':
-                    ci['Qma'][:, extras, :] = 0.0
-                elif fld == 'i_Qk':
-                    ci['i_Qk'][:, extras] = 0.0
-                elif fld == 'j_Qk':
-                    ci['j_Qk'][:, extras] = 0.0
-                elif fld in ('K_bar_chem', 'K_bar_ij', 'K_bar_ji'):
-                    ci[fld][extras] = 0.0
-        print(f"[DLPNO_ZERO_EXTRA_LMOS={_zero_fields_env}] "
-              f"zeroed {n_extras_total} p_lmos\\pair_lmo_idx rows across "
-              f"{n_pairs_touched} pairs in fields {sorted(_zero_set)}",
-              flush=True)
 
     return cc_ints
 

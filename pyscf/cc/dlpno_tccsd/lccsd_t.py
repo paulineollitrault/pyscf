@@ -199,10 +199,9 @@ def _triple_pno_union_psi4(pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
     if npao_can_ijk == 0:
         return np.zeros((nao, 0)), 0, None, None, None
 
-    # F_orth_ijk and D_ijk: heavy-numerical body of the function.
-    # Single C kernel call (DLPNO_C_CYCLE=1) folds:
+    # F_orth_ijk and D_ijk: single C kernel call folds
     #   F_orth = X.T @ F_pao[trip,trip] @ X
-    #   D_ijk = (1/3) Σ_keys S.T @ D_pair @ S, with S, D_pair built per key
+    #   D_ijk = (1/3) Σ_keys S.T @ D_pair @ S, with S, D_pair built per key.
     # Pack 3-key data into flat buffers for the C kernel.
     keys_list   = [ij, jk, ik]
     ij_lmos     = [(i, j), (j, k), (i, k)]
@@ -1878,7 +1877,7 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             sparse_df['aux_atom_ids'] = aux_atom_ids_arr
             _bi("per-atom np.stack qij/qia/qab")
 
-            # Flat per-atom stacks for the C kernel (DLPNO_C_CYCLE=1 path).
+            # Flat per-atom stacks for the C kernel.
             # qij_atom[A]: (nQ_A, nl_A, nl_A); qia: (nQ_A, nl_A, np_A);
             # qab: (nQ_A, np_A, np_A). We concat each per-atom block end-to-end
             # and store offsets + dim hints so the C kernel can navigate them.

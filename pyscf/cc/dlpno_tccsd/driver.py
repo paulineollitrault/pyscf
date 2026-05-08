@@ -53,22 +53,6 @@ import numpy as np
 from pyscf import mcscf
 from pyscf.lib import logger
 
-# DLPNO_C_CYCLE / DLPNO_CCSD_MONO_DROPIN_CYCLE / DLPNO_TRIPLE_ORCH_FULL
-# defaults removed in cleanup pass 3: their gated alternates were the
-# slow Python paths used for cross-validation during development. Those
-# paths are now unconditionally taken.
-# Per-pair vvL restructure for (T) (Psi4-style algorithm) — NOT default.
-# Replaces the n_pao_ijk² factor in vvL build with n_pao_ijk × n_pno_pair.
-# Mathematically a different (Psi4-equivalent) algorithm: produces
-# Psi4-style E(T) which differs from the OLD path (full triple-TNO
-# projection) by μEh-level on water-10, ~50 μEh on water-15 (the
-# residual scales with TNO truncation factor).
-# Performance: at our typical water-cluster sizes, slight regression
-# (3 q_vv_pair + 3 K_ovvv + 6 T_pair builds vs 1 vvL + K_ab + t2_block).
-# Win materializes at much larger N where n_pao_ijk² dominates.
-# See HANDOFF_TRIPLES_VVL_PER_PAIR.md.
-# Opt in with DLPNO_TRIPLE_QVV_PAIR=1.
-
 from pyscf.cc.dlpno_tccsd.dmrg_interface import extract_amplitudes_from_mps
 from pyscf.cc.dlpno_tccsd.local_orbs import split_localize_orbitals, make_paos
 from pyscf.cc.dlpno_tccsd.pno import make_pnos
