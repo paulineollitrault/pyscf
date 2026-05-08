@@ -591,54 +591,42 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
 
     # G_addition is what the kernel adds onto G. Pass G itself; kernel does
     # G[i, j] += sum_ij in place. (G already initialized to Fkj copy above.)
-    if 1:
-        # Native-C path: matches Psi4 ccsd.cc:2085 compute_G_tilde via
-        # the same plan-cached effective tensors. See
-        # pyscf/lib/cc/dlpno_g_tilde.c::DLPNOcompute_G_tilde_inner.
-        import ctypes
-        from pyscf import lib as _pyscflib
-        _libcc = getattr(build_G_tilde, '_libcc', None)
-        if _libcc is None:
-            _libcc = _pyscflib.load_library('libcc')
-            _libcc.DLPNOcompute_G_tilde_inner.restype = None
-            _libcc.DLPNOcompute_G_tilde_inner.argtypes = [
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_size_t, ctypes.c_size_t,
-            ]
-            build_G_tilde._libcc = _libcc
-        n_ij_slots = plan['ij_i_arr'].shape[0]
-        naocc = G.shape[0]
-        # Ensure G is C-contiguous and writable in place (Fkj.copy() above
-        # makes it so, but a defensive ascontiguousarray is cheap).
-        if not G.flags['C_CONTIGUOUS']:
-            G = np.ascontiguousarray(G)
-        _libcc.DLPNOcompute_G_tilde_inner(
-            plan['triple_eff_offset'].ctypes.data_as(ctypes.c_void_p),
-            plan['triple_T2_pair_idx'].ctypes.data_as(ctypes.c_void_p),
-            plan['triple_n_lj'].ctypes.data_as(ctypes.c_void_p),
-            plan['ij_triple_starts'].ctypes.data_as(ctypes.c_void_p),
-            plan['ij_i_arr'].ctypes.data_as(ctypes.c_void_p),
-            plan['ij_j_arr'].ctypes.data_as(ctypes.c_void_p),
-            plan['effective_flat'].ctypes.data_as(ctypes.c_void_p),
-            T2_flat.ctypes.data_as(ctypes.c_void_p),
-            plan['T2_offsets'].ctypes.data_as(ctypes.c_void_p),
-            G.ctypes.data_as(ctypes.c_void_p),
-            n_ij_slots, naocc,
-        )
-    else:
-        g_tilde_batched(
-            plan['triple_eff_offset'], plan['triple_T2_pair_idx'],
-            plan['triple_n_lj'],
-            plan['ij_triple_starts'], plan['ij_i_arr'], plan['ij_j_arr'],
-            plan['effective_flat'],
-            T2_flat, plan['T2_offsets'],
-            G,
-            plan['num_threads'],
-        )
-
+    # Native-C path: matches Psi4 ccsd.cc:2085 compute_G_tilde via
+    # the same plan-cached effective tensors. See
+    # pyscf/lib/cc/dlpno_g_tilde.c::DLPNOcompute_G_tilde_inner.
+    import ctypes
+    from pyscf import lib as _pyscflib
+    _libcc = getattr(build_G_tilde, '_libcc', None)
+    if _libcc is None:
+        _libcc = _pyscflib.load_library('libcc')
+        _libcc.DLPNOcompute_G_tilde_inner.restype = None
+        _libcc.DLPNOcompute_G_tilde_inner.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_size_t,
+        ]
+        build_G_tilde._libcc = _libcc
+    n_ij_slots = plan['ij_i_arr'].shape[0]
+    naocc = G.shape[0]
+    # Ensure G is C-contiguous and writable in place (Fkj.copy() above
+    # makes it so, but a defensive ascontiguousarray is cheap).
+    if not G.flags['C_CONTIGUOUS']:
+        G = np.ascontiguousarray(G)
+    _libcc.DLPNOcompute_G_tilde_inner(
+        plan['triple_eff_offset'].ctypes.data_as(ctypes.c_void_p),
+        plan['triple_T2_pair_idx'].ctypes.data_as(ctypes.c_void_p),
+        plan['triple_n_lj'].ctypes.data_as(ctypes.c_void_p),
+        plan['ij_triple_starts'].ctypes.data_as(ctypes.c_void_p),
+        plan['ij_i_arr'].ctypes.data_as(ctypes.c_void_p),
+        plan['ij_j_arr'].ctypes.data_as(ctypes.c_void_p),
+        plan['effective_flat'].ctypes.data_as(ctypes.c_void_p),
+        T2_flat.ctypes.data_as(ctypes.c_void_p),
+        plan['T2_offsets'].ctypes.data_as(ctypes.c_void_p),
+        G.ctypes.data_as(ctypes.c_void_p),
+        n_ij_slots, naocc,
+    )
     # GTILDE_DUMP: parity dump vs Psi4 ccsd.cc:1943 compute_G_tilde.
     # G is the full (nocc, nocc) double-dressed Fock oo. Track per-call
     # iteration count to dump only the first 3 iterations.
@@ -861,50 +849,39 @@ def _run_g_term_batched(plan, bv, t2_pno_all, G_tilde,
         tmp = np.empty((num_threads, max_n_ij * max_n_ik))
         tiles = np.zeros(int(side_bv['tile_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            if 1:
-                # Native-C path: see pyscf/lib/cc/dlpno_g_term.c.
-                import ctypes as _ct
-                from pyscf import lib as _pyscflib
-                _libcc = getattr(_run_g_term_batched, '_libcc', None)
-                if _libcc is None:
-                    _libcc = _pyscflib.load_library('libcc')
-                    _libcc.DLPNOg_term_batched.restype = None
-                    _libcc.DLPNOg_term_batched.argtypes = (
-                        [_ct.c_int]
-                        + [_ct.c_void_p] * 10
-                        + [_ct.c_size_t,
-                           _ct.c_void_p, _ct.c_size_t,
-                           _ct.c_void_p, _ct.c_int])
-                    _run_g_term_batched._libcc = _libcc
-                t2_off_view = np.ascontiguousarray(side_bv['t2_off'][:N])
-                G_c = np.ascontiguousarray(G_tilde_c)
-                _libcc.DLPNOg_term_batched(
-                    int(N),
-                    side_bv['n_ij'].ctypes.data_as(_ct.c_void_p),
-                    side_bv['n_ik'].ctypes.data_as(_ct.c_void_p),
-                    side_bv['S_off'].ctypes.data_as(_ct.c_void_p),
-                    t2_off_view.ctypes.data_as(_ct.c_void_p),
-                    side_bv['tile_off'].ctypes.data_as(_ct.c_void_p),
-                    side_bv['k_idx'].ctypes.data_as(_ct.c_void_p),
-                    side_bv['scalar_lmo'].ctypes.data_as(_ct.c_void_p),
-                    side_bv['S_flat'].ctypes.data_as(_ct.c_void_p),
-                    t2_flat.ctypes.data_as(_ct.c_void_p),
-                    G_c.ctypes.data_as(_ct.c_void_p),
-                    G_c.shape[0],
-                    tmp.ctypes.data_as(_ct.c_void_p), tmp.shape[1],
-                    tiles.ctypes.data_as(_ct.c_void_p),
-                    int(num_threads),
-                )
-            else:
-                g_term_batched(
-                    N, max_n_ij, max_n_ik,
-                    side_bv['n_ij'], side_bv['n_ik'],
-                    side_bv['S_off'], side_bv['t2_off'][:N],
-                    side_bv['tile_off'],
-                    side_bv['k_idx'], side_bv['scalar_lmo'],
-                    side_bv['S_flat'], t2_flat, G_tilde_c,
-                    tmp, tiles, num_threads,
-                )
+            # Native-C path: see pyscf/lib/cc/dlpno_g_term.c.
+            import ctypes as _ct
+            from pyscf import lib as _pyscflib
+            _libcc = getattr(_run_g_term_batched, '_libcc', None)
+            if _libcc is None:
+                _libcc = _pyscflib.load_library('libcc')
+                _libcc.DLPNOg_term_batched.restype = None
+                _libcc.DLPNOg_term_batched.argtypes = (
+                    [_ct.c_int]
+                    + [_ct.c_void_p] * 10
+                    + [_ct.c_size_t,
+                       _ct.c_void_p, _ct.c_size_t,
+                       _ct.c_void_p, _ct.c_int])
+                _run_g_term_batched._libcc = _libcc
+            t2_off_view = np.ascontiguousarray(side_bv['t2_off'][:N])
+            G_c = np.ascontiguousarray(G_tilde_c)
+            _libcc.DLPNOg_term_batched(
+                int(N),
+                side_bv['n_ij'].ctypes.data_as(_ct.c_void_p),
+                side_bv['n_ik'].ctypes.data_as(_ct.c_void_p),
+                side_bv['S_off'].ctypes.data_as(_ct.c_void_p),
+                t2_off_view.ctypes.data_as(_ct.c_void_p),
+                side_bv['tile_off'].ctypes.data_as(_ct.c_void_p),
+                side_bv['k_idx'].ctypes.data_as(_ct.c_void_p),
+                side_bv['scalar_lmo'].ctypes.data_as(_ct.c_void_p),
+                side_bv['S_flat'].ctypes.data_as(_ct.c_void_p),
+                t2_flat.ctypes.data_as(_ct.c_void_p),
+                G_c.ctypes.data_as(_ct.c_void_p),
+                G_c.shape[0],
+                tmp.ctypes.data_as(_ct.c_void_p), tmp.shape[1],
+                tiles.ctypes.data_as(_ct.c_void_p),
+                int(num_threads),
+            )
         # Serial scatter — out -= Cc per item.
         flat_views = {n_ij: buf.ravel() for n_ij, buf in flat_out.items()}
         target_slot = side_bv['target_slot']
@@ -1490,56 +1467,43 @@ def build_D_tilde_batched(
         sc = plan['scratch']
 
         with threadpool_limits(limits=1, user_api='blas'):
-            if 1:
-                # Native-C path: matches Psi4 ccsd.cc:1991 compute_D_tilde
-                # Phase 1 (Terms 1+2). See pyscf/lib/cc/dlpno_d_tilde.c::
-                # DLPNOcompute_D_tilde_ph1_batched. Same flat-buffer plan
-                # as the Cython kernel; scratch is allocated internally
-                # per pair (small ~5 KB malloc each), so the
-                # part1/part2 buffers in `sc` are unused on this path.
-                import ctypes
-                from pyscf import lib as _pyscflib
-                _libcc = getattr(build_D_tilde_batched, '_libcc', None)
-                if _libcc is None:
-                    _libcc = _pyscflib.load_library('libcc')
-                    _libcc.DLPNOcompute_D_tilde_ph1_batched.restype = None
-                    _libcc.DLPNOcompute_D_tilde_ph1_batched.argtypes = [
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_size_t,
-                    ]
-                    build_D_tilde_batched._libcc = _libcc
-                _libcc.DLPNOcompute_D_tilde_ph1_batched(
-                    plan['K_tilde_chem_flat'].ctypes.data_as(ctypes.c_void_p),
-                    plan['K_tilde_chem_off'].ctypes.data_as(ctypes.c_void_p),
-                    plan['M_static_flat'].ctypes.data_as(ctypes.c_void_p),
-                    plan['M_static_off'].ctypes.data_as(ctypes.c_void_p),
-                    t1_flat.ctypes.data_as(ctypes.c_void_p),
-                    t1_off_plan.ctypes.data_as(ctypes.c_void_p),
-                    T1_rows_flat.ctypes.data_as(ctypes.c_void_p),
-                    T1_rows_off_plan.ctypes.data_as(ctypes.c_void_p),
-                    plan['n_pno_arr'].ctypes.data_as(ctypes.c_void_p),
-                    plan['n_domain_arr'].ctypes.data_as(ctypes.c_void_p),
-                    D_flat.ctypes.data_as(ctypes.c_void_p),
-                    plan['D_off'].ctypes.data_as(ctypes.c_void_p),
-                    len(plan['covered_pairs']),
-                )
-            else:
-                d_tilde_ph1_batched(
-                    plan['K_tilde_chem_flat'], plan['K_tilde_chem_off'],
-                    plan['M_static_flat'], plan['M_static_off'],
-                    t1_flat, t1_off_plan,
-                    T1_rows_flat, T1_rows_off_plan,
-                    plan['n_pno_arr'], plan['n_domain_arr'],
-                    sc['part1'], sc['part2'],
-                    D_flat, plan['D_off'],
-                    plan['num_threads'],
-                )
-
+            # Native-C path: matches Psi4 ccsd.cc:1991 compute_D_tilde
+            # Phase 1 (Terms 1+2). See pyscf/lib/cc/dlpno_d_tilde.c::
+            # DLPNOcompute_D_tilde_ph1_batched. Same flat-buffer plan
+            # as the Cython kernel; scratch is allocated internally
+            # per pair (small ~5 KB malloc each), so the
+            # part1/part2 buffers in `sc` are unused on this path.
+            import ctypes
+            from pyscf import lib as _pyscflib
+            _libcc = getattr(build_D_tilde_batched, '_libcc', None)
+            if _libcc is None:
+                _libcc = _pyscflib.load_library('libcc')
+                _libcc.DLPNOcompute_D_tilde_ph1_batched.restype = None
+                _libcc.DLPNOcompute_D_tilde_ph1_batched.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                build_D_tilde_batched._libcc = _libcc
+            _libcc.DLPNOcompute_D_tilde_ph1_batched(
+                plan['K_tilde_chem_flat'].ctypes.data_as(ctypes.c_void_p),
+                plan['K_tilde_chem_off'].ctypes.data_as(ctypes.c_void_p),
+                plan['M_static_flat'].ctypes.data_as(ctypes.c_void_p),
+                plan['M_static_off'].ctypes.data_as(ctypes.c_void_p),
+                t1_flat.ctypes.data_as(ctypes.c_void_p),
+                t1_off_plan.ctypes.data_as(ctypes.c_void_p),
+                T1_rows_flat.ctypes.data_as(ctypes.c_void_p),
+                T1_rows_off_plan.ctypes.data_as(ctypes.c_void_p),
+                plan['n_pno_arr'].ctypes.data_as(ctypes.c_void_p),
+                plan['n_domain_arr'].ctypes.data_as(ctypes.c_void_p),
+                D_flat.ctypes.data_as(ctypes.c_void_p),
+                plan['D_off'].ctypes.data_as(ctypes.c_void_p),
+                len(plan['covered_pairs']),
+            )
         D_off_plan = plan['D_off']
         for p, ik in enumerate(plan['covered_pairs']):
             n_pno = int(plan['n_pno_arr'][p])
@@ -2085,53 +2049,41 @@ def compute_C_tilde_batched(
         C_flat = np.zeros(plan['C_total'])
 
         with threadpool_limits(limits=1, user_api='blas'):
-            if 1:
-                # Native-C path: matches Psi4 ccsd.cc:1809 compute_C_tilde
-                # Phase 1 (Terms 1+2). See pyscf/lib/cc/dlpno_c_tilde.c::
-                # DLPNOcompute_C_tilde_ph1_batched. Same flat-buffer plan
-                # as the Cython kernel.
-                import ctypes
-                from pyscf import lib as _pyscflib
-                _libcc = getattr(compute_C_tilde_batched, '_libcc', None)
-                if _libcc is None:
-                    _libcc = _pyscflib.load_library('libcc')
-                    _libcc.DLPNOcompute_C_tilde_ph1_batched.restype = None
-                    _libcc.DLPNOcompute_C_tilde_ph1_batched.argtypes = [
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_void_p, ctypes.c_void_p,
-                        ctypes.c_size_t,
-                    ]
-                    compute_C_tilde_batched._libcc = _libcc
-                _libcc.DLPNOcompute_C_tilde_ph1_batched(
-                    plan['K_tilde_chem_flat'].ctypes.data_as(ctypes.c_void_p),
-                    plan['K_tilde_chem_off'].ctypes.data_as(ctypes.c_void_p),
-                    plan['K_bar_chem_slice_flat'].ctypes.data_as(ctypes.c_void_p),
-                    plan['K_bar_chem_slice_off'].ctypes.data_as(ctypes.c_void_p),
-                    t1_flat.ctypes.data_as(ctypes.c_void_p),
-                    t1_off_plan.ctypes.data_as(ctypes.c_void_p),
-                    T1_local_flat.ctypes.data_as(ctypes.c_void_p),
-                    T1_local_off_plan.ctypes.data_as(ctypes.c_void_p),
-                    plan['n_pno_arr'].ctypes.data_as(ctypes.c_void_p),
-                    plan['n_domain_arr'].ctypes.data_as(ctypes.c_void_p),
-                    C_flat.ctypes.data_as(ctypes.c_void_p),
-                    plan['C_off'].ctypes.data_as(ctypes.c_void_p),
-                    len(plan['covered_pairs']),
-                )
-            else:
-                c_tilde_ph1_batched(
-                    plan['K_tilde_chem_flat'], plan['K_tilde_chem_off'],
-                    plan['K_bar_chem_slice_flat'], plan['K_bar_chem_slice_off'],
-                    t1_flat, t1_off_plan,
-                    T1_local_flat, T1_local_off_plan,
-                    plan['n_pno_arr'], plan['n_domain_arr'],
-                    C_flat, plan['C_off'],
-                    plan['num_threads'],
-                )
-
+            # Native-C path: matches Psi4 ccsd.cc:1809 compute_C_tilde
+            # Phase 1 (Terms 1+2). See pyscf/lib/cc/dlpno_c_tilde.c::
+            # DLPNOcompute_C_tilde_ph1_batched. Same flat-buffer plan
+            # as the Cython kernel.
+            import ctypes
+            from pyscf import lib as _pyscflib
+            _libcc = getattr(compute_C_tilde_batched, '_libcc', None)
+            if _libcc is None:
+                _libcc = _pyscflib.load_library('libcc')
+                _libcc.DLPNOcompute_C_tilde_ph1_batched.restype = None
+                _libcc.DLPNOcompute_C_tilde_ph1_batched.argtypes = [
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_void_p, ctypes.c_void_p,
+                    ctypes.c_size_t,
+                ]
+                compute_C_tilde_batched._libcc = _libcc
+            _libcc.DLPNOcompute_C_tilde_ph1_batched(
+                plan['K_tilde_chem_flat'].ctypes.data_as(ctypes.c_void_p),
+                plan['K_tilde_chem_off'].ctypes.data_as(ctypes.c_void_p),
+                plan['K_bar_chem_slice_flat'].ctypes.data_as(ctypes.c_void_p),
+                plan['K_bar_chem_slice_off'].ctypes.data_as(ctypes.c_void_p),
+                t1_flat.ctypes.data_as(ctypes.c_void_p),
+                t1_off_plan.ctypes.data_as(ctypes.c_void_p),
+                T1_local_flat.ctypes.data_as(ctypes.c_void_p),
+                T1_local_off_plan.ctypes.data_as(ctypes.c_void_p),
+                plan['n_pno_arr'].ctypes.data_as(ctypes.c_void_p),
+                plan['n_domain_arr'].ctypes.data_as(ctypes.c_void_p),
+                C_flat.ctypes.data_as(ctypes.c_void_p),
+                plan['C_off'].ctypes.data_as(ctypes.c_void_p),
+                len(plan['covered_pairs']),
+            )
         C_off_plan = plan['C_off']
         for p, ki in enumerate(plan['covered_pairs']):
             n_pno = int(plan['n_pno_arr'][p])
@@ -2745,44 +2697,37 @@ def compute_B_E_batched_v2(
                 else:
                     beta_kl_arr[n] = B_tilde[k, l]
                     beta_lk_arr[n] = 0.0 if k == l else B_tilde[l, k]
-            if 1:
-                # Native-C path: see pyscf/lib/cc/dlpno_be.c::DLPNObe_kernel.
-                # Same N×(n_ij,n_kl) layout as the Cython kernel.
-                import ctypes as _ct
-                from pyscf import lib as _pyscflib
-                _libcc = getattr(compute_B_E_batched_v2, '_libcc', None)
-                if _libcc is None:
-                    _libcc = _pyscflib.load_library('libcc')
-                    _libcc.DLPNObe_kernel.restype = None
-                    _libcc.DLPNObe_kernel.argtypes = (
-                        [_ct.c_void_p] * 9 + [_ct.c_size_t] * 3 + [_ct.c_int])
-                    compute_B_E_batched_v2._libcc = _libcc
-                S_c = np.ascontiguousarray(bucket['S'])
-                T_c = np.ascontiguousarray(T_arr)
-                K_c = np.ascontiguousarray(bucket['K'])
-                beta_kl_c = np.ascontiguousarray(beta_kl_arr)
-                beta_lk_c = np.ascontiguousarray(beta_lk_arr)
-                same_c = np.ascontiguousarray(bucket['same']).astype(np.uint8, copy=False)
-                idx_c = np.ascontiguousarray(bucket['item_idx']).astype(np.int64, copy=False)
-                _libcc.DLPNObe_kernel(
-                    S_c.ctypes.data_as(_ct.c_void_p),
-                    T_c.ctypes.data_as(_ct.c_void_p),
-                    K_c.ctypes.data_as(_ct.c_void_p),
-                    beta_kl_c.ctypes.data_as(_ct.c_void_p),
-                    beta_lk_c.ctypes.data_as(_ct.c_void_p),
-                    same_c.ctypes.data_as(_ct.c_void_p),
-                    idx_c.ctypes.data_as(_ct.c_void_p),
-                    flat_B[n_ij].ctypes.data_as(_ct.c_void_p),
-                    flat_E[n_ij].ctypes.data_as(_ct.c_void_p),
-                    N, n_ij, n_kl,
-                    int(omp_threads if omp_threads else 16),
-                )
-            else:
-                be_kernel(bucket['S'], T_arr, bucket['K'],
-                          beta_kl_arr, beta_lk_arr, bucket['same'],
-                          bucket['item_idx'],
-                          flat_B[n_ij], flat_E[n_ij])
-
+            # Native-C path: see pyscf/lib/cc/dlpno_be.c::DLPNObe_kernel.
+            # Same N×(n_ij,n_kl) layout as the Cython kernel.
+            import ctypes as _ct
+            from pyscf import lib as _pyscflib
+            _libcc = getattr(compute_B_E_batched_v2, '_libcc', None)
+            if _libcc is None:
+                _libcc = _pyscflib.load_library('libcc')
+                _libcc.DLPNObe_kernel.restype = None
+                _libcc.DLPNObe_kernel.argtypes = (
+                    [_ct.c_void_p] * 9 + [_ct.c_size_t] * 3 + [_ct.c_int])
+                compute_B_E_batched_v2._libcc = _libcc
+            S_c = np.ascontiguousarray(bucket['S'])
+            T_c = np.ascontiguousarray(T_arr)
+            K_c = np.ascontiguousarray(bucket['K'])
+            beta_kl_c = np.ascontiguousarray(beta_kl_arr)
+            beta_lk_c = np.ascontiguousarray(beta_lk_arr)
+            same_c = np.ascontiguousarray(bucket['same']).astype(np.uint8, copy=False)
+            idx_c = np.ascontiguousarray(bucket['item_idx']).astype(np.int64, copy=False)
+            _libcc.DLPNObe_kernel(
+                S_c.ctypes.data_as(_ct.c_void_p),
+                T_c.ctypes.data_as(_ct.c_void_p),
+                K_c.ctypes.data_as(_ct.c_void_p),
+                beta_kl_c.ctypes.data_as(_ct.c_void_p),
+                beta_lk_c.ctypes.data_as(_ct.c_void_p),
+                same_c.ctypes.data_as(_ct.c_void_p),
+                idx_c.ctypes.data_as(_ct.c_void_p),
+                flat_B[n_ij].ctypes.data_as(_ct.c_void_p),
+                flat_E[n_ij].ctypes.data_as(_ct.c_void_p),
+                N, n_ij, n_kl,
+                int(omp_threads if omp_threads else 16),
+            )
     # Unpack flat outputs into dicts keyed by strong pair.
     B_all = {}
     E_all = {}
@@ -3293,54 +3238,41 @@ def _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
         Kt1_ki = np.empty((num_threads, max_n_ki))
         t3_tiles = np.zeros(int(bv['t3_tile_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            if 1:
-                import ctypes as _ct
-                from pyscf import lib as _pyscflib
-                _libcc = getattr(_run_t34_batched, '_libcc', None)
-                if _libcc is None:
-                    _libcc = _pyscflib.load_library('libcc')
-                    _libcc.DLPNOt3_kernel_batched.restype = None
-                    _libcc.DLPNOt3_kernel_batched.argtypes = (
-                        [_ct.c_int]
-                        + [_ct.c_void_p] * 10
-                        + [_ct.c_void_p, _ct.c_size_t] * 2
-                        + [_ct.c_void_p, _ct.c_int])
-                    _libcc.DLPNOt4_kernel_batched.restype = None
-                    _libcc.DLPNOt4_kernel_batched.argtypes = (
-                        [_ct.c_int]
-                        + [_ct.c_void_p] * 14
-                        + [_ct.c_void_p, _ct.c_size_t] * 3
-                        + [_ct.c_void_p, _ct.c_double, _ct.c_int])
-                    _run_t34_batched._libcc = _libcc
-                _libcc.DLPNOt3_kernel_batched(
-                    int(t3_N),
-                    bv['t3_n_kl'].ctypes.data_as(_ct.c_void_p),
-                    bv['t3_n_ki'].ctypes.data_as(_ct.c_void_p),
-                    bv['t3_K_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['t3_S_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['t3_t1i_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['t3_T1l_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['t3_tile_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['t3_K_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['t3_S_flat'].ctypes.data_as(_ct.c_void_p),
-                    t1_cache._buffer.ctypes.data_as(_ct.c_void_p),
-                    Kt1.ctypes.data_as(_ct.c_void_p), Kt1.shape[1],
-                    Kt1_ki.ctypes.data_as(_ct.c_void_p), Kt1_ki.shape[1],
-                    t3_tiles.ctypes.data_as(_ct.c_void_p),
-                    int(num_threads),
-                )
-            else:
-                t3_kernel_batched(
-                    t3_N, max_n_ki, max_n_kl,
-                    bv['t3_n_kl'], bv['t3_n_ki'],
-                    bv['t3_K_off'], bv['t3_S_off'],
-                    bv['t3_t1i_off'], bv['t3_T1l_off'],
-                    bv['t3_tile_off'],
-                    bv['t3_K_flat'], bv['t3_S_flat'],
-                    t1_cache._buffer,
-                    Kt1, Kt1_ki,
-                    t3_tiles, num_threads,
-                )
+            import ctypes as _ct
+            from pyscf import lib as _pyscflib
+            _libcc = getattr(_run_t34_batched, '_libcc', None)
+            if _libcc is None:
+                _libcc = _pyscflib.load_library('libcc')
+                _libcc.DLPNOt3_kernel_batched.restype = None
+                _libcc.DLPNOt3_kernel_batched.argtypes = (
+                    [_ct.c_int]
+                    + [_ct.c_void_p] * 10
+                    + [_ct.c_void_p, _ct.c_size_t] * 2
+                    + [_ct.c_void_p, _ct.c_int])
+                _libcc.DLPNOt4_kernel_batched.restype = None
+                _libcc.DLPNOt4_kernel_batched.argtypes = (
+                    [_ct.c_int]
+                    + [_ct.c_void_p] * 14
+                    + [_ct.c_void_p, _ct.c_size_t] * 3
+                    + [_ct.c_void_p, _ct.c_double, _ct.c_int])
+                _run_t34_batched._libcc = _libcc
+            _libcc.DLPNOt3_kernel_batched(
+                int(t3_N),
+                bv['t3_n_kl'].ctypes.data_as(_ct.c_void_p),
+                bv['t3_n_ki'].ctypes.data_as(_ct.c_void_p),
+                bv['t3_K_off'].ctypes.data_as(_ct.c_void_p),
+                bv['t3_S_off'].ctypes.data_as(_ct.c_void_p),
+                bv['t3_t1i_off'].ctypes.data_as(_ct.c_void_p),
+                bv['t3_T1l_off'].ctypes.data_as(_ct.c_void_p),
+                bv['t3_tile_off'].ctypes.data_as(_ct.c_void_p),
+                bv['t3_K_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['t3_S_flat'].ctypes.data_as(_ct.c_void_p),
+                t1_cache._buffer.ctypes.data_as(_ct.c_void_p),
+                Kt1.ctypes.data_as(_ct.c_void_p), Kt1.shape[1],
+                Kt1_ki.ctypes.data_as(_ct.c_void_p), Kt1_ki.shape[1],
+                t3_tiles.ctypes.data_as(_ct.c_void_p),
+                int(num_threads),
+            )
         # Scatter contrib tiles into flat_out (-= for both C and D —
         # the sign is absorbed into the kernel via the negative T1l).
         # Reference scatters with `out[idx] += contrib`, kernel stores
@@ -3405,45 +3337,31 @@ def _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
         tmp3 = np.empty((num_threads, max_n_ki * max_n_kl))
         t4_tiles = np.zeros(int(bv['t4_tile_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            if 1:
-                import ctypes as _ct
-                _libcc = _run_t34_batched._libcc
-                t4_t2_off_view = np.ascontiguousarray(bv['t4_t2_off'][:t4_N])
-                _libcc.DLPNOt4_kernel_batched(
-                    int(t4_N),
-                    bv['t4_n_ki'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_n_li'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_n_kl'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_S_ki_li_off'].ctypes.data_as(_ct.c_void_p),
-                    t4_t2_off_view.ctypes.data_as(_ct.c_void_p),
-                    bv['t4_S_li_kl_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_K_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_S_kl_ki_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_tile_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_S_ki_li_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_S_li_kl_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_K_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['t4_S_kl_ki_flat'].ctypes.data_as(_ct.c_void_p),
-                    t2_flat.ctypes.data_as(_ct.c_void_p),
-                    tmp1.ctypes.data_as(_ct.c_void_p), tmp1.shape[1],
-                    tmp2.ctypes.data_as(_ct.c_void_p), tmp2.shape[1],
-                    tmp3.ctypes.data_as(_ct.c_void_p), tmp3.shape[1],
-                    t4_tiles.ctypes.data_as(_ct.c_void_p),
-                    float(t4_scale), int(num_threads),
-                )
-            else:
-                t4_kernel_batched(
-                    t4_N, max_n_ki, max_n_li, max_n_kl,
-                    bv['t4_n_ki'], bv['t4_n_li'], bv['t4_n_kl'],
-                    bv['t4_S_ki_li_off'], bv['t4_t2_off'][:t4_N],
-                    bv['t4_S_li_kl_off'], bv['t4_K_off'],
-                    bv['t4_S_kl_ki_off'], bv['t4_tile_off'],
-                    bv['t4_S_ki_li_flat'], bv['t4_S_li_kl_flat'],
-                    bv['t4_K_flat'], bv['t4_S_kl_ki_flat'],
-                    t2_flat,
-                    tmp1, tmp2, tmp3,
-                    t4_tiles, t4_scale, num_threads,
-                )
+            import ctypes as _ct
+            _libcc = _run_t34_batched._libcc
+            t4_t2_off_view = np.ascontiguousarray(bv['t4_t2_off'][:t4_N])
+            _libcc.DLPNOt4_kernel_batched(
+                int(t4_N),
+                bv['t4_n_ki'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_n_li'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_n_kl'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_S_ki_li_off'].ctypes.data_as(_ct.c_void_p),
+                t4_t2_off_view.ctypes.data_as(_ct.c_void_p),
+                bv['t4_S_li_kl_off'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_K_off'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_S_kl_ki_off'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_tile_off'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_S_ki_li_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_S_li_kl_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_K_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['t4_S_kl_ki_flat'].ctypes.data_as(_ct.c_void_p),
+                t2_flat.ctypes.data_as(_ct.c_void_p),
+                tmp1.ctypes.data_as(_ct.c_void_p), tmp1.shape[1],
+                tmp2.ctypes.data_as(_ct.c_void_p), tmp2.shape[1],
+                tmp3.ctypes.data_as(_ct.c_void_p), tmp3.shape[1],
+                t4_tiles.ctypes.data_as(_ct.c_void_p),
+                float(t4_scale), int(num_threads),
+            )
         t4_tile_off = bv['t4_tile_off']
         t4_target = bv['t4_target_slot']
         t4_n_ki = bv['t4_n_ki']
@@ -3750,66 +3668,51 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
             _t0 = _cd_time.perf_counter()
 
         with threadpool_limits(limits=1, user_api='blas'):
-            if 1:
-                # Native-C path: see pyscf/lib/cc/dlpno_cd_term.c.
-                import ctypes as _ct
-                from pyscf import lib as _pyscflib
-                _libcc = getattr(compute_CD_terms_batched, '_libcc', None)
-                if _libcc is None:
-                    _libcc = _pyscflib.load_library('libcc')
-                    _libcc.DLPNOc_term_batched.restype = None
-                    _libcc.DLPNOc_term_batched.argtypes = (
-                        [_ct.c_int]
-                        + [_ct.c_void_p] * 16
-                        + [_ct.c_void_p, _ct.c_size_t] * 3
-                        + [_ct.c_void_p, _ct.c_int])
-                    _libcc.DLPNOd_term_batched.restype = None
-                    _libcc.DLPNOd_term_batched.argtypes = (
-                        [_ct.c_int]
-                        + [_ct.c_void_p] * 16
-                        + [_ct.c_void_p, _ct.c_size_t] * 4
-                        + [_ct.c_void_p, _ct.c_int])
-                    compute_CD_terms_batched._libcc = _libcc
-                c_t2_off_view = np.ascontiguousarray(bv['c_t2_off'][:c_N])
-                c_ct_off_view = np.ascontiguousarray(bv['c_ct_off'][:c_N])
-                _libcc.DLPNOc_term_batched(
-                    int(c_N),
-                    bv['c_n_pno'].ctypes.data_as(_ct.c_void_p),
-                    bv['c_n_ct'].ctypes.data_as(_ct.c_void_p),
-                    bv['c_n_other'].ctypes.data_as(_ct.c_void_p),
-                    bv['c_S_big_off'].ctypes.data_as(_ct.c_void_p),
-                    c_ct_off_view.ctypes.data_as(_ct.c_void_p),
-                    bv['c_S_mid_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['c_J_bold_off'].ctypes.data_as(_ct.c_void_p),
-                    c_t2_off_view.ctypes.data_as(_ct.c_void_p),
-                    bv['c_S_outer_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['c_tile_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['c_S_big_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['c_S_mid_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['c_J_bold_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['c_S_outer_flat'].ctypes.data_as(_ct.c_void_p),
-                    ct_flat.ctypes.data_as(_ct.c_void_p),
-                    t2_flat.ctypes.data_as(_ct.c_void_p),
-                    STB.ctypes.data_as(_ct.c_void_p), STB.shape[1],
-                    GAMMA.ctypes.data_as(_ct.c_void_p), GAMMA.shape[1],
-                    GT.ctypes.data_as(_ct.c_void_p), GT.shape[1],
-                    c_tiles.ctypes.data_as(_ct.c_void_p),
-                    int(num_threads),
-                )
-            else:
-                c_kernel_batched(
-                    c_N, max_n_pno, max_n_ct, max_n_other,
-                    bv['c_n_pno'], bv['c_n_ct'], bv['c_n_other'],
-                    bv['c_S_big_off'], bv['c_ct_off'][:c_N],
-                    bv['c_S_mid_off'], bv['c_J_bold_off'],
-                    bv['c_t2_off'][:c_N], bv['c_S_outer_off'],
-                    bv['c_tile_off'],
-                    bv['c_S_big_flat'], bv['c_S_mid_flat'],
-                    bv['c_J_bold_flat'], bv['c_S_outer_flat'],
-                    ct_flat, t2_flat,
-                    STB, GAMMA, GT,
-                    c_tiles, num_threads,
-                )
+            # Native-C path: see pyscf/lib/cc/dlpno_cd_term.c.
+            import ctypes as _ct
+            from pyscf import lib as _pyscflib
+            _libcc = getattr(compute_CD_terms_batched, '_libcc', None)
+            if _libcc is None:
+                _libcc = _pyscflib.load_library('libcc')
+                _libcc.DLPNOc_term_batched.restype = None
+                _libcc.DLPNOc_term_batched.argtypes = (
+                    [_ct.c_int]
+                    + [_ct.c_void_p] * 16
+                    + [_ct.c_void_p, _ct.c_size_t] * 3
+                    + [_ct.c_void_p, _ct.c_int])
+                _libcc.DLPNOd_term_batched.restype = None
+                _libcc.DLPNOd_term_batched.argtypes = (
+                    [_ct.c_int]
+                    + [_ct.c_void_p] * 16
+                    + [_ct.c_void_p, _ct.c_size_t] * 4
+                    + [_ct.c_void_p, _ct.c_int])
+                compute_CD_terms_batched._libcc = _libcc
+            c_t2_off_view = np.ascontiguousarray(bv['c_t2_off'][:c_N])
+            c_ct_off_view = np.ascontiguousarray(bv['c_ct_off'][:c_N])
+            _libcc.DLPNOc_term_batched(
+                int(c_N),
+                bv['c_n_pno'].ctypes.data_as(_ct.c_void_p),
+                bv['c_n_ct'].ctypes.data_as(_ct.c_void_p),
+                bv['c_n_other'].ctypes.data_as(_ct.c_void_p),
+                bv['c_S_big_off'].ctypes.data_as(_ct.c_void_p),
+                c_ct_off_view.ctypes.data_as(_ct.c_void_p),
+                bv['c_S_mid_off'].ctypes.data_as(_ct.c_void_p),
+                bv['c_J_bold_off'].ctypes.data_as(_ct.c_void_p),
+                c_t2_off_view.ctypes.data_as(_ct.c_void_p),
+                bv['c_S_outer_off'].ctypes.data_as(_ct.c_void_p),
+                bv['c_tile_off'].ctypes.data_as(_ct.c_void_p),
+                bv['c_S_big_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['c_S_mid_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['c_J_bold_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['c_S_outer_flat'].ctypes.data_as(_ct.c_void_p),
+                ct_flat.ctypes.data_as(_ct.c_void_p),
+                t2_flat.ctypes.data_as(_ct.c_void_p),
+                STB.ctypes.data_as(_ct.c_void_p), STB.shape[1],
+                GAMMA.ctypes.data_as(_ct.c_void_p), GAMMA.shape[1],
+                GT.ctypes.data_as(_ct.c_void_p), GT.shape[1],
+                c_tiles.ctypes.data_as(_ct.c_void_p),
+                int(num_threads),
+            )
         if _cd_dump:
             _cd_t['c_kern'] = _cd_time.perf_counter() - _t0
             _t0 = _cd_time.perf_counter()
@@ -3893,50 +3796,35 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
             _t0 = _cd_time.perf_counter()
 
         with threadpool_limits(limits=1, user_api='blas'):
-            if 1:
-                import ctypes as _ct
-                _libcc = compute_CD_terms_batched._libcc  # set above
-                d_u_off_view = np.ascontiguousarray(bv['d_u_off'][:d_N])
-                d_dt_off_view = np.ascontiguousarray(bv['d_dt_off'][:d_N])
-                _libcc.DLPNOd_term_batched(
-                    int(d_N),
-                    bv['d_n_pno'].ctypes.data_as(_ct.c_void_p),
-                    bv['d_n_A'].ctypes.data_as(_ct.c_void_p),
-                    bv['d_n_B'].ctypes.data_as(_ct.c_void_p),
-                    bv['d_S_a_off'].ctypes.data_as(_ct.c_void_p),
-                    d_u_off_view.ctypes.data_as(_ct.c_void_p),
-                    bv['d_S_b_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['d_S_c_off'].ctypes.data_as(_ct.c_void_p),
-                    d_dt_off_view.ctypes.data_as(_ct.c_void_p),
-                    bv['d_KJ_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['d_tile_off'].ctypes.data_as(_ct.c_void_p),
-                    bv['d_S_a_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['d_S_b_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['d_S_c_flat'].ctypes.data_as(_ct.c_void_p),
-                    bv['d_KJ_flat'].ctypes.data_as(_ct.c_void_p),
-                    u_flat.ctypes.data_as(_ct.c_void_p),
-                    dt_flat.ctypes.data_as(_ct.c_void_p),
-                    SU.ctypes.data_as(_ct.c_void_p), SU.shape[1],
-                    UP.ctypes.data_as(_ct.c_void_p), UP.shape[1],
-                    SCD.ctypes.data_as(_ct.c_void_p), SCD.shape[1],
-                    Bint.ctypes.data_as(_ct.c_void_p), Bint.shape[1],
-                    d_tiles.ctypes.data_as(_ct.c_void_p),
-                    int(num_threads),
-                )
-            else:
-                d_kernel_batched(
-                    d_N, max_n_pno, max_n_A, max_n_B,
-                    bv['d_n_pno'], bv['d_n_A'], bv['d_n_B'],
-                    bv['d_S_a_off'], bv['d_u_off'][:d_N],
-                    bv['d_S_b_off'], bv['d_S_c_off'],
-                    bv['d_dt_off'][:d_N], bv['d_KJ_off'],
-                    bv['d_tile_off'],
-                    bv['d_S_a_flat'], bv['d_S_b_flat'],
-                    bv['d_S_c_flat'], bv['d_KJ_flat'],
-                    u_flat, dt_flat,
-                    SU, UP, SCD, Bint,
-                    d_tiles, num_threads,
-                )
+            import ctypes as _ct
+            _libcc = compute_CD_terms_batched._libcc  # set above
+            d_u_off_view = np.ascontiguousarray(bv['d_u_off'][:d_N])
+            d_dt_off_view = np.ascontiguousarray(bv['d_dt_off'][:d_N])
+            _libcc.DLPNOd_term_batched(
+                int(d_N),
+                bv['d_n_pno'].ctypes.data_as(_ct.c_void_p),
+                bv['d_n_A'].ctypes.data_as(_ct.c_void_p),
+                bv['d_n_B'].ctypes.data_as(_ct.c_void_p),
+                bv['d_S_a_off'].ctypes.data_as(_ct.c_void_p),
+                d_u_off_view.ctypes.data_as(_ct.c_void_p),
+                bv['d_S_b_off'].ctypes.data_as(_ct.c_void_p),
+                bv['d_S_c_off'].ctypes.data_as(_ct.c_void_p),
+                d_dt_off_view.ctypes.data_as(_ct.c_void_p),
+                bv['d_KJ_off'].ctypes.data_as(_ct.c_void_p),
+                bv['d_tile_off'].ctypes.data_as(_ct.c_void_p),
+                bv['d_S_a_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['d_S_b_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['d_S_c_flat'].ctypes.data_as(_ct.c_void_p),
+                bv['d_KJ_flat'].ctypes.data_as(_ct.c_void_p),
+                u_flat.ctypes.data_as(_ct.c_void_p),
+                dt_flat.ctypes.data_as(_ct.c_void_p),
+                SU.ctypes.data_as(_ct.c_void_p), SU.shape[1],
+                UP.ctypes.data_as(_ct.c_void_p), UP.shape[1],
+                SCD.ctypes.data_as(_ct.c_void_p), SCD.shape[1],
+                Bint.ctypes.data_as(_ct.c_void_p), Bint.shape[1],
+                d_tiles.ctypes.data_as(_ct.c_void_p),
+                int(num_threads),
+            )
         if _cd_dump:
             _cd_t['d_kern'] = _cd_time.perf_counter() - _t0
             _t0 = _cd_time.perf_counter()

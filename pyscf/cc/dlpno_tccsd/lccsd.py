@@ -1347,83 +1347,60 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
 
         contrib_flat = np.zeros(int(bp['contrib_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            if 1:
-                # Native-C path: see pyscf/lib/cc/dlpno_t1_residual.c::
-                # DLPNOper_kl_batched. Same flat-buffer plan + per-thread
-                # scratch as the Cython kernel.
-                import ctypes as _ct
-                from pyscf import lib as _pyscflib
-                _libcc = getattr(_compute_t1_residual_psi4, '_libcc', None)
-                if _libcc is None:
-                    _libcc = _pyscflib.load_library('libcc')
-                    _libcc.DLPNOper_kl_batched.restype = None
-                    _libcc.DLPNOper_kl_batched.argtypes = (
-                        [_ct.c_int, _ct.c_int]                      # n_tasks, M
-                        + [_ct.c_void_p] * 7                        # per-task arrays
-                        + [_ct.c_void_p] * 14                       # per-(t,i) arrays
-                        + [_ct.c_void_p] * 5                        # static + dynamic flat buffers
-                        + [_ct.c_void_p, _ct.c_size_t] * 6          # 6 scratch (ptr, stride)
-                        + [_ct.c_void_p, _ct.c_int])                # contrib_flat, num_threads
-                    _compute_t1_residual_psi4._libcc = _libcc
-                _libcc.DLPNOper_kl_batched(
-                    int(bp['n_tasks']), int(_M),
-                    bp['n_kl_arr'].ctypes.data_as(_ct.c_void_p),
-                    bp['t2_swap_kl'].ctypes.data_as(_ct.c_void_p),
-                    bp['K_iajb_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['K_bar_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['t2_kl_canon_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['T_n_kl_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['inner_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['i_arr'].ctypes.data_as(_ct.c_void_p),
-                    bp['n_pno_ii_arr'].ctypes.data_as(_ct.c_void_p),
-                    bp['is_diag_kl_ii'].ctypes.data_as(_ct.c_void_p),
-                    bp['has_S_ii_kl'].ctypes.data_as(_ct.c_void_p),
-                    bp['S_ii_kl_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['has_A2'].ctypes.data_as(_ct.c_void_p),
-                    bp['is_diag_kl_ki'].ctypes.data_as(_ct.c_void_p),
-                    bp['n_ki_arr'].ctypes.data_as(_ct.c_void_p),
-                    bp['t2_swap_ki'].ctypes.data_as(_ct.c_void_p),
-                    bp['t2_ki_canon_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['S_kl_ki_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['S_ki_kl_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['T_n_l_ii_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['contrib_off'].ctypes.data_as(_ct.c_void_p),
-                    bp['K_iajb_static'].ctypes.data_as(_ct.c_void_p),
-                    bp['K_bar_static'].ctypes.data_as(_ct.c_void_p),
-                    bp['S_consolidated'].ctypes.data_as(_ct.c_void_p),
-                    t2_pno_all._buffer.ctypes.data_as(_ct.c_void_p),
-                    t1_cache._buffer.ctypes.data_as(_ct.c_void_p),
-                    _bp_scratch['Tt_kl'].ctypes.data_as(_ct.c_void_p), _bp_scratch['Tt_kl'].shape[1],
-                    _bp_scratch['K_kilc'].ctypes.data_as(_ct.c_void_p), _bp_scratch['K_kilc'].shape[1],
-                    _bp_scratch['B_ia'].ctypes.data_as(_ct.c_void_p), _bp_scratch['B_ia'].shape[1],
-                    _bp_scratch['Tt_ki'].ctypes.data_as(_ct.c_void_p), _bp_scratch['Tt_ki'].shape[1],
-                    _bp_scratch['X'].ctypes.data_as(_ct.c_void_p), _bp_scratch['X'].shape[1],
-                    _bp_scratch['Z'].ctypes.data_as(_ct.c_void_p), _bp_scratch['Z'].shape[1],
-                    contrib_flat.ctypes.data_as(_ct.c_void_p),
-                    int(_NTH),
-                )
-            else:
-                per_kl_batched(
-                    bp['n_tasks'], _M,
-                    bp['n_kl_arr'], bp['t2_swap_kl'],
-                    bp['K_iajb_off'], bp['K_bar_off'],
-                    bp['t2_kl_canon_off'], bp['T_n_kl_off'],
-                    bp['inner_off'],
-                    bp['i_arr'], bp['n_pno_ii_arr'],
-                    bp['is_diag_kl_ii'], bp['has_S_ii_kl'], bp['S_ii_kl_off'],
-                    bp['has_A2'], bp['is_diag_kl_ki'], bp['n_ki_arr'],
-                    bp['t2_swap_ki'], bp['t2_ki_canon_off'],
-                    bp['S_kl_ki_off'], bp['S_ki_kl_off'],
-                    bp['T_n_l_ii_off'], bp['contrib_off'],
-                    bp['K_iajb_static'], bp['K_bar_static'],
-                    bp['S_consolidated'],
-                    t2_pno_all._buffer, t1_cache._buffer,
-                    _bp_scratch['Tt_kl'], _bp_scratch['K_kilc'],
-                    _bp_scratch['B_ia'], _bp_scratch['Tt_ki'],
-                    _bp_scratch['X'], _bp_scratch['Z'],
-                    contrib_flat,
-                    _NTH,
-                )
+            # Native-C path: see pyscf/lib/cc/dlpno_t1_residual.c::
+            # DLPNOper_kl_batched. Same flat-buffer plan + per-thread
+            # scratch as the Cython kernel.
+            import ctypes as _ct
+            from pyscf import lib as _pyscflib
+            _libcc = getattr(_compute_t1_residual_psi4, '_libcc', None)
+            if _libcc is None:
+                _libcc = _pyscflib.load_library('libcc')
+                _libcc.DLPNOper_kl_batched.restype = None
+                _libcc.DLPNOper_kl_batched.argtypes = (
+                    [_ct.c_int, _ct.c_int]                      # n_tasks, M
+                    + [_ct.c_void_p] * 7                        # per-task arrays
+                    + [_ct.c_void_p] * 14                       # per-(t,i) arrays
+                    + [_ct.c_void_p] * 5                        # static + dynamic flat buffers
+                    + [_ct.c_void_p, _ct.c_size_t] * 6          # 6 scratch (ptr, stride)
+                    + [_ct.c_void_p, _ct.c_int])                # contrib_flat, num_threads
+                _compute_t1_residual_psi4._libcc = _libcc
+            _libcc.DLPNOper_kl_batched(
+                int(bp['n_tasks']), int(_M),
+                bp['n_kl_arr'].ctypes.data_as(_ct.c_void_p),
+                bp['t2_swap_kl'].ctypes.data_as(_ct.c_void_p),
+                bp['K_iajb_off'].ctypes.data_as(_ct.c_void_p),
+                bp['K_bar_off'].ctypes.data_as(_ct.c_void_p),
+                bp['t2_kl_canon_off'].ctypes.data_as(_ct.c_void_p),
+                bp['T_n_kl_off'].ctypes.data_as(_ct.c_void_p),
+                bp['inner_off'].ctypes.data_as(_ct.c_void_p),
+                bp['i_arr'].ctypes.data_as(_ct.c_void_p),
+                bp['n_pno_ii_arr'].ctypes.data_as(_ct.c_void_p),
+                bp['is_diag_kl_ii'].ctypes.data_as(_ct.c_void_p),
+                bp['has_S_ii_kl'].ctypes.data_as(_ct.c_void_p),
+                bp['S_ii_kl_off'].ctypes.data_as(_ct.c_void_p),
+                bp['has_A2'].ctypes.data_as(_ct.c_void_p),
+                bp['is_diag_kl_ki'].ctypes.data_as(_ct.c_void_p),
+                bp['n_ki_arr'].ctypes.data_as(_ct.c_void_p),
+                bp['t2_swap_ki'].ctypes.data_as(_ct.c_void_p),
+                bp['t2_ki_canon_off'].ctypes.data_as(_ct.c_void_p),
+                bp['S_kl_ki_off'].ctypes.data_as(_ct.c_void_p),
+                bp['S_ki_kl_off'].ctypes.data_as(_ct.c_void_p),
+                bp['T_n_l_ii_off'].ctypes.data_as(_ct.c_void_p),
+                bp['contrib_off'].ctypes.data_as(_ct.c_void_p),
+                bp['K_iajb_static'].ctypes.data_as(_ct.c_void_p),
+                bp['K_bar_static'].ctypes.data_as(_ct.c_void_p),
+                bp['S_consolidated'].ctypes.data_as(_ct.c_void_p),
+                t2_pno_all._buffer.ctypes.data_as(_ct.c_void_p),
+                t1_cache._buffer.ctypes.data_as(_ct.c_void_p),
+                _bp_scratch['Tt_kl'].ctypes.data_as(_ct.c_void_p), _bp_scratch['Tt_kl'].shape[1],
+                _bp_scratch['K_kilc'].ctypes.data_as(_ct.c_void_p), _bp_scratch['K_kilc'].shape[1],
+                _bp_scratch['B_ia'].ctypes.data_as(_ct.c_void_p), _bp_scratch['B_ia'].shape[1],
+                _bp_scratch['Tt_ki'].ctypes.data_as(_ct.c_void_p), _bp_scratch['Tt_ki'].shape[1],
+                _bp_scratch['X'].ctypes.data_as(_ct.c_void_p), _bp_scratch['X'].shape[1],
+                _bp_scratch['Z'].ctypes.data_as(_ct.c_void_p), _bp_scratch['Z'].shape[1],
+                contrib_flat.ctypes.data_as(_ct.c_void_p),
+                int(_NTH),
+            )
         # Aggregate per-(t,i) contributions into r1_pno[i]
         i_arr_np = bp['i_arr']
         contrib_off_np = bp['contrib_off']

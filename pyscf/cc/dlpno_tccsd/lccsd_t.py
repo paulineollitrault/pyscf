@@ -2537,142 +2537,141 @@ def _process_one_triple(i, j, k,
     # (synthetic triples with non-trivial U + transpose flags) at
     # machine-precision agreement; transpose_flag convention fixed
     # below to match _proj_t2(p=l, q=r) ordering.
-    if 1:
-        try:
-            from pyscf.cc.dlpno_tccsd._w3_full_cy import w3_full_kernel
-        except ImportError:
-            w3_full_kernel = None
-        if w3_full_kernel is not None:
-            n = n_tno
-            m_dom = m_dom_size
+    try:
+        from pyscf.cc.dlpno_tccsd._w3_full_cy import w3_full_kernel
+    except ImportError:
+        w3_full_kernel = None
+    if w3_full_kernel is not None:
+        n = n_tno
+        m_dom = m_dom_size
 
-            # Build U_flat / T2_flat for per-m vooo: 3 * m_dom items.
-            # Item flat_idx = r * m_dom + l_ijk for r in [0,3), l in [0,m_dom).
-            n_tasks = 3 * m_dom
-            n_pno_arr = np.zeros(n_tasks, dtype=np.int64)
-            transpose_flags = np.zeros(n_tasks, dtype=np.int8)
-            U_blocks = [None] * n_tasks
-            T2_blocks = [None] * n_tasks
-            for r_local in range(3):
-                r_global = triple_lmo[r_local]
-                for l_local in range(m_dom):
-                    l_global = triple_domain[l_local]
-                    pk = (min(r_global, l_global), max(r_global, l_global))
-                    if pk not in t2_for_T:
-                        continue
-                    U = _U_for(pk)
-                    if U is None:
-                        continue
-                    n_pno_pk = U.shape[0]
-                    flat_idx = r_local * m_dom + l_local
-                    n_pno_arr[flat_idx] = n_pno_pk
-                    U_blocks[flat_idx] = np.ascontiguousarray(U)
-                    T2_blocks[flat_idx] = np.ascontiguousarray(t2_for_T[pk])
-                    # The kernel computes T_il[r] = projected T2 for pair
-                    # (l_lmo, r_lmo) — matching _proj_t2(p=l_global,
-                    # q=r_global). Convention: t2_for_T[pk] is canonical
-                    # (min <= max). The pair (l, r) is non-canonical when
-                    # l > r, so the kernel must transpose then.
-                    transpose_flags[flat_idx] = 1 if l_global > r_global else 0
-
-            U_sizes = (n_pno_arr * n)        # n_pno × n_tno per item
-            T2_sizes = (n_pno_arr * n_pno_arr)
-            U_offsets = np.empty(n_tasks + 1, dtype=np.int64)
-            U_offsets[0] = 0
-            U_offsets[1:] = np.cumsum(U_sizes)
-            T2_offsets = np.empty(n_tasks + 1, dtype=np.int64)
-            T2_offsets[0] = 0
-            T2_offsets[1:] = np.cumsum(T2_sizes)
-            n_pno_max = int(n_pno_arr.max(initial=0))
-            U_flat = np.empty(int(U_offsets[-1]))
-            T2_flat = np.empty(int(T2_offsets[-1]))
-            for t in range(n_tasks):
-                if n_pno_arr[t] == 0:
+        # Build U_flat / T2_flat for per-m vooo: 3 * m_dom items.
+        # Item flat_idx = r * m_dom + l_ijk for r in [0,3), l in [0,m_dom).
+        n_tasks = 3 * m_dom
+        n_pno_arr = np.zeros(n_tasks, dtype=np.int64)
+        transpose_flags = np.zeros(n_tasks, dtype=np.int8)
+        U_blocks = [None] * n_tasks
+        T2_blocks = [None] * n_tasks
+        for r_local in range(3):
+            r_global = triple_lmo[r_local]
+            for l_local in range(m_dom):
+                l_global = triple_domain[l_local]
+                pk = (min(r_global, l_global), max(r_global, l_global))
+                if pk not in t2_for_T:
                     continue
-                U_flat[U_offsets[t]:U_offsets[t + 1]] = U_blocks[t].ravel()
-                T2_flat[T2_offsets[t]:T2_offsets[t + 1]] = T2_blocks[t].ravel()
+                U = _U_for(pk)
+                if U is None:
+                    continue
+                n_pno_pk = U.shape[0]
+                flat_idx = r_local * m_dom + l_local
+                n_pno_arr[flat_idx] = n_pno_pk
+                U_blocks[flat_idx] = np.ascontiguousarray(U)
+                T2_blocks[flat_idx] = np.ascontiguousarray(t2_for_T[pk])
+                # The kernel computes T_il[r] = projected T2 for pair
+                # (l_lmo, r_lmo) — matching _proj_t2(p=l_global,
+                # q=r_global). Convention: t2_for_T[pk] is canonical
+                # (min <= max). The pair (l, r) is non-canonical when
+                # l > r, so the kernel must transpose then.
+                transpose_flags[flat_idx] = 1 if l_global > r_global else 0
 
-            # K_ab_cache (3, n, n, n): K_ab_cache[ip, a, b, f] from ovL_ijk[ip] @ vvL_sc
-            K_ab_cache = np.empty((3, n, n, n))
-            for ip in range(3):
-                t = np.tensordot(ovL_ijk[ip], vvL_sc, axes=([1], [2]))
-                K_ab_cache[ip] = t.transpose(0, 2, 1)
+        U_sizes = (n_pno_arr * n)        # n_pno × n_tno per item
+        T2_sizes = (n_pno_arr * n_pno_arr)
+        U_offsets = np.empty(n_tasks + 1, dtype=np.int64)
+        U_offsets[0] = 0
+        U_offsets[1:] = np.cumsum(U_sizes)
+        T2_offsets = np.empty(n_tasks + 1, dtype=np.int64)
+        T2_offsets[0] = 0
+        T2_offsets[1:] = np.cumsum(T2_sizes)
+        n_pno_max = int(n_pno_arr.max(initial=0))
+        U_flat = np.empty(int(U_offsets[-1]))
+        T2_flat = np.empty(int(T2_offsets[-1]))
+        for t in range(n_tasks):
+            if n_pno_arr[t] == 0:
+                continue
+            U_flat[U_offsets[t]:U_offsets[t + 1]] = U_blocks[t].ravel()
+            T2_flat[T2_offsets[t]:T2_offsets[t + 1]] = T2_blocks[t].ravel()
 
-            # t2_T_all (3, 3, n, n): t2_block transposed on virtual axes.
-            t2_T_all = np.ascontiguousarray(t2_block.transpose(0, 1, 3, 2))
+        # K_ab_cache (3, n, n, n): K_ab_cache[ip, a, b, f] from ovL_ijk[ip] @ vvL_sc
+        K_ab_cache = np.empty((3, n, n, n))
+        for ip in range(3):
+            t = np.tensordot(ovL_ijk[ip], vvL_sc, axes=([1], [2]))
+            K_ab_cache[ip] = t.transpose(0, 2, 1)
 
-            has_t1 = 1 if (t1_lmo is not None and fvo is not None) else 0
-            if has_t1:
-                K_jk = ovL_ijk[1] @ ovL_ijk[2].T
-                K_ik = ovL_ijk[0] @ ovL_ijk[2].T
-                K_ij = ovL_ijk[0] @ ovL_ijk[1].T
-                t1_sc_arr = np.ascontiguousarray(t1_lmo)
-            else:
-                K_jk = np.zeros((n, n))
-                K_ik = np.zeros((n, n))
-                K_ij = np.zeros((n, n))
-                t1_sc_arr = np.zeros((3, n))
+        # t2_T_all (3, 3, n, n): t2_block transposed on virtual axes.
+        t2_T_all = np.ascontiguousarray(t2_block.transpose(0, 1, 3, 2))
 
-            dij = int(i == j); djk = int(j == k); dik = int(i == k)
-            occ_denom = 1 + dij + djk + dik + 2 * dij * djk * dik
+        has_t1 = 1 if (t1_lmo is not None and fvo is not None) else 0
+        if has_t1:
+            K_jk = ovL_ijk[1] @ ovL_ijk[2].T
+            K_ik = ovL_ijk[0] @ ovL_ijk[2].T
+            K_ij = ovL_ijk[0] @ ovL_ijk[1].T
+            t1_sc_arr = np.ascontiguousarray(t1_lmo)
+        else:
+            K_jk = np.zeros((n, n))
+            K_ik = np.zeros((n, n))
+            K_ij = np.zeros((n, n))
+            t1_sc_arr = np.zeros((3, n))
 
-            # Native-C W3 kernel (replaces Cython _w3_full_cy.w3_full_kernel).
-            # Same math, no GIL re-acquisition during BLAS calls.
-            if os.environ.get('DLPNO_W3_PYTHON', '0') != '1':
-                import ctypes as _ct
-                from pyscf import lib as _pl
-                _libcc_w3 = getattr(_process_one_triple, '_libcc_w3', None)
-                if _libcc_w3 is None:
-                    _libcc_w3 = _pl.load_library('libcc')
-                    _libcc_w3.DLPNOcompute_w3_energy.restype = _ct.c_double
-                    _libcc_w3.DLPNOcompute_w3_energy.argtypes = (
-                        [_ct.c_void_p] * 15       # 15 array/tensor pointers
-                        + [_ct.c_int] * 5         # has_t1, occ_denom, n, m_dom, n_pno_max
-                    )
-                    _process_one_triple._libcc_w3 = _libcc_w3
-                K_ab_cache_c = np.ascontiguousarray(K_ab_cache)
-                t2_T_all_c   = np.ascontiguousarray(t2_T_all)
-                K_jk_c       = np.ascontiguousarray(K_jk)
-                K_ik_c       = np.ascontiguousarray(K_ik)
-                K_ij_c       = np.ascontiguousarray(K_ij)
-                K_ooov_c     = np.ascontiguousarray(K_ooov)
-                eps_occ_c    = np.ascontiguousarray(eps_occ)
-                eps_tno_c    = np.ascontiguousarray(eps_tno_sc)
-                t1_c         = np.ascontiguousarray(t1_sc_arr)
-                tflags_c = transpose_flags.astype(np.int8, copy=False)
-                return _libcc_w3.DLPNOcompute_w3_energy(
-                    K_ab_cache_c.ctypes.data_as(_ct.c_void_p),
-                    t2_T_all_c.ctypes.data_as(_ct.c_void_p),
-                    K_jk_c.ctypes.data_as(_ct.c_void_p),
-                    K_ik_c.ctypes.data_as(_ct.c_void_p),
-                    K_ij_c.ctypes.data_as(_ct.c_void_p),
-                    K_ooov_c.ctypes.data_as(_ct.c_void_p),
-                    U_flat.ctypes.data_as(_ct.c_void_p),
-                    U_offsets.ctypes.data_as(_ct.c_void_p),
-                    n_pno_arr.ctypes.data_as(_ct.c_void_p),
-                    T2_flat.ctypes.data_as(_ct.c_void_p),
-                    T2_offsets.ctypes.data_as(_ct.c_void_p),
-                    tflags_c.ctypes.data_as(_ct.c_void_p),
-                    eps_occ_c.ctypes.data_as(_ct.c_void_p),
-                    eps_tno_c.ctypes.data_as(_ct.c_void_p),
-                    t1_c.ctypes.data_as(_ct.c_void_p),
-                    int(has_t1), int(occ_denom),
-                    int(n), int(m_dom), int(n_pno_max),
+        dij = int(i == j); djk = int(j == k); dik = int(i == k)
+        occ_denom = 1 + dij + djk + dik + 2 * dij * djk * dik
+
+        # Native-C W3 kernel (replaces Cython _w3_full_cy.w3_full_kernel).
+        # Same math, no GIL re-acquisition during BLAS calls.
+        if os.environ.get('DLPNO_W3_PYTHON', '0') != '1':
+            import ctypes as _ct
+            from pyscf import lib as _pl
+            _libcc_w3 = getattr(_process_one_triple, '_libcc_w3', None)
+            if _libcc_w3 is None:
+                _libcc_w3 = _pl.load_library('libcc')
+                _libcc_w3.DLPNOcompute_w3_energy.restype = _ct.c_double
+                _libcc_w3.DLPNOcompute_w3_energy.argtypes = (
+                    [_ct.c_void_p] * 15       # 15 array/tensor pointers
+                    + [_ct.c_int] * 5         # has_t1, occ_denom, n, m_dom, n_pno_max
                 )
-
-            return w3_full_kernel(
-                K_ab_cache, t2_T_all,
-                np.ascontiguousarray(K_jk),
-                np.ascontiguousarray(K_ik),
-                np.ascontiguousarray(K_ij),
-                np.ascontiguousarray(K_ooov),
-                U_flat, U_offsets, n_pno_arr,
-                T2_flat, T2_offsets, transpose_flags,
-                np.ascontiguousarray(eps_occ),
-                np.ascontiguousarray(eps_tno_sc),
-                t1_sc_arr, has_t1, occ_denom,
+                _process_one_triple._libcc_w3 = _libcc_w3
+            K_ab_cache_c = np.ascontiguousarray(K_ab_cache)
+            t2_T_all_c   = np.ascontiguousarray(t2_T_all)
+            K_jk_c       = np.ascontiguousarray(K_jk)
+            K_ik_c       = np.ascontiguousarray(K_ik)
+            K_ij_c       = np.ascontiguousarray(K_ij)
+            K_ooov_c     = np.ascontiguousarray(K_ooov)
+            eps_occ_c    = np.ascontiguousarray(eps_occ)
+            eps_tno_c    = np.ascontiguousarray(eps_tno_sc)
+            t1_c         = np.ascontiguousarray(t1_sc_arr)
+            tflags_c = transpose_flags.astype(np.int8, copy=False)
+            return _libcc_w3.DLPNOcompute_w3_energy(
+                K_ab_cache_c.ctypes.data_as(_ct.c_void_p),
+                t2_T_all_c.ctypes.data_as(_ct.c_void_p),
+                K_jk_c.ctypes.data_as(_ct.c_void_p),
+                K_ik_c.ctypes.data_as(_ct.c_void_p),
+                K_ij_c.ctypes.data_as(_ct.c_void_p),
+                K_ooov_c.ctypes.data_as(_ct.c_void_p),
+                U_flat.ctypes.data_as(_ct.c_void_p),
+                U_offsets.ctypes.data_as(_ct.c_void_p),
+                n_pno_arr.ctypes.data_as(_ct.c_void_p),
+                T2_flat.ctypes.data_as(_ct.c_void_p),
+                T2_offsets.ctypes.data_as(_ct.c_void_p),
+                tflags_c.ctypes.data_as(_ct.c_void_p),
+                eps_occ_c.ctypes.data_as(_ct.c_void_p),
+                eps_tno_c.ctypes.data_as(_ct.c_void_p),
+                t1_c.ctypes.data_as(_ct.c_void_p),
+                int(has_t1), int(occ_denom),
                 int(n), int(m_dom), int(n_pno_max),
             )
+
+        return w3_full_kernel(
+            K_ab_cache, t2_T_all,
+            np.ascontiguousarray(K_jk),
+            np.ascontiguousarray(K_ik),
+            np.ascontiguousarray(K_ij),
+            np.ascontiguousarray(K_ooov),
+            U_flat, U_offsets, n_pno_arr,
+            T2_flat, T2_offsets, transpose_flags,
+            np.ascontiguousarray(eps_occ),
+            np.ascontiguousarray(eps_tno_sc),
+            t1_sc_arr, has_t1, occ_denom,
+            int(n), int(m_dom), int(n_pno_max),
+        )
 
     return _w3_intermediate(t2_block, ovL_ijk, None, vvL_sc,
                             eps_occ, eps_tno_sc,
