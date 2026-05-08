@@ -1756,27 +1756,6 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
     # Psi4 stores ordered pairs (i,j) AND (j,i); each entry has i_Qk_t1
     # for its "i-side". To match Psi4's total, our canonical-pair store
     # contributes: diag: ‖i_Qk_t1‖² once; off-diag: ‖i_Qk_t1‖² + ‖j_Qk_t1‖².
-    if int(os.environ.get('DLPNO_DUMP_T1INTS', '0')):
-        _it = getattr(t1_ints, '_iter', 0)
-        t1_ints._iter = _it + 1
-        if _it <= 2:
-            iqk_fro2 = 0.0
-            iqa_fro2 = 0.0
-            n_strong_ordered = 0
-            for key, val in dressed.items():
-                i, j = key
-                iqk_fro2 += float(np.sum(val['i_Qk_t1'] ** 2))
-                iqa_fro2 += float(np.sum(val['i_Qa_t1'] ** 2))
-                n_strong_ordered += 1
-                if i != j:
-                    iqk_fro2 += float(np.sum(val['j_Qk_t1'] ** 2))
-                    iqa_fro2 += float(np.sum(val['j_Qa_t1'] ** 2))
-                    n_strong_ordered += 1
-            print(f"T1INTS_DUMP iter={_it} n_strong={n_strong_ordered} "
-                  f"iQk_fro2={iqk_fro2:.12e} "
-                  f"iQa_fro2={iqa_fro2:.12e}",
-                  flush=True)
-
     return dressed
 
 
@@ -2100,21 +2079,6 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
     # contribution; that bug is now fixed.
 
     # FKJ_DUMP: parity dump vs Psi4 ccsd.cc t1_fock Fkj_ output.
-    if int(os.environ.get('DLPNO_DUMP_FKJ', '0')):
-        _it = getattr(t1_fock, '_iter', 0)
-        t1_fock._iter = _it + 1
-        if _it <= 2:
-            rms = float(np.sqrt((Fkj ** 2).mean()))
-            sm = float(Fkj.sum())
-            tr = float(np.trace(Fkj))
-            fro = float(np.linalg.norm(Fkj, 'fro'))
-            off = Fkj - np.diag(np.diag(Fkj))
-            off_fro = float(np.linalg.norm(off, 'fro'))
-            print(f"FKJ_DUMP iter={_it} nocc={Fkj.shape[0]} "
-                  f"rms={rms:.12e} sum={sm:.12e} tr={tr:.12e} "
-                  f"fro={fro:.12e} off_fro={off_fro:.12e}",
-                  flush=True)
-
     return Fkj, Fab_all, foo_t1, Fij_bar_snapshot
 
 
@@ -2223,24 +2187,6 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
 
     # BTILDE_DUMP: parity dump vs Psi4 ccsd.cc compute_B_tilde.
     # Track per-key call count: first time we see (cc_ints, key) is iter 0.
-    if int(os.environ.get('DLPNO_DUMP_BTILDE', '0')):
-        _counts = getattr(compute_B_tilde, '_counts', None)
-        if _counts is None:
-            _counts = {}
-            compute_B_tilde._counts = _counts
-        counts_key = (id(cc_ints), key)
-        _it = _counts.get(counts_key, 0)
-        _counts[counts_key] = _it + 1
-        if _it <= 2:
-            i, j = key
-            rms = float(np.sqrt((B_local ** 2).mean())) if B_local.size else 0.0
-            sm = float(B_local.sum())
-            li = ','.join(str(int(x)) for x in lmo_idx)
-            flat = ','.join(f'{v:.12e}' for v in B_local.ravel())
-            print(f"BTILDE_DUMP iter={_it} pair=({i},{j}) nlmo={nlmo} "
-                  f"rms={rms:.12e} sum={sm:.12e} lmo_idx=[{li}] B=[{flat}]",
-                  flush=True)
-
     # Per-pair Psi4 layout: return reduced (nlmo, nlmo) plus a global→pair-domain
     # map so consumers do B_local[p_dense[k], p_dense[l]] without scattering.
     p_lmos_dense = np.full(nocc, -1, dtype=np.intp)
@@ -2298,22 +2244,4 @@ def compute_ladder(cc_ints, t2_pno_all, t1_pno, pno_spaces,
     A_local = np.tensordot(X, Qab_t1, axes=((0, 2), (0, 2)))
 
     # LADDER_DUMP: parity dump vs Psi4 ccsd.cc:2317. Track per-key call count.
-    if int(os.environ.get('DLPNO_DUMP_LADDER', '0')):
-        _counts = getattr(compute_ladder, '_counts', None)
-        if _counts is None:
-            _counts = {}
-            compute_ladder._counts = _counts
-        counts_key = (id(cc_ints), key)
-        _it = _counts.get(counts_key, 0)
-        _counts[counts_key] = _it + 1
-        if _it <= 2 and A_local.size:
-            i, j = key
-            rms = float(np.sqrt((A_local ** 2).mean()))
-            sm = float(A_local.sum())
-            fro = float(np.linalg.norm(A_local, 'fro'))
-            tr = float(np.trace(A_local))
-            print(f"LADDER_DUMP iter={_it} pair=({i},{j}) npno={npno} "
-                  f"rms={rms:.12e} sum={sm:.12e} fro={fro:.12e} tr={tr:.12e}",
-                  flush=True)
-
     return A_local
