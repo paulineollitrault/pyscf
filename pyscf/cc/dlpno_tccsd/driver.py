@@ -53,15 +53,10 @@ import numpy as np
 from pyscf import mcscf
 from pyscf.lib import logger
 
-# Default to the most-optimised (T) path: full per-triple body in one C call
-# (Phase 3c-2/3, ~2x faster on water-10 than the default driver-orchestrated
-# variant). Caller can opt out with DLPNO_TRIPLE_ORCH_FULL=0.
-_os.environ.setdefault('DLPNO_TRIPLE_ORCH_FULL', '1')
-# Default to the C-cycle path for cc_ints / B_tilde / etc per-pair kernels.
-_os.environ.setdefault('DLPNO_C_CYCLE', '1')
-# Default to the C++ DLPNOCCSDSolver class for cycles 2+ (Cycle 1 still
-# uses the Python baseline path to populate caches the class consumes).
-_os.environ.setdefault('DLPNO_CCSD_MONO_DROPIN_CYCLE', '1')
+# DLPNO_C_CYCLE / DLPNO_CCSD_MONO_DROPIN_CYCLE / DLPNO_TRIPLE_ORCH_FULL
+# defaults removed in cleanup pass 3: their gated alternates were the
+# slow Python paths used for cross-validation during development. Those
+# paths are now unconditionally taken.
 # Per-pair vvL restructure for (T) (Psi4-style algorithm) — NOT default.
 # Replaces the n_pao_ijk² factor in vvL build with n_pao_ijk × n_pno_pair.
 # Mathematically a different (Psi4-equivalent) algorithm: produces

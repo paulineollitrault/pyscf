@@ -1347,7 +1347,7 @@ def _compute_t1_residual_psi4(t1_pno, t2_pno_all, pno_spaces,
 
         contrib_flat = np.zeros(int(bp['contrib_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 # Native-C path: see pyscf/lib/cc/dlpno_t1_residual.c::
                 # DLPNOper_kl_batched. Same flat-buffer plan + per-thread
                 # scratch as the Cython kernel.
@@ -1935,7 +1935,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # back to the serial path.
     # Native-C S_pno builder: per-pair-A all-partners-B in one C call.
     # Eliminates ~25k Python compute_S_pno dispatches on water-10 (~5s wall).
-    _use_spno_c = bool(int(os.environ.get('DLPNO_C_CYCLE', '0')))
+    _use_spno_c = True
     if _use_spno_c:
         import ctypes as _ct
         from pyscf import lib as _pyscflib
@@ -2406,21 +2406,11 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 compute_ladder as _cL_fn,
             )
             _bt_pool = _fine_pool or _pool
-            if int(os.environ.get('DLPNO_CCSD_MONO_DROPIN_T1_INTS', '0')):
-                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
-                    t1_ints_via_class)
-                _t1_dressed_all = t1_ints_via_class(
-                    _cc_ints, t1_pno, pno_spaces, S_pno_cache,
-                    keys_sorted, nocc,
-                    pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
-                    fov_pno=fov_pno, F_lmo=F_lmo, eps_lmo=eps_lmo,
-                    t2_pno_all=t2_pno_all)
-            else:
-                _t1_dressed_all = _t1_ints_all(
-                    _cc_ints, t1_pno, pno_spaces, S_pno_cache,
-                    keys_sorted, nocc,
-                    pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
-                    _pool=_bt_pool)
+            _t1_dressed_all = _t1_ints_all(
+                _cc_ints, t1_pno, pno_spaces, S_pno_cache,
+                keys_sorted, nocc,
+                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
+                _pool=_bt_pool)
 
             # B_tilde uses the shared dressed dict (no recomputation).
             def _bt_one(_key):
@@ -2430,23 +2420,14 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                     pair_lmo_idx=pair_lmo_idx,
                                     t1_cache=_t1_cache)
             _t_bt0 = _time.perf_counter()
-            if int(os.environ.get('DLPNO_CCSD_MONO_DROPIN_B_TILDE', '0')):
-                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
-                    b_tilde_via_class)
-                _B_tilde_per_ij = b_tilde_via_class(
-                    _cc_ints, _t1_dressed_all, t2_pno_all, t1_pno,
-                    pno_spaces, S_pno_cache, keys_sorted, nocc,
-                    pair_lmo_idx, _t1_cache,
-                    F_lmo=F_lmo, eps_lmo=eps_lmo, fov_pno=fov_pno)
+            _B_tilde_per_ij = {}
+            if _bt_pool is not None:
+                for _k, _bt in _bt_pool.map(_bt_one, keys_sorted):
+                    _B_tilde_per_ij[_k] = _bt
             else:
-                _B_tilde_per_ij = {}
-                if _bt_pool is not None:
-                    for _k, _bt in _bt_pool.map(_bt_one, keys_sorted):
-                        _B_tilde_per_ij[_k] = _bt
-                else:
-                    for _k in keys_sorted:
-                        _, _bt = _bt_one(_k)
-                        _B_tilde_per_ij[_k] = _bt
+                for _k in keys_sorted:
+                    _, _bt = _bt_one(_k)
+                    _B_tilde_per_ij[_k] = _bt
             _t_bt = _time.perf_counter() - _t_bt0
 
             # Hoist compute_ladder similarly: per-pair calls run via the
@@ -2900,8 +2881,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # caches are populated), take over remaining cycles via the
             # C++ class.  Returns to the outer loop with t1_pno / t2_pno_all
             # at the converged or max-cycle state.
-            if (cycle == 0 and int(os.environ.get(
-                    'DLPNO_CCSD_MONO_DROPIN_CYCLE', '0'))):
+            if cycle == 0:
                 print('[CCSD MONO DROPIN] Taking over remaining cycles via C++ class...',
                       flush=True)
                 from pyscf.cc.dlpno_tccsd._ccsd_solver import (

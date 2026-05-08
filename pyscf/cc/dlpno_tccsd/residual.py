@@ -672,7 +672,7 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
 
     # G_addition is what the kernel adds onto G. Pass G itself; kernel does
     # G[i, j] += sum_ij in place. (G already initialized to Fkj copy above.)
-    if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+    if 1:
         # Native-C path: matches Psi4 ccsd.cc:2085 compute_G_tilde via
         # the same plan-cached effective tensors. See
         # pyscf/lib/cc/dlpno_g_tilde.c::DLPNOcompute_G_tilde_inner.
@@ -958,7 +958,7 @@ def _run_g_term_batched(plan, bv, t2_pno_all, G_tilde,
         tmp = np.empty((num_threads, max_n_ij * max_n_ik))
         tiles = np.zeros(int(side_bv['tile_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 # Native-C path: see pyscf/lib/cc/dlpno_g_term.c.
                 import ctypes as _ct
                 from pyscf import lib as _pyscflib
@@ -1789,7 +1789,7 @@ def build_D_tilde_batched(
         sc = plan['scratch']
 
         with threadpool_limits(limits=1, user_api='blas'):
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 # Native-C path: matches Psi4 ccsd.cc:1991 compute_D_tilde
                 # Phase 1 (Terms 1+2). See pyscf/lib/cc/dlpno_d_tilde.c::
                 # DLPNOcompute_D_tilde_ph1_batched. Same flat-buffer plan
@@ -2595,7 +2595,7 @@ def compute_C_tilde_batched(
         C_flat = np.zeros(plan['C_total'])
 
         with threadpool_limits(limits=1, user_api='blas'):
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 # Native-C path: matches Psi4 ccsd.cc:1809 compute_C_tilde
                 # Phase 1 (Terms 1+2). See pyscf/lib/cc/dlpno_c_tilde.c::
                 # DLPNOcompute_C_tilde_ph1_batched. Same flat-buffer plan
@@ -3204,7 +3204,7 @@ def compute_B_E_batched_v2(
 
     # Session 14a: build B_flat once per cycle (replaces per-item Python
     # dict lookups + p_dense indexing in the inner bucket loop).
-    _use_v2 = (int(os.environ.get('DLPNO_C_CYCLE', '0'))
+    _use_v2 = (1
                and plan.get('has_flat_t2', False))
     B_flat = None
     if _use_v2:
@@ -3274,7 +3274,7 @@ def compute_B_E_batched_v2(
                 else:
                     beta_kl_arr[n] = B_tilde[k, l]
                     beta_lk_arr[n] = 0.0 if k == l else B_tilde[l, k]
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 # Native-C path: see pyscf/lib/cc/dlpno_be.c::DLPNObe_kernel.
                 # Same N×(n_ij,n_kl) layout as the Cython kernel.
                 import ctypes as _ct
@@ -3822,7 +3822,7 @@ def _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
         Kt1_ki = np.empty((num_threads, max_n_ki))
         t3_tiles = np.zeros(int(bv['t3_tile_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 import ctypes as _ct
                 from pyscf import lib as _pyscflib
                 _libcc = getattr(_run_t34_batched, '_libcc', None)
@@ -3934,7 +3934,7 @@ def _run_t34_batched(plan, bv, t1_cache, t2_pno_all, flat_out,
         tmp3 = np.empty((num_threads, max_n_ki * max_n_kl))
         t4_tiles = np.zeros(int(bv['t4_tile_off'][-1]))
         with threadpool_limits(limits=1, user_api='blas'):
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 import ctypes as _ct
                 _libcc = _run_t34_batched._libcc
                 t4_t2_off_view = np.ascontiguousarray(bv['t4_t2_off'][:t4_N])
@@ -4279,7 +4279,7 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
             _t0 = _cd_time.perf_counter()
 
         with threadpool_limits(limits=1, user_api='blas'):
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 # Native-C path: see pyscf/lib/cc/dlpno_cd_term.c.
                 import ctypes as _ct
                 from pyscf import lib as _pyscflib
@@ -4422,7 +4422,7 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
             _t0 = _cd_time.perf_counter()
 
         with threadpool_limits(limits=1, user_api='blas'):
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 import ctypes as _ct
                 _libcc = compute_CD_terms_batched._libcc  # set above
                 d_u_off_view = np.ascontiguousarray(bv['d_u_off'][:d_N])

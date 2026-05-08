@@ -858,7 +858,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     # per LMP2 iteration. Plan-cached: tasks list built once, kernel called
     # per LMP2 iteration with current T2.
     # ------------------------------------------------------------------
-    _use_c_lmp2_resid = bool(int(os.environ.get('DLPNO_LMP2_RESIDUAL_C', '1')))
+    _use_c_lmp2_resid = True
     _c_resid_plan = None
     _t_plan_start = _pno_time.perf_counter()
     if _use_c_lmp2_resid and _lmp2_keys:

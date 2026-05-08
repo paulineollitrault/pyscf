@@ -194,7 +194,7 @@ def _triple_pno_union_psi4(pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
     # One C call replaces orthogonalize_pao_domain + the entire body
     # below (LAPACK eigh + dpstrf in C).  Returns X_tno_ijk + eps_tno
     # directly.
-    if (os.environ.get('DLPNO_C_CYCLE', '0') == '1'
+    if (True
             and os.environ.get('DLPNO_TRIPLE_TNO_FULL', '0') == '1'):
         n_pao_ijk = int(triple_paos.size)
         n_pao_total = int(F_pao_full.shape[0])
@@ -319,7 +319,7 @@ def _triple_pno_union_psi4(pno_spaces, i, j, k, C_pao, S_pao_full, F_pao_full,
     # Single C kernel call (DLPNO_C_CYCLE=1) folds:
     #   F_orth = X.T @ F_pao[trip,trip] @ X
     #   D_ijk = (1/3) Σ_keys S.T @ D_pair @ S, with S, D_pair built per key
-    if (os.environ.get('DLPNO_C_CYCLE', '0') == '1'
+    if (True
             and os.environ.get('DLPNO_TRIPLE_TNO_PYTHON', '0') != '1'):
         # Pack 3-key data into flat buffers for the C kernel.
         keys_list   = [ij, jk, ik]
@@ -852,7 +852,7 @@ def _build_triple_local_DF(i, j, k, X_tno_ijk, triple_paos, triple_domain,
                 np.zeros((3, n_domain, 0)))
 
     if (not _force_python
-            and os.environ.get('DLPNO_C_CYCLE', '0') == '1'
+            and True
             and os.environ.get('DLPNO_TRIPLE_DF_PYTHON', '0') != '1'):
         # Local J^{-1/2}: stays in NumPy (LAPACK eigh is already optimal).
         j_loc = j2c_full[np.ix_(aux_idx, aux_idx)]
@@ -2231,8 +2231,8 @@ def _process_one_triple(i, j, k,
 
     # === Phase 3c-2/3 path: ENTIRE per-triple body in one C call ===
     if (_use_psi4_tno
-            and os.environ.get('DLPNO_C_CYCLE', '0') == '1'
-            and os.environ.get('DLPNO_TRIPLE_ORCH_FULL', '0') == '1'):
+            and True
+            and True):
         return _orch_full(
             i, j, k, pno_spaces, t2_for_T,
             C_pao, S_pao_full, F_pao_full, F_lmo,
@@ -2242,7 +2242,7 @@ def _process_one_triple(i, j, k,
 
     # === Phase 3c-1 path: fused TNO + DF + U cache via single C orchestrator ===
     _orch_active = (_use_psi4_tno
-                    and os.environ.get('DLPNO_C_CYCLE', '0') == '1'
+                    and True
                     and os.environ.get('DLPNO_TRIPLE_TNO_FULL', '0') == '1'
                     and os.environ.get('DLPNO_TRIPLE_ORCH', '0') == '1')
     _orch_data = None
@@ -2344,7 +2344,7 @@ def _process_one_triple(i, j, k,
     # ~60 unique pks needed for this triple, build U for each in C
     # via dgemm(W_sub @ X), populate the dict so subsequent _U_for
     # calls hit the cache.
-    if (_pao_basis and int(os.environ.get('DLPNO_C_CYCLE', '0'))
+    if (_pao_basis and 1
             and (_orch_data is None
                  or os.environ.get('DLPNO_ORCH_PYTHON_U', '0') == '1')):
         # Enumerate unique pks the rest of _process_one_triple will ask
@@ -2472,7 +2472,7 @@ def _process_one_triple(i, j, k,
     # t2_mr (m_dom × 3 × n_tno × n_tno) is never read.  Skip its
     # construction (avg ~50 _proj_t2 calls per triple in Python) when
     # the kernel path is active.
-    _skip_t2_mr = bool(int(os.environ.get('DLPNO_C_CYCLE', '0')))
+    _skip_t2_mr = True
     if _skip_t2_mr:
         # Only the 3×3 t2_block is needed (used by Phase 1 K_ovvv).
         t2_mr = None
@@ -2537,7 +2537,7 @@ def _process_one_triple(i, j, k,
     # (synthetic triples with non-trivial U + transpose flags) at
     # machine-precision agreement; transpose_flag convention fixed
     # below to match _proj_t2(p=l, q=r) ordering.
-    if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+    if 1:
         try:
             from pyscf.cc.dlpno_tccsd._w3_full_cy import w3_full_kernel
         except ImportError:

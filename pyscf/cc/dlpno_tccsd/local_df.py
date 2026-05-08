@@ -768,7 +768,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     # === Native-C centerQ kernel (DLPNO_C_CYCLE=1): replaces the Python
     # body of the inner `for centerQ in unique_centers:` loop with a
     # single C call per centerQ. See pyscf/lib/cc/dlpno_pair_centerQ.c.
-    _use_centerQ_c = bool(int(os.environ.get('DLPNO_C_CYCLE', '0')))
+    _use_centerQ_c = True
     _libcc_centerQ = None
     if _use_centerQ_c:
         import ctypes as _ctypes_cQ
@@ -1642,7 +1642,7 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
         t1_cache = build_t1_cache(
             t1_pno, _pi, S_pno_cache, pno_spaces)
 
-    _use_c_cycle = bool(int(os.environ.get('DLPNO_C_CYCLE', '0')))
+    _use_c_cycle = True
     if _use_c_cycle:
         # Lazy-init libcc for the t1_ints C kernel. See
         # pyscf/lib/cc/dlpno_t1_ints.c::DLPNOt1_ints_pair_side.
@@ -1959,7 +1959,7 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
         sc = plan['scratch']
 
         with threadpool_limits(limits=1, user_api='blas'):
-            if int(os.environ.get('DLPNO_C_CYCLE', '0')):
+            if 1:
                 # Native-C path: matches Psi4 ccsd.cc:1571 t1_fock Step 1
                 # (d_ij/d_ji) + Step 2 (Fia/Fab dressing). See
                 # pyscf/lib/cc/dlpno_t1_fock.c::DLPNOt1_fock_batched.
@@ -2184,7 +2184,7 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
 
     T2_ij = t2_pno_all[key]
 
-    if int(os.environ.get('DLPNO_C_CYCLE', '0')) and nlmo > 0 and npno > 0:
+    if 1 and nlmo > 0 and npno > 0:
         # Native-C path: matches Psi4 ccsd.cc:1742 compute_B_tilde.
         # See pyscf/lib/cc/dlpno_b_tilde.c. Validation gates:
         # water-4 E_TCCSD(T)=-304.98979787, water-10 E_TCCSD=-2.13088299002.
