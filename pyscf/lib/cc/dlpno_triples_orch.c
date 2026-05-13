@@ -738,10 +738,14 @@ double DLPNOcompute_one_triple_E_T0(
      * skip the n_pao_ijk² gather + dgemm work in the DF kernel.
      * vvL_sc allocation is also skipped to save memory.
      */
+    /* Default ON: Psi4-faithful per-pair q_vv (no implicit X_tno @ X_tno.T
+     * projector around T2).  Set DLPNO_TRIPLE_QVV_PAIR=0 to fall back to
+     * the legacy full-vvL path (slightly cheaper at water-N<30, slightly
+     * different energy answer — µEh-level drift vs Psi4 reference). */
     static int _qvv_pair_enabled = -1;
     if (_qvv_pair_enabled < 0) {
         const char *_env = getenv("DLPNO_TRIPLE_QVV_PAIR");
-        _qvv_pair_enabled = (_env && _env[0] == '1') ? 1 : 0;
+        _qvv_pair_enabled = (_env && _env[0] == '0') ? 0 : 1;
     }
     ENSURE(ovL_sc, double, (size_t)3 * n * naux_ijk);
     if (!_qvv_pair_enabled) {

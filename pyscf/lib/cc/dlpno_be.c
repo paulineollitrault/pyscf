@@ -205,6 +205,158 @@ void DLPNObe_kernel(const double      *S,           /* (N, n_ij, n_kl) */
     free(Ec);
 }
 
+/* DLPNObe_kernel_gathered — memory-light variant of DLPNObe_kernel.
+ *
+ * Same math, identical kernel structure (BLAS 4-5 DGEMMs per item; Stage 2
+ * sequential scatter into out_B / out_E).  The only difference is the
+ * input access pattern: instead of stacked per-bucket (N, n_ij, n_kl) S
+ * and (N, n_kl, n_kl) T/K buffers, S/T/K are read from caller-owned
+ * master flats via per-item offsets:
+ *
+ *     S[n] = S_master + S_off[n]   (n_ij × n_kl tile)
+ *     T[n] = T_master + T_off[n]   (n_kl × n_kl tile)
+ *     K[n] = K_master + K_off[n]   (n_kl × n_kl tile)
+ *
+ * Eliminates the per-bucket (N, n_ij, n_kl) + (N, n_kl, n_kl) copies that
+ * the legacy kernel reads from — at water-22 the BE plan stack-arrays
+ * total ~1.5 GB across all buckets, growing as N² (pairs²) × n_pno²;
+ * cc-pVTZ water-49 would otherwise blow the box.
+ */
+void DLPNObe_kernel_gathered(const double      *S_master,
+                             const long        *S_off,
+                             const double      *T_master,
+                             const long        *T_off,
+                             const double      *K_master,
+                             const long        *K_off,
+                             const double      *beta_kl,
+                             const double      *beta_lk,
+                             const unsigned char *same,
+                             const long        *idx,
+                             double            *out_B,
+                             double            *out_E,
+                             const size_t       N,
+                             const size_t       n_ij,
+                             const size_t       n_kl,
+                             const int          num_threads)
+{
+    if (N == 0) return;
+
+    const size_t out_stride = n_ij * n_ij;
+
+    double *Bc = (double *)malloc(sizeof(double) * N * out_stride);
+    double *Ec = (double *)malloc(sizeof(double) * N * out_stride);
+
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0;
+    int int_n_ij = (int)n_ij, int_n_kl = (int)n_kl;
+
+#pragma omp parallel num_threads(num_threads)
+    {
+        double *TT_minus = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *TT_plus  = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *TB       = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *UK       = (double *)malloc(sizeof(double) * n_kl * n_kl);
+        double *STB      = (double *)malloc(sizeof(double) * n_ij * n_kl);
+        double *SUK      = (double *)malloc(sizeof(double) * n_ij * n_kl);
+
+#pragma omp for schedule(dynamic, 1)
+        for (size_t n = 0; n < N; n++) {
+            const double bkl = beta_kl[n];
+            const double blk = beta_lk[n];
+            const unsigned char sm = same[n];
+
+            const double *Sn = S_master + S_off[n];
+            const double *Tn = T_master + T_off[n];
+            const double *Kn = K_master + K_off[n];
+            double       *Bcn = Bc + n * out_stride;
+            double       *Ecn = Ec + n * out_stride;
+
+            for (size_t b = 0; b < n_kl; b++) {
+                for (size_t d = 0; d < n_kl; d++) {
+                    TT_minus[b * n_kl + d] = 2.0 * Tn[b * n_kl + d]
+                                              - Tn[d * n_kl + b];
+                }
+            }
+
+            if (sm) {
+                for (size_t e = 0; e < n_kl * n_kl; e++) {
+                    TB[e] = bkl * Tn[e];
+                }
+            } else {
+                for (size_t b = 0; b < n_kl; b++) {
+                    for (size_t c = 0; c < n_kl; c++) {
+                        TB[b * n_kl + c] = bkl * Tn[b * n_kl + c]
+                                          + blk * Tn[c * n_kl + b];
+                    }
+                }
+                for (size_t b = 0; b < n_kl; b++) {
+                    for (size_t d = 0; d < n_kl; d++) {
+                        TT_plus[b * n_kl + d] = 2.0 * Tn[d * n_kl + b]
+                                                 - Tn[b * n_kl + d];
+                    }
+                }
+            }
+
+            dgemm_(&T_flag, &N_flag,
+                   &int_n_kl, &int_n_kl, &int_n_kl,
+                   &one, Kn, &int_n_kl,
+                   TT_minus, &int_n_kl,
+                   &zero, UK, &int_n_kl);
+            if (!sm) {
+                dgemm_(&N_flag, &N_flag,
+                       &int_n_kl, &int_n_kl, &int_n_kl,
+                       &one, Kn, &int_n_kl,
+                       TT_plus, &int_n_kl,
+                       &one, UK, &int_n_kl);
+            }
+
+            dgemm_(&N_flag, &N_flag,
+                   &int_n_kl, &int_n_ij, &int_n_kl,
+                   &one, TB, &int_n_kl,
+                   Sn, &int_n_kl,
+                   &zero, STB, &int_n_kl);
+            dgemm_(&N_flag, &N_flag,
+                   &int_n_kl, &int_n_ij, &int_n_kl,
+                   &one, UK, &int_n_kl,
+                   Sn, &int_n_kl,
+                   &zero, SUK, &int_n_kl);
+            dgemm_(&T_flag, &N_flag,
+                   &int_n_ij, &int_n_ij, &int_n_kl,
+                   &one, Sn, &int_n_kl,
+                   STB, &int_n_kl,
+                   &zero, Bcn, &int_n_ij);
+            dgemm_(&T_flag, &N_flag,
+                   &int_n_ij, &int_n_ij, &int_n_kl,
+                   &one, Sn, &int_n_kl,
+                   SUK, &int_n_kl,
+                   &zero, Ecn, &int_n_ij);
+        }
+
+        free(TT_minus);
+        free(TT_plus);
+        free(TB);
+        free(UK);
+        free(STB);
+        free(SUK);
+    }
+
+    for (size_t n = 0; n < N; n++) {
+        const long target = idx[n];
+        const double *Bcn = Bc + n * out_stride;
+        const double *Ecn = Ec + n * out_stride;
+        double *out_Bt = out_B + (size_t)target * out_stride;
+        double *out_Et = out_E + (size_t)target * out_stride;
+        for (size_t k = 0; k < out_stride; k++) {
+            out_Bt[k] += Bcn[k];
+            out_Et[k] += Ecn[k];
+        }
+    }
+
+    free(Bc);
+    free(Ec);
+}
+
+
 /* DLPNObe_kernel_v3 — per-target accumulation variant.
  *
  * Same math as DLPNObe_kernel (per-item TT_minus/TT_plus/TB/UK/STB/SUK build,

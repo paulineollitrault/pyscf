@@ -97,7 +97,8 @@ def _pair_K_iajb(ovL_i, ovL_j):
 
 def _iterative_lmp2(pair_data, F_lmo, s1e, nocc_lmo,
                     max_iter=50, e_conv=1e-7, r_conv=5e-7,
-                    fock_cutoff=1e-5, log=None):
+                    fock_cutoff=1e-5, log=None,
+                    S_pao=None):
     """Run iterative local MP2 with inter-pair occupied Fock coupling.
 
     This matches ORCA's "full local MP2" used for PNO generation (Pass-2).
@@ -140,27 +141,43 @@ def _iterative_lmp2(pair_data, F_lmo, s1e, nocc_lmo,
         U = pair_data[ij]['U_sc']
         t2_sc[ij] = reduce(np.dot, (U.T, pair_data[ij]['T2_orth'], U))
 
-    # Precompute SC-basis projection matrices between coupled pair domains
-    # P_sc_{ij,kj} = U_sc_ij.T @ C_orth_ij.T @ S_ao @ C_orth_kj @ U_sc_kj
+    # Precompute SC-basis projection matrices between coupled pair domains.
+    # Original (Psi4-equivalent) formula:
+    #   P_sc[ij, kj] = U_sc_ij.T @ C_orth_ij.T @ S_ao @ C_orth_kj @ U_sc_kj
+    # With C_orth = C_pao[:, domain] @ X_orth, this reduces to a slice of the
+    # PAO overlap S_pao = C_pao.T @ S_ao @ C_pao:
+    #   P_sc[ij, kj] = U_sc_ij.T @ X_orth_ij.T @ S_pao[domain_ij, domain_kj]
+    #                  @ X_orth_kj @ U_sc_kj
+    # All matrices are O(npao²) or smaller; the (nao, n_orth) C_orth is
+    # never materialised. This is what allows Psi4 to handle 700-atom
+    # insulin without per-pair AO-basis matrices.
     proj_sc_cache = {}
+    if S_pao is None:
+        raise ValueError(
+            '_iterative_lmp2 requires S_pao for the sparse projection path; '
+            'caller must precompute S_pao = C_pao.T @ s1e @ C_pao')
     for ij in keys:
         i, j = ij
-        C_ij = pair_data[ij]['C_orth']
         U_ij = pair_data[ij]['U_sc']
-        SC_ij = U_ij.T @ C_ij.T @ s1e  # (n_sc_ij, nao)
+        X_ij = pair_data[ij]['X_orth']
+        dom_ij = pair_data[ij]['domain_ij']
+        # Precontract once per ij: M_ij = U_ij.T @ X_ij.T  (shape (n_sc_ij, |dom_ij|))
+        M_ij = U_ij.T @ X_ij.T
         for k in range(nocc_lmo):
             if k != i and abs(F_lmo[i, k]) >= fock_cutoff:
                 kj = (min(k, j), max(k, j))
                 if kj in pair_data and (ij, kj) not in proj_sc_cache:
-                    C_kj = pair_data[kj]['C_orth']
-                    U_kj = pair_data[kj]['U_sc']
-                    proj_sc_cache[(ij, kj)] = SC_ij @ C_kj @ U_kj
+                    pdkj = pair_data[kj]
+                    S_blk = S_pao[np.ix_(dom_ij, pdkj['domain_ij'])]
+                    proj_sc_cache[(ij, kj)] = (
+                        M_ij @ S_blk @ pdkj['X_orth'] @ pdkj['U_sc'])
             if k != j and abs(F_lmo[k, j]) >= fock_cutoff:
                 ik = (min(i, k), max(i, k))
                 if ik in pair_data and (ij, ik) not in proj_sc_cache:
-                    C_ik = pair_data[ik]['C_orth']
-                    U_ik = pair_data[ik]['U_sc']
-                    proj_sc_cache[(ij, ik)] = SC_ij @ C_ik @ U_ik
+                    pdik = pair_data[ik]
+                    S_blk = S_pao[np.ix_(dom_ij, pdik['domain_ij'])]
+                    proj_sc_cache[(ij, ik)] = (
+                        M_ij @ S_blk @ pdik['X_orth'] @ pdik['U_sc'])
 
     # Precompute Jacobi preconditioner in SC basis:
     # D_ij[a,b] = eps_sc_a + eps_sc_b - F_ii - F_jj  (exact diagonal)
@@ -329,69 +346,79 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         _auxmol = mf.with_df.auxmol
         _naux = _auxmol.nao_nr()
         _pmol = mf.mol + _auxmol
-        _shls = (0, mf.mol.nbas, 0, mf.mol.nbas,
-                 mf.mol.nbas, mf.mol.nbas + _auxmol.nbas)
-        _raw_3c = _pmol.intor('int3c2e', shls_slice=_shls)  # (nao, nao, naux)
-        _pmark_pre("intor('int3c2e')", _t)
-        _t = _t_pno_pre.perf_counter()
         _j2c = _auxmol.intor('int2c2e')  # (naux, naux) Coulomb metric
         _pmark_pre("intor('int2c2e')", _t)
-        # Precompute raw_3c @ C_pao for half-transform.
-        # _raw_3c is (nao, nao, naux); we contract its axis-1 with C_pao
-        # axis-0 → output (nao, naux, npao).  np.tensordot reduces to
-        # ONE single-threaded BLAS dgemm here (~3 s on water-15) because
-        # MKL is pinned to 1 thread by DLPNO_POOL_PIN_BLAS.  Split the
-        # output's leading u-axis across the shared pool so each worker
-        # processes a thin slab; this releases the GIL inside the BLAS
-        # call and yields ~30× speedup on water-15.
-        _t = _t_pno_pre.perf_counter()
-        nao_loc = _raw_3c.shape[0]
-        _naux_loc = _raw_3c.shape[2]
-        _npao_loc = C_pao.shape[1]
-        _raw_half_pao = np.empty((nao_loc, _naux_loc, _npao_loc),
-                                  dtype=_raw_3c.dtype)
-        if _pool is not None and nao_loc > 16:
-            n_workers = 32
-            chunk = max(1, (nao_loc + n_workers - 1) // n_workers)
-            ranges = [(s, min(s + chunk, nao_loc))
-                       for s in range(0, nao_loc, chunk)]
-            def _slab_half(rng):
-                s, e = rng
-                # _raw_3c[s:e]: (n, nao, naux); contract axis 1 with C_pao
-                # axis 0 → (n, naux, npao).
-                _raw_half_pao[s:e] = np.tensordot(
-                    _raw_3c[s:e], C_pao, axes=([1], [0]))
-            list(_pool.map(_slab_half, ranges))
-        else:
-            _raw_half_pao[:] = np.tensordot(
-                _raw_3c, C_pao, axes=([1], [0]))
-        del _raw_3c
-        _pmark_pre('tensordot raw_3c @ C_pao', _t)
-        # Hoist the LMO contraction out of the per-pair Phase 1 loop.
-        # _raw_lmo_pao[i, Q, b] = sum_u C_lmo[u, i] * _raw_half_pao[u, Q, b].
-        # Same parallelisation: split the output occupied axis i across the
-        # pool so each worker drives one BLAS call (much smaller than the
-        # half-transform — typically ~0.3 s — but free win).
+
+        # Build raw_lmo_pao[i, Q, b] = sum_{u,v} C_lmo[u,i] * (uv|Q) * C_pao[v,b]
+        # blocked over auxiliary shells.  The full (nao, nao, naux) raw 3c
+        # tensor would be 80+ GB at water-64; build it in aux-shell chunks
+        # and contract immediately into the (nocc, naux, npao) output (~20
+        # GB at water-64) so peak transient memory stays bounded.
         _t = _t_pno_pre.perf_counter()
         _nocc_lmo_loc = C_lmo.shape[1]
-        _raw_lmo_pao = np.empty((_nocc_lmo_loc, _naux_loc, _npao_loc),
-                                 dtype=_raw_half_pao.dtype)
-        if _pool is not None and _nocc_lmo_loc > 8:
-            n_workers = 16
-            chunk = max(1, (_nocc_lmo_loc + n_workers - 1) // n_workers)
-            ranges = [(s, min(s + chunk, _nocc_lmo_loc))
-                       for s in range(0, _nocc_lmo_loc, chunk)]
-            def _slab_lmo(rng):
-                s, e = rng
-                # C_lmo[:, s:e] is (nao, n); contract its axis-0 with
-                # _raw_half_pao axis-0 → (n, naux, npao).
-                _raw_lmo_pao[s:e] = np.tensordot(
-                    C_lmo[:, s:e], _raw_half_pao, axes=([0], [0]))
-            list(_pool.map(_slab_lmo, ranges))
+        _npao_loc = C_pao.shape[1]
+        nao_loc = mf.mol.nao_nr()
+        _raw_lmo_pao = np.empty((_nocc_lmo_loc, _naux, _npao_loc),
+                                 dtype=np.float64)
+
+        # Auxiliary-shell offsets: aux_loc[k]..aux_loc[k+1] is the AO range
+        # of shell k (within auxmol's own shell numbering).
+        aux_loc = _auxmol.ao_loc_nr()  # (naux_shells + 1,)
+        n_aux_sh = _auxmol.nbas
+        # Each per-block work-set holds TWO buffers simultaneously
+        # (raw_3c_block + half_block), each ~nao*max(nao,npao)*|aux| bytes.
+        # With N parallel workers via _pool.map, peak transient is
+        #   2 * N_workers * nao * max(nao, npao) * |aux| * 8.
+        # We size the block to cap total transient at ~32 GB (leaves
+        # ~200 GB of the box's 247 GB for the rest of make_pnos).  At
+        # water-64 / 64 workers this gives |aux| ≈ 33 (~33 GB peak).
+        _bytes_per_q = 2 * nao_loc * max(nao_loc, _npao_loc) * 8
+        try:
+            _n_workers_est = (max(1, _pool._max_workers)
+                              if _pool is not None else 1)
+        except AttributeError:
+            _n_workers_est = 8
+        _target_peak_bytes = 32 * 1024 ** 3
+        _target_q_per_block = max(
+            8, int(_target_peak_bytes
+                   // max(1, _bytes_per_q * _n_workers_est)))
+
+        # Build aux-shell ranges hitting roughly _target_q_per_block AOs each.
+        sh_ranges = []
+        sh_lo = 0
+        cur_q = 0
+        for sh in range(n_aux_sh):
+            cur_q += aux_loc[sh + 1] - aux_loc[sh]
+            if cur_q >= _target_q_per_block or sh == n_aux_sh - 1:
+                sh_ranges.append((sh_lo, sh + 1))
+                sh_lo = sh + 1
+                cur_q = 0
+        # Q index ranges for output slicing.
+        q_ranges = [(int(aux_loc[lo]), int(aux_loc[hi]))
+                    for lo, hi in sh_ranges]
+
+        _mol_nbas = mf.mol.nbas
+
+        def _aux_block(arg):
+            (sh_lo_, sh_hi_), (q_lo_, q_hi_) = arg
+            shls = (0, _mol_nbas, 0, _mol_nbas,
+                    _mol_nbas + sh_lo_, _mol_nbas + sh_hi_)
+            # int3c2e block: (nao, nao, |aux_block|)
+            blk = _pmol.intor('int3c2e', shls_slice=shls)
+            # Half-transform: (nao, nao, q) @ C_pao[v,b] → (nao, q, npao)
+            half = np.tensordot(blk, C_pao, axes=([1], [0]))
+            del blk
+            # Full LMO transform: C_lmo[u,i].T @ (nao, q, npao) → (nocc, q, npao)
+            _raw_lmo_pao[:, q_lo_:q_hi_, :] = np.tensordot(
+                C_lmo, half, axes=([0], [0]))
+
+        args = list(zip(sh_ranges, q_ranges))
+        if _pool is not None and len(args) > 1:
+            list(_pool.map(_aux_block, args))
         else:
-            _raw_lmo_pao[:] = np.tensordot(
-                C_lmo, _raw_half_pao, axes=([0], [0]))
-        _pmark_pre('tensordot C_lmo @ raw_half_pao', _t)
+            for arg in args:
+                _aux_block(arg)
+        _pmark_pre("intor('int3c2e') + half + LMO transform (blocked)", _t)
     else:
         log.info('Building LMO/PAO exact 4-index integrals (no density fitting)...')
         from pyscf import ao2mo as _ao2mo_mod
@@ -516,9 +543,14 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             return ij, None
 
         _t = _pno_time_p1.perf_counter()
-        C_orth_ij, X_orth_ij = orthogonalize_pao_domain(
+        # Discard the (nao, n_orth) AO-basis C_orth from this helper; we
+        # only need X_orth (|domain|, n_orth) here.  The dense AO matrix
+        # would otherwise blow Stage 3 memory at scale (~30 GB at water-64
+        # if held per-pair; 65× the X_orth cost).
+        _C_orth_unused, X_orth_ij = orthogonalize_pao_domain(
             C_pao, S_pao, domain_ij, S_cut=S_cut_domain, method='psi4')
-        n_orth = C_orth_ij.shape[1]
+        del _C_orth_unused
+        n_orth = X_orth_ij.shape[1]
         if getattr(make_pnos, '_dump_n_orth', False):
             print(f'NORTH pair({i},{j}): npao_raw={len(domain_ij)} '
                   f'npao_ortho={n_orth}', flush=True)
@@ -576,7 +608,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         _p1_add('mp2', _pno_time_p1.perf_counter() - _t)
 
         return ij, {
-            'C_orth': C_orth_ij, 'X_orth': X_orth_ij, 'F_orth': F_orth,
+            'X_orth': X_orth_ij, 'F_orth': F_orth,
             'K_orth': K_ij, 'T2_orth': T2_orth,
             'U_sc': U_sc, 'eps_sc': eps_sc, 'K_sc': K_sc,
             'domain_ij': domain_ij,
@@ -594,8 +626,36 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         if data is not None:
             pair_domain_data[ij] = data
 
+    # Release the global (nocc, naux, npao) tensors that fed Phase 1.
+    # At water-64 each is ~13 GB (256 × 4116 × ~1500 × 8) and they are
+    # captured by `_phase1_one`'s closure cells; without dropping the
+    # closure too, the cells keep them alive through Phases 2-3.
+    if use_df:
+        del ovL
+        if '_raw_lmo_pao' in dir():
+            del _raw_lmo_pao
+    del _phase1_one
+    import gc as _gc_p1
+    _gc_p1.collect()
+    try:
+        import ctypes as _ct_p1
+        _ct_p1.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
+
     _t_p1_collect = _pno_time_p1.perf_counter()
     _t_p2a_start = _pno_time_p1.perf_counter()
+    if os.environ.get('DLPNO_MEM_PROBE'):
+        try:
+            with open('/proc/self/status') as _fmem:
+                for _ln in _fmem:
+                    if _ln.startswith('VmRSS:'):
+                        print(f'  [MEM/pno_phase1_done] RSS='
+                              f'{int(_ln.split()[1])/1024/1024:.2f} GiB',
+                              flush=True)
+                        break
+        except Exception:
+            pass
     # ===================================================================
     # Phase 2a: Build INITIAL PNOs from direct SC-MP2 T2
     # (matching Psi4 compute_pair_energies<false>() lines 489-609)
@@ -614,7 +674,6 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         K_sc = pdata['K_sc']
         K_ij = pdata['K_orth']
         domain_ij = pdata['domain_ij']
-        C_orth_ij = pdata['C_orth']
         X_orth_ij = pdata['X_orth']
 
         # Direct SC-MP2 T2
@@ -698,15 +757,24 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         K_pno = V_pno.T @ K_pno @ V_pno
         T2_pno = V_pno.T @ T2_pno @ V_pno
 
-        # C_pno in AO basis
-        C_pno = C_orth_ij @ X_pno_final
+        # Psi4-style sparse PNO transform: X_pno_pair = X_orth @ X_pno_final,
+        # shape (|domain_ij|, npno_init).  Combined with `domain_ij` (the PAO
+        # indices that span the pair), this carries the same information as
+        # C_pno = C_pao[:, domain_ij] @ X_pno_pair while costing
+        # |domain|*npno*8 ≈ 30 KB per pair vs nao*npno*8 ≈ 300 KB at water-64
+        # — a ~10x reduction.  We never store the (nao, n_orth) C_orth either:
+        # downstream consumers can rebuild it as C_pao[:, domain_ij] @ X_orth
+        # on demand (typically in a way that fuses the reconstruction with the
+        # next contraction so the dense matrix is never materialised).
+        X_pno_pair = X_orth_ij @ X_pno_final  # (|domain|, npno_init)
 
         return ij, {
-            'C_pno': C_pno, 'e_pno': e_pno_sc, 'K_pno': K_pno,
+            'e_pno': e_pno_sc, 'K_pno': K_pno,
             'T2_pno': T2_pno, 'n_pno': n_pno_init,
             'e_ij': e_ij_init, 'domain_ij': domain_ij,
             'X_pno_final': X_pno_final,
-            'C_orth': C_orth_ij, 'X_orth': X_orth_ij,
+            'X_pno_pair': X_pno_pair,
+            'X_orth': X_orth_ij,
             'F_orth': pdata['F_orth'],
             'U_sc': pdata['U_sc'], 'eps_sc': pdata['eps_sc'],
         }
@@ -717,6 +785,20 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
                  else (_phase2a_one(x) for x in _p2a_items))
     for ij, val in _p2a_iter:
         initial_pno_data[ij] = val
+    # Free Phase 1 per-pair workspace.  Each entry held |domain|² × ~6
+    # tensors (X_orth, F_orth, K_orth, U_sc, K_sc, T2_orth) which sum to
+    # ~1 MB at water-64 × ~33k pairs ≈ 33 GB no longer needed past Phase
+    # 2a.  Items still needed downstream (X_orth, U_sc, eps_sc) are now
+    # carried inside initial_pno_data.
+    del _p2a_items
+    pair_domain_data.clear()
+    import gc as _gc_pno
+    _gc_pno.collect()
+    try:
+        import ctypes as _ct_pno
+        _ct_pno.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
 
 
     # Crude prescreen (Psi4-style): drop pairs whose initial SC-MP2 |e_ij|
@@ -766,42 +848,61 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         for ii in range(nocc_lmo)
     ]
 
-    # Pre-compute s1e @ C_pno_k for all k once (reused across all pair_ij
-    # overlap computations). This turns the 3-matmul per-pair pattern
-    # `C_pno_ij.T @ s1e @ C_pno_kj` into a single 2-matmul `C_pno_ij.T @ Z_kj`
-    # where Z_kj = s1e @ C_pno_kj, halving FLOPs and reducing memory traffic.
-    # Skip empty-PNO pairs (npno=0) which would trigger MKL DGEMM LDA warnings.
-    _s1e_C_cache = {k: s1e @ initial_pno_data[k]['C_pno']
-                    for k in initial_pno_data
-                    if initial_pno_data[k]['C_pno'].shape[1] > 0}
-
+    # Cross-pair PNO overlaps S[ij, kj] = C_pno_ij^T @ S_AO @ C_pno_kj.
+    # Psi4-style sparse formula via S_pao = C_pao^T @ S_AO @ C_pao:
+    #   S[ij, kj] = X_pno_pair_ij^T @ S_pao[domain_ij, domain_kj]
+    #               @ X_pno_pair_kj
+    # All factors are O(|domain|*npno) per pair — never materialises the
+    # (nao, npno) C_pno tensor that scales as nao*N_pairs*npno (47 GB at
+    # water-64 in the old AO-basis path).
     def _spno_one(key_ij):
         i, j = key_ij
-        C_pno_ij = initial_pno_data[key_ij]['C_pno']
+        data_ij = initial_pno_data[key_ij]
         out = {}
-        if C_pno_ij.shape[1] == 0:
+        if data_ij['n_pno'] == 0:
             return out
-        C_pno_ij_T = C_pno_ij.T
+        Xp_ij = data_ij['X_pno_pair']
+        dom_ij = data_ij['domain_ij']
         for k in _F_neigh_pre[i]:
             key_kj = (min(k, j), max(k, j))
-            Z_kj = _s1e_C_cache.get(key_kj)
-            if Z_kj is not None:
-                out[(key_ij, key_kj)] = C_pno_ij_T @ Z_kj
+            data_kj = initial_pno_data.get(key_kj)
+            if data_kj is None or data_kj['n_pno'] == 0:
+                continue
+            S_blk = S_pao[np.ix_(dom_ij, data_kj['domain_ij'])]
+            out[(key_ij, key_kj)] = Xp_ij.T @ S_blk @ data_kj['X_pno_pair']
         for k in _F_neigh_pre[j]:
             key_ik = (min(i, k), max(i, k))
-            Z_ik = _s1e_C_cache.get(key_ik)
-            if Z_ik is not None:
-                out[(key_ij, key_ik)] = C_pno_ij_T @ Z_ik
+            data_ik = initial_pno_data.get(key_ik)
+            if data_ik is None or data_ik['n_pno'] == 0:
+                continue
+            S_blk = S_pao[np.ix_(dom_ij, data_ik['domain_ij'])]
+            out[(key_ij, key_ik)] = Xp_ij.T @ S_blk @ data_ik['X_pno_pair']
         return out
 
     _key_list = list(initial_pno_data.keys())
+    # Stream results into pno_S_cache directly — DO NOT collect into an
+    # `_all_outs` list (that doubles memory because the per-worker dicts
+    # stay alive until the list iteration completes; at water-64 each
+    # worker's dict averages ~280 KB and across 33k pairs that's ~9 GB
+    # held in parallel with the pno_S_cache that's being built).
     if _pool is not None:
-        _all_outs = list(_pool.map(_spno_one, _key_list))
+        for _o in _pool.map(_spno_one, _key_list):
+            pno_S_cache.update(_o)
     else:
-        _all_outs = [_spno_one(k) for k in _key_list]
-    for _o in _all_outs:
-        pno_S_cache.update(_o)
+        for k in _key_list:
+            pno_S_cache.update(_spno_one(k))
     _t_spno_build = _pno_time.perf_counter() - _t_spno_start
+    if os.environ.get('DLPNO_MEM_PROBE'):
+        try:
+            with open('/proc/self/status') as _fmem:
+                for _ln in _fmem:
+                    if _ln.startswith('VmRSS:'):
+                        print(f'  [MEM/pno_phase2a_pno_S_done] RSS='
+                              f'{int(_ln.split()[1])/1024/1024:.2f} GiB',
+                              flush=True)
+                        break
+        except Exception:
+            pass
 
     # Iterative LMP2 in PNO space with DIIS (matching Psi4 lines 690-802)
     T2_pno_all = {k: d['T2_pno'].copy() for k, d in initial_pno_data.items()}
@@ -1144,8 +1245,11 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         e_ij = np.einsum('ab,ab->', K_pno, Tt)
 
         domain_ij = pdata['domain_ij']
-        C_orth_ij = pdata['C_orth']
+        X_orth_ij = pdata['X_orth']
         X_pno_old = pdata['X_pno_final']  # orth → old PNO
+        # C_orth = C_pao[:, domain_ij] @ X_orth_ij when needed (CAS path
+        # only); the (nao, n_orth) AO-basis matrix is built on-demand
+        # rather than stored per-pair in initial_pno_data.
 
         # Transform K, Tt to new PNO basis for energy criterion (Psi4 lines 851-852)
         K_pno_new = reduce(np.dot, (U_pno.T, K_pno, U_pno))
@@ -1218,6 +1322,10 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         if is_cas_pair:
             nvir_cas_local = nvir_cas
             X_new_cas = np.dot(X_pno_old, U_pno_kept)
+            # CAS path needs AO basis for projection against C_cas_vir.
+            # Reconstruct C_orth on demand here only — costs (nao*n_orth*8)
+            # transient and is released at function exit.
+            C_orth_ij = C_pao[:, domain_ij] @ X_orth_ij
             C_ext_pno = np.dot(C_orth_ij, X_new_cas)
 
             if s1e is not None and C_ext_pno.shape[1] > 0:
@@ -1251,9 +1359,14 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             K_pno = None
             T2_pno = None
         else:
-            # New PNO in AO basis: C_orth @ X_pno_old @ U_pno_kept
+            # Non-CAS path: never materialise the (nao, npno) AO-basis
+            # C_pno here.  The driver drops C_pno post-make_pnos anyway;
+            # all production-path consumers prefer the sparse
+            # (X_pno_pair, pair_paos) representation.  We pass C_pno as
+            # None so the entry-builder records `C_pno=None` and stores
+            # the sparse form instead.
             X_new = np.dot(X_pno_old, U_pno_kept)  # orth → new PNO
-            C_pno_ij = np.dot(C_orth_ij, X_new)
+            C_pno_ij = None
             U_full = X_new  # for backward compat
 
             K_pno = reduce(np.dot, (U_pno_kept.T, pdata['K_pno'], U_pno_kept))
@@ -1270,15 +1383,20 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         if is_cas_pair:
             X_pno_pair = None
             pair_paos = None
+            n_pno_count = int(C_pno_ij.shape[1])
         else:
             X_pno_pair = pdata['X_orth'] @ X_new
             pair_paos = domain_ij
+            # X_pno_pair is (|domain|, npno). Use that as the npno source
+            # — C_pno is None on the non-CAS path (dropped to save memory).
+            n_pno_count = int(X_pno_pair.shape[1])
 
         entry = {
             'C_pno': C_pno_ij,
             'X_pno': X_pno_pair,
             'pair_paos': pair_paos,
-            'n_pno': n_pno_kept,
+            'n_pno': n_pno_count,
+            'pno_occ': n_pno_kept,
             'e_pno': e_pno_sc,
             'K_pno': K_pno,
             'T2_pno': T2_pno,

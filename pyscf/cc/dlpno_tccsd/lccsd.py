@@ -408,8 +408,7 @@ def _compute_foo_dressed(t2_pno_all, pno_spaces, nocc_lmo, with_df, C_lmo, s1e,
         if t2_mq_raw is None or t2_mq_raw.shape[0] == 0:
             continue
         m, q = key_mq  # m <= q
-        C_pno_mq = pno_spaces[key_mq]['C_pno']
-        n_mq = C_pno_mq.shape[1]
+        n_mq = pno_spaces[key_mq]['n_pno']
         if n_mq == 0:
             continue
 
@@ -557,14 +556,14 @@ def _project_t1_to_pair(t1_pno, i, key_kl, S_pno_cache, pno_spaces):
     key_ii = (i, i)
     t1_i = t1_pno.get(i)
     if t1_i is None or t1_i.size == 0:
-        return np.zeros(pno_spaces[key_kl]['C_pno'].shape[1])
+        return np.zeros(pno_spaces[key_kl]['n_pno'])
     if key_ii == key_kl:
         return t1_i.copy()
     S = S_pno_cache.get((key_kl, key_ii))
     if S is not None:
         return S @ t1_i
     # Fallback: should not happen if cache is built correctly
-    return np.zeros(pno_spaces[key_kl]['C_pno'].shape[1])
+    return np.zeros(pno_spaces[key_kl]['n_pno'])
 
 
 def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
@@ -637,7 +636,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
         if key_ii not in pno_spaces:
             r1_pno[i] = np.zeros(0)
             continue
-        n_ii = pno_spaces[key_ii]['C_pno'].shape[1]
+        n_ii = pno_spaces[key_ii]['n_pno']
         if n_ii == 0:
             r1_pno[i] = np.zeros(0)
             continue
@@ -693,7 +692,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
         if ci_ij is None:
             continue
         i0, j0 = key_ij  # canonical (i0 <= j0)
-        n_ij = pno_spaces[key_ij]['C_pno'].shape[1]
+        n_ij = pno_spaces[key_ij]['n_pno']
         if n_ij == 0:
             continue
         # T_n_ij[m, c] = t1_m projected to canonical pair's PNO basis —
@@ -718,7 +717,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
         ci = cc_ints.get(key_ki)
         if ci is None:
             return None
-        n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+        n_ki = pno_spaces[key_ki]['n_pno']
         if n_ki == 0:
             return None
         k_Qa = ci['i_Qa'] if key_ki[0] == k else ci['j_Qa']
@@ -739,7 +738,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
             ci_im = cc_ints.get(key_im)
             if ci_im is None:
                 continue
-            if pno_spaces[key_im]['C_pno'].shape[1] == 0:
+            if pno_spaces[key_im]['n_pno'] == 0:
                 continue
             K_im = ci_im['K_iajb']
             L_im = 2.0 * K_im - K_im.T
@@ -760,7 +759,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
         key_ii = (i, i)
         if key_ii not in pno_spaces:
             return i, None
-        n_ii = pno_spaces[key_ii]['C_pno'].shape[1]
+        n_ii = pno_spaces[key_ii]['n_pno']
         if n_ii == 0:
             return i, None
 
@@ -958,7 +957,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
     if _pkl_plan is None:
         _ba_work = []
         for key_kl in t2_pno_all:
-            if pno_spaces[key_kl]['C_pno'].shape[1] == 0:
+            if pno_spaces[key_kl]['n_pno'] == 0:
                 continue
             k0, l0 = key_kl
             if k0 == l0:
@@ -976,7 +975,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
             if ci_kl is None:
                 _per_task_plan.append(None)
                 continue
-            n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
+            n_kl = pno_spaces[key_kl]['n_pno']
             K_iajb_kl = ci_kl['K_iajb']
             # K_bar_ij/ji reduced to (nlmo_p, n_kl) in cc_ints; the existing
             # per-task plan + Cython kernel iterate over global LMOs, so
@@ -997,7 +996,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                 key_ii = (i, i)
                 if key_ii not in pno_spaces:
                     continue
-                n_pno_ii = pno_spaces[key_ii]['C_pno'].shape[1]
+                n_pno_ii = pno_spaces[key_ii]['n_pno']
                 if n_pno_ii == 0:
                     continue
                 # B-side static
@@ -1011,8 +1010,8 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                 t2_swap_ki = False
                 a2_diag = False
                 if (key_ki in t2_pno_all and key_ki in pno_spaces
-                        and pno_spaces[key_ki]['C_pno'].shape[1] > 0):
-                    a2_n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+                        and pno_spaces[key_ki]['n_pno'] > 0):
+                    a2_n_ki = pno_spaces[key_ki]['n_pno']
                     t2_swap_ki = (k > i)
                     if key_kl == key_ki:
                         a2_diag = True
@@ -1111,7 +1110,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                     _b_T_n_kl_off.append(0)
                     _b_inner_off.append(_b_inner_off[-1])
                     continue
-                n_kl = pno_spaces[key_kl]['C_pno'].shape[1]
+                n_kl = pno_spaces[key_kl]['n_pno']
                 canon_kl_idx = _canon_to_idx[key_kl]
                 # K_iajb_kl + K_bar_kl: copy into our own static flat
                 # buffers (own them, simpler than passing two cc_ints
@@ -1144,7 +1143,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                     key_ii = (i, i)
                     if key_ii not in pno_spaces:
                         continue
-                    n_pno_ii = pno_spaces[key_ii]['C_pno'].shape[1]
+                    n_pno_ii = pno_spaces[key_ii]['n_pno']
                     if n_pno_ii == 0:
                         continue
                     canon_ii_idx = _canon_to_idx[key_ii]
@@ -1173,8 +1172,8 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                     key_ki = (min(k, i), max(k, i))
                     a2_added = False
                     if (key_ki in t2_pno_all and key_ki in pno_spaces
-                            and pno_spaces[key_ki]['C_pno'].shape[1] > 0):
-                        n_ki = pno_spaces[key_ki]['C_pno'].shape[1]
+                            and pno_spaces[key_ki]['n_pno'] > 0):
+                        n_ki = pno_spaces[key_ki]['n_pno']
                         canon_ki_idx = _canon_to_idx[key_ki]
                         if key_kl == key_ki:
                             _b_has_A2.append(1)
@@ -1485,6 +1484,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     with_df = getattr(mf, 'with_df', None)
     nocc = C_lmo.shape[1]
 
+    # Stage 5 phase-by-phase timing.  Set DLPNO_S5_PROFILE=1 to print.
+    import time as _t_s5
+    import os as _os_s5
+    _s5_t = [_t_s5.perf_counter()]
+    _s5_dbg = bool(int(_os_s5.environ.get('DLPNO_S5_PROFILE', '0')))
+    def _s5_tick(label):
+        if _s5_dbg:
+            now = _t_s5.perf_counter()
+            print(f'  [S5-PROFILE] {label}: {now - _s5_t[0]:.2f}s', flush=True)
+            _s5_t[0] = now
+
     # Jiang uses bare integrals with explicit T1 dressing
     use_t1_transform = False
 
@@ -1512,9 +1522,12 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # redundant ao2mo call when DF is available).
     J_oo = None
 
-    # PAO coefficients and (LMO,PAO|L) 3-index tensor for ring coupling.
-    # C_pao must be the SAME PAOs used by pno.make_pnos, passed from the driver.
-    from pyscf.cc.dlpno_tccsd.pno import _build_ovL
+    # PAO coefficients must be the SAME PAOs used by pno.make_pnos
+    # (passed from the driver).  No DF tensor build needed at Stage 5
+    # entry — the legacy ovL_lmo_pao (nocc × n_pao × naux) was dead code
+    # left from before compute_cc_integrals_sparse subsumed all DF work
+    # via the local-aux per-pair flat store.  At water-22 it was ~30s of
+    # cderi-rebuild + 700 MB transient; removed 2026-05-11.
     if C_pao is None:
         # Fallback: build PAOs from scratch (may not match pno.py's PAOs)
         nao = C_lmo.shape[0]
@@ -1525,10 +1538,6 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         eigvals, eigvecs = np.linalg.eigh(S_pao)
         keep = eigvals > 1e-8
         C_pao = C_pao_raw @ eigvecs[:, keep] / np.sqrt(eigvals[keep])
-
-    ovL_lmo_pao = None
-    if with_df is not None:
-        ovL_lmo_pao = _build_ovL(with_df, C_lmo, C_pao)
 
     # ------------------------------------------------------------------
     # T1 amplitudes: local in diagonal PNO basis (Jiang et al. JCP 2024).
@@ -1547,13 +1556,21 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     for i in range(nocc):
         key_ii = (i, i)
         data_ii = pno_spaces[key_ii]
-        C_pno_ii = data_ii['C_pno']
-        n_pno_ii = C_pno_ii.shape[1]
+        n_pno_ii = data_ii['n_pno']
         if n_pno_ii == 0:
             t1_pno[i] = np.zeros(0)
             fov_pno[i] = np.zeros(0)
             continue
         # F_{a_ii, i} = C_pno_ii^T @ fock_ao @ C_lmo[:,i]
+        # When the dense AO-basis C_pno has been freed post-make_pnos,
+        # reconstruct from PAO-domain X_pno + pair_paos: this is the
+        # (Psi4-style) sparse representation that scales as |domain|·npno
+        # vs nao·npno.
+        C_pno_ii = data_ii.get('C_pno')
+        if C_pno_ii is None:
+            X_pno = data_ii['X_pno']
+            pair_paos = data_ii['pair_paos']
+            C_pno_ii = C_pao[:, pair_paos] @ X_pno
         fov_i = C_pno_ii.T @ (fock_ao @ C_lmo[:, i])  # (n_pno_ii,)
         fov_pno[i] = fov_i
         # T1 initialisation: Psi4 starts T1 at zero (ccsd.cc line 1960).
@@ -1591,7 +1608,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         if key not in pno_spaces:
             continue
         data = pno_spaces[key]
-        n_pno = data['C_pno'].shape[1]
+        n_pno = data['n_pno']
         if n_pno == 0:
             t2_pno_all[key] = np.zeros((0, 0))
             continue
@@ -1619,7 +1636,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     for key_w, data_w in pno_spaces.items():
         if key_w in _strong_keys_set:
             continue
-        if data_w['C_pno'].shape[1] == 0:
+        if data_w['n_pno'] == 0:
             continue
         T2_w = data_w.get('T2_pno')
         if T2_w is not None:
@@ -1628,6 +1645,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     n_active = len(keys_sorted)
     print(f'  DLPNO-CCSD: {n_active} pairs, CAS freeze = {len(cas_blocks)} pairs',
           flush=True)
+    _s5_tick('pre-CCSD entry (F_lmo, t2_pno_all init, keys_sorted)')
 
     # ------------------------------------------------------------------
     # Pre-compute K_pno cache (exchange integrals for energy monitoring)
@@ -1637,8 +1655,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     for key in keys_sorted:
         i, j = key
         data = pno_spaces[key]
-        C_pno_ij = data['C_pno']
-        n_pno = C_pno_ij.shape[1]
+        n_pno = data['n_pno']
         if n_pno == 0:
             continue
 
@@ -1658,6 +1675,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 t2_pno_all[key] = K_pno_cache[key] / D_full_safe
                 cas_sl, t2c = cas_blocks[key]
                 t2_pno_all[key][cas_sl, cas_sl] = t2c
+
+    _s5_tick('K_pno_cache (post-build loop)')
 
     # ------------------------------------------------------------------
     # Pre-compute ovL_pno cache: 3-index DF tensors in PNO basis.
@@ -1682,7 +1701,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         else:
             _auxmol = with_df.auxmol
         _aux_atom_ids = np.array([lbl[0] for lbl in _auxmol.ao_labels(fmt=False)])
-        _naux_full = with_df.get_naoaux()
+        # NOTE: do NOT call `with_df.get_naoaux()` — after cderi has been
+        # released to free memory, that call rebuilds cderi from scratch
+        # (~47s wasted at water-34, scales as ~N^3).  The variable was
+        # never read downstream anyway.
 
         # Mulliken aux domain matching Psi4 dlpnobase.cc:667-704 EXACTLY:
         # P_i[u,v] = C[u,i] * S[u,v] * C[v,i]
@@ -1697,7 +1719,10 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         # Each task is read-only on shared inputs (s1e, C_lmo, _atom_ids,
         # _aux_atom_ids) and returns a (mask, atom_set) tuple. Same pattern as
         # local_df.build_screening_maps._per_lmo. ~1-2s saved on water-15.
-        _atom_id_masks = [(_atom_ids == a) for a in range(_natm)]
+        # No per-atom fancy-indexing loop here — at water-34 the
+        # `contrib_u[m, :]` slicing was ~1 TB of memory traffic per
+        # cycle, dominating Stage 5 setup (48s at water-34).
+        # Equivalent vectorisation: row/col sums then atom-bincount.
         def _mulliken_per_lmo(i):
             c_i = C_lmo[:, i]
             P_i = s1e * c_i[:, None] * c_i[None, :]
@@ -1708,28 +1733,31 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                p_diag[:, None] / sum_diag, 0.0)
                 w_v = np.where(sum_diag > 1e-15,
                                p_diag[None, :] / sum_diag, 0.0)
-            contrib_u = P_i * w_u
-            contrib_v = P_i * w_v
-            mkn_pop = np.empty(_natm)
-            for a in range(_natm):
-                m = _atom_id_masks[a]
-                mkn_pop[a] = (np.sum(contrib_u[m, :])
-                              + np.sum(contrib_v[:, m]))
+            # mkn_pop[a] = Σ_{u ∈ a} Σ_v contrib_u[u,v] + Σ_u Σ_{v ∈ a} contrib_v[u,v]
+            #            = bincount(atom_id, row_sum_u) + bincount(atom_id, col_sum_v)
+            row_sum_u = (P_i * w_u).sum(axis=1)   # (nao,)
+            col_sum_v = (P_i * w_v).sum(axis=0)   # (nao,)
+            mkn_pop = (np.bincount(_atom_ids, weights=row_sum_u, minlength=_natm)
+                       + np.bincount(_atom_ids, weights=col_sum_v, minlength=_natm))
             atoms_in = np.where(np.abs(mkn_pop) > T_CutMKN)[0]
             return (np.isin(_aux_atom_ids, atoms_in),
                     set(atoms_in.tolist()))
-        if _pool is not None and nocc > 1:
-            _mkn_results = list(_pool.map(_mulliken_per_lmo, range(nocc)))
-        else:
-            _mkn_results = [_mulliken_per_lmo(i) for i in range(nocc)]
+        # Pool dispatch over this kernel is a NET LOSS at large N: per-LMO
+        # kernel is ~11 ms single-thread, so serial over nocc=136 = 1.5s.
+        # Sending 136 tasks to a 128-worker ThreadPool produced 47s wall
+        # — 30× slower than serial — due to GIL contention on the small
+        # element-wise numpy ops + memory pressure from 128 concurrent
+        # ~30 MB (nao, nao) temporaries.  Serial-only is simpler/faster.
+        _mkn_results = [_mulliken_per_lmo(i) for i in range(nocc)]
         _lmo_aux_mask = [r[0] for r in _mkn_results]
         _lmo_atom_set = [r[1] for r in _mkn_results]
+        _s5_tick('Mulliken aux domain per LMO')
 
         # Pair aux domain = union of LMO i and LMO j aux domains
         # Include ALL pairs in pno_spaces (strong + weak + diagonal)
         _all_keys_init = list(keys_sorted)
         for key_w in pno_spaces:
-            if key_w not in _all_keys_init and pno_spaces[key_w]['C_pno'].shape[1] > 0:
+            if key_w not in _all_keys_init and pno_spaces[key_w]['n_pno'] > 0:
                 _all_keys_init.append(key_w)
 
         # Pair LMO domain: m is in pair (i,j)'s domain iff pairs (i,m) AND
@@ -1764,6 +1792,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             pair_lmo_idx = dict(_build_pair_lmo_idx(key)
                                 for key in _all_keys_init)
         _plens = np.array([len(v) for v in pair_lmo_idx.values()])
+        _s5_tick('pair_lmo_idx (pair LMO domains)')
         print(f"  Pair LMO domains: mean={_plens.mean():.1f}  "
               f"max={_plens.max()} (of nocc={nocc})",
               flush=True)
@@ -1799,7 +1828,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     _all_keys_cc = list(keys_sorted)
     for key_w in pno_spaces:
         if key_w not in _all_keys_cc:
-            if pno_spaces[key_w]['C_pno'].shape[1] > 0 and key_w in pair_aux_idx:
+            if pno_spaces[key_w]['n_pno'] > 0 and key_w in pair_aux_idx:
                 _all_keys_cc.append(key_w)
     # Psi4-style sparse per-aux-Q build with X_pno + pair_paos. Defaults
     # to Psi4's TightPNO thresholds (1e-3); override via mf attributes.
@@ -1812,6 +1841,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _pao_domains.append(np.asarray(pno_spaces[_ki]['pair_paos']))
         else:
             _pao_domains.append(np.zeros(0, dtype=int))
+    _s5_tick('pre-cc_ints prep (auxmol, j2c, pao_domains)')
     _cc_ints = compute_cc_integrals_sparse(
         mf.mol, _auxmol, C_lmo, C_pao, pno_spaces, pair_aux_idx,
         _j2c, _all_keys_cc, nocc, s1e=s1e,
@@ -1819,8 +1849,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         T_CUT_MKN=_t_mkn, T_CUT_CLMO=_t_clmo,
         pair_lmo_idx=pair_lmo_idx,
         _pool=_pool)
+    _s5_tick('compute_cc_integrals_sparse')
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
+    # Force release of pool-worker transient buffers (raw int3c2e shells,
+    # screening intermediates) that pymalloc hoards after the parallel
+    # libcint sweep. Without this RSS stays at the high-water mark even
+    # though the live cc_ints output is only ~7-8 GiB at water-49.
+    from pyscf.cc.dlpno_tccsd.driver import (
+        _log_mem as _drv_log_mem, _malloc_trim as _drv_malloc_trim)
+    _drv_malloc_trim()
+    _drv_log_mem('after_cc_ints')
     _t_post_ccints = _time_cc.perf_counter()
 
     # ------------------------------------------------------------------
@@ -1853,6 +1892,11 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
           f'{_time_cc.perf_counter() - _t_flat:.2f}s '
           f'total_buffer={sum(s.buffer.size for s in _cc_ints_flat.values())*8/2**20:.1f} MB',
           flush=True)
+    # Per-pair ndarrays were replaced by views into the flat store; force
+    # the allocator to release the original-allocation arenas (~6 GiB at
+    # water-49) instead of keeping them pooled.
+    _drv_malloc_trim()
+    _drv_log_mem('after_cc_ints_flat')
 
     # Rebuild K_pno_cache from locally-fitted K_iajb (now a view
     # into the flattened Qab/K_iajb field store).
@@ -1881,7 +1925,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # This drops setup from O(N^4) to O(N^2) memory + build time.
     from pyscf.cc.dlpno_tccsd.local_df import compute_S_pno as _compute_S_pno
     _all_pair_keys = [k for k in pno_spaces
-                      if pno_spaces[k]['C_pno'].shape[1] > 0]
+                      if pno_spaces[k]['n_pno'] > 0]
     _all_pair_set = set(_all_pair_keys)
     S_pao_full = C_pao.T @ s1e @ C_pao
     # Build into a plain dict first — the upfront set is domain-
@@ -2097,7 +2141,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
 
         print(f'  [STAGE5_DBG] post-cc_ints setup before cycle loop: '
               f'{_time_cc.perf_counter() - _t_post_ccints:.2f}s', flush=True)
-        _t_loop_start = _time_cc.perf_counter()
+        _drv_log_mem('before_cycle_loop')
+        _t_loop_start = _time.perf_counter() if False else _time_cc.perf_counter()
         for cycle in range(this_max):
             # Phase 1: pre-project t1 into every pair's PNO basis once
             # per cycle, replacing ~1.5 M lazy _project_t1_to_pair calls.
@@ -2127,7 +2172,11 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 for ii in range(nocc):
                     key_ii = (ii, ii)
                     if key_ii in pno_spaces and t1_pno[ii].size > 0:
-                        C_pno_ii = pno_spaces[key_ii]['C_pno']
+                        _data_ii = pno_spaces[key_ii]
+                        C_pno_ii = _data_ii.get('C_pno')
+                        if C_pno_ii is None:
+                            C_pno_ii = (C_pao[:, _data_ii['pair_paos']]
+                                         @ _data_ii['X_pno'])
                         C_lmo_t1[:, ii] += C_pno_ii @ t1_pno[ii]
 
                 # Per-iter rebuild of full-naux ovL/ooL/J_oo/K_coul_cache
@@ -2385,7 +2434,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 access to shared caches, writes only to returned arrays)."""
                 i, j = key
                 data = pno_spaces[key]
-                n_pno = data['C_pno'].shape[1]
+                n_pno = data['n_pno']
                 if n_pno == 0:
                     return key, np.zeros((0, 0))
 
@@ -2564,10 +2613,14 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                         if key_ii not in pno_spaces:
                             _t1_fov[ii] = np.zeros(0)
                             continue
-                        C_pno_ii = pno_spaces[key_ii]['C_pno']
-                        if C_pno_ii.shape[1] == 0:
+                        _data_ii = pno_spaces[key_ii]
+                        if _data_ii['n_pno'] == 0:
                             _t1_fov[ii] = np.zeros(0)
                             continue
+                        C_pno_ii = _data_ii.get('C_pno')
+                        if C_pno_ii is None:
+                            C_pno_ii = (C_pao[:, _data_ii['pair_paos']]
+                                         @ _data_ii['X_pno'])
                         _t1_fov[ii] = C_pno_ii.T @ (fock_ao @ _t1_C[:, ii])
                 else:
                     _t1_fov = fov_pno
@@ -2728,6 +2781,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # C++ class.  Returns to the outer loop with t1_pno / t2_pno_all
             # at the converged or max-cycle state.
             if cycle == 0:
+                _drv_log_mem('after_cycle1')
+                from pyscf.cc.dlpno_tccsd.driver import _dump_plan_cache_sizes
+                _dump_plan_cache_sizes('after_cycle1')
                 print('[CCSD MONO DROPIN] Taking over remaining cycles via C++ class...',
                       flush=True)
                 from pyscf.cc.dlpno_tccsd._ccsd_solver import (
@@ -2741,6 +2797,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _B_tilde_per_ij, _jiang_C, _jiang_D,
                     mydiis, diis_start_cycle, strong_pairs, cas_blocks,
                     _pool=_pool)
+                _drv_log_mem('after_class_dropin')
                 break
         else:
             if boot_step == n_bootstrap - 1:
@@ -2860,16 +2917,36 @@ def run_lccsd(mf, C_lmo, pno_spaces, strong_pairs, cas_pairs,
     log = logger.new_logger(mf, verbose)
     mol = mf.mol
 
+    import time as _t_rlc
+    import os as _os_rlc
+    _rlc_t = [_t_rlc.perf_counter()]
+    _rlc_dbg = bool(int(_os_rlc.environ.get('DLPNO_S5_PROFILE', '0')))
+    def _rlc_tick(label):
+        if _rlc_dbg:
+            now = _t_rlc.perf_counter()
+            print(f'  [S5-PROFILE] (run_lccsd) {label}: {now - _rlc_t[0]:.2f}s',
+                  flush=True)
+            _rlc_t[0] = now
+
     if s1e is None:
         s1e = mf.get_ovlp()
+    _rlc_tick('mf.get_ovlp')
 
     nocc_lmo = C_lmo.shape[1]
     occ_cas_set = set(occ_cas_idx.tolist())
 
-    # AO Fock: used for LMO orbital energies AND passed to fake_mf for pair CCSD
-    fock_ao = mf.get_fock()
+    # AO Fock matrix.  Prefer a cached copy if the caller stored one
+    # (mf._dlpno_fock_ao) — that lets the driver capture F_AO while cderi
+    # is still alive and avoid a 30s+ J/K rebuild at the DLPNO entry.
+    # Fall back to mf.get_fock() (which rebuilds J/K via libcint when
+    # cderi has been released).
+    fock_ao = getattr(mf, '_dlpno_fock_ao', None)
+    if fock_ao is None:
+        fock_ao = mf.get_fock()
+    _rlc_tick('fock_ao (cached if present)')
     F_lmo = reduce(np.dot, (C_lmo.T, fock_ao, C_lmo))
     eps_lmo = F_lmo.diagonal().real
+    _rlc_tick('F_lmo + eps_lmo')
 
     n_total = len(strong_pairs)
     print(f'  LCCSD: solving {n_total} strong pairs (ncores={ncores})...', flush=True)

@@ -95,7 +95,7 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
         i, j = key
         ij_to_i_j[2 * p]     = i
         ij_to_i_j[2 * p + 1] = j
-        n_pno_per_pair[p]    = int(pno_spaces[key]['C_pno'].shape[1])
+        n_pno_per_pair[p]    = int(pno_spaces[key]['n_pno'])
         if pair_lmo_idx is not None and key in pair_lmo_idx:
             ll = np.asarray(pair_lmo_idx[key], dtype=np.int32)
         else:

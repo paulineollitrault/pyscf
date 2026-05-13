@@ -117,6 +117,17 @@ extern "C" void DLPNObe_kernel_v3(
     size_t N, size_t n_ij, size_t n_kl,
     int num_threads, size_t n_slots);
 
+extern "C" void DLPNObe_kernel_gathered(
+    const double *S_master, const long *S_off,
+    const double *T_master, const long *T_off,
+    const double *K_master, const long *K_off,
+    const double *beta_kl, const double *beta_lk,
+    const unsigned char *same,
+    const long *idx,
+    double *out_B, double *out_E,
+    size_t N, size_t n_ij, size_t n_kl,
+    int num_threads);
+
 extern "C" void DLPNOc_term_batched(
     int N,
     const int  *n_pno_arr, const int *n_ct_arr, const int *n_other_arr,
@@ -499,9 +510,9 @@ struct BEInputs {
     int n_ij;
     int n_kl;
     int n_slots;          // for caller-allocated output buffer sizing
-    const double        *S;          // (N, n_ij, n_kl)
-    const double        *T;          // (N, n_kl, n_kl)
-    const double        *K;          // (N, n_kl, n_kl)
+    const double        *S;          // (N, n_ij, n_kl) — used when S_master is null
+    const double        *T;          // (N, n_kl, n_kl) — used when T_master is null
+    const double        *K;          // (N, n_kl, n_kl) — used when K_master is null
     const double        *beta_kl;    // (N,) — refreshable; see p_ij_arr
     const double        *beta_lk;    // (N,)
     const unsigned char *same;       // (N,)
@@ -513,6 +524,16 @@ struct BEInputs {
     const int *p_ij_arr;             // (N,) source pair index
     const int *dense_k_arr;          // (N,) k row index in B_tilde_flat[p]
     const int *dense_l_arr;          // (N,) l col index in B_tilde_flat[p]
+    // Memory-light "gathered" mode (DLPNO_BE_GATHERED=1): when all three
+    // master pointers are non-null, BE reads S/T/K from caller-owned flats
+    // via per-item element offsets instead of stacked per-bucket copies.
+    // Eliminates ~1.5 GB/water-22 of redundant slice copies in _inv_cache.
+    const double        *S_master;
+    const double        *T_master;
+    const double        *K_master;
+    const long          *S_off;      // (N,) element offset into S_master
+    const long          *T_off;      // (N,) element offset into T_master
+    const long          *K_off;      // (N,) element offset into K_master
 };
 
 struct BEOutputs {
@@ -1670,7 +1691,13 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 BEOutputs out;
                 out.out_B = flat_B.data() + group_off;
                 out.out_E = flat_E.data() + group_off;
-                if (_be_use_v2) {
+                // Gathered mode (DLPNO_BE_GATHERED=1): bucket S/T/K stacks
+                // are null; route through run_phase_be_into which dispatches
+                // DLPNObe_kernel_gathered from the master flats.
+                const bool _gathered = (bucket->S_master != nullptr
+                                        && bucket->T_master != nullptr
+                                        && bucket->K_master != nullptr);
+                if (_be_use_v2 && !_gathered) {
                     int num_threads = 1;
 #ifdef _OPENMP
                     num_threads = std::min(omp_get_max_threads(), 16);
@@ -2784,13 +2811,26 @@ void DLPNOCCSDSolver::run_phase_be_into(
         num_threads = std::min(omp_get_max_threads(), 16);
         if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
     #endif
-    DLPNObe_kernel(
-        plan->S, plan->T, plan->K,
-        plan->beta_kl, plan->beta_lk,
-        plan->same, plan->idx,
-        out->out_B, out->out_E,
-        (size_t)plan->N, (size_t)plan->n_ij, (size_t)plan->n_kl,
-        num_threads);
+    if (plan->S_master != nullptr && plan->T_master != nullptr
+            && plan->K_master != nullptr) {
+        DLPNObe_kernel_gathered(
+            plan->S_master, plan->S_off,
+            plan->T_master, plan->T_off,
+            plan->K_master, plan->K_off,
+            plan->beta_kl, plan->beta_lk,
+            plan->same, plan->idx,
+            out->out_B, out->out_E,
+            (size_t)plan->N, (size_t)plan->n_ij, (size_t)plan->n_kl,
+            num_threads);
+    } else {
+        DLPNObe_kernel(
+            plan->S, plan->T, plan->K,
+            plan->beta_kl, plan->beta_lk,
+            plan->same, plan->idx,
+            out->out_B, out->out_E,
+            (size_t)plan->N, (size_t)plan->n_ij, (size_t)plan->n_kl,
+            num_threads);
+    }
 }
 
 void DLPNOCCSDSolver::run_phase_t1_residual_per_kl_into(

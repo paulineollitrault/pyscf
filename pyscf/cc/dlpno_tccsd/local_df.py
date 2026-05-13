@@ -73,6 +73,14 @@ def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
         if len(pao_domains[i]) == 0:
             paoatoms_i = np.zeros(0, dtype=int)
         else:
+            # Atoms hosting the LMO's DOI-screened PAO domain PLUS atoms
+            # with significant C_pao tail amplitude.  Tested matching
+            # Psi4 by dropping the tail expansion at water-34: anchor
+            # drifted -544 µEh (well outside DLPNO's 100 µEh envelope),
+            # so the tail atoms are carrying real correlation that
+            # cannot be excluded.  Psi4's grid-DOI implicitly captures
+            # those atoms via the broader DOI sweep; our DF-DOI doesn't,
+            # so the explicit tail expansion stays.
             indexed_atoms_set = set(atom_ids[pao_domains[i]].tolist())
             if C_pao is not None:
                 C_slice = C_pao[:, pao_domains[i]]
@@ -204,6 +212,7 @@ def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
     atom_to_ao_sh = [np.where(ao_shell_to_atom == a)[0] for a in range(natm)]
     ao_shell_loc = mol.ao_loc_nr()
 
+
     # --- per-aux-atom Boughton-Pulay refit C_lmo ---
     SC_lmo = s1e @ C_lmo   # (nao, nocc)
     def _c_refit_one_atom(a):
@@ -243,25 +252,89 @@ def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
     }
 
 
-def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps, _pool=None):
+def _compute_schwarz_data(mol, auxmol, _pool=None):
+    """Precompute Schwarz screening data, matching Psi4 dlpnobase.cc.
+
+    Returns:
+        J_metric_shell_diag[Q_sh] = max |(q|q)| for aux funcs q in shell Q_sh.
+        shell_pair_value[M, N]    = max |(MN|MN)| over the 4-index shell block.
+
+    Results are memoized on ``mol`` / ``auxmol`` (``_dlpno_schwarz`` /
+    ``_dlpno_jmetric`` attrs) so repeated callers (per-stage / per-(T)-label
+    invocations of ``build_sparse_df_arrays``) share one O(nbas²) precompute.
+
+    The Schwarz inequality |(μν|Q)|² ≤ (Q|Q) · (μν|μν) is then applied as
+        J_metric_shell_diag[Q] * shell_pair_value[M, N] < ints_tolerance²
+    to skip negligible shell-pair contributions.
+    """
+    cached_J = getattr(auxmol, '_dlpno_jmetric', None)
+    cached_sp = getattr(mol, '_dlpno_schwarz', None)
+    if cached_J is not None and cached_sp is not None:
+        return cached_J, cached_sp
+
+    aux_nbas = auxmol.nbas
+    nbas = mol.nbas
+
+    # --- aux-side: max |(Q|Q)| per aux shell ---
+    aux_shell_loc = auxmol.ao_loc_nr()
+    J_full_diag = np.abs(auxmol.intor('int2c2e').diagonal())
+    J_metric_shell_diag = np.empty(aux_nbas)
+    for Q_sh in range(aux_nbas):
+        q0 = aux_shell_loc[Q_sh]
+        q1 = aux_shell_loc[Q_sh + 1]
+        J_metric_shell_diag[Q_sh] = J_full_diag[q0:q1].max() if q1 > q0 else 0.0
+
+    # --- AO-side: max |(MN|MN)| per AO shell pair ---
+    def _row(M):
+        row = np.zeros(nbas)
+        for N in range(M + 1):
+            I_MN = mol.intor(
+                'int2e', shls_slice=(M, M + 1, N, N + 1, M, M + 1, N, N + 1))
+            row[N] = np.abs(I_MN).max() if I_MN.size > 0 else 0.0
+        return M, row
+
+    shell_pair_value = np.zeros((nbas, nbas))
+    if _pool is not None and nbas > 1:
+        rows = list(_pool.map(_row, range(nbas)))
+    else:
+        rows = [_row(M) for M in range(nbas)]
+    for M, row in rows:
+        shell_pair_value[M, :M + 1] = row[:M + 1]
+        shell_pair_value[:M + 1, M] = row[:M + 1]
+
+    try:
+        auxmol._dlpno_jmetric = J_metric_shell_diag
+        mol._dlpno_schwarz = shell_pair_value
+    except (AttributeError, TypeError):
+        pass
+
+    return J_metric_shell_diag, shell_pair_value
+
+
+def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps, _pool=None,
+                            ints_tolerance=1.0e-10):
     """Build sparse per-aux DF integrals qij_[Q], qia_[Q], qab_[Q].
 
-    For each aux function Q on atom A_Q, stores:
-        qij_[Q] of shape (|lmos_ext[A_Q]|, |lmos_ext[A_Q]|)  = (i j | Q)
-        qia_[Q] of shape (|lmos_ext[A_Q]|, |paos_ext[A_Q]|)  = (i a | Q)
-        qab_[Q] of shape (|paos_ext[A_Q]|, |paos_ext[A_Q]|)  = (a b | Q)
+    Architecture (mirrors Psi4 dlpnobase.cc::compute_qij/qia/qab):
+      * One bounding-box ``int3c2e`` call per aux shell Q (atoms1 × atoms2
+        ranges); the same buffer feeds qij/qia/qab via fancy-indexed slices.
+      * Schwarz screen
+            J_metric_shell_diag[Q] * shell_pair_value[M, N] < tol²
+        is applied as a vectorized post-mask: (M, N) shell-pair contributions
+        that fall below the Psi4 ``DLPNO_AO_INTS_TOL`` threshold are zeroed
+        out before the C_r / C_pao transform. Algorithmically identical to
+        Psi4's per-(M,N) skip — those zeros do not contribute to the final
+        qij/qia/qab; only the integral-compute work is not skipped (a C
+        kernel would close that remaining gap).
 
-    Integrals are built shell-by-shell with atom-level screening:
-        (μν | Q) computed only for μ ∈ bfs1[A_Q], ν ∈ bfs2[A_Q],
-        then transformed via BP-refitted C_lmo (LMO side) and sliced C_pao (PAO side).
-
-    Memory: Σ_Q |lmos_ext|² + |lmos_ext|×|paos_ext| + |paos_ext|². For large
-    systems this is O(naux × const²) — linear in naux, not O(naux × nao²).
-
-    Returns dict with 'qij', 'qia', 'qab': each a list of length naux.
+    Storage per aux function Q:
+        qij_[Q] : (|lmos_ext[A_Q]|, |lmos_ext[A_Q]|)
+        qia_[Q] : (|lmos_ext[A_Q]|, |paos_ext[A_Q]|)
+        qab_[Q] : (|paos_ext[A_Q]|, |paos_ext[A_Q]|)
     """
     naux = auxmol.nao_nr()
     pmol = mol + auxmol
+    nbas = mol.nbas
     aux_shell_to_atom = maps['aux_shell_to_atom']
     aux_shell_loc = maps['aux_shell_loc']
     atom_to_ao_sh = maps['atom_to_ao_sh']
@@ -271,7 +344,26 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps, _pool=None):
     riatom_to_bfs1 = maps['riatom_to_bfs1']
     riatom_to_bfs2 = maps['riatom_to_bfs2']
     riatom_to_paos_ext = maps['riatom_to_paos_ext']
+    riatom_to_lmos_ext = maps['riatom_to_lmos_ext']
     c_refit = maps['c_refit']
+
+    # Cache Schwarz screening data on maps for reuse across stages
+    if 'J_metric_shell_diag' not in maps or 'shell_pair_value' not in maps:
+        J_diag, sp_val = _compute_schwarz_data(mol, auxmol, _pool=_pool)
+        maps['J_metric_shell_diag'] = J_diag
+        maps['shell_pair_value'] = sp_val
+    J_metric_shell_diag = maps['J_metric_shell_diag']
+    shell_pair_value = maps['shell_pair_value']
+
+    # AO-index → AO-shell lookup (used to vectorize the Schwarz post-mask)
+    if 'ao_to_shell' not in maps:
+        ao_to_shell = np.empty(mol.nao_nr(), dtype=int)
+        for sh in range(nbas):
+            ao_to_shell[ao_shell_loc[sh]:ao_shell_loc[sh + 1]] = sh
+        maps['ao_to_shell'] = ao_to_shell
+    ao_to_shell = maps['ao_to_shell']
+
+    tol_sq = ints_tolerance * ints_tolerance
 
     qij = [None] * naux
     qia = [None] * naux
@@ -284,57 +376,63 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps, _pool=None):
 
         bfs1 = riatom_to_bfs1[centerQ]
         bfs2 = riatom_to_bfs2[centerQ]
-        lmos_ext = maps['riatom_to_lmos_ext'][centerQ]
+        lmos_ext = riatom_to_lmos_ext[centerQ]
         paos_ext = riatom_to_paos_ext[centerQ]
-        C_r = c_refit[centerQ]  # (|bfs1|, |lmos_ext|)
+        C_r = c_refit[centerQ]
 
-        # AO shell ranges for bfs1/bfs2: for AO-shell-level intor we need
-        # to include shells whose AO indices touch bfs1/bfs2. Easier:
-        # compute (μν | q) for μ ∈ union of bfs1's atoms, then slice.
-        atoms1 = riatom_to_atoms1[centerQ]
-        atoms2 = riatom_to_atoms2[centerQ]
         if len(bfs1) == 0 or len(bfs2) == 0 or len(lmos_ext) == 0:
-            # Empty neighborhood — no contribution from this Q
             return [(q_start + q,
                      np.zeros((len(lmos_ext), len(lmos_ext))),
                      np.zeros((len(lmos_ext), len(paos_ext))),
                      np.zeros((len(paos_ext), len(paos_ext))))
                     for q in range(nq)]
 
-        # Build shell slices for atoms1, atoms2
+        atoms1 = riatom_to_atoms1[centerQ]
+        atoms2 = riatom_to_atoms2[centerQ]
+        same_set = (atoms1.tolist() == atoms2.tolist())
+
         sh1_list = np.concatenate([atom_to_ao_sh[a] for a in atoms1])
         sh2_list = np.concatenate([atom_to_ao_sh[a] for a in atoms2])
         sh1_min, sh1_max = sh1_list.min(), sh1_list.max() + 1
         sh2_min, sh2_max = sh2_list.min(), sh2_list.max() + 1
 
-        buf = pmol.intor(
+        J_Q = J_metric_shell_diag[Q_sh]
+
+        # Per-AO shell-index for Schwarz mask construction
+        shells_bfs1 = ao_to_shell[bfs1]
+        shells_bfs2 = ao_to_shell[bfs2]
+        sp_11 = shell_pair_value[shells_bfs1[:, None], shells_bfs1[None, :]]
+        sp_12 = shell_pair_value[shells_bfs1[:, None], shells_bfs2[None, :]]
+        sp_22 = shell_pair_value[shells_bfs2[:, None], shells_bfs2[None, :]]
+        keep_11 = (J_Q * sp_11) >= tol_sq
+        keep_12 = (J_Q * sp_12) >= tol_sq
+        keep_22 = (J_Q * sp_22) >= tol_sq
+
+        # Bounding-box integral compute for bfs1 × bfs2 (always needed)
+        buf12 = pmol.intor(
             'int3c2e',
             shls_slice=(sh1_min, sh1_max, sh2_min, sh2_max,
                         mol.nbas + Q_sh, mol.nbas + Q_sh + 1))
-
         bf1_start = ao_shell_loc[sh1_min]
         bf2_start = ao_shell_loc[sh2_min]
         rel_bfs1 = bfs1 - bf1_start
         rel_bfs2 = bfs2 - bf2_start
-        mn_block = buf[rel_bfs1][:, rel_bfs2, :]
+        mn_block = buf12[rel_bfs1][:, rel_bfs2, :] * keep_12[:, :, None]
 
-        if atoms1.tolist() == atoms2.tolist():
-            mn1_block = mn_block
+        if same_set:
+            mn1_block = buf12[rel_bfs1][:, rel_bfs1, :] * keep_11[:, :, None]
+            mn2_block = buf12[rel_bfs2][:, rel_bfs2, :] * keep_22[:, :, None]
         else:
-            buf1 = pmol.intor(
+            buf11 = pmol.intor(
                 'int3c2e',
                 shls_slice=(sh1_min, sh1_max, sh1_min, sh1_max,
                             mol.nbas + Q_sh, mol.nbas + Q_sh + 1))
-            mn1_block = buf1[rel_bfs1][:, rel_bfs1, :]
-
-        if atoms1.tolist() == atoms2.tolist():
-            mn2_block = mn_block
-        else:
-            buf2 = pmol.intor(
+            mn1_block = buf11[rel_bfs1][:, rel_bfs1, :] * keep_11[:, :, None]
+            buf22 = pmol.intor(
                 'int3c2e',
                 shls_slice=(sh2_min, sh2_max, sh2_min, sh2_max,
                             mol.nbas + Q_sh, mol.nbas + Q_sh + 1))
-            mn2_block = buf2[rel_bfs2][:, rel_bfs2, :]
+            mn2_block = buf22[rel_bfs2][:, rel_bfs2, :] * keep_22[:, :, None]
 
         C_pao_slice = C_pao[np.ix_(bfs2, paos_ext)]
         results = []
@@ -349,8 +447,11 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps, _pool=None):
         return results
 
     Q_shells = list(range(auxmol.nbas))
+
     if _pool is not None:
-        all_results = list(_pool.map(_process_shell, Q_shells))
+        _ps = getattr(_pool, '_processes', 64) or 64
+        chunksize = max(1, len(Q_shells) // (_ps * 4))
+        all_results = list(_pool.map(_process_shell, Q_shells, chunksize=chunksize))
     else:
         all_results = [_process_shell(Q_sh) for Q_sh in Q_shells]
     for shell_results in all_results:
@@ -358,6 +459,72 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps, _pool=None):
             qij[Q] = qij_Q
             qia[Q] = qia_Q
             qab[Q] = qab_Q
+
+    return {'qij': qij, 'qia': qia, 'qab': qab}
+
+
+def derive_subset_sparse_df(tight_sparse, tight_maps, sub_maps):
+    """Build a subset sparse-DF dict (qij/qia/qab) by slicing an existing
+    tight sparse-DF, given a stricter-threshold screening maps dict.
+
+    Assumes ``sub_maps`` is a strict refinement of ``tight_maps``:
+        sub_maps['riatom_to_lmos_ext'][A] ⊆ tight_maps['riatom_to_lmos_ext'][A]
+        sub_maps['riatom_to_paos_ext'][A] ⊆ tight_maps['riatom_to_paos_ext'][A]
+    for every atom A. This holds when sub_maps was built with looser
+    Mulliken (T_CUT_MKN) and/or looser DOI (T_CUT_DO) thresholds than the
+    tight one — the resulting per-atom domains are subsets.
+
+    Replaces a full ``build_sparse_df_arrays`` rebuild for the (T) PRESCREEN
+    pass, which was running the full naux × bounding-box integral compute
+    a second time at the larger systems and dominated the (T) scaling
+    exponent (N^2.60 per build). Slicing is O(N²) wallclock vs O(N²-N³) for
+    the rebuild — same algorithmic content, just no integral recompute.
+    """
+    aux_shell_to_atom = tight_maps['aux_shell_to_atom']
+    aux_shell_loc = tight_maps['aux_shell_loc']
+    naux_full = len(tight_sparse['qij'])
+
+    tight_lmos = tight_maps['riatom_to_lmos_ext']
+    tight_paos = tight_maps['riatom_to_paos_ext']
+    sub_lmos = sub_maps['riatom_to_lmos_ext']
+    sub_paos = sub_maps['riatom_to_paos_ext']
+
+    # Per centerQ, build the index arrays once (re-used for every Q on that atom)
+    natm = tight_maps['natm']
+    lmo_idx_per_atom = [None] * natm
+    pao_idx_per_atom = [None] * natm
+    for A in range(natm):
+        if len(tight_lmos[A]) == 0:
+            lmo_idx_per_atom[A] = np.zeros(0, dtype=np.int64)
+        else:
+            t_pos = {int(l): i for i, l in enumerate(tight_lmos[A])}
+            lmo_idx_per_atom[A] = np.array(
+                [t_pos[int(l)] for l in sub_lmos[A] if int(l) in t_pos],
+                dtype=np.int64)
+        if len(tight_paos[A]) == 0:
+            pao_idx_per_atom[A] = np.zeros(0, dtype=np.int64)
+        else:
+            t_pos = {int(p): i for i, p in enumerate(tight_paos[A])}
+            pao_idx_per_atom[A] = np.array(
+                [t_pos[int(p)] for p in sub_paos[A] if int(p) in t_pos],
+                dtype=np.int64)
+
+    qij = [None] * naux_full
+    qia = [None] * naux_full
+    qab = [None] * naux_full
+    for Q_sh in range(len(aux_shell_to_atom)):
+        cQ = aux_shell_to_atom[Q_sh]
+        lmo_idx = lmo_idx_per_atom[cQ]
+        pao_idx = pao_idx_per_atom[cQ]
+        for q in range(aux_shell_loc[Q_sh + 1] - aux_shell_loc[Q_sh]):
+            Q = aux_shell_loc[Q_sh] + q
+            qij[Q] = (tight_sparse['qij'][Q][np.ix_(lmo_idx, lmo_idx)]
+                      if lmo_idx.size else np.zeros((0, 0)))
+            qia[Q] = (tight_sparse['qia'][Q][np.ix_(lmo_idx, pao_idx)]
+                      if lmo_idx.size and pao_idx.size
+                      else np.zeros((lmo_idx.size, pao_idx.size)))
+            qab[Q] = (tight_sparse['qab'][Q][np.ix_(pao_idx, pao_idx)]
+                      if pao_idx.size else np.zeros((0, 0)))
 
     return {'qij': qij, 'qia': qia, 'qab': qab}
 
@@ -1659,7 +1826,7 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
             for p, key in enumerate(valid_keys):
                 ci = cc_ints[key]
                 i, j = key
-                npno = pno_spaces[key]['C_pno'].shape[1]
+                npno = pno_spaces[key]['n_pno']
                 lmo_idx = np.asarray(_pair_domain(key), dtype=np.intp)
                 nlmo = lmo_idx.size
                 n_local = ci['Qma'].shape[0]
@@ -1845,7 +2012,7 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
         t1_j = t1_pno.get(j_idx)
         if t1_j is None or t1_j.size == 0:
             continue
-        npno = pno_spaces[key_jj]['C_pno'].shape[1]
+        npno = pno_spaces[key_jj]['n_pno']
         lmo_idx = _pair_domain(key_jj)
         # Phase 1: fancy-index the cached matrix.
         T1_local = np.ascontiguousarray(
@@ -1871,7 +2038,7 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
             if ci2 is None: continue
             t1_j2 = t1_pno.get(j_idx2)
             if t1_j2 is None or t1_j2.size == 0: continue
-            npno2 = pno_spaces[key_jj2]['C_pno'].shape[1]
+            npno2 = pno_spaces[key_jj2]['n_pno']
             T1_all2 = t1_cache[key_jj2]
             gamma2 = np.einsum('ma,Qma->Q', T1_all2, ci2['Qma'])
             Fia_bar2 = 2.0 * np.einsum('Qka,Q->ka', ci2['Qma'], gamma2)
@@ -1917,7 +2084,7 @@ def compute_B_tilde(cc_ints, dressed_ints, t2_pno_all, t1_pno,
         return None
 
     i, j = key
-    npno = pno_spaces[key]['C_pno'].shape[1]
+    npno = pno_spaces[key]['n_pno']
 
     if pair_lmo_idx is not None and key in pair_lmo_idx:
         lmo_idx = np.asarray(pair_lmo_idx[key])
@@ -2023,7 +2190,7 @@ def compute_ladder(cc_ints, t2_pno_all, t1_pno, pno_spaces,
         return np.zeros((0, 0))
 
     i, j = key
-    npno = pno_spaces[key]['C_pno'].shape[1]
+    npno = pno_spaces[key]['n_pno']
     Qab = ci['Qab']
     Qma_full = ci['Qma']   # (n_local, nlmo_p, npno) reduced
 

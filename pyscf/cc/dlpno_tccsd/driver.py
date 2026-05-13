@@ -54,6 +54,157 @@ from pyscf import mcscf
 from pyscf.lib import logger
 
 from pyscf.cc.dlpno_tccsd.dmrg_interface import extract_amplitudes_from_mps
+
+
+def _malloc_trim():
+    """Force glibc to release free chunks back to the OS. Without this,
+    pymalloc / malloc keep large arenas pooled and RSS stays at the
+    high-water mark even after refcounts drop."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes as _ct
+        _ct.CDLL('libc.so.6').malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _log_mem(label):
+    """Print [MEM/<label>] RSS=X GiB tmpfs=Y GiB if DLPNO_MEM_PROBE=1."""
+    if not _os.environ.get('DLPNO_MEM_PROBE'):
+        return
+    try:
+        with open('/proc/self/status') as _f:
+            _txt = _f.read()
+        _rss = 0
+        for _ln in _txt.splitlines():
+            if _ln.startswith('VmRSS:'):
+                _rss = int(_ln.split()[1]) // 1024  # MB
+                break
+        _st = _os.statvfs('/tmp')
+        _tmpfs = (_st.f_blocks - _st.f_bfree) * _st.f_frsize // (1024 ** 2)
+        print(f'  [MEM/{label}] RSS={_rss/1024:.2f} GiB  tmpfs={_tmpfs/1024:.2f} GiB',
+              flush=True)
+    except Exception:
+        pass
+
+
+def _free_triples_caches():
+    """Drop the function-attribute caches that the (T) orchestrator
+    accumulates across triples (pair arena, t1 cache, globals).  Intended
+    for cross-triple reuse within ONE run_dlpno_tccsd_t call; if left in
+    place between calls the next molecule inherits 30+ GiB of stale flat
+    arenas (water-49 → water-64 transition was carrying ~45 GiB of these).
+    """
+    try:
+        from pyscf.cc.dlpno_tccsd import lccsd_t as _lt
+        for func_name in ('_orch', '_run_triples_omp'):
+            func = getattr(_lt, func_name, None)
+            if func is None:
+                continue
+            for attr in ('_pair_arena', '_t1_cache', '_globals_cache'):
+                try:
+                    delattr(func, attr)
+                except AttributeError:
+                    pass
+        # Per-LMO partner-set cache from _build_partners (id-keyed).
+        if hasattr(_lt, '_partners_cache'):
+            _lt._partners_cache.clear()
+    except Exception as _e:
+        print(f'  [_free_triples_caches] failed: {_e}', flush=True)
+    _malloc_trim()
+
+
+def _free_ccsd_plan_caches():
+    """Drop the cycle-invariant plan caches that residual / t1_residual
+    functions accumulate during cycle 1 and reuse for cycles 2+.
+
+    These are reachable only via function attributes set as a perf cache;
+    after Stage 5 returns the converged amplitudes, nothing else needs
+    them — Stage 6 (T) and the public-energy reduction don't touch the
+    residual plans. Clearing them between Stage 5 and Stage 6 frees
+    O(N²)-by-pair-count memory that would otherwise stay resident through
+    the rest of the calculation.
+    """
+    import gc
+    try:
+        from pyscf.cc.dlpno_tccsd import residual as _r
+        from pyscf.cc.dlpno_tccsd import lccsd as _l
+        targets = [
+            (_r.compute_G_term_batched, '_plan_cache'),
+            (_r.build_D_tilde_batched, '_plan_cache'),
+            (_r.compute_C_tilde_batched, '_plan_cache'),
+            (_r.compute_B_E_batched, '_plan_cache'),
+            (_r.compute_CD_terms_batched, '_plan_cache'),
+            (_l._compute_t1_residual, '_per_kl_plan_cache'),
+            (_l._compute_t1_residual, '_per_kl_batched_scratch'),
+        ]
+        for func, attr in targets:
+            if hasattr(func, attr):
+                # Always delattr — dict.clear() leaves the attr as an
+                # empty dict, but downstream code re-uses
+                # `_per_kl_batched_scratch['num_threads']` and similar
+                # without a None / empty-dict guard, which would KeyError.
+                try:
+                    delattr(func, attr)
+                except AttributeError:
+                    pass
+    except Exception as _e:
+        print(f'  [_free_ccsd_plan_caches] failed: {_e}', flush=True)
+    _malloc_trim()
+
+
+def _walk_bytes(obj, _seen=None, _depth=0, _max_depth=4):
+    """Sum nbytes of numpy arrays reachable from obj (best-effort)."""
+    if _seen is None:
+        _seen = set()
+    if id(obj) in _seen or _depth > _max_depth:
+        return 0
+    _seen.add(id(obj))
+    if hasattr(obj, 'nbytes') and hasattr(obj, 'shape'):
+        return int(obj.nbytes)
+    if isinstance(obj, dict):
+        return sum(_walk_bytes(v, _seen, _depth + 1, _max_depth)
+                    for v in obj.values())
+    if isinstance(obj, (list, tuple, set)):
+        return sum(_walk_bytes(x, _seen, _depth + 1, _max_depth)
+                    for x in obj)
+    return 0
+
+
+def _dump_plan_cache_sizes(label):
+    """If DLPNO_MEM_PROBE=1, sum the nbytes of every function-attribute
+    `_plan_cache` / `_per_kl_plan_cache` we know about and print."""
+    if not _os.environ.get('DLPNO_MEM_PROBE'):
+        return
+    try:
+        from pyscf.cc.dlpno_tccsd import residual as _r
+        from pyscf.cc.dlpno_tccsd import lccsd as _l
+        targets = [
+            ('G_term', getattr(_r.compute_G_term_batched, '_plan_cache', None)),
+            ('D_tilde', getattr(_r.build_D_tilde_batched, '_plan_cache', None)),
+            ('C_tilde', getattr(_r.compute_C_tilde_batched, '_plan_cache', None)),
+            ('B_E', getattr(_r.compute_B_E_batched, '_plan_cache', None)),
+            ('CD', getattr(_r.compute_CD_terms_batched, '_plan_cache', None)),
+            ('per_kl', getattr(_l._compute_t1_residual,
+                                '_per_kl_plan_cache', None)),
+            ('per_kl_scratch', getattr(_l._compute_t1_residual,
+                                        '_per_kl_batched_scratch', None)),
+        ]
+        total = 0
+        rows = []
+        for name, c in targets:
+            if c is None:
+                rows.append((name, 0))
+                continue
+            sz = _walk_bytes(c)
+            rows.append((name, sz))
+            total += sz
+        print(f'  [PLAN_CACHE/{label}] total={total/2**30:.2f} GiB  '
+              + '  '.join(f'{n}={s/2**30:.2f}G' for n, s in rows),
+              flush=True)
+    except Exception as _e:
+        print(f'  [PLAN_CACHE/{label}] dump failed: {_e}', flush=True)
 from pyscf.cc.dlpno_tccsd.local_orbs import split_localize_orbitals, make_paos
 from pyscf.cc.dlpno_tccsd.pno import make_pnos
 from pyscf.cc.dlpno_tccsd.screening import classify_pairs
@@ -375,6 +526,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # ------------------------------------------------------------------
     # Stage 3: PAO + PNO construction
     # ------------------------------------------------------------------
+    _log_mem('stage3_enter')
     print('  Stage 3: PAO + PNO construction...', flush=True)
     import time as _time_s3
     _t_s3_0 = _time_s3.perf_counter()
@@ -390,6 +542,8 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         doi_method='grid')
     print(f'  [STAGE3-PROF] make_paos: {_time_s3.perf_counter() - _t_paos:.2f}s',
           flush=True)
+    _malloc_trim()
+    _log_mem('after_make_paos')
 
     nlmo = C_lmo.shape[1]
     domain_sizes = [len(pao_domains[i]) for i in range(nlmo)]
@@ -421,6 +575,76 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
           flush=True)
     print(f'  [STAGE3-PROF] Stage 3 total: '
           f'{_time_s3.perf_counter() - _t_s3_0:.2f}s', flush=True)
+    # Drop the dense AO-basis C_pno (nao × npno per pair) — it's a legacy
+    # representation; the X_pno + pair_paos pair (PAO-domain basis) carries
+    # the same information at ~1/13th the size for typical water clusters.
+    # All production-path consumers prefer X_pno when available and only
+    # fall back to C_pno for CAS pairs (where X_pno is None). See Psi4's
+    # equivalent storage in DLPNO::pno_construction.
+    _n_dropped = 0
+    _bytes_dropped = 0
+    for _k, _v in pno_spaces.items():
+        if _v.get('is_cas_pair', False):
+            continue  # CAS pairs need C_pno (X_pno is None)
+        if _v.get('X_pno') is None or _v.get('pair_paos') is None:
+            continue
+        _cp = _v.get('C_pno')
+        if _cp is not None and hasattr(_cp, 'nbytes'):
+            _bytes_dropped += int(_cp.nbytes)
+            _v['C_pno'] = None
+            _n_dropped += 1
+    if _n_dropped > 0:
+        print(f'  [pno_spaces] dropped C_pno from {_n_dropped} pairs '
+              f'({_bytes_dropped/2**30:.2f} GiB freed)', flush=True)
+
+    # Stage 3 has consumed the dense DF tensor twice: once for SCF
+    # (DF-RHF J/K) and once to build ovL via with_df.loop().  Stage 5 and
+    # Stage 6 of the production path never read cderi: Stage 5 uses
+    # cc_ints (built fresh by compute_cc_integrals_sparse, libcint
+    # shell-by-shell) and Stage 6 uses the sparse-DF stack
+    # (build_sparse_df_arrays).  The remaining with_df.loop() /
+    # with_df.ao2mo() call sites in residual.py / lccsd.py are explicit
+    # fallbacks only hit when _term2_precomputed is None / K_pno is
+    # None (CAS pairs only).  Releasing the cderi backing now frees
+    # ~50–100 GB at water-64 (the (naux × nao_pair) tensor) and avoids
+    # holding it on /scratch disk for the rest of the calculation.
+    if hasattr(mf, 'with_df') and mf.with_df is not None:
+        try:
+            _cderi = getattr(mf.with_df, '_cderi', None)
+            if _cderi is not None:
+                # Cache F_AO regardless of whether we release cderi — the
+                # cost is tiny and it future-proofs Stage 5's get_fock.
+                try:
+                    mf._dlpno_fock_ao = mf.get_fock()
+                except Exception as _ef:
+                    print(f'  [with_df] cache F_AO failed: {_ef}', flush=True)
+                # Releasing cderi was originally for the water-64 memory
+                # budget.  But after the release, both Stage 5 (mf.get_fock,
+                # with_df.get_naoaux) and Stage 6 ((T) DF tensors) trigger
+                # cderi rebuilds — at water-34 the rebuild cost was ~47s
+                # in CCSD and another ~50s in (T).  Default: keep cderi
+                # alive (sits in RAM/page-cache, ~10 GB at water-49).
+                # Set DLPNO_RELEASE_CDERI=1 to release for water-64+ runs
+                # where the cderi exceeds RAM.
+                _release_cderi = bool(int(_os.environ.get(
+                    'DLPNO_RELEASE_CDERI', '0'))) if False else (
+                    __import__('os').environ.get('DLPNO_RELEASE_CDERI', '0')
+                    not in ('0', '', 'false', 'False'))
+                if _release_cderi:
+                    if hasattr(mf.with_df, 'reset'):
+                        mf.with_df.reset()
+                    else:
+                        mf.with_df._cderi = None
+                    print(f'  [with_df] released cderi backing '
+                          f'(DLPNO_RELEASE_CDERI=1)', flush=True)
+                else:
+                    print(f'  [with_df] keeping cderi alive '
+                          f'(set DLPNO_RELEASE_CDERI=1 to release)',
+                          flush=True)
+        except Exception as _e:
+            print(f'  [with_df] cderi release failed: {_e}', flush=True)
+    _malloc_trim()
+    _log_mem('after_make_pnos')
 
     # ------------------------------------------------------------------
     # Stage 4: Pair screening
@@ -441,7 +665,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     print(f'  Eliminated-pair SC-MP2 correction: {e_lmp2_negligible:.6e} Eh',
           flush=True)
     if strong_pairs:
-        pno_counts = [len(pno_spaces[p]['n_pno']) for p in strong_pairs]
+        pno_counts = [pno_spaces[p]['n_pno'] for p in strong_pairs]
         print(f'  Strong-pair PNOs: min={min(pno_counts)}  '
               f'max={max(pno_counts)}  avg={np.mean(pno_counts):.1f}')
 
@@ -475,6 +699,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
 
     stage5_label = 'DLPNO-CCSD' if no_cas else 'DLPNO-TCCSD'
     print(f'  Stage 5: {stage5_label}...', flush=True)
+    _log_mem('stage5_enter')
     _t_ccsd_start = _time.time()
 
     mo_coeff_cas_arg = mo_loc if no_cas else mc.mo_coeff
@@ -504,6 +729,12 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     _t_ccsd = _time.time() - _t_ccsd_start
     log.info('E(%s) correlation = %.15g', stage5_label, e_tccsd)
     print(f'  Stage 5 wall time: {_t_ccsd:.2f} s', flush=True)
+    _log_mem('stage5_exit')
+
+    # Free cycle-invariant residual plan caches before (T): they're
+    # reachable only via function attributes and (T) never touches them.
+    _free_ccsd_plan_caches()
+    _log_mem('after_free_ccsd_plans')
 
     # ------------------------------------------------------------------
     # Stage 6: External (T) correction. Same BLAS-thread limit as CCSD —
@@ -511,6 +742,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # internal memory-region cap and triggers BLAS allocation errors.
     # ------------------------------------------------------------------
     print('  Stage 6: (T) correction...', flush=True)
+    _log_mem('stage6_enter')
     _t_triples_start = _time.time()
 
     C_cas_vir_t = None if no_cas else mo_loc[:, vir_cas_idx]
@@ -575,6 +807,11 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     print(f'\n  Timings:  localization={_t_loc:.2f}s  '
           f'CCSD={_t_ccsd:.2f}s  (T)={_t_triples:.2f}s  '
           f'total={_t_loc + _t_ccsd + _t_triples:.2f}s', flush=True)
+
+    # Drop cross-call function-attribute caches before returning to the
+    # caller. Without this, the next system inherits ~30+ GiB of stale
+    # flat pair arenas / t1 caches from the (T) orchestrator.
+    _free_triples_caches()
 
     return {
         'e_hf':         mf.e_tot,

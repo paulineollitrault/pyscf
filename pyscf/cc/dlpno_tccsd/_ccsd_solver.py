@@ -453,6 +453,16 @@ class PyBEInputs(ctypes.Structure):
         ('p_ij_arr',    ctypes.c_void_p),
         ('dense_k_arr', ctypes.c_void_p),
         ('dense_l_arr', ctypes.c_void_p),
+        # Gathered mode (DLPNO_BE_GATHERED=1): when all three masters are
+        # non-null the BE C kernel reads S/T/K from these caller-owned
+        # flats via per-item element offsets, eliminating the redundant
+        # (N, n_ij, n_kl) + 2 × (N, n_kl, n_kl) per-bucket stack copies.
+        ('S_master',    ctypes.c_void_p),
+        ('T_master',    ctypes.c_void_p),
+        ('K_master',    ctypes.c_void_p),
+        ('S_off',       ctypes.c_void_p),
+        ('T_off',       ctypes.c_void_p),
+        ('K_off',       ctypes.c_void_p),
     ]
 
 
@@ -904,7 +914,7 @@ def _build_Fij_bar_full(F_lmo, t2_pno_all, cc_ints, pno_spaces,
         if ci_ij is None:
             continue
         i0, j0 = key_ij
-        if pno_spaces[key_ij]['C_pno'].shape[1] == 0:
+        if pno_spaces[key_ij]['n_pno'] == 0:
             continue
         T_n_ij_mat = t1_cache[key_ij]
         T_n_red = T_n_ij_mat[ci_ij['p_lmos']]
@@ -943,7 +953,7 @@ def _build_Fkc_per_ordered(cc_ints, t1_pno, t1_cache, S_pno_cache,
             key_im = (min(i_out, m), max(i_out, m))
             if key_im not in pno_spaces:
                 continue
-            if pno_spaces[key_im]['C_pno'].shape[1] == 0:
+            if pno_spaces[key_im]['n_pno'] == 0:
                 continue
             ci_im = cc_ints.get(key_im)
             if ci_im is None:
@@ -1212,6 +1222,13 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             # solver refreshes them from B_tilde_flat at the top of
             # run_one_cycle (lines ~1601-1612 of dlpno_ccsd_solver.cpp),
             # so any work here is dead.
+            # Gathered mode: BE plan kept only S_off/K_off into master flats
+            # (S_pno_master, K_iajb_master) instead of stacked per-bucket
+            # copies.  C kernel reads S/T/K directly via offsets — eliminate
+            # T_buf, S_c, K_c entirely.  Saves ~1.5 GB at water-22, scales
+            # as N_pair² × n_pno² (cc-pVTZ water-49+ requires this).
+            _be_gathered = (bucket['S'] is None
+                            and be_plan.get('gathered_mode'))
             inv = bucket.get('_inv_cache')
             if inv is None:
                 p_ij_arr    = np.empty(N_b, dtype=np.int32)
@@ -1228,52 +1245,59 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                     p_ij_arr[n]    = key_to_p.get(key_ij_n, -1)
                     dense_k_arr[n] = dk
                     dense_l_arr[n] = dl
-                # T_buf and beta arrays — allocated once, refilled in place.
-                T_buf       = np.empty((N_b, n_kl, n_kl))
                 beta_kl_arr = np.empty(N_b)
                 beta_lk_arr = np.empty(N_b)
-                S_c = np.ascontiguousarray(bucket['S'])
-                K_c = np.ascontiguousarray(bucket['K'])
                 same_c = np.ascontiguousarray(bucket['same']).astype(
                     np.uint8, copy=False)
                 idx_c = np.ascontiguousarray(bucket['item_idx']).astype(
                     np.int64, copy=False)
-                # Pre-resolve the t2_pno_all references for fast per-cycle
-                # refill (saves dict lookups in the hot loop).
-                kl_refs = [t2_pno_all[k] for k in bucket['kl_keys']]
-                inv = {
-                    'T_buf': T_buf, 'beta_kl': beta_kl_arr,
-                    'beta_lk': beta_lk_arr,
-                    'p_ij_arr': p_ij_arr, 'dense_k_arr': dense_k_arr,
-                    'dense_l_arr': dense_l_arr,
-                    'S_c': S_c, 'K_c': K_c, 'same_c': same_c, 'idx_c': idx_c,
-                    'kl_refs': kl_refs,
-                }
+                if _be_gathered:
+                    # No stacked arrays; cache the offset arrays + master
+                    # pointers used by every cycle.
+                    S_off_c = np.ascontiguousarray(
+                        bucket['S_off']).astype(np.int64, copy=False)
+                    K_off_c = np.ascontiguousarray(
+                        bucket['K_off']).astype(np.int64, copy=False)
+                    T_off_c = np.ascontiguousarray(
+                        bucket['t2_off']).astype(np.int64, copy=False)
+                    inv = {
+                        'beta_kl': beta_kl_arr, 'beta_lk': beta_lk_arr,
+                        'p_ij_arr': p_ij_arr, 'dense_k_arr': dense_k_arr,
+                        'dense_l_arr': dense_l_arr,
+                        'same_c': same_c, 'idx_c': idx_c,
+                        'S_off_c': S_off_c, 'T_off_c': T_off_c,
+                        'K_off_c': K_off_c,
+                        'gathered': True,
+                    }
+                else:
+                    T_buf = np.empty((N_b, n_kl, n_kl))
+                    S_c = np.ascontiguousarray(bucket['S'])
+                    K_c = np.ascontiguousarray(bucket['K'])
+                    kl_refs = [t2_pno_all[k] for k in bucket['kl_keys']]
+                    inv = {
+                        'T_buf': T_buf, 'beta_kl': beta_kl_arr,
+                        'beta_lk': beta_lk_arr,
+                        'p_ij_arr': p_ij_arr, 'dense_k_arr': dense_k_arr,
+                        'dense_l_arr': dense_l_arr,
+                        'S_c': S_c, 'K_c': K_c, 'same_c': same_c,
+                        'idx_c': idx_c,
+                        'kl_refs': kl_refs,
+                        'gathered': False,
+                    }
                 bucket['_inv_cache'] = inv
 
-            T_buf       = inv['T_buf']
             beta_kl_arr = inv['beta_kl']
             beta_lk_arr = inv['beta_lk']
             p_ij_arr    = inv['p_ij_arr']
             dense_k_arr = inv['dense_k_arr']
             dense_l_arr = inv['dense_l_arr']
-            S_c         = inv['S_c']
-            K_c         = inv['K_c']
             same_c      = inv['same_c']
             idx_c       = inv['idx_c']
-            # Per-cycle: refill T_buf in place from current t2_pno_all values.
-            kl_refs = inv['kl_refs']
-            for n, src in enumerate(kl_refs):
-                np.copyto(T_buf[n], src)
-            T_c = T_buf  # alias; already contiguous (np.empty default)
             n_pairs_in_group = len(be_plan['pairs_by_n_ij'][n_ij])
             buckets_arr[b_idx].N = int(N_b)
             buckets_arr[b_idx].n_ij = int(n_ij)
             buckets_arr[b_idx].n_kl = int(n_kl)
             buckets_arr[b_idx].n_slots = int(n_pairs_in_group)
-            buckets_arr[b_idx].S           = S_c.ctypes.data
-            buckets_arr[b_idx].T           = T_c.ctypes.data
-            buckets_arr[b_idx].K           = K_c.ctypes.data
             buckets_arr[b_idx].beta_kl     = beta_kl_arr.ctypes.data
             buckets_arr[b_idx].beta_lk     = beta_lk_arr.ctypes.data
             buckets_arr[b_idx].same        = same_c.ctypes.data
@@ -1281,9 +1305,46 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             buckets_arr[b_idx].p_ij_arr    = p_ij_arr.ctypes.data
             buckets_arr[b_idx].dense_k_arr = dense_k_arr.ctypes.data
             buckets_arr[b_idx].dense_l_arr = dense_l_arr.ctypes.data
-            be_owned_buckets.extend([S_c, T_c, K_c, beta_kl_arr,
-                                     beta_lk_arr, same_c, idx_c,
-                                     p_ij_arr, dense_k_arr, dense_l_arr])
+            if inv.get('gathered'):
+                buckets_arr[b_idx].S        = 0
+                buckets_arr[b_idx].T        = 0
+                buckets_arr[b_idx].K        = 0
+                buckets_arr[b_idx].S_master = be_plan[
+                    'S_pno_master'].ctypes.data
+                buckets_arr[b_idx].T_master = t2_pno_all._buffer.ctypes.data
+                buckets_arr[b_idx].K_master = be_plan[
+                    'K_iajb_master'].ctypes.data
+                buckets_arr[b_idx].S_off    = inv['S_off_c'].ctypes.data
+                buckets_arr[b_idx].T_off    = inv['T_off_c'].ctypes.data
+                buckets_arr[b_idx].K_off    = inv['K_off_c'].ctypes.data
+                be_owned_buckets.extend([
+                    beta_kl_arr, beta_lk_arr, same_c, idx_c,
+                    p_ij_arr, dense_k_arr, dense_l_arr,
+                    inv['S_off_c'], inv['T_off_c'], inv['K_off_c'],
+                    be_plan['S_pno_master'], be_plan['K_iajb_master'],
+                    t2_pno_all._buffer,
+                ])
+            else:
+                T_buf       = inv['T_buf']
+                S_c         = inv['S_c']
+                K_c         = inv['K_c']
+                kl_refs     = inv['kl_refs']
+                # Per-cycle refill of T_buf in place from current t2_pno_all.
+                for n, src in enumerate(kl_refs):
+                    np.copyto(T_buf[n], src)
+                T_c = T_buf
+                buckets_arr[b_idx].S        = S_c.ctypes.data
+                buckets_arr[b_idx].T        = T_c.ctypes.data
+                buckets_arr[b_idx].K        = K_c.ctypes.data
+                buckets_arr[b_idx].S_master = 0
+                buckets_arr[b_idx].T_master = 0
+                buckets_arr[b_idx].K_master = 0
+                buckets_arr[b_idx].S_off    = 0
+                buckets_arr[b_idx].T_off    = 0
+                buckets_arr[b_idx].K_off    = 0
+                be_owned_buckets.extend([S_c, T_c, K_c, beta_kl_arr,
+                                         beta_lk_arr, same_c, idx_c,
+                                         p_ij_arr, dense_k_arr, dense_l_arr])
 
         unique_arr = np.asarray(unique_n_ij, dtype=np.int32)
         own.extend([buckets_arr, unique_arr, flat_off])
@@ -1301,7 +1362,7 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             p = key_to_p.get(key, -1)
             if p < 0:
                 continue
-            n_ij = pno_spaces[key]['C_pno'].shape[1]
+            n_ij = pno_spaces[key]['n_pno']
             if n_ij in unique_n_ij:
                 be_pair_n_ij_idx_arr[p] = unique_n_ij.index(n_ij)
                 be_pair_slot_arr[p] = slot
@@ -1644,6 +1705,13 @@ def run_remaining_cycles_via_class(
     plan_struct.t1_cache_buffer = t1_cache._buffer.ctypes.data
     g_plan_struct, g_plan_own = _extract_g_tilde_plan(key_to_p)
     _pmark('extract per_kl + g_tilde plans', _t)
+    # Note: the class drop-in keeps reading per-cycle gather metadata
+    # (`bv['c_t2_canon_off']`, `bv['c_t2_trans_arr']`, etc.) from inside
+    # the python plan dicts during the cycle loop. Clearing the plan
+    # caches here corrupted the residual at S22-1 (E_int went from
+    # -1.65 to -26.6 kcal/mol) — not safe. The plan caches stay alive
+    # until run_lccsd returns, and `_free_ccsd_plan_caches()` clears
+    # them in the driver between Stage 5 and Stage 6.
 
     # Strong-pair mask (cycle-invariant).  For DIIS we emit T1 (nocc slots)
     # + T2 over STRONG pairs (matching PySCF DIIS vector layout).

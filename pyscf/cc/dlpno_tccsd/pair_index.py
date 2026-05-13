@@ -76,13 +76,13 @@ class PairIndex:
         self.n_pairs = len(self.canonical_keys)
         self.nocc = int(nocc)
 
-        # n_pno[p] from pno_spaces[k]['C_pno'].shape[1].
+        # n_pno[p] from pno_spaces[k]['n_pno'].
         self.n_pno = np.empty(self.n_pairs, dtype=np.int32)
         for p, k in enumerate(self.canonical_keys):
             space = pno_spaces.get(k)
             if space is None:
                 raise KeyError(f"pno_spaces missing key {k}")
-            self.n_pno[p] = int(space["C_pno"].shape[1])
+            self.n_pno[p] = int(space["n_pno"])
 
         # Domain LMOs per pair (ragged).  Falls back to full nocc when
         # pair_lmo_idx is None or lacks the key — matches the convention
@@ -907,12 +907,12 @@ def assert_consistent_with_dicts(
       * canonical_keys is exactly the sorted set of normalised keys in
         pno_spaces (with n_pno > 0).  A subset is OK — we only require
         that every canonical_key is present in pno_spaces.
-      * n_pno[p] matches pno_spaces[k]['C_pno'].shape[1].
+      * n_pno[p] matches pno_spaces[k]['n_pno'].
       * domain_lmos[p] matches pair_lmo_idx[k] when present.
     """
     for p, k in enumerate(pair_index.canonical_keys):
         assert k in pno_spaces, f"canonical_keys has {k} absent from pno_spaces"
-        expected = int(pno_spaces[k]["C_pno"].shape[1])
+        expected = int(pno_spaces[k]["n_pno"])
         got = int(pair_index.n_pno[p])
         assert got == expected, (
             f"n_pno mismatch at {k}: PairIndex={got} pno_spaces={expected}"

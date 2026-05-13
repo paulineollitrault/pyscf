@@ -1614,8 +1614,14 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     """
     log = logger.new_logger(mf, verbose)
     import time as _time
+    import os as _os_tp
+    _tp_dbg = bool(int(_os_tp.environ.get('DLPNO_T_PROFILE', '0')))
+    _tp_t = [_time.perf_counter()]
     def _tp(label):
-        pass
+        if _tp_dbg:
+            now = _time.perf_counter()
+            print(f'  [T-PROFILE] {label}: {now - _tp_t[0]:.2f}s', flush=True)
+            _tp_t[0] = now
 
     if not hasattr(mf, 'with_df') or mf.with_df is None:
         import warnings
@@ -1645,8 +1651,12 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
         t2_for_T = t2_pno_all
     _tp("CAS T2 zeroing")
 
-    # Fock diagonal in LMO basis for occupied orbital energies
-    fock_ao = mf.get_fock()
+    # Fock diagonal in LMO basis for occupied orbital energies.
+    # Pick up the cached F_AO the driver stored before cderi was
+    # released — avoids a J/K rebuild here.
+    fock_ao = getattr(mf, '_dlpno_fock_ao', None)
+    if fock_ao is None:
+        fock_ao = mf.get_fock()
     F_lmo = reduce(np.dot, (C_lmo.T, fock_ao, C_lmo))
 
     occ_list = list(range(nocc_lmo))
@@ -1701,16 +1711,22 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
 
     _tp("valid_triples enumerate")
 
-    # Preload all DF 3-index integrals into memory (single HDF5 read).
-    # This makes all subsequent nr_e2 calls thread-safe and eliminates
-    # redundant I/O (~252 DF reads → 1).
+    # The default Phase 3c-2 (T) path goes through _orch_full, which
+    # builds its own per-aux sparse stack via build_sparse_df_arrays
+    # (libcint shell-by-shell, never reads cderi).  Lpq_full is only
+    # consumed by the opt-in DLPNO_TRIPLE_OMP=1 OMP-over-triples driver
+    # and by the optional run_lccsd_t1_iterations path; build it lazily
+    # if either is requested. At water-64 this single allocation was
+    # ~51 GB (5376 aux × 1.18M nao_pair × 8 bytes) for a tensor that's
+    # never touched in the default path.
     _t0 = _time.perf_counter()
-    Lpq_full = _preload_df_integrals(mf.with_df)
-    _dt_preload = _time.perf_counter() - _t0
-    log.info('(T) preloaded DF integrals: shape=%s, %.1f MB, %.2f s',
-             Lpq_full.shape,
-             Lpq_full.nbytes / 1e6,
-             _dt_preload)
+    if os.environ.get('DLPNO_TRIPLE_OMP', '0') == '1':
+        Lpq_full = _preload_df_integrals(mf.with_df)
+        log.info('(T) preloaded DF integrals: shape=%s, %.1f MB, %.2f s',
+                 Lpq_full.shape, Lpq_full.nbytes / 1e6,
+                 _time.perf_counter() - _t0)
+    else:
+        Lpq_full = None  # _orch_full doesn't read it
     _tp("preload Lpq_full")
 
     # --- Build sparse-DF infrastructure for triple-local aux path ---
@@ -1748,17 +1764,33 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             [lbl[0] for lbl in _auxmol.ao_labels(fmt=False)])
         _atom_to_ao = [np.where(_atom_ids == a)[0] for a in range(_natm)]
 
-        def _build_triples_infrastructure(T_CUT_MKN, T_CUT_DO, label):
+        def _build_triples_infrastructure(T_CUT_MKN, T_CUT_DO, label,
+                                          tight_sparse=None, tight_screen=None):
             """Build lmo_aux_mask, pao_domains, screening, and sparse_df stacks
             at the given thresholds. Mirrors Psi4 triples_sparsity(prescreening).
+
+            If ``tight_sparse`` and ``tight_screen`` are passed in, the
+            sparse-DF arrays (qij/qia/qab) are derived by slicing the tight
+            build instead of recomputing the int3c2e integrals. PRESCREEN
+            uses tighter Mulliken / looser DOI thresholds → its per-atom
+            (lmos_ext, paos_ext) are strict subsets of TIGHT's, so the
+            integrals are a no-op subset extract (~tenths of a second) vs
+            the full rebuild (3-10s scaling N^2.6).
             """
+            _bi_t = [_time.perf_counter()]
             def _bi(step):
-                pass
+                if _tp_dbg:
+                    now = _time.perf_counter()
+                    print(f'    [T-BI {label}] {step}: {now - _bi_t[0]:.2f}s',
+                          flush=True)
+                    _bi_t[0] = now
 
             # --- lmo_aux_mask: per-LMO Mulliken-weighted aux-atom mask ---
-            # Parallel over LMOs via shared pool — pre-cache atom-id masks
-            # once outside the per-LMO worker so each task is GIL-light.
-            _atom_id_masks_t = [(_atom_ids == _a) for _a in range(_natm)]
+            # Vectorised with row/col sum + bincount (no per-atom fancy
+            # indexing — that pattern blew up to ~50s at water-34, scaling
+            # as N_atom × nao² of memory traffic per LMO).  Serial loop;
+            # pool dispatch over this small element-wise kernel was a
+            # 30× regression at large N due to GIL + memory pressure.
             def _t_mkn_per_lmo(ii):
                 c_i = C_lmo[:, ii]
                 P_i = s1e * c_i[:, None] * c_i[None, :]
@@ -1769,20 +1801,16 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                                    p_diag[:, None] / sum_diag, 0.0)
                     w_v = np.where(sum_diag > 1e-15,
                                    p_diag[None, :] / sum_diag, 0.0)
-                contrib_u = P_i * w_u
-                contrib_v = P_i * w_v
-                mkn_pop = np.empty(_natm)
-                for _a in range(_natm):
-                    m = _atom_id_masks_t[_a]
-                    mkn_pop[_a] = (np.sum(contrib_u[m, :])
-                                   + np.sum(contrib_v[:, m]))
+                row_sum_u = (P_i * w_u).sum(axis=1)
+                col_sum_v = (P_i * w_v).sum(axis=0)
+                mkn_pop = (np.bincount(_atom_ids, weights=row_sum_u,
+                                       minlength=_natm)
+                         + np.bincount(_atom_ids, weights=col_sum_v,
+                                       minlength=_natm))
                 return np.isin(
                     _aux_atom_ids,
                     np.where(np.abs(mkn_pop) > T_CUT_MKN)[0])
-            if _pool is not None and nocc_lmo > 1:
-                mask_rows = list(_pool.map(_t_mkn_per_lmo, range(nocc_lmo)))
-            else:
-                mask_rows = [_t_mkn_per_lmo(ii) for ii in range(nocc_lmo)]
+            mask_rows = [_t_mkn_per_lmo(ii) for ii in range(nocc_lmo)]
             lmo_aux_mask = np.array(mask_rows)
             _bi("lmo_aux_mask (Mulliken)")
 
@@ -1822,12 +1850,22 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                 T_CUT_MKN=T_CUT_MKN, T_CUT_CLMO=_T_CUT_CLMO, C_pao=C_pao,
                 _pool=_pool)
             _bi("_build_screen")
-            # Pass the shared thread pool so the per-aux-shell loop runs
-            # parallel. Without this, _build_sparse iterates serially over
-            # all aux shells in Python — dominates (T) wall at large N
-            # (61s of 78s on water-22).
-            sparse_df = _build_sparse(
-                mf.mol, _auxmol, C_lmo, C_pao, screening, _pool=_pool)
+            # PRESCREEN: derive sparse-DF by slicing the TIGHT build instead
+            # of recomputing integrals. PRESCREEN per-atom domains are
+            # subsets of TIGHT's (looser MKN/DOI), so this is exact, not an
+            # approximation. Saves the full int3c2e rebuild (3-10s wall at
+            # water-22..34, scaling N^2.6).
+            if tight_sparse is not None and tight_screen is not None:
+                from pyscf.cc.dlpno_tccsd.local_df import derive_subset_sparse_df
+                sparse_df = derive_subset_sparse_df(
+                    tight_sparse, tight_screen, screening)
+            else:
+                # Pass the shared thread pool so the per-aux-shell loop runs
+                # parallel. Without this, _build_sparse iterates serially over
+                # all aux shells in Python — dominates (T) wall at large N
+                # (61s of 78s on water-22).
+                sparse_df = _build_sparse(
+                    mf.mol, _auxmol, C_lmo, C_pao, screening, _pool=_pool)
             _bi("_build_sparse")
             aux_atom_ids_arr = screening['aux_atom_ids']
             naux_total = len(sparse_df['qij'])
@@ -1952,7 +1990,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
         if T_CutTriplesWeak > 0.0:
             _lmo_aux_mask_pre, _pao_domains_pre, _screening_pre, _sparse_df_pre = \
                 _build_triples_infrastructure(
-                    _T_CUT_MKN_TRIPLES_PRE, _T_CUT_DO_TRIPLES_PRE, 'prescreen')
+                    _T_CUT_MKN_TRIPLES_PRE, _T_CUT_DO_TRIPLES_PRE, 'prescreen',
+                    tight_sparse=_sparse_df, tight_screen=_screening)
             _tp("build PRESCREEN sparse-DF infra")
         else:
             _lmo_aux_mask_pre = _lmo_aux_mask
@@ -2447,7 +2486,9 @@ def run_lccsd_t1_iterations(mf, C_lmo, pno_spaces, strong_pairs,
     occ_cas_set = set(occ_cas_idx.tolist()) if occ_cas_idx is not None else set()
     nocc = C_lmo.shape[1]
     s1e = mf.get_ovlp()
-    fock_ao = mf.get_fock()
+    fock_ao = getattr(mf, '_dlpno_fock_ao', None)
+    if fock_ao is None:
+        fock_ao = mf.get_fock()
     F_lmo = reduce(np.dot, (C_lmo.T, fock_ao, C_lmo))
 
     # Zero CAS T2 amplitudes
