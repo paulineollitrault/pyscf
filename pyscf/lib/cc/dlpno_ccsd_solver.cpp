@@ -258,6 +258,32 @@ extern "C" void DLPNOt1_fock_batched(
 
 namespace pyscf_dlpno_ccsd {
 
+// -- OpenMP team size for the per-phase parallel-over-pairs regions ----------
+//
+// The DLPNO driver runs with OMP_NUM_THREADS=1 so the Python ThreadPool
+// dispatching cc_ints / (T) is not oversubscribed by BLAS.  Around the CCSD
+// cycle loop ONLY, the Python side raises the OpenMP team via threadpoolctl
+// (DLPNO_CCSD_CYCLE_OMP) — the pool is idle there, so the cycle's own
+// parallel regions can use the whole machine.  omp_get_max_threads() thus
+// already reflects that raised team.  This helper additionally clamps it to
+// DLPNO_SOLVER_MAX_THREADS when that env var is set — a benchmarking / safety
+// knob.  Default cap 64 (machine has 64 physical cores; hyperthreads past
+// that thrash a bandwidth-bound DGEMM kernel).
+static int solver_team_size() {
+#ifdef _OPENMP
+    int team = omp_get_max_threads();
+    int cap = 64;
+    const char *env = std::getenv("DLPNO_SOLVER_MAX_THREADS");
+    if (env != nullptr && env[0] != '\0') {
+        int v = std::atoi(env);
+        if (v > 0) cap = v;
+    }
+    return (team < cap) ? team : cap;
+#else
+    return 1;
+#endif
+}
+
 // -- Pair-axis flat tensor view (non-owning) ---------------------------------
 //
 // Mirrors the layout introduced in the cc_ints storage refactor + Phase III
@@ -1115,7 +1141,7 @@ void DLPNOCCSDSolver::run_phase_t1_fock_into(T1FockOutputs *out) {
 
     int num_threads = 1;
     #ifdef _OPENMP
-        num_threads = std::min(omp_get_max_threads(), 16);
+        num_threads = solver_team_size();
         if (N < num_threads) num_threads = (N > 0) ? N : 1;
     #endif
 
@@ -1243,6 +1269,18 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     // Per-phase profiling (set DLPNO_CCSD_PROFILE=1 to enable).
     const bool _profile = (std::getenv("DLPNO_CCSD_PROFILE") != nullptr
                             && std::getenv("DLPNO_CCSD_PROFILE")[0] != '0');
+    if (_profile) {
+        int _omp_max = 1, _omp_procs = 1;
+        #ifdef _OPENMP
+            _omp_max   = omp_get_max_threads();
+            _omp_procs = omp_get_num_procs();
+        #endif
+        std::fprintf(stderr,
+            "[CCSD-PROFILE] run_one_cycle entry: omp_get_max_threads=%d "
+            "omp_get_num_procs=%d  -> per-phase team size=%d\n",
+            _omp_max, _omp_procs, solver_team_size());
+        std::fflush(stderr);
+    }
     using _clock = std::chrono::high_resolution_clock;
     auto _t0 = _clock::now();
     auto _tprev = _t0;
@@ -1700,7 +1738,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                 if (_be_use_v2 && !_gathered) {
                     int num_threads = 1;
 #ifdef _OPENMP
-                    num_threads = std::min(omp_get_max_threads(), 16);
+                    num_threads = solver_team_size();
                     if (bucket->N > 0 && num_threads > bucket->N)
                         num_threads = bucket->N;
 #endif
@@ -2096,7 +2134,7 @@ void DLPNOCCSDSolver::run_phase_t1_residual_AC_init_into(
     // ------------------------------------------------------------------
     int num_threads = 1;
     #ifdef _OPENMP
-        num_threads = std::min(omp_get_max_threads(), 16);
+        num_threads = solver_team_size();
         if (N_ord > 0 && num_threads > N_ord) num_threads = N_ord;
     #endif
     std::vector<double> R1_thread((size_t)num_threads * total_R1, 0.0);
@@ -2670,7 +2708,7 @@ void DLPNOCCSDSolver::run_phase_t3_into(
     const T3Inputs *plan, T3Outputs *out) {
     int num_threads = 1;
     #ifdef _OPENMP
-        num_threads = std::min(omp_get_max_threads(), 16);
+        num_threads = solver_team_size();
         if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
     #endif
     const size_t Kt1_stride    = (size_t)plan->max_n_kl;
@@ -2694,7 +2732,7 @@ void DLPNOCCSDSolver::run_phase_t4_into(
     const T4Inputs *plan, T4Outputs *out) {
     int num_threads = 1;
     #ifdef _OPENMP
-        num_threads = std::min(omp_get_max_threads(), 16);
+        num_threads = solver_team_size();
         if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
     #endif
     const size_t tmp1_stride = (size_t)plan->max_n_ki * plan->max_n_li;
@@ -2724,7 +2762,7 @@ void DLPNOCCSDSolver::run_phase_g_term_into(
     const GTermInputs *plan, GTermOutputs *out) {
     int num_threads = 1;
     #ifdef _OPENMP
-        num_threads = std::min(omp_get_max_threads(), 16);
+        num_threads = solver_team_size();
         if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
     #endif
     const size_t tmp_stride = (size_t)plan->max_n_ij * plan->max_n_ik;
@@ -2746,7 +2784,7 @@ void DLPNOCCSDSolver::run_phase_c_term_into(
     const CTermInputs *plan, CTermOutputs *out) {
     int num_threads = 1;
     #ifdef _OPENMP
-        num_threads = std::min(omp_get_max_threads(), 16);
+        num_threads = solver_team_size();
         if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
     #endif
     const size_t STB_stride   = (size_t)plan->max_n_pno * plan->max_n_ct;
@@ -2776,7 +2814,7 @@ void DLPNOCCSDSolver::run_phase_d_term_into(
     const DTermInputs *plan, DTermOutputs *out) {
     int num_threads = 1;
     #ifdef _OPENMP
-        num_threads = std::min(omp_get_max_threads(), 16);
+        num_threads = solver_team_size();
         if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
     #endif
     const size_t SU_stride   = (size_t)plan->max_n_pno * plan->max_n_A;
@@ -2808,7 +2846,7 @@ void DLPNOCCSDSolver::run_phase_be_into(
     const BEInputs *plan, BEOutputs *out) {
     int num_threads = 1;
     #ifdef _OPENMP
-        num_threads = std::min(omp_get_max_threads(), 16);
+        num_threads = solver_team_size();
         if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
     #endif
     if (plan->S_master != nullptr && plan->T_master != nullptr
@@ -2837,7 +2875,7 @@ void DLPNOCCSDSolver::run_phase_t1_residual_per_kl_into(
     const PerKlPlanInputs *plan, PerKlOutputs *out) {
     int num_threads = 1;
     #ifdef _OPENMP
-        num_threads = std::min(omp_get_max_threads(), 16);
+        num_threads = solver_team_size();
         if (plan->n_tasks > 0 && num_threads > plan->n_tasks)
             num_threads = plan->n_tasks;
     #endif

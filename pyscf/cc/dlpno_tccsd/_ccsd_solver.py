@@ -1812,19 +1812,23 @@ def run_remaining_cycles_via_class(
     e_prev = float('-inf')
 
     # Inside `run_one_cycle` every C-kernel reads `omp_get_max_threads()`
-    # to set its team size.  When the driver runs with
-    # `OMP_NUM_THREADS=1` (so the Python pool can dispatch cc_ints /
-    # S_pno builds without OMP oversubscription), this returns 1 and
-    # every class kernel runs SINGLE-THREADED.  The pool is idle while
-    # the class iterates, so it's safe (and a big win) to bump the OMP
-    # team inside the cycle loop only.  On water-22 baseline per-cycle
-    # wall = 5.0 s; with OMP=16 each phase's BLAS dgemms parallelise
-    # and per-cycle drops by O(2-4×).
+    # (clamped by solver_team_size() in dlpno_ccsd_solver.cpp) to set its
+    # team size.  When the driver runs with `OMP_NUM_THREADS=1` (so the
+    # Python pool can dispatch cc_ints / S_pno builds without OMP
+    # oversubscription), this returns 1 and every class kernel runs
+    # SINGLE-THREADED.  The pool is idle while the class iterates, so it's
+    # safe (and a big win) to bump the OMP team inside the cycle loop only.
+    #
+    # Default 32: an MOBH35-33 def2-tzvpp sweep (2026-05-19) gave per-cycle
+    # wall 3.80 s @16, 3.50 s @32, 3.55 s @48, 3.72 s @64 — 32 is the sweet
+    # spot.  Past 32 the dominant phases (BE kernel, C/D-tilde) stop scaling
+    # and thread contention regresses the total.  Override via
+    # DLPNO_CCSD_CYCLE_OMP; the C side honours up to DLPNO_SOLVER_MAX_THREADS.
     try:
         from threadpoolctl import threadpool_limits as _tpl
     except ImportError:
         _tpl = None
-    _omp_n = int(os.environ.get('DLPNO_CCSD_CYCLE_OMP', '16'))
+    _omp_n = int(os.environ.get('DLPNO_CCSD_CYCLE_OMP', '32'))
     _omp_ctx = (_tpl(limits=_omp_n, user_api='openmp')
                  if _tpl is not None and _omp_n > 1 else None)
     if _omp_ctx is not None:

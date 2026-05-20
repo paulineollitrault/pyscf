@@ -15,6 +15,20 @@ import os
 import numpy as np
 
 
+def _ccmem(label):
+    """Print [CCMEM/<label>] RSS if DLPNO_MEM_PROBE=1 (process VmRSS)."""
+    if not os.environ.get('DLPNO_MEM_PROBE'):
+        return
+    try:
+        for ln in open('/proc/self/status'):
+            if ln.startswith('VmRSS:'):
+                rss = int(ln.split()[1]) / 1048576.0
+                print(f'  [CCMEM/{label}] RSS={rss:.2f} GiB', flush=True)
+                return
+    except OSError:
+        pass
+
+
 def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
                          T_CUT_MKN=1e-3, T_CUT_CLMO=1e-3, C_pao=None,
                          _pool=None):
@@ -815,17 +829,20 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         strong_pair_keys = list(keys)
 
     import time as _ccints_setup_time
+    _ccmem('cc_ints:entry')
     _t_setup0 = _ccints_setup_time.perf_counter()
     if screening_maps is None:
         screening_maps = build_screening_maps(
             mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
             T_CUT_MKN=T_CUT_MKN, T_CUT_CLMO=T_CUT_CLMO, C_pao=C_pao)
     _t_screening = _ccints_setup_time.perf_counter() - _t_setup0
+    _ccmem('cc_ints:after_screening_maps')
     _t_setup0 = _ccints_setup_time.perf_counter()
     if sparse_arrays is None:
         sparse_arrays = build_sparse_df_arrays(
             mol, auxmol, C_lmo, C_pao, screening_maps, _pool=_pool)
     _t_sparse = _ccints_setup_time.perf_counter() - _t_setup0
+    _ccmem('cc_ints:after_sparse_arrays')
 
     qij = sparse_arrays['qij']
     qia = sparse_arrays['qia']
@@ -1595,8 +1612,79 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     # work is read-only on shared inputs (pno_spaces, pair_aux_idx, sparse
     # arrays) and writes only to its own local arrays before returning the
     # cc_ints entry — thread-safe.
+    #
+    # Memory-bounded wave dispatch: each _process_pair worker holds a
+    # transient working set whose dominant terms scale as
+    #   n_local * npno * (npno + Sum_partner n_partner_pno).
+    # For a small molecule in a large basis (e.g. def2-QZVPP) n_local is
+    # nearly the full aux set and there are many partners, so a single pair
+    # can transiently need 10+ GiB. With a 64-thread pool admitting all
+    # pairs at once this peaked at ~210 GiB on MOBH35 / def2-QZVPP.
+    #
+    # We instead admit pairs in waves whose summed estimate stays under a
+    # RAM budget. Small pairs (the majority) still fill the whole pool;
+    # only the few big pairs run with reduced concurrency. When the whole
+    # job fits in one wave (small systems / bases) this is exactly the old
+    # behaviour — no barrier, no slowdown.
+    def _pair_mem_estimate(_k):
+        """Rough per-pair transient working set, in bytes."""
+        _xp = pno_spaces.get(_k, {}).get('X_pno')
+        if _xp is None or _k not in pair_aux_idx:
+            return 0
+        _npno = _xp.shape[1]
+        _nloc = len(np.asarray(pair_aux_idx[_k]))
+        # raw_ab (n_local,npno,npno) is the cheap-to-evaluate proxy; the
+        # full footprint (partner-cross flat buffers, raw_ma, the entry)
+        # was calibrated against the measured 64-way peak at ~30x raw_ab.
+        return int(30 * _nloc * _npno * _npno * 8)
+
+    # Per-pair-concurrency RAM budget for the cc_ints build (env-tunable).
+    # Default 110 GiB: caps the cc_ints transient peak near ~183 GiB on a
+    # def2-QZVPP / Pt-complex run (vs ~210 GiB unthrottled) with only a
+    # small cc_ints-build slowdown. Lower it (e.g. 85) for more headroom,
+    # raise it (e.g. 150) to minimise throttling on a large-RAM host.
+    _budget = float(os.environ.get('DLPNO_CCINTS_MEM_GIB', '110')) * 2**30
+    _ests = {_k: _pair_mem_estimate(_k) for _k in keys}
+    _have_submit = _pool is not None and hasattr(_pool, 'submit')
+
+    if os.environ.get('DLPNO_MEM_PROBE'):
+        _szs = sorted(e / 2**30 for e in _ests.values() if e > 0)
+        if _szs:
+            print(f'  [CCMEM/cc_ints_dispatch] n_pairs={len(_szs)} '
+                  f'est_min={_szs[0]:.2f} est_med={_szs[len(_szs)//2]:.2f} '
+                  f'est_max={_szs[-1]:.2f} est_sum={sum(_szs):.1f} GiB '
+                  f'budget={_budget/2**30:.0f} GiB', flush=True)
+    _ccmem('cc_ints:before_pool_map')
     _t_pool_start = _ccints_setup_time.perf_counter()
-    if _pool is not None:
+    if _have_submit and sum(_ests.values()) > _budget:
+        # Continuous memory-gated scheduling (no wave barriers): admit
+        # pairs largest-first, keeping the summed in-flight estimate under
+        # the RAM budget. When a pair finishes its estimate is released and
+        # the next pair is admitted — the pool stays maximally full subject
+        # only to the memory cap. Small pairs (the majority) keep full
+        # 64-way concurrency; only the few big pairs are throttled.
+        from concurrent.futures import FIRST_COMPLETED, wait as _fut_wait
+        _ordered = sorted(keys, key=lambda _k: _ests[_k], reverse=True)
+        _running = {}        # future -> estimate
+        _committed = 0
+        _idx = 0
+        while _idx < len(_ordered) or _running:
+            while _idx < len(_ordered):
+                _e = _ests[_ordered[_idx]]
+                # Always admit if nothing is running (cannot do better);
+                # otherwise honour the budget.
+                if _running and _committed + _e > _budget:
+                    break
+                _fut = _pool.submit(_process_pair, _ordered[_idx])
+                _running[_fut] = _e
+                _committed += _e
+                _idx += 1
+            _done, _ = _fut_wait(_running, return_when=FIRST_COMPLETED)
+            for _fut in _done:
+                _committed -= _running.pop(_fut)
+                k, entry = _fut.result()
+                cc_ints[k] = entry
+    elif _pool is not None:
         for k, entry in _pool.map(_process_pair, keys):
             cc_ints[k] = entry
     else:
@@ -1604,6 +1692,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             k, entry = _process_pair(key)
             cc_ints[k] = entry
     _t_pool_wall = _ccints_setup_time.perf_counter() - _t_pool_start
+    _ccmem('cc_ints:after_pool_map')
 
 
 
