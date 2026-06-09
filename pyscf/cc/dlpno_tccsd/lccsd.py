@@ -1318,6 +1318,22 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         _pool=_pool)
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
+    # CAS pairs (X_pno is None: their PNO basis includes the delocalised DMRG
+    # active virtuals) are skipped by the sparse local-aux builder. Build their
+    # cc_ints entries over the FULL aux instead, so they flow through the same
+    # maintained downstream path as the local strong pairs (see
+    # build_cas_pair_cc_ints). Without this they fall back to dead bare-path
+    # globals (ooL_3idx/Fab_all/J_oo, all None after the local-aux refactor).
+    from pyscf.cc.dlpno_tccsd.local_df import build_cas_pair_cc_ints
+    _cas_int_keys = [k for k in pno_spaces
+                     if _cc_ints.get(k) is None
+                     and pno_spaces[k]['C_pno'].shape[1] > 0]
+    for _ck in _cas_int_keys:
+        _cc_ints[_ck] = build_cas_pair_cc_ints(
+            _ck, pno_spaces, C_lmo, with_df, nocc)
+    if _cas_int_keys:
+        print(f'  CAS-pair full-aux integrals: {len(_cas_int_keys)} pairs',
+              flush=True)
     # Rebuild K_pno_cache from locally-fitted K_iajb
     for key in list(K_pno_cache.keys()):
         ci = _cc_ints.get(key)

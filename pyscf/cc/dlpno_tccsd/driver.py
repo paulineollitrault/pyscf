@@ -299,9 +299,22 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         mo_cas = mo_loc[:, ncore:ncore + ncas]
         h1e_cas, ecore = mc.h1e_for_cas()
 
-        from pyscf import ao2mo as _ao2mo
-        h2e_cas = _ao2mo.kernel(mol, mo_cas, compact=False).reshape(
-            ncas, ncas, ncas, ncas)
+        # Build the active-space 2e integrals with the SAME density fitting the
+        # rest of this method uses. h1e_for_cas() already folds in the DF core
+        # potential, so using exact (non-DF) ao2mo for h2e mixes DF and exact
+        # integrals and leaves a spurious DF-error offset in e_dmrg (e.g. a
+        # trivial 0-virtual CAS then sits ~310 uEh off the DF-HF reference
+        # instead of equalling it). Using DF h2e makes the DMRG-CI Hamiltonian
+        # fully DF-consistent: the trivial CAS reproduces DF-HF to <1 uEh and
+        # the tailoring amplitudes are taken from the same integrals as the
+        # DLPNO pair treatment.
+        if getattr(mf, 'with_df', None) is not None:
+            h2e_cas = mf.with_df.ao2mo(mo_cas, compact=False).reshape(
+                ncas, ncas, ncas, ncas)
+        else:
+            from pyscf import ao2mo as _ao2mo
+            h2e_cas = _ao2mo.kernel(mol, mo_cas, compact=False).reshape(
+                ncas, ncas, ncas, ncas)
 
         from pyblock2.driver.core import DMRGDriver, SymmetryTypes
         import os as _os
@@ -311,22 +324,47 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         n_elec = nalpha + nbeta
         spin = nalpha - nbeta
 
-        # Run DMRG-CI in SU2 mode (spin-adapted, more efficient)
+        # Run DMRG-CI in SU2 mode (spin-adapted, more efficient).
+        #
+        # Two settings are CRITICAL for converging to the true ground state
+        # (validated vs pyscf CASCI/FCI to <1 uEh; see
+        # ~/Work/3d_tmcs/dlpno_ccsdt_small_test.py):
+        #
+        #  (1) reorder=None on get_qc_mpo. The default Fiedler/gaopt orbital
+        #      reordering permutes the DMRG sites, which (a) misaligns the
+        #      reference-occupation MPS seed below and (b) breaks the
+        #      original-orbital-order assumption of the downstream amplitude
+        #      extraction. Keep sites in active-orbital order.
+        #
+        #  (2) occs=reference occupation on get_random_mps. A purely random
+        #      initial MPS lands in the wrong basin and single-root DMRG then
+        #      locks onto an EXCITED state — e.g. H2O cc-pVDZ CAS(4,4)
+        #      converged 305 mEh ABOVE the exact ground state, and the trivial
+        #      N2 CAS(10,5) sat 310 uEh above HF — even with heavy noise.
+        #      Seeding from the closed-/open-shell reference determinant (the
+        #      dominant configuration) fixes this; DMRG then hits exact FCI.
         su2_driver = DMRGDriver(scratch=dmrg_scratch, symm_type=SymmetryTypes.SU2,
                                 n_threads=ncores, stack_mem=int(100e9))
         su2_driver.initialize_system(n_sites=ncas, n_elec=n_elec, spin=spin)
-        mpo = su2_driver.get_qc_mpo(h1e_cas, h2e_cas, ecore=ecore, iprint=0)
+        mpo = su2_driver.get_qc_mpo(h1e_cas, h2e_cas, ecore=ecore,
+                                    reorder=None, iprint=0)
+
+        # Reference determinant occupation in active-orbital order:
+        # doubly-occupied (nbeta) | singly-occupied (nalpha-nbeta) | empty.
+        ref_occ = np.array([2] * nbeta + [1] * (nalpha - nbeta)
+                           + [0] * (ncas - nalpha))
 
         M1 = min(dmrg_maxM // 4, 100)
         M2 = min(dmrg_maxM // 2, 250)
         M3 = min(3 * dmrg_maxM // 4, 500)
-        ket_su2 = su2_driver.get_random_mps(tag="KET_SU2", bond_dim=M1, nroots=1)
+        ket_su2 = su2_driver.get_random_mps(tag="KET_SU2", bond_dim=M1,
+                                            nroots=1, occs=ref_occ)
         e_dmrg = su2_driver.dmrg(
             mpo, ket_su2,
             bond_dims=[M1, M2, M3, dmrg_maxM, dmrg_maxM],
             noises=[1e-4, 1e-4, 1e-5, 1e-5, 0],
             thrds=[1e-5, 1e-5, 1e-6, 1e-7, dmrg_tol],
-            tol=1e-6, n_sweeps=30, twosite_to_onesite=18, iprint=1)
+            tol=1e-6, n_sweeps=30, iprint=1)
 
         mc.e_tot = e_dmrg  # store for downstream use
         print(f'  E(DMRG-CI) = {e_dmrg:.10f}')

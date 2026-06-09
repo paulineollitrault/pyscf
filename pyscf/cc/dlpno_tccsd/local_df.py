@@ -794,6 +794,100 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     return cc_ints
 
 
+def build_cas_pair_cc_ints(key, pno_spaces, C_lmo, with_df, nocc):
+    """Build a cc_ints entry for a CAS pair using the FULL auxiliary basis.
+
+    CAS pairs have ``X_pno is None`` — their PNO basis ``C_pno`` includes the
+    (delocalised) DMRG active virtuals ``C_cas_vir``, which spill outside any
+    single pair's local PAO/aux domain — so ``compute_cc_integrals_sparse``
+    cannot build them (it returns None) and the per-pair *local-aux* path skips
+    them. Locality buys nothing for delocalised active orbitals anyway, so we
+    build the same quantities exactly over the full aux basis here.
+
+    Every field a consumer reads is an inner product over the aux index of
+    fitted 3-index integrals (q_iv, q_io, Qma, Qab, ...). Cholesky fitting
+    (``_build_ovL`` via ``with_df.loop()``) and the symmetric J^{-1/2} fitting
+    used by the local builder give identical results for any aux-contracted
+    quantity, so this entry is fully consistent with the local-aux strong-pair
+    entries. The returned dict matches ``_process_pair``'s schema exactly, so
+    CAS pairs then flow through the same maintained downstream code (B_tilde,
+    ladder, t1_ints, C/D_tilde, residual) as every other pair.
+    """
+    from pyscf.cc.dlpno_tccsd.pno import _build_ovL
+
+    i, j = key
+    C_pno = pno_spaces[key]['C_pno']
+    npno = C_pno.shape[1]
+    naux = with_df.get_naoaux()
+
+    # Fitted 3-index over full aux. _build_ovL(C_occ, C_vir) -> (nocc,nvir,naux)
+    # = (occ vir | L). We store the local-builder's convention q[Q, ...].
+    ov_ij = _build_ovL(with_df, C_lmo[:, [i, j]], C_pno)   # (2, npno, naux)
+    q_iv = np.ascontiguousarray(ov_ij[0].T)                # (naux, npno) = (Q|i a)
+    q_jv = np.ascontiguousarray(ov_ij[1].T)
+    oo_ij = _build_ovL(with_df, C_lmo[:, [i, j]], C_lmo)   # (2, nocc, naux)
+    q_io = np.ascontiguousarray(oo_ij[0].T)                # (naux, nocc) = (Q|i k)
+    q_jo = np.ascontiguousarray(oo_ij[1].T)
+    q_pair = np.ascontiguousarray(q_io[:, j])              # (naux,) = (Q|i j)
+    Qma = np.ascontiguousarray(
+        _build_ovL(with_df, C_lmo, C_pno).transpose(2, 0, 1))   # (naux,nocc,npno)
+    Qab = np.ascontiguousarray(
+        _build_ovL(with_df, C_pno, C_pno).transpose(2, 0, 1))   # (naux,npno,npno)
+
+    K_iajb = q_iv.T @ q_jv
+    K_mnij = q_io.T @ q_jo
+    K_bar_ij = q_io.T @ q_jv
+    K_bar_ji = q_jo.T @ q_iv
+    K_bar_chem = np.tensordot(q_pair, Qma, axes=(0, 0))    # (nocc, npno)
+    J_ijab = np.tensordot(q_pair, Qab, axes=(0, 0))        # (npno, npno)
+
+    # Cross-pair partners: every present pair sharing j (resp. i) with a
+    # non-empty PNO space. Each cross integral is fitted over the same full aux.
+    J_ij_kj, K_ij_kj_dict = {}, {}
+    J_ji_ki, K_ji_ki_dict = {}, {}
+    for k in range(nocc):
+        key_kj = (min(k, j), max(k, j))
+        pd_kj = pno_spaces.get(key_kj)
+        if pd_kj is not None and pd_kj['C_pno'].shape[1] > 0:
+            C_pno_kj = pd_kj['C_pno']
+            # (Q | a_ij c_kj): treat ij-PNO as "occ", kj-PNO as "vir"
+            cross = _build_ovL(with_df, C_pno, C_pno_kj)   # (npno, n_kj, naux)
+            cross = np.ascontiguousarray(cross.transpose(2, 0, 1))  # (naux,npno,n_kj)
+            J_ij_kj[(key, k)] = np.tensordot(q_io[:, k], cross, axes=(0, 0))
+            q_kv_kj = _build_ovL(with_df, C_lmo[:, [k]], C_pno_kj)[0].T  # (naux,n_kj)
+            K_ij_kj_dict[(key, k)] = q_iv.T @ q_kv_kj
+        key_ki = (min(k, i), max(k, i))
+        pd_ki = pno_spaces.get(key_ki)
+        if pd_ki is not None and pd_ki['C_pno'].shape[1] > 0:
+            C_pno_ki = pd_ki['C_pno']
+            cross = _build_ovL(with_df, C_pno, C_pno_ki)   # (npno, n_ki, naux)
+            cross = np.ascontiguousarray(cross.transpose(2, 0, 1))
+            J_ji_ki[(key, k)] = np.tensordot(q_jo[:, k], cross, axes=(0, 0))
+            q_kv_ki = _build_ovL(with_df, C_lmo[:, [k]], C_pno_ki)[0].T
+            K_ji_ki_dict[(key, k)] = q_jv.T @ q_kv_ki
+
+    return {
+        'K_iajb': K_iajb,
+        'K_mnij': K_mnij,
+        'K_bar_ij': K_bar_ij,
+        'K_bar_ji': K_bar_ji,
+        'K_bar_chem': K_bar_chem,
+        'J_ijab': J_ijab,
+        'J_ij_kj': J_ij_kj,
+        'K_ij_kj': K_ij_kj_dict,
+        'J_ji_ki': J_ji_ki,
+        'K_ji_ki': K_ji_ki_dict,
+        'i_Qa': q_iv.copy(),
+        'j_Qa': q_jv.copy(),
+        'i_Qk': q_io.copy(),
+        'j_Qk': q_jo.copy(),
+        'Qma': Qma,
+        'Qab': Qab,
+        'n_local': naux,
+        'aux_idx': np.arange(naux),
+    }
+
+
 def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc):
     """Build T1-dressed DF intermediates, matching Psi4 t1_ints().
 

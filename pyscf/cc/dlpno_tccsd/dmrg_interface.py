@@ -347,8 +347,17 @@ def extract_amplitudes_from_mps(driver, ket, ncas, nelec_cas, nocc_cas, nvir_cas
             phase = (-1) ** (i + j + dn)
             t2_cas[i, j, a, b] = phase * dvals[idx] / C0
 
+    # The loop above gives the CI coefficient c_ij^ab/C0 (the alpha-beta double
+    # excitation amplitude of the wavefunction). The tailored CLUSTER amplitude
+    # is the CONNECTED double (Lang et al. eq 4 / Veis et al. 2016):
+    #     t_ij^ab = c_ij^ab/C0 - t_i^a t_j^b
+    # Without subtracting the disconnected T1^2 term, the downstream CCSD (which
+    # rebuilds tau = t2 + t1 t1) double-counts T1^2, giving the wrong tailored
+    # energy for every CAS with non-zero singles (k>5). Subtract it here.
+    t2_cas -= np.einsum('ia,jb->ijab', t1_cas, t1_cas)
+
     log.note('CAS amplitudes extracted from MPS via exact CI projection '
-             '(Lang et al. eq 3-4).')
+             '(Lang et al. eq 3-4; connected t2 = c2/C0 - t1 t1).')
     return t1_cas, t2_cas
 
 
@@ -561,6 +570,11 @@ def get_cas_amplitudes(mc, verbose=None):
         t2_cas, C0 = _ci_to_t2(ci_2d, nocc_cas, ncas, nelec_cas)
         t1_cas = _ci_to_t1(ci_2d, nocc_cas, ncas, nelec_cas, C0)
         log.debug('C0 = %.8f  (|C0|^2 = %.6f)', C0, C0**2)
+        # _ci_to_t2 returns the CI coefficient c_ij^ab/C0; the tailored CLUSTER
+        # amplitude is the connected double t_ij^ab = c_ij^ab/C0 - t_i^a t_j^b.
+        # (Same fix as extract_amplitudes_from_mps; without it the downstream
+        # CCSD double-counts T1^2 via tau = t2 + t1 t1.)
+        t2_cas = t2_cas - np.einsum('ia,jb->ijab', t1_cas, t1_cas)
 
     # ------------------------------------------------------------------
     # DMRG fallback: spin-free 2-RDM (approximate, kept for compatibility).
