@@ -32,8 +32,9 @@ _libcc = _pyscf_lib.load_library('libcc')
 class PyFlatPairStore(ctypes.Structure):
     """Mirrors C++ ``pyscf_dlpno_ccsd::FlatPairStore``."""
     _fields_ = [
-        ('data',    ctypes.c_void_p),     # const double *
-        ('offsets', ctypes.c_void_p),     # const int64_t *
+        ('data',        ctypes.c_void_p),  # const double *
+        ('offsets',     ctypes.c_void_p),  # const int64_t * (sizes)
+        ('block_start', ctypes.c_void_p),  # const int64_t * or NULL (aliased pos)
     ]
 
 
@@ -512,6 +513,7 @@ class PyCTermInputs(ctypes.Structure):
         ('S_outer_flat',  ctypes.c_void_p),
         ('ct_flat',       ctypes.c_void_p),
         ('t2_flat',       ctypes.c_void_p),
+        ('t2_trans',      ctypes.c_void_p),
         ('max_n_pno',     ctypes.c_int),
         ('max_n_ct',      ctypes.c_int),
         ('max_n_other',   ctypes.c_int),
@@ -559,6 +561,9 @@ class PyDTermInputs(ctypes.Structure):
         ('KJ_flat',     ctypes.c_void_p),
         ('u_flat',      ctypes.c_void_p),
         ('dt_flat',     ctypes.c_void_p),
+        ('u_base',      ctypes.c_void_p),
+        ('u_canon_off', ctypes.c_void_p),
+        ('u_trans',     ctypes.c_void_p),
         ('max_n_pno',   ctypes.c_int),
         ('max_n_A',     ctypes.c_int),
         ('max_n_B',     ctypes.c_int),
@@ -1227,8 +1232,18 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             # copies.  C kernel reads S/T/K directly via offsets — eliminate
             # T_buf, S_c, K_c entirely.  Saves ~1.5 GB at water-22, scales
             # as N_pair² × n_pno² (cc-pVTZ water-49+ requires this).
-            _be_gathered = (bucket['S'] is None
-                            and be_plan.get('gathered_mode'))
+            # Gathered (memory-light) when either: full gathered_mode, OR the
+            # cycle-0 deferred-stack path left only ref-lists but the master
+            # flats + per-bucket offsets are available (class_gathered).  This
+            # lets the class read S/T/K via offsets instead of rebuilding and
+            # caching the +55 GiB S_c/K_c stacks for the whole class phase.
+            _be_gathered = (
+                (be_plan.get('gathered_mode') or be_plan.get('class_gathered'))
+                and bucket.get('S_off') is not None
+                and bucket.get('K_off') is not None
+                and bucket.get('t2_off') is not None
+                and be_plan.get('S_pno_master') is not None
+                and be_plan.get('K_iajb_master') is not None)
             inv = bucket.get('_inv_cache')
             if inv is None:
                 p_ij_arr    = np.empty(N_b, dtype=np.int32)
@@ -1271,8 +1286,21 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                     }
                 else:
                     T_buf = np.empty((N_b, n_kl, n_kl))
-                    S_c = np.ascontiguousarray(bucket['S'])
-                    K_c = np.ascontiguousarray(bucket['K'])
+                    # Deferred-stack BE plan (DLPNO_BE_DEFER_STACK): the plan
+                    # holds light ref-lists, not stacked S/K — rebuild this
+                    # bucket's stacks here (same as compute_B_E_batched).
+                    _Sb = bucket['S']
+                    _Kb = bucket['K']
+                    if _Sb is None and bucket.get('S_list') is not None:
+                        _Sb = np.empty((N_b, n_ij, n_kl))
+                        _Kb = np.empty((N_b, n_kl, n_kl))
+                        _Sl = bucket['S_list']
+                        _Kl = bucket['K_list']
+                        for _n in range(N_b):
+                            _Sb[_n] = _Sl[_n]
+                            _Kb[_n] = _Kl[_n]
+                    S_c = np.ascontiguousarray(_Sb)
+                    K_c = np.ascontiguousarray(_Kb)
                     kl_refs = [t2_pno_all[k] for k in bucket['kl_keys']]
                     inv = {
                         'T_buf': T_buf, 'beta_kl': beta_kl_arr,
@@ -1392,38 +1420,40 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
         # C side.
         c_N = bv['c_N']
         if c_N > 0:
-            # Gather ct_flat + t2_flat per cycle.
-            # ct_flat scratch buffer is cycle-invariant in size; keep it in
-            # bv so we don't reallocate every cycle. Likewise cache the
-            # offsets/sizes as Python ints so the inner refill loop avoids
-            # numpy.int64 box-unbox overhead.
-            if 'c_ct_flat_buf' not in bv:
-                bv['c_ct_flat_buf'] = np.zeros(int(bv['c_ct_off'][-1]))
-                bv['_c_ct_off_int'] = [int(x) for x in bv['c_ct_off']]
-                bv['_c_n_ct_int']   = [int(x) for x in bv['c_n_ct']]
-            ct_flat = bv['c_ct_flat_buf']
-            ct_flat.fill(0.0)
-            _c_ct_off_int = bv['_c_ct_off_int']
-            _c_n_ct_int   = bv['_c_n_ct_int']
-            _c_ct_keys    = bv['c_ct_keys']
-            if C_tilde_cache is not None:
-                _ctc_get = C_tilde_cache.get
-                for n in range(c_N):
-                    ct_val = _ctc_get(_c_ct_keys[n])
-                    if ct_val is not None and ct_val.shape[0] == _c_n_ct_int[n]:
-                        ct_flat[_c_ct_off_int[n]:_c_ct_off_int[n + 1]] = (
-                            ct_val.ravel())
-            # Cache t2_flat scratch buffer on bv (size cycle-invariant).
-            if '_c_t2_flat_buf' in bv:
-                t2_flat = bv['_c_t2_flat_buf']
+            # ct_flat is NOT built here: when c_N>0 the class always wires
+            # c_term_ct_ord_pair_idx, so the C++ run_one_cycle overrides
+            # c_plan.ct_flat to point at the native (current-cycle) C_tilde_flat
+            # via per-item ord offsets.  The old Python gather copied the
+            # cycle-0 C_tilde_cache (stale AND duplicated, ~GiB) and was then
+            # discarded — pure dead weight.  Skip it entirely.
+            ct_flat = None
+            # t2: offset-alias into the canonical t2_pno_all buffer (read
+            # t2[key] directly; the kernel applies the per-item transpose by
+            # flipping its GT dgemm flag) instead of gathering a per-item-
+            # DUPLICATED t2_flat copy each cycle.  The unique t2 buffer is tiny
+            # (~0.05 GiB) but the gather inflates it to GiBs (same t2[key]
+            # copied for every item sharing the key) — the dominant CCSD-cycle
+            # anon on TM complexes.  Falls back to the gather when canonical
+            # offsets are unavailable.
+            _t2_alias = bv.get('c_t2_canon_off') is not None
+            if _t2_alias:
+                _c_t2_base_ptr = t2_pno_all._buffer.ctypes.data
+                _c_t2_off_ptr  = bv['c_t2_canon_off'].ctypes.data
+                _c_t2_tr_ptr   = bv['c_t2_trans'].ctypes.data  # bool/uint8
             else:
-                t2_flat = np.empty(int(bv['c_t2_off'][-1]))
-                bv['_c_t2_flat_buf'] = t2_flat
-            gather_t2_with_transpose(
-                c_N, bv['c_n_other'],
-                bv['c_t2_canon_off'], bv['c_t2_trans_arr'],
-                bv['c_t2_off'], t2_pno_all._buffer, t2_flat,
-                min(64, c_N))
+                if '_c_t2_flat_buf' in bv:
+                    t2_flat = bv['_c_t2_flat_buf']
+                else:
+                    t2_flat = np.empty(int(bv['c_t2_off'][-1]))
+                    bv['_c_t2_flat_buf'] = t2_flat
+                gather_t2_with_transpose(
+                    c_N, bv['c_n_other'],
+                    bv['c_t2_canon_off'], bv['c_t2_trans_arr'],
+                    bv['c_t2_off'], t2_pno_all._buffer, t2_flat,
+                    min(64, c_N))
+                _c_t2_base_ptr = t2_flat.ctypes.data
+                _c_t2_off_ptr  = bv['c_t2_off'].ctypes.data
+                _c_t2_tr_ptr   = 0
             c_plan_struct = PyCTermInputs()
             c_plan_struct.N           = int(c_N)
             c_plan_struct.n_pno_arr   = bv['c_n_pno'].ctypes.data
@@ -1433,15 +1463,16 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             c_plan_struct.ct_off      = bv['c_ct_off'].ctypes.data
             c_plan_struct.S_mid_off   = bv['c_S_mid_off'].ctypes.data
             c_plan_struct.J_bold_off  = bv['c_J_bold_off'].ctypes.data
-            c_plan_struct.t2_off      = bv['c_t2_off'].ctypes.data
+            c_plan_struct.t2_off      = _c_t2_off_ptr
             c_plan_struct.S_outer_off = bv['c_S_outer_off'].ctypes.data
             c_plan_struct.tile_off    = bv['c_tile_off'].ctypes.data
             c_plan_struct.S_big_flat  = bv['c_S_big_flat'].ctypes.data
             c_plan_struct.S_mid_flat  = bv['c_S_mid_flat'].ctypes.data
             c_plan_struct.J_bold_flat = bv['c_J_bold_flat'].ctypes.data
             c_plan_struct.S_outer_flat= bv['c_S_outer_flat'].ctypes.data
-            c_plan_struct.ct_flat     = ct_flat.ctypes.data
-            c_plan_struct.t2_flat     = t2_flat.ctypes.data
+            c_plan_struct.ct_flat     = 0   # overridden by C++ (C_tilde_flat)
+            c_plan_struct.t2_flat     = _c_t2_base_ptr
+            c_plan_struct.t2_trans    = _c_t2_tr_ptr
             c_plan_struct.max_n_pno   = int(bv['c_n_pno'].max(initial=1))
             c_plan_struct.max_n_ct    = int(bv['c_n_ct'].max(initial=1))
             c_plan_struct.max_n_other = int(bv['c_n_other'].max(initial=1))
@@ -1464,45 +1495,51 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                         c_target_ji_arr[n] = _off_to_pair(c_target_ji_off[n], np_n)
                 bv['c_target_ij_arr_cached'] = c_target_ij_arr
                 bv['c_target_ji_arr_cached'] = c_target_ji_arr
-            own.extend([ct_flat, t2_flat, c_target_ij_arr, c_target_ji_arr])
+            own.extend([c_target_ij_arr, c_target_ji_arr])
+            if not _t2_alias:
+                own.append(t2_flat)   # aliased t2 stays alive via t2_pno_all
 
         # D side.
         d_N = bv['d_N']
         if d_N > 0:
-            # Cache u_flat scratch buffer (size cycle-invariant).
-            if '_d_u_flat_buf' in bv:
-                u_flat = bv['_d_u_flat_buf']
+            # u = 2*t2 - t2.T: offset-alias the canonical t2_pno_all buffer and
+            # compute u in-kernel (per item) instead of gathering a per-item-
+            # DUPLICATED u_flat copy each cycle.  Falls back to the gather when
+            # canonical offsets are unavailable.
+            _d_u_alias = bv.get('d_t2_canon_off') is not None
+            if _d_u_alias:
+                _d_u_base_ptr = t2_pno_all._buffer.ctypes.data
+                _d_u_off_ptr  = bv['d_t2_canon_off'].ctypes.data
+                _d_u_tr_ptr   = bv['d_t2_trans'].ctypes.data  # bool/uint8
+                _d_u_flat_ptr = 0          # kernel computes u in-scratch
+                u_flat = None
             else:
-                u_flat = np.empty(int(bv['d_u_off'][-1]))
-                bv['_d_u_flat_buf'] = u_flat
-            gather_u_from_t2(
-                d_N, bv['d_n_A'],
-                bv['d_t2_canon_off'], bv['d_t2_trans_arr'],
-                bv['d_u_off'], t2_pno_all._buffer, u_flat,
-                min(64, d_N))
-            # Same caching pattern as ct_flat: persistent buffer + Python-int
-            # offset list to skip numpy box-unbox per item.
-            if 'd_dt_flat_buf' not in bv:
-                bv['d_dt_flat_buf'] = np.zeros(int(bv['d_dt_off'][-1]))
-                bv['_d_dt_off_int'] = [int(x) for x in bv['d_dt_off']]
-            dt_flat = bv['d_dt_flat_buf']
-            dt_flat.fill(0.0)
-            _d_dt_off_int = bv['_d_dt_off_int']
-            _d_dt_keys    = bv['d_dt_keys']
-            if D_tilde_cache is not None:
-                _dtc_get = D_tilde_cache.get
-                for n in range(d_N):
-                    dt_val = _dtc_get(_d_dt_keys[n])
-                    if dt_val is not None:
-                        dt_flat[_d_dt_off_int[n]:_d_dt_off_int[n + 1]] = (
-                            dt_val.ravel())
+                if '_d_u_flat_buf' in bv:
+                    u_flat = bv['_d_u_flat_buf']
+                else:
+                    u_flat = np.empty(int(bv['d_u_off'][-1]))
+                    bv['_d_u_flat_buf'] = u_flat
+                gather_u_from_t2(
+                    d_N, bv['d_n_A'],
+                    bv['d_t2_canon_off'], bv['d_t2_trans_arr'],
+                    bv['d_u_off'], t2_pno_all._buffer, u_flat,
+                    min(64, d_N))
+                _d_u_base_ptr = 0
+                _d_u_off_ptr  = bv['d_u_off'].ctypes.data
+                _d_u_tr_ptr   = 0
+                _d_u_flat_ptr = u_flat.ctypes.data
+            # dt_flat NOT built here (mirrors ct_flat): the C++ overrides
+            # d_plan.dt_flat to the native current-cycle D_tilde_flat via ord
+            # offsets, so the cycle-0 D_tilde_cache gather was stale dead
+            # weight (~GiB).  Skip it.
+            dt_flat = None
             d_plan_struct = PyDTermInputs()
             d_plan_struct.N         = int(d_N)
             d_plan_struct.n_pno_arr = bv['d_n_pno'].ctypes.data
             d_plan_struct.n_A_arr   = bv['d_n_A'].ctypes.data
             d_plan_struct.n_B_arr   = bv['d_n_B'].ctypes.data
             d_plan_struct.S_a_off   = bv['d_S_a_off'].ctypes.data
-            d_plan_struct.u_off     = bv['d_u_off'].ctypes.data
+            d_plan_struct.u_off     = _d_u_off_ptr
             d_plan_struct.S_b_off   = bv['d_S_b_off'].ctypes.data
             d_plan_struct.S_c_off   = bv['d_S_c_off'].ctypes.data
             d_plan_struct.dt_off    = bv['d_dt_off'].ctypes.data
@@ -1512,8 +1549,11 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
             d_plan_struct.S_b_flat  = bv['d_S_b_flat'].ctypes.data
             d_plan_struct.S_c_flat  = bv['d_S_c_flat'].ctypes.data
             d_plan_struct.KJ_flat   = bv['d_KJ_flat'].ctypes.data
-            d_plan_struct.u_flat    = u_flat.ctypes.data
-            d_plan_struct.dt_flat   = dt_flat.ctypes.data
+            d_plan_struct.u_flat    = _d_u_flat_ptr
+            d_plan_struct.dt_flat   = 0   # overridden by C++ (D_tilde_flat)
+            d_plan_struct.u_base    = _d_u_base_ptr
+            d_plan_struct.u_canon_off = _d_u_off_ptr if _d_u_alias else 0
+            d_plan_struct.u_trans   = _d_u_tr_ptr
             d_plan_struct.max_n_pno = int(bv['d_n_pno'].max(initial=1))
             d_plan_struct.max_n_A   = int(bv['d_n_A'].max(initial=1))
             d_plan_struct.max_n_B   = int(bv['d_n_B'].max(initial=1))
@@ -1534,7 +1574,9 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                         d_target_ji_arr[n] = _off_to_pair(d_target_ji_off[n], np_n)
                 bv['d_target_ij_arr_cached'] = d_target_ij_arr
                 bv['d_target_ji_arr_cached'] = d_target_ji_arr
-            own.extend([u_flat, dt_flat, d_target_ij_arr, d_target_ji_arr])
+            own.extend([d_target_ij_arr, d_target_ji_arr])
+            if not _d_u_alias:
+                own.append(u_flat)   # aliased u computed in-kernel from t2
 
     return {
         'g_plan_ik': g_plan_struct_ik, 'g_plan_jk': g_plan_struct_jk,
@@ -1634,7 +1676,7 @@ def run_remaining_cycles_via_class(
         b_tilde_per_ij_pyscf, jiang_C_pyscf, jiang_D_pyscf,
         # DIIS state:
         mydiis, diis_start_cycle, strong_pairs, cas_blocks,
-        verbose=True, _pool=None):
+        verbose=True, _pool=None, ktc_store=None):
     """Pack-once optimized drop-in cycle driver.
 
     SolverInputs and per_kl plan are packed ONCE at function entry; per
@@ -1648,6 +1690,25 @@ def run_remaining_cycles_via_class(
     from pyscf.cc.dlpno_tccsd.lccsd import _compute_t1_residual
 
     _pi = PairIndex(pno_spaces.keys(), pno_spaces, pair_lmo_idx, nocc)
+
+    if os.environ.get('DLPNO_CLASS_INPUT_DEBUG') == '1':
+        import numpy as _np
+        _fields = ('Qab', 'Qma', 'K_iajb', 'K_tilde_chem_i', 'K_tilde_chem_j',
+                   'K_bar_chem', 'K_bar_ij', 'K_bar_ji', 'i_Qk', 'j_Qk',
+                   'i_Qa', 'j_Qa')
+        _sums = {f: 0.0 for f in _fields}
+        for _k in sorted(cc_ints.keys()):
+            _e = cc_ints.get(_k)
+            if not isinstance(_e, dict):
+                continue
+            for f in _fields:
+                a = _e.get(f)
+                if a is not None:
+                    _sums[f] += float(_np.abs(a).sum())
+        _spno = (float(_np.abs(S_pno_cache._buffer).sum())
+                 if hasattr(S_pno_cache, '_buffer') else -1.0)
+        print('[CLASS_INPUT] ' + ' '.join(f'{f}={_sums[f]:.4f}'
+              for f in _fields) + f' Spno={_spno:.4f}', flush=True)
 
     # ---- ONE-TIME setup ----
     _t_setup0 = _time.perf_counter()
@@ -1674,8 +1735,28 @@ def run_remaining_cycles_via_class(
     inputs, ownership, key_to_p, aux = pack_for_t1_ints(
         cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
         F_lmo, eps_lmo, fov_pno, nocc, _all_keys,
-        t2_pno_all=t2_pno_all, S_pno_cache=S_pno_cache, _pool=_pool)
+        t2_pno_all=t2_pno_all, S_pno_cache=S_pno_cache, _pool=_pool,
+        cc_ints_flat=cc_ints_flat, pair_index=pair_index)
     _pmark('pack_for_t1_ints', _t)
+
+    # K_tilde_chem_{i,j} were just copied into the pack's own flat store
+    # (inputs.K_tilde_chem_{i,j}); the C++ class reads them from there for the
+    # whole cycle loop.  The combined-ktilde buffer (ktc_store['buf'], ~8 GiB
+    # on a TM complex) and the per-pair cc_ints views into it are now dead
+    # weight — drop them so the ~8 GiB is reclaimed before the cycle loop.
+    if ktc_store is not None:
+        for _k in (list(ktc_store.get('off_i', {}).keys())
+                   + list(ktc_store.get('off_j', {}).keys())):
+            _e = cc_ints.get(_k)
+            if _e is not None:
+                _e.pop('K_tilde_chem_i', None)
+                _e.pop('K_tilde_chem_j', None)
+        ktc_store['buf'] = None
+        ktc_store['off_i'] = {}
+        ktc_store['off_j'] = {}
+        import gc as _gc
+        _gc.collect()
+
     keys_reorder = aux['keys_sorted']
     n_pairs = len(keys_reorder)
     npno = aux['n_pno_per_pair']
@@ -1705,6 +1786,12 @@ def run_remaining_cycles_via_class(
     plan_struct.t1_cache_buffer = t1_cache._buffer.ctypes.data
     g_plan_struct, g_plan_own = _extract_g_tilde_plan(key_to_p)
     _pmark('extract per_kl + g_tilde plans', _t)
+    if os.environ.get('DLPNO_PACK_PROBE'):
+        def _gb(lst):
+            return sum(getattr(a, 'nbytes', 0) for a in lst) / 2**30
+        print(f'  [class_probe] pack_own={_gb(ownership):.1f} GiB '
+              f'per_kl_plan={_gb(plan_own):.1f} GiB '
+              f'g_tilde_plan={_gb(g_plan_own):.1f} GiB', flush=True)
     # Note: the class drop-in keeps reading per-cycle gather metadata
     # (`bv['c_t2_canon_off']`, `bv['c_t2_trans_arr']`, etc.) from inside
     # the python plan dicts during the cycle loop. Clearing the plan
@@ -1879,6 +1966,27 @@ def run_remaining_cycles_via_class(
             natives, native_own, t1_cache, t2_pno_all,
             ord_idx_lookup, key_to_p, nocc)
         _t_plans = _time.perf_counter() - _t_plans0
+        if os.environ.get('DLPNO_PACK_PROBE') and cycle == cycle_start:
+            _nat_gb = sum(getattr(a, 'nbytes', 0)
+                          for a in native_own) / 2**30
+            print(f'  [class_probe] native_r2_plans(t34/c/d/g)='
+                  f'{_nat_gb:.1f} GiB', flush=True)
+        if os.environ.get('DLPNO_MEM_PROBE'):
+            try:
+                from pyscf.cc.dlpno_tccsd.driver import _log_mem as _lm
+                _lm(f'class_after_native_plans_cyc{cycle}')
+            except Exception:
+                pass
+        if cycle <= cycle_start + 1:   # first two class cycles only
+            try:
+                from pyscf.cc.dlpno_tccsd.driver import _dump_anon_profile
+                _dump_anon_profile(f'cyc{cycle}', extra_roots={
+                    'jiang_C': jiang_C_pyscf, 'jiang_D': jiang_D_pyscf,
+                    'native_own': native_own, 'natives': natives,
+                    't2_pno_all': t2_pno_all, 't1_cache': t1_cache,
+                    'ownership': ownership})
+            except Exception:
+                pass
 
         # Wire plans (most fields cycle-invariant; ptrs may rebind).
         plans = PyRunCycleInputs()

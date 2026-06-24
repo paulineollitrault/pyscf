@@ -16,6 +16,8 @@ t1_ints-only path.  Subsequent steps extend the packer.
 """
 
 import ctypes
+import os
+import tempfile
 import numpy as np
 
 from pyscf.cc.dlpno_tccsd._ccsd_solver import (
@@ -38,10 +40,28 @@ def _build_flat_from_per_pair(per_pair_arrays, ownership):
     offsets = np.zeros(n + 1, dtype=np.int64)
     for p in range(n):
         offsets[p + 1] = offsets[p] + per_pair_arrays[p].size
-    flat = np.empty(int(offsets[-1]), dtype=np.float64)
+    _total = int(offsets[-1])
+    # Page LARGE packed buffers to NVMe (DLPNO_CCINTS_MMAP).  The class pack
+    # is a second copy of cc_ints; building it in RAM while cc_ints is still
+    # paged in needs ~2× cc_ints resident (the OOM wall).  As a memmap, this
+    # copy's pages flush/evict under pressure during the build, and the C++
+    # solver reads it through the same raw pointer.  >1 GiB fields only (tiny
+    # fields aren't worth a file).
+    _min_bytes = float(os.environ.get('DLPNO_PACK_MMAP_MIN_MB', '1024')) * (1 << 20)
+    _mmap = bool(os.environ.get('DLPNO_CCINTS_MMAP')) and _total * 8 > _min_bytes
+    if _mmap:
+        _tmpdir = os.environ.get('PYSCF_TMPDIR') or tempfile.gettempdir()
+        _fd, _path = tempfile.mkstemp(
+            suffix='.packflat', prefix='dlpno_', dir=_tmpdir)
+        os.close(_fd)
+        flat = np.memmap(_path, dtype=np.float64, mode='w+', shape=(_total,))
+    else:
+        flat = np.empty(_total, dtype=np.float64)
     for p in range(n):
         flat[offsets[p]:offsets[p + 1]] = (
             np.ascontiguousarray(per_pair_arrays[p]).ravel())
+    if _mmap:
+        flat.flush()   # dirty -> clean/file-backed so pages can evict
     ownership.append(flat)
     ownership.append(offsets)
     fps = PyFlatPairStore()
@@ -63,9 +83,54 @@ def _reorder_diag_first(keys_sorted_real, nocc):
     return keys_reordered, real_set
 
 
+def _alias_cc_ints_field(field, cc_ints_flat, keys_sorted, c2i, ownership):
+    """Zero-copy FlatPairStore aliasing the shared cc_ints_flat[field] buffer.
+
+    The solver packs pairs in diag-first order (keys_sorted); cc_ints_flat is
+    in canonical order.  We hand the C++ side the SHARED buffer as ``data``,
+    a per-pack-pair ``block_start`` giving each pair's canonical position, and
+    ``offsets`` = cumulative sizes in pack order (for the size arithmetic).
+    No per-pair copy — eliminates the ~cc_ints-sized pack duplication.
+
+    Returns a PyFlatPairStore, or None if the field is absent or any pair has
+    no cc_ints entry (e.g. a diag placeholder) — caller then falls back to the
+    copying path for correctness.
+    """
+    store = cc_ints_flat.get(field) if cc_ints_flat is not None else None
+    if store is None:
+        if os.environ.get('DLPNO_ALIAS_DEBUG'):
+            print(f'  [alias {field}] FALLBACK: no store', flush=True)
+        return None
+    buf = store.buffer
+    soff = store.offsets
+    n = len(keys_sorted)
+    block_start = np.empty(n, dtype=np.int64)
+    sizes = np.empty(n, dtype=np.int64)
+    for p, key in enumerate(keys_sorted):
+        ci = c2i.get((min(key), max(key)))
+        if ci is None:
+            if os.environ.get('DLPNO_ALIAS_DEBUG'):
+                print(f'  [alias {field}] FALLBACK: pair {key} not in c2i '
+                      f'(p={p}/{n})', flush=True)
+            return None
+        block_start[p] = soff[ci]
+        sizes[p] = soff[ci + 1] - soff[ci]
+    offsets = np.zeros(n + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(sizes)
+    ownership.append(buf)
+    ownership.append(offsets)
+    ownership.append(block_start)
+    fps = PyFlatPairStore()
+    fps.data = _ptr(buf)
+    fps.offsets = _ptr(offsets)
+    fps.block_start = _ptr(block_start)
+    return fps
+
+
 def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
                      F_lmo, eps_lmo, fov_pno, nocc, keys_sorted,
-                     t2_pno_all=None, S_pno_cache=None, _pool=None):
+                     t2_pno_all=None, S_pno_cache=None, _pool=None,
+                     cc_ints_flat=None, pair_index=None):
     """Build a PySolverInputs covering t1_ints-phase requirements only.
 
     Returns (inputs, ownership, key_to_p, aux) where ``ownership`` is a
@@ -320,19 +385,34 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
     inputs.T1_flat = _ptr(T1_flat)
     inputs.T2_flat = _ptr(T2_flat)
 
-    # Per-pair FlatPairStores.
-    Qma_fps,  _, _ = _build_flat_from_per_pair(Qma_list,  ownership)
-    Qab_fps,  _, _ = _build_flat_from_per_pair(Qab_list,  ownership)
-    i_Qk_fps, _, _ = _build_flat_from_per_pair(i_Qk_list, ownership)
-    j_Qk_fps, _, _ = _build_flat_from_per_pair(j_Qk_list, ownership)
-    i_Qa_fps, _, _ = _build_flat_from_per_pair(i_Qa_list, ownership)
-    j_Qa_fps, _, _ = _build_flat_from_per_pair(j_Qa_list, ownership)
+    # Per-pair FlatPairStores.  cc_ints-backed fields are ALIASED zero-copy
+    # from the shared cc_ints_flat buffer (no second copy); others copy.
+    _c2i = pair_index.canonical_to_idx if pair_index is not None else None
+
+    _alias_allow = os.environ.get('DLPNO_ALIAS_FIELDS')
+    _alias_set = (set(_alias_allow.split(',')) if _alias_allow else None)
+
+    def _F(field, lst):
+        _ok = (_c2i is not None
+               and (_alias_set is None or field in _alias_set))
+        fps = (_alias_cc_ints_field(field, cc_ints_flat, keys_sorted,
+                                    _c2i, ownership) if _ok else None)
+        if fps is not None:
+            return fps
+        return _build_flat_from_per_pair(lst, ownership)[0]
+
+    Qma_fps  = _F('Qma',  Qma_list)
+    Qab_fps  = _F('Qab',  Qab_list)
+    i_Qk_fps = _F('i_Qk', i_Qk_list)
+    j_Qk_fps = _F('j_Qk', j_Qk_list)
+    i_Qa_fps = _F('i_Qa', i_Qa_list)
+    j_Qa_fps = _F('j_Qa', j_Qa_list)
     T1_in_pair_fps, T1_in_pair_flat_arr, T1_in_pair_offs = (
         _build_flat_from_per_pair(T1_in_pair_list, ownership))
-    K_iajb_fps, _, _      = _build_flat_from_per_pair(K_iajb_list,      ownership)
-    K_bar_chem_fps, _, _  = _build_flat_from_per_pair(K_bar_chem_list,  ownership)
-    K_bar_ij_fps, _, _    = _build_flat_from_per_pair(K_bar_ij_list,    ownership)
-    K_bar_ji_fps, _, _    = _build_flat_from_per_pair(K_bar_ji_list,    ownership)
+    K_iajb_fps     = _F('K_iajb',     K_iajb_list)
+    K_bar_chem_fps = _F('K_bar_chem', K_bar_chem_list)
+    K_bar_ij_fps   = _F('K_bar_ij',   K_bar_ij_list)
+    K_bar_ji_fps   = _F('K_bar_ji',   K_bar_ji_list)
     K_tilde_chem_i_fps, _, _ = _build_flat_from_per_pair(
         K_tilde_chem_i_list, ownership)
     K_tilde_chem_j_fps, _, _ = _build_flat_from_per_pair(
@@ -380,39 +460,79 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
         else:
             cache_iter = list(S_pno_cache.keys()) if hasattr(
                 S_pno_cache, 'keys') else []
-        sizes = np.zeros(n_blocks, dtype=np.int64)
-        kv_pairs = []
-        for cache_key in cache_iter:
-            key_a, key_b = cache_key
-            p_a = key_to_p.get(key_a, -1)
-            p_b = key_to_p.get(key_b, -1)
-            if p_a < 0 or p_b < 0:
-                continue
-            S_ab = S_pno_cache.get(cache_key)
-            if S_ab is None:
-                continue
-            expected = int(n_pno_per_pair[p_a]) * int(n_pno_per_pair[p_b])
-            if int(S_ab.size) != expected:
-                continue
-            idx = p_a * n_canon + p_b
-            sizes[idx] = expected
-            kv_pairs.append((idx, S_ab))
-        # Build cumulative offsets from sizes vector.
-        S_pno_offsets[1:] = np.cumsum(sizes)
-        # Concatenate populated blocks in idx-sorted order.
-        kv_pairs.sort(key=lambda kv: kv[0])
-        for idx, S_ab in kv_pairs:
-            S_blocks.append(np.ascontiguousarray(
-                S_ab, dtype=np.float64).ravel())
-        if S_blocks:
-            S_pno_data = np.concatenate(S_blocks)
+        # SPARSE S_PNO (dedup): alias the S_pno_cache's own buffer (slot order)
+        # and hand the C++ a dense (p_a*N+p_b -> slot) index, instead of
+        # building a SECOND dense copy of all overlaps (~73 GiB on a TM
+        # complex).  per_kl already shares this cache buffer; this makes the
+        # main residual share it too -> one S_PNO copy total -> fits in RAM ->
+        # no per-cycle paging.  C++ reads via s_pno_lookup(S_pno_index).
+        _sparse_ok = (hasattr(S_pno_cache, '_buffer')
+                      and hasattr(S_pno_cache, '_idx_matrix')
+                      and hasattr(S_pno_cache, '_offsets')
+                      and hasattr(S_pno_cache, '_pi'))
+        if _sparse_ok:
+            _cache_c2i = S_pno_cache._pi.canonical_to_idx
+            _cache_idxm = S_pno_cache._idx_matrix
+            S_pno_index = np.full(n_blocks, -1, dtype=np.int32)
+            for cache_key in cache_iter:
+                key_a, key_b = cache_key
+                p_a = key_to_p.get(key_a, -1)
+                p_b = key_to_p.get(key_b, -1)
+                if p_a < 0 or p_b < 0:
+                    continue
+                ia = _cache_c2i.get(key_a)
+                ib = _cache_c2i.get(key_b)
+                if ia is None or ib is None:
+                    continue
+                slot = int(_cache_idxm[ia, ib])
+                if slot < 0:
+                    continue
+                S_pno_index[p_a * n_canon + p_b] = slot
+            _cache_buf = S_pno_cache._buffer
+            _cache_off = np.ascontiguousarray(S_pno_cache._offsets,
+                                              dtype=np.int64)
+            if os.environ.get('DLPNO_PACK_PROBE'):
+                print(f'  [pack_probe] S_pno SPARSE alias '
+                      f'(cache buffer {_cache_buf.nbytes/2**30:.1f} GiB, '
+                      f'n_slots={int(np.sum(S_pno_index >= 0))}) '
+                      f'— no dense copy', flush=True)
+            ownership.append(_cache_buf)
+            ownership.append(_cache_off)
+            ownership.append(S_pno_index)
+            inputs.S_pno_data    = _ptr(_cache_buf)
+            inputs.S_pno_offsets = _ptr(_cache_off)
+            inputs.S_pno_index   = _ptr(S_pno_index)
         else:
-            S_pno_data = np.zeros(0, dtype=np.float64)
-        ownership.append(S_pno_data)
-        ownership.append(S_pno_offsets)
-        inputs.S_pno_data    = _ptr(S_pno_data)
-        inputs.S_pno_offsets = _ptr(S_pno_offsets)
-        inputs.S_pno_index   = None
+            # Legacy dense build (cache without flat buffer / idx_matrix).
+            sizes = np.zeros(n_blocks, dtype=np.int64)
+            kv_pairs = []
+            for cache_key in cache_iter:
+                key_a, key_b = cache_key
+                p_a = key_to_p.get(key_a, -1)
+                p_b = key_to_p.get(key_b, -1)
+                if p_a < 0 or p_b < 0:
+                    continue
+                S_ab = S_pno_cache.get(cache_key)
+                if S_ab is None:
+                    continue
+                expected = int(n_pno_per_pair[p_a]) * int(n_pno_per_pair[p_b])
+                if int(S_ab.size) != expected:
+                    continue
+                idx = p_a * n_canon + p_b
+                sizes[idx] = expected
+                kv_pairs.append((idx, S_ab))
+            S_pno_offsets[1:] = np.cumsum(sizes)
+            _total = int(S_pno_offsets[-1])
+            S_pno_data = np.empty(_total, dtype=np.float64)
+            for idx, S_ab in kv_pairs:
+                o = int(S_pno_offsets[idx])
+                blk = np.ascontiguousarray(S_ab, dtype=np.float64).ravel()
+                S_pno_data[o:o + blk.size] = blk
+            ownership.append(S_pno_data)
+            ownership.append(S_pno_offsets)
+            inputs.S_pno_data    = _ptr(S_pno_data)
+            inputs.S_pno_offsets = _ptr(S_pno_offsets)
+            inputs.S_pno_index   = None
     else:
         inputs.S_pno_data    = None
         inputs.S_pno_offsets = None
@@ -452,18 +572,19 @@ def pack_for_t1_ints(cc_ints, t1_pno, t1_cache, pno_spaces, pair_lmo_idx,
     inputs.R2_external = None
     inputs.is_strong_pair = None
 
+    # NOTE: the per-pair ndarray lists (Qma_list, i_Qa_list, ..., T1_in_pair_*
+    # _list) are intentionally NOT stored in aux.  The class cycle loop reads
+    # only the flat/aliased stores + metadata below — never the per-pair lists
+    # (verified in _ccsd_solver.py:run_remaining_cycles_via_class).  The
+    # aliased lists were views into cc_ints_flat (free), but T1_in_pair_list /
+    # T1_in_pair_full_list were real copies; dropping all of them lets them GC
+    # as soon as pack_for_t1_ints returns instead of being pinned for the whole
+    # class phase.
     aux = {
         'keys_sorted': list(keys_sorted),
         'key_to_p': key_to_p,
         'pair_lmo_lists': pair_lmo_lists,
         'n_pno_per_pair': n_pno_per_pair,
-        'Qma_list': Qma_list,
-        'i_Qa_list': i_Qa_list,
-        'j_Qa_list': j_Qa_list,
-        'i_Qk_list': i_Qk_list,
-        'j_Qk_list': j_Qk_list,
-        'T1_in_pair_list': T1_in_pair_list,
-        'T1_in_pair_full_list': T1_in_pair_full_list,
         'T1_in_pair_flat': T1_in_pair_flat_arr,
         'T1_in_pair_offs': T1_in_pair_offs,
         'T1_in_pair_full_flat': T1_in_pair_full_flat_arr,

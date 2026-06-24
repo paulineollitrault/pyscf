@@ -76,15 +76,19 @@ def _log_mem(label):
     try:
         with open('/proc/self/status') as _f:
             _txt = _f.read()
-        _rss = 0
+        _rss = _anon = _file = 0
         for _ln in _txt.splitlines():
             if _ln.startswith('VmRSS:'):
                 _rss = int(_ln.split()[1]) // 1024  # MB
-                break
+            elif _ln.startswith('RssAnon:'):
+                _anon = int(_ln.split()[1]) // 1024
+            elif _ln.startswith('RssFile:'):
+                _file = int(_ln.split()[1]) // 1024
         _st = _os.statvfs('/tmp')
         _tmpfs = (_st.f_blocks - _st.f_bfree) * _st.f_frsize // (1024 ** 2)
-        print(f'  [MEM/{label}] RSS={_rss/1024:.2f} GiB  tmpfs={_tmpfs/1024:.2f} GiB',
-              flush=True)
+        print(f'  [MEM/{label}] RSS={_rss/1024:.2f} GiB '
+              f'(anon={_anon/1024:.2f} file={_file/1024:.2f}) '
+              f'tmpfs={_tmpfs/1024:.2f} GiB', flush=True)
     except Exception:
         pass
 
@@ -205,6 +209,219 @@ def _dump_plan_cache_sizes(label):
               flush=True)
     except Exception as _e:
         print(f'  [PLAN_CACHE/{label}] dump failed: {_e}', flush=True)
+
+
+def _dump_plan_cache_keys(label):
+    """If DLPNO_PLAN_KEY_PROBE=1, drill into each cycle-0 plan cache and
+    report per-field nbytes aggregated across all cache entries.  Used to
+    decide which large numeric stacks can be freed before the C++ class
+    takes over (vs the small metadata the class reads per cycle)."""
+    if not _os.environ.get('DLPNO_PLAN_KEY_PROBE'):
+        return
+    try:
+        from pyscf.cc.dlpno_tccsd import residual as _r
+        from pyscf.cc.dlpno_tccsd import lccsd as _l
+        targets = [
+            ('G_term', getattr(_r.compute_G_term_batched, '_plan_cache', None)),
+            ('D_tilde', getattr(_r.build_D_tilde_batched, '_plan_cache', None)),
+            ('C_tilde', getattr(_r.compute_C_tilde_batched, '_plan_cache', None)),
+            ('B_E', getattr(_r.compute_B_E_batched, '_plan_cache', None)),
+            ('CD', getattr(_r.compute_CD_terms_batched, '_plan_cache', None)),
+            ('per_kl', getattr(_l._compute_t1_residual,
+                                '_per_kl_plan_cache', None)),
+        ]
+        _global_seen = set()      # cross-cache id dedup -> true unique bytes
+        _unique_total = 0
+        _smaster_ids = {}
+        for name, c in targets:
+            if c is None:
+                continue
+            # c is a dict cache_key -> plan(dict).  Aggregate per field.
+            per_field = {}
+            for plan in (c.values() if isinstance(c, dict) else []):
+                if not isinstance(plan, dict):
+                    # plan cache may itself be the plan dict
+                    plan = {'_plan': plan}
+                for fk, fv in plan.items():
+                    per_field[fk] = per_field.get(fk, 0) + _walk_bytes(fv)
+                    if fk == 'S_pno_master' and hasattr(fv, 'nbytes'):
+                        _smaster_ids.setdefault(name, (id(fv),
+                            type(fv).__name__, int(fv.nbytes)))
+            rows = sorted(per_field.items(), key=lambda kv: -kv[1])
+            top = [f'{k}={v/2**30:.2f}G' for k, v in rows[:8] if v > 2**26]
+            tot = sum(per_field.values()) / 2**30
+            print(f'  [PLAN_KEYS/{label}/{name}] total={tot:.2f}G  '
+                  + '  '.join(top), flush=True)
+            # accumulate cross-cache unique bytes
+            for plan in (c.values() if isinstance(c, dict) else []):
+                _unique_total += _walk_bytes(
+                    plan if isinstance(plan, dict) else {'_p': plan},
+                    _seen=_global_seen)
+        print(f'  [PLAN_KEYS/{label}/UNIQUE] cross-cache unique='
+              f'{_unique_total/2**30:.2f}G  (file-backed memmap is reclaimable;'
+              f' ndarray is anonymous RAM)', flush=True)
+        for nm, (oid, tp, nb) in _smaster_ids.items():
+            print(f'    S_pno_master[{nm}] id={oid} type={tp} '
+                  f'{nb/2**30:.2f}G', flush=True)
+    except Exception as _e:
+        print(f'  [PLAN_KEYS/{label}] dump failed: {_e}', flush=True)
+
+
+def _dump_anon_profile(label, extra_roots=None):
+    """If DLPNO_ANON_PROFILE=1, report the TRUE anonymous numpy footprint:
+    walk gc.get_objects(), reduce every ndarray to its root base, dedup by
+    base id (views don't double-count), EXCLUDE np.memmap bases (file-backed,
+    already attributed by smaps).  The honest per-buffer breakdown _walk_bytes
+    could not give."""
+    if not _os.environ.get('DLPNO_ANON_PROFILE'):
+        return
+    try:
+        import gc as _gc
+        import numpy as _np
+        # Numeric ndarrays are NOT gc-tracked, so gc.get_objects() won't return
+        # them directly.  Instead scan every tracked CONTAINER (dict/list/tuple/
+        # object-__dict__) for ndarray members; dedup by root base; exclude
+        # np.memmap (file-backed).  Catches arrays held in plan caches (dicts),
+        # ownership (list), jiang/bv (dicts) — i.e. the real anon buffers.
+        seen = {}                       # id(base) -> nbytes  (global dedup)
+        by_shape = {}                   # (ndim,dtype,sizeclass) -> [count,bytes]
+        by_cont = {}                    # gc-scan container attribution
+
+        def _sizeclass(nb):
+            kb = nb / 1024.0
+            if kb < 1: return '<1KB'
+            if kb < 16: return '1-16KB'
+            if kb < 64: return '16-64KB'
+            if kb < 256: return '64-256KB'
+            if kb < 1024: return '256KB-1MB'
+            return '>1MB'
+
+        # ---- explicit root-traversal: sees untracked pure-array dicts that
+        # gc.get_objects() drops.  Recurse the known DLPNO caches; attribute
+        # unique-base bytes per named root. ----
+        def _root_walk(obj, visited, acc):
+            oid = id(obj)
+            if oid in visited:
+                return
+            visited.add(oid)
+            if isinstance(obj, _np.ndarray):
+                base = obj
+                while isinstance(base.base, _np.ndarray):
+                    base = base.base
+                if isinstance(base, _np.memmap):
+                    return
+                bid = id(base)
+                if bid not in acc:
+                    nb = int(base.nbytes)
+                    acc[bid] = nb
+                    if bid not in seen:
+                        sk = (base.ndim, str(base.dtype), _sizeclass(nb))
+                        e = by_shape.setdefault(sk, [0, 0])
+                        e[0] += 1
+                        e[1] += nb
+                return
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    _root_walk(v, visited, acc)
+            elif isinstance(obj, (list, tuple, set, frozenset)):
+                for v in obj:
+                    _root_walk(v, visited, acc)
+            else:
+                _d = getattr(obj, '__dict__', None)
+                if isinstance(_d, dict):
+                    for v in _d.values():
+                        _root_walk(v, visited, acc)
+
+        def _root_total(root):
+            acc = {}
+            _root_walk(root, set(), acc)
+            # fold into global seen + shape buckets
+            for bid, nb in acc.items():
+                seen.setdefault(bid, nb)
+            return sum(acc.values()), len(acc)
+
+        try:
+            from pyscf.cc.dlpno_tccsd import residual as _r
+            from pyscf.cc.dlpno_tccsd import lccsd as _l
+            _roots = [
+                ('C_tilde', getattr(_r.compute_C_tilde_batched, '_plan_cache', None)),
+                ('D_tilde', getattr(_r.build_D_tilde_batched, '_plan_cache', None)),
+                ('G_term', getattr(_r.compute_G_term_batched, '_plan_cache', None)),
+                ('B_E', getattr(_r.compute_B_E_batched, '_plan_cache', None)),
+                ('CD', getattr(_r.compute_CD_terms_batched, '_plan_cache', None)),
+                ('per_kl', getattr(_l._compute_t1_residual, '_per_kl_plan_cache', None)),
+                ('per_kl_scr', getattr(_l._compute_t1_residual, '_per_kl_batched_scratch', None)),
+            ]
+            if extra_roots:
+                _roots.extend(list(extra_roots.items()))
+            _G = 2 ** 30
+            print(f'  [ANON-ROOTS/{label}] per-cache unique-anon (excl memmap):',
+                  flush=True)
+            for _nm, _rt in _roots:
+                if _rt is None:
+                    continue
+                _b, _n = _root_total(_rt)
+                if _b > 0.1 * _G:
+                    print(f'      {_nm}: {_b/_G:.2f}G  n_bases={_n}', flush=True)
+        except Exception as _e:
+            print(f'  [ANON-ROOTS/{label}] failed: {_e}', flush=True)
+
+        def _consider(v, cont_id=None, cont_ty=None, key=None):
+            if not isinstance(v, _np.ndarray):
+                return
+            base = v
+            while isinstance(base.base, _np.ndarray):
+                base = base.base
+            if isinstance(base, _np.memmap):
+                return
+            bid = id(base)
+            nb = int(base.nbytes)
+            if bid not in seen:
+                seen[bid] = nb
+                sk = (base.ndim, str(base.dtype), _sizeclass(nb))
+                e = by_shape.setdefault(sk, [0, 0])
+                e[0] += 1; e[1] += nb
+            if cont_id is not None:
+                c = by_cont.setdefault(cont_id, [0, 0, cont_ty, key])
+                c[0] += 1; c[1] += nb
+
+        for obj in _gc.get_objects():
+            try:
+                if isinstance(obj, dict):
+                    oid = id(obj)
+                    _k0 = next(iter(obj), None)
+                    for v in obj.values():
+                        _consider(v, oid, 'dict', repr(_k0)[:40])
+                elif isinstance(obj, (list, tuple)):
+                    oid = id(obj)
+                    for v in obj:
+                        _consider(v, oid, type(obj).__name__, None)
+                elif isinstance(obj, _np.ndarray):
+                    _consider(obj)
+                else:
+                    _d = getattr(obj, '__dict__', None)
+                    if isinstance(_d, dict):
+                        oid = id(obj)
+                        for v in _d.values():
+                            _consider(v, oid, type(obj).__name__, None)
+            except Exception:
+                continue
+        G = 2 ** 30
+        total = sum(seen.values())
+        print(f'  [ANON/{label}] unique-ndarray anon={total/G:.1f}G '
+              f'n_bases={len(seen)}', flush=True)
+        print('    by size-class/shape (count, GiB):', flush=True)
+        for sk, (cnt, nb) in sorted(by_shape.items(), key=lambda kv: -kv[1][1])[:10]:
+            print(f'      ndim={sk[0]} {sk[1]} {sk[2]}: n={cnt} {nb/G:.2f}G',
+                  flush=True)
+        print('    top containers (n_arrays, GiB, type, sample-key):', flush=True)
+        for cid, (cnt, nb, ty, key) in sorted(
+                by_cont.items(), key=lambda kv: -kv[1][1])[:8]:
+            if nb < 0.5 * G:
+                break
+            print(f'      {ty} n={cnt} {nb/G:.2f}G key={key}', flush=True)
+    except Exception as _e:
+        print(f'  [ANON/{label}] dump failed: {_e}', flush=True)
 from pyscf.cc.dlpno_tccsd.local_orbs import split_localize_orbitals, make_paos
 from pyscf.cc.dlpno_tccsd.pno import make_pnos
 from pyscf.cc.dlpno_tccsd.screening import classify_pairs

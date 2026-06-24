@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import Iterable, Tuple
 
+import os
+import tempfile
 import numpy as np
 
 
@@ -296,11 +298,12 @@ class FlatTensorStore:
     """
 
     __slots__ = ("_pi", "_buffer", "_offsets", "_shapes", "_ndim", "dtype",
-                 "_views", "_canon_to_idx")
+                 "_views", "_canon_to_idx", "_mmap_path")
 
     def __init__(self, pair_index, shape_fn, dtype=np.float64):
         self._pi = pair_index
         self.dtype = np.dtype(dtype)
+        self._mmap_path = None
         n_pairs = pair_index.n_pairs
 
         # First pass: determine per-pair shapes + common rank + sizes.
@@ -331,7 +334,25 @@ class FlatTensorStore:
 
         self._offsets = np.zeros(n_pairs + 1, dtype=np.int64)
         self._offsets[1:] = np.cumsum(sizes)
-        self._buffer = np.zeros(int(self._offsets[-1]), dtype=self.dtype)
+        _total = int(self._offsets[-1])
+        # Low-memory mode: back the buffer with a memmap on PYSCF_TMPDIR (a
+        # real NVMe disk).  cc_ints is the dominant Stage-5 base allocation
+        # (~79 GiB on a TM complex); paging it out keeps it off the resident
+        # set.  Crucially the buffer is written once during flatten then read
+        # only — so its file-backed pages are CLEAN and the kernel can evict
+        # them under memory pressure (e.g. while the C++-class pack builds its
+        # own copy), giving automatic "use-and-free" without a code rewrite.
+        # The Cython/C kernels read it through the same raw pointer; the OS
+        # pages it transparently.  Enable with DLPNO_CCINTS_MMAP=1.
+        if os.environ.get('DLPNO_CCINTS_MMAP') and _total > 0:
+            _tmpdir = os.environ.get('PYSCF_TMPDIR') or tempfile.gettempdir()
+            _fd, self._mmap_path = tempfile.mkstemp(
+                suffix='.ccflat', prefix='dlpno_', dir=_tmpdir)
+            os.close(_fd)
+            self._buffer = np.memmap(self._mmap_path, dtype=self.dtype,
+                                     mode='w+', shape=(_total,))
+        else:
+            self._buffer = np.zeros(_total, dtype=self.dtype)
 
         # Pre-build per-pair views.  The buffer is allocated once and
         # never resized; mutations go through ``set_at`` (view[:] = ...)
@@ -471,6 +492,27 @@ class FlatTensorStore:
         return store
 
 
+def _madvise_dontneed(buf):
+    """Drop a (just-flushed) memmap's pages from this process's RAM.
+
+    For a MAP_SHARED file-backed mapping, MADV_DONTNEED frees the resident
+    pages after their dirty data has been written back (we call .flush()
+    first); subsequent access re-faults the data from /scratch.  This keeps
+    the S_pno buffer's resident footprint near zero while it is being filled.
+    Best-effort: any failure (non-Linux, no libc) is silently ignored.
+    """
+    try:
+        import ctypes
+        base = buf.ctypes.data            # mmap base is page-aligned
+        nbytes = buf.nbytes
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        MADV_DONTNEED = 4
+        libc.madvise(ctypes.c_void_p(base), ctypes.c_size_t(nbytes),
+                     ctypes.c_int(MADV_DONTNEED))
+    except Exception:
+        pass
+
+
 class FlatPairPairStore:
     """Sparse ``(pair_a, pair_b) -> ndarray`` store with flat backing.
 
@@ -501,7 +543,7 @@ class FlatPairPairStore:
     __slots__ = (
         "_pi", "dtype", "_buffer", "_offsets", "_shapes",
         "_idx_matrix", "_n_flat", "_overflow",
-        "_views", "_canon_to_idx",
+        "_views", "_canon_to_idx", "_mmap_path",
     )
 
     def __init__(self, pair_index, initial=None, dtype=np.float64):
@@ -516,49 +558,82 @@ class FlatPairPairStore:
         """
         self._pi = pair_index
         self.dtype = np.dtype(dtype)
+        self._mmap_path = None
 
-        # Resolve initial entries to (idx_a, idx_b) preserving order.
-        entries = []
+        # Low-memory mode: back the flat buffer with a memmap on PYSCF_TMPDIR
+        # (a real disk such as /scratch) instead of RAM.  The S_pno_cache
+        # buffer is the dominant Stage-5 allocation on large/TM systems
+        # (tens of GiB); paging it to NVMe keeps it out of the resident set.
+        # The C++ solver / Cython kernels read it through the same raw
+        # pointer, so the memmap is transparent (the OS pages it in/out).
+        # When enabled we also POP each source array out of ``initial`` as it
+        # is written so the source dict and the buffer never both stay
+        # resident — this is what reduces the *construction* peak.
+        _mmap = bool(os.environ.get('DLPNO_SPNO_MMAP'))
+
+        # Pass 1: resolve (idx_a, idx_b) + shapes WITHOUT retaining the arrays
+        # (so memmap mode can free them incrementally in pass 2).
+        meta = []  # (ia, ib, orig_key, shape)
         if initial is not None:
             for (pa, pb), arr in initial.items():
-                pa_norm = (min(pa), max(pa))
-                pb_norm = (min(pb), max(pb))
-                ia = pair_index.canonical_to_idx.get(pa_norm)
-                ib = pair_index.canonical_to_idx.get(pb_norm)
+                ia = pair_index.canonical_to_idx.get((min(pa), max(pa)))
+                ib = pair_index.canonical_to_idx.get((min(pb), max(pb)))
                 if ia is None or ib is None:
                     continue
-                entries.append(((ia, ib), arr))
+                shape = arr.shape
+                if len(shape) != 2:
+                    raise ValueError(
+                        f"FlatPairPairStore expects rank-2 entries; "
+                        f"got shape {shape} for ({ia},{ib})")
+                meta.append((ia, ib, (pa, pb), shape))
 
-        n = len(entries)
+        n = len(meta)
         self._n_flat = n
         self._shapes = np.zeros((n, 2), dtype=np.int32)
         sizes = np.zeros(n, dtype=np.int64)
-        for k, ((ia, ib), arr) in enumerate(entries):
-            shape = arr.shape
-            if len(shape) != 2:
-                raise ValueError(
-                    f"FlatPairPairStore expects rank-2 entries; "
-                    f"got shape {shape} for ({ia},{ib})"
-                )
+        for k, (ia, ib, _ok, shape) in enumerate(meta):
             self._shapes[k, 0] = shape[0]
             self._shapes[k, 1] = shape[1]
             sizes[k] = shape[0] * shape[1]
 
         self._offsets = np.zeros(n + 1, dtype=np.int64)
         self._offsets[1:] = np.cumsum(sizes)
-        self._buffer = np.empty(int(self._offsets[-1]), dtype=self.dtype)
+        _total = int(self._offsets[-1])
+        if _mmap and _total > 0:
+            _tmpdir = os.environ.get('PYSCF_TMPDIR') or tempfile.gettempdir()
+            _fd, self._mmap_path = tempfile.mkstemp(
+                suffix='.spno', prefix='dlpno_', dir=_tmpdir)
+            os.close(_fd)
+            self._buffer = np.memmap(self._mmap_path, dtype=self.dtype,
+                                     mode='w+', shape=(_total,))
+        else:
+            self._buffer = np.empty(_total, dtype=self.dtype)
 
-        # (n_pairs, n_pairs) int32 dense lookup replaces the slow tuple
-        # dict.  ``-1`` means "not in flat tier".  Memory cost is
-        # ``4 * n_pairs**2`` bytes (~1 MB at n_pairs = 528) — cheap.
+        # (n_pairs, n_pairs) int32 dense lookup; ``-1`` == "not in flat tier".
         n_pairs = pair_index.n_pairs
         self._idx_matrix = np.full((n_pairs, n_pairs), -1, dtype=np.int32)
-        for k, ((ia, ib), arr) in enumerate(entries):
+        # Flush the memmap to disk every ~4 GiB of writes so the dirty pages
+        # don't accumulate in RAM (which would defeat the point of paging the
+        # buffer out).  After flush+madvise the pages are clean/file-backed
+        # and the kernel can evict them under memory pressure.
+        _flush_every = (4 << 30) // self.dtype.itemsize if _mmap else 0
+        _since_flush = 0
+        for k, (ia, ib, okey, _shape) in enumerate(meta):
             start = int(self._offsets[k])
             end = int(self._offsets[k + 1])
             if end > start:
+                arr = (initial.pop(okey) if _mmap else initial[okey])
                 self._buffer[start:end] = arr.ravel()
+                del arr
+                _since_flush += (end - start)
+                if _flush_every and _since_flush >= _flush_every:
+                    self._buffer.flush()
+                    _madvise_dontneed(self._buffer)
+                    _since_flush = 0
             self._idx_matrix[ia, ib] = k
+        if _mmap and _total > 0:
+            self._buffer.flush()
+            _madvise_dontneed(self._buffer)
 
         self._overflow = {}
 
@@ -889,7 +964,65 @@ def flatten_cc_ints_fields(cc_ints, pair_index, _pool=None):
     else:
         results = [_flatten_one_field(f, r) for f, r in tasks]
 
+    # If any field is memmap-backed (DLPNO_CCINTS_MMAP), flush its writes to
+    # disk now so the pages become CLEAN/file-backed — only then can the OS
+    # evict them under memory pressure (the whole point of the mmap).
+    for _f, _store in results:
+        _buf = getattr(_store, '_buffer', None)
+        if getattr(_store, '_mmap_path', None) is not None and _buf is not None:
+            _buf.flush()
+
     return dict(results)
+
+
+def build_combined_ktilde_store(cc_ints, pair_index):
+    """Pack every pair's ``K_tilde_chem_i`` / ``K_tilde_chem_j`` into one
+    contiguous buffer and replace the per-pair entries with views into it.
+
+    ``K_tilde_chem_{i,j}`` are the (n_pno, n_pno²) — i.e. n_pno³ — Term-2
+    intermediates.  ``compute_C_tilde_batched`` and ``build_D_tilde_batched``
+    each used to gather the per-pair (i-or-j) selection into a *retained*
+    flat plan buffer, so on a TM complex K_tilde_chem was held ~4× (cc_ints
+    i+j originals, plus a C_tilde copy, plus a D_tilde copy).  Packing it once
+    here and pointing both builders at this single buffer (via the returned
+    element offsets) collapses that to 1×.
+
+    Returns ``{'buf', 'off_i', 'off_j'}`` where ``off_{i,j}`` are dicts
+    ``{canonical_key: element_start_offset}`` into ``buf``, or ``None`` if no
+    pair carries K_tilde_chem.
+    """
+    canon = pair_index.canonical_keys
+    off_i = {}
+    off_j = {}
+
+    total = 0
+    plan = []  # (key, which, size, shape)
+    for key in canon:
+        entry = cc_ints.get(key)
+        if entry is None:
+            continue
+        for which, off_d in (('K_tilde_chem_i', off_i),
+                             ('K_tilde_chem_j', off_j)):
+            arr = entry.get(which)
+            if arr is None:
+                continue
+            off_d[key] = total
+            plan.append((key, which, arr.size, arr.shape))
+            total += arr.size
+
+    if total == 0:
+        return None
+
+    buf = np.empty(total, dtype=np.float64)
+    # Copy each source array into the buffer, then replace the dict slot with
+    # a view so the original (held only by that slot) is freed.
+    for (key, which, size, shape) in plan:
+        start = int(off_i[key] if which == 'K_tilde_chem_i' else off_j[key])
+        entry = cc_ints[key]
+        buf[start:start + size] = np.ascontiguousarray(entry[which]).ravel()
+        entry[which] = buf[start:start + size].reshape(shape)
+
+    return {'buf': buf, 'off_i': off_i, 'off_j': off_j}
 
 
 # ----------------------------------------------------------------------

@@ -137,6 +137,7 @@ extern "C" void DLPNOc_term_batched(
     const double *S_big_flat, const double *S_mid_flat,
     const double *J_bold_flat, const double *S_outer_flat,
     const double *ct_flat, const double *t2_flat,
+    const unsigned char *t2_trans,
     double *STB_scratch,   size_t STB_stride,
     double *GAMMA_scratch, size_t GAMMA_stride,
     double *GT_scratch,    size_t GT_stride,
@@ -188,6 +189,8 @@ extern "C" void DLPNOd_term_batched(
     const long *tile_off,
     const double *S_a_flat, const double *S_b_flat, const double *S_c_flat,
     const double *KJ_flat, const double *u_flat, const double *dt_flat,
+    const double *u_base, const long *u_canon_off, const unsigned char *u_trans,
+    double *U_scratch,    size_t U_stride,
     double *SU_scratch,   size_t SU_stride,
     double *UP_scratch,   size_t UP_stride,
     double *SCD_scratch,  size_t SCD_stride,
@@ -293,9 +296,31 @@ static int solver_team_size() {
 // just hand the kernel the pointer and let it interpret the per-pair shape
 // using n_pno_per_pair / pair_lmo_idx_offsets.
 struct FlatPairStore {
-    const double *data;      // contiguous storage for all pairs
-    const int64_t *offsets;  // length n_pairs + 1
+    const double *data;      // storage for all pairs (may be a SHARED buffer)
+    const int64_t *offsets;  // length n_pairs + 1; offsets[p+1]-offsets[p] is
+                             // the SIZE of pair p (always valid for sizing)
+    // Optional: when non-NULL, pair p's data START is data[block_start[p]]
+    // instead of data[offsets[p]].  This lets `data` alias a buffer whose
+    // pair layout differs from this store's pack order (e.g. the cc_ints
+    // flat store in canonical order vs the solver's diag-first order) — a
+    // true zero-copy view, no per-pair re-copy.  NULL = contiguous (legacy).
+    const int64_t *block_start;
 };
+
+// Start pointer of pair `p` in a FlatPairStore: block_start[p] when set
+// (aliased/shared buffer), else offsets[p] (contiguous).  Size is always
+// offsets[p+1]-offsets[p].
+static inline const double *fps_ptr(const FlatPairStore &s, int64_t p) {
+    return s.data + (s.block_start ? s.block_start[p] : s.offsets[p]);
+}
+
+// Position-offset array to hand a batched C kernel that does its own
+// `data + offs[p]` indexing: block_start when aliased (canonical positions),
+// else offsets (contiguous).  The kernel derives per-pair SIZE from
+// n_local/npno, not from this array, so passing positions here is correct.
+static inline const long *fps_pos(const FlatPairStore &s) {
+    return (const long *)(s.block_start ? s.block_start : s.offsets);
+}
 
 // -- Inputs from Python (read-only views unless noted) -----------------------
 struct SolverInputs {
@@ -413,6 +438,24 @@ struct SolverInputs {
     //   When null, all pairs counted (legacy behavior).
     const unsigned char *is_strong_pair;
 };
+
+// S_PNO block lookup for dense pair index s_idx (= p_a*N_canon + p_b).
+// When S_pno_index is provided (sparse mode), S_pno_data aliases the
+// S_pno_cache buffer (slot order) and S_pno_offsets are its slot offsets:
+// s_idx -> slot -> (offset, size).  slot < 0 means the block is absent
+// (size 0).  When S_pno_index is NULL (legacy dense mode), s_idx indexes
+// S_pno_offsets directly.  This lets the pack alias the shared cache buffer
+// instead of building a second dense copy of all S_PNO overlaps.
+static inline void s_pno_lookup(const SolverInputs &in, int64_t s_idx,
+                                int64_t &s_off, int64_t &s_size) {
+    int64_t slot = s_idx;
+    if (in.S_pno_index) {
+        slot = (int64_t)in.S_pno_index[s_idx];
+        if (slot < 0) { s_off = 0; s_size = 0; return; }
+    }
+    s_off = in.S_pno_offsets[slot];
+    s_size = in.S_pno_offsets[slot + 1] - s_off;
+}
 
 // -- Output struct for the t1_ints phase (Step 2b) --------------------------
 //
@@ -586,6 +629,7 @@ struct CTermInputs {
     const double *S_outer_flat;
     const double *ct_flat;
     const double *t2_flat;
+    const unsigned char *t2_trans;   // NULL => legacy gathered t2 (flag T)
     int max_n_pno;
     int max_n_ct;
     int max_n_other;
@@ -614,6 +658,9 @@ struct DTermInputs {
     const double *KJ_flat;
     const double *u_flat;
     const double *dt_flat;
+    const double *u_base;            // NULL => legacy gathered u_flat
+    const long   *u_canon_off;       // canonical t2[key] offsets (when u_base)
+    const unsigned char *u_trans;    // per-item transpose flag (when u_base)
     int max_n_pno;
     int max_n_A;
     int max_n_B;
@@ -1086,15 +1133,15 @@ void DLPNOCCSDSolver::run_phase_t1_ints_into(T1IntsOutputs *out) {
         const int64_t per_q = (int64_t)nlmo_p * (int64_t)npno;
         const size_t n_local = (size_t)(qma_size / per_q);
 
-        const double *Qma_p   = in_.Qma.data   + in_.Qma.offsets[p];
-        const double *Qab_p   = in_.Qab.data   + in_.Qab.offsets[p];
-        const double *i_Qa_p  = in_.i_Qa.data  + in_.i_Qa.offsets[p];
-        const double *i_Qk_p  = in_.i_Qk.data  + in_.i_Qk.offsets[p];
-        const double *j_Qa_p  = in_.j_Qa.data  + in_.j_Qa.offsets[p];
-        const double *j_Qk_p  = in_.j_Qk.data  + in_.j_Qk.offsets[p];
+        const double *Qma_p   = fps_ptr(in_.Qma, p);
+        const double *Qab_p   = fps_ptr(in_.Qab, p);
+        const double *i_Qa_p  = fps_ptr(in_.i_Qa, p);
+        const double *i_Qk_p  = fps_ptr(in_.i_Qk, p);
+        const double *j_Qa_p  = fps_ptr(in_.j_Qa, p);
+        const double *j_Qk_p  = fps_ptr(in_.j_Qk, p);
 
         const double *T1_local =
-            in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+            fps_ptr(in_.T1_in_pair, p);
         const double *t1_lmo_i = T1_local + (int64_t)i_in_p * npno;
         const double *t1_lmo_j = T1_local + (int64_t)j_in_p * npno;
 
@@ -1171,12 +1218,12 @@ void DLPNOCCSDSolver::run_phase_t1_fock_into(T1FockOutputs *out) {
         Z_xxx_sc.assign((size_t)num_threads * s_Z, 0.0);
 
     DLPNOt1_fock_batched(
-        in_.T1_in_pair.data,    (const long *)in_.T1_in_pair.offsets,
-        in_.K_bar_chem.data,    (const long *)in_.K_bar_chem.offsets,
-        in_.K_bar_ji.data,      (const long *)in_.K_bar_ji.offsets,
-        in_.K_bar_ij.data,      (const long *)in_.K_bar_ij.offsets,
-        in_.Qma.data,           (const long *)in_.Qma.offsets,
-        in_.Qab.data,           (const long *)in_.Qab.offsets,
+        in_.T1_in_pair.data,    fps_pos(in_.T1_in_pair),
+        in_.K_bar_chem.data,    fps_pos(in_.K_bar_chem),
+        in_.K_bar_ji.data,      fps_pos(in_.K_bar_ji),
+        in_.K_bar_ij.data,      fps_pos(in_.K_bar_ij),
+        in_.Qma.data,           fps_pos(in_.Qma),
+        in_.Qab.data,           fps_pos(in_.Qab),
         in_.e_pno_flat,         (const long *)in_.pno_offsets,
         nlmo_arr.data(), npno_arr.data(), n_local_arr.data(), need_dji_arr.data(),
         in_.is_strong_pair,
@@ -1246,25 +1293,63 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
         ord_npno2_off[o + 1] = ord_npno2_off[o] + (int64_t)npno * npno;
     }
 
+    // One-time scratch-size report (DLPNO_CCSD_SIZE_PROBE=1): which static
+    // buffers dominate run_one_cycle's anonymous footprint.  Each value is the
+    // element count; ×8 bytes / 2^30 = GiB.  R2_total/t2 buffers and the
+    // C/D_tilde + per-side flat_* contribution buffers are the streaming
+    // targets (each ~R2_total or ~ord_npno2_off[N_ord]-sized).
+    if (std::getenv("DLPNO_CCSD_SIZE_PROBE")) {
+        static bool _printed_sizes = false;
+        if (!_printed_sizes) {
+            _printed_sizes = true;
+            const double G = 8.0 / (1024.0*1024.0*1024.0);
+            const int64_t R2t = in_.t2_offsets[N];
+            std::fprintf(stderr,
+              "[CCSD-SIZE] N=%d N_ord=%d nocc=%d | t2_off[N]=%.2fG "
+              "ord_npno2_off[N_ord]=%.2fG dressed_qa=%.2fG dressed_qk=%.2fG "
+              "fia_bar=%.2fG b_tilde=%.2fG\n"
+              "[CCSD-SIZE] per-buffer GiB: Fab=%.2f K=%.2f A=%.2f R2_buf=%.2f "
+              "C_tilde=%.2f D_tilde=%.2f | flat_{B,E}=2x%.2f "
+              "flat_{C,D,G}_{ij,ji}=6x%.2f  => big-buffer subtotal ~%.1fG\n",
+              N, N_ord, nocc, R2t*G, ord_npno2_off[N_ord]*G,
+              dressed_qa_off[N]*G, dressed_qk_off[N]*G,
+              fia_bar_off[N]*G, b_tilde_off[N]*G,
+              R2t*G, R2t*G, R2t*G, R2t*G,
+              ord_npno2_off[N_ord]*G, ord_npno2_off[N_ord]*G,
+              R2t*G, R2t*G,
+              (R2t*4 + ord_npno2_off[N_ord]*2 + R2t*2 + R2t*6)*G);
+            std::fflush(stderr);
+        }
+    }
+
     // ------------------------------------------------------------------
-    // Allocate scratch buffers (per-call; promote to class members later).
-    // ------------------------------------------------------------------
-    std::vector<double> dressed_iQa(dressed_qa_off[N], 0.0);
-    std::vector<double> dressed_jQa(dressed_qa_off[N], 0.0);
-    std::vector<double> dressed_iQk(dressed_qk_off[N], 0.0);
-    std::vector<double> dressed_jQk(dressed_qk_off[N], 0.0);
-    std::vector<double> Fab_flat(in_.t2_offsets[N], 0.0);
-    std::vector<double> d_flat((size_t)N * 2, 0.0);
-    std::vector<double> Fkj_mat((size_t)nocc * nocc, 0.0);
-    std::vector<double> Fij_bar_mat((size_t)nocc * nocc, 0.0);
-    std::vector<double> foo_t1_mat((size_t)nocc * nocc, 0.0);
-    std::vector<double> Fia_bar_flat(fia_bar_off[N], 0.0);
-    std::vector<double> B_tilde_flat(b_tilde_off[N], 0.0);
-    std::vector<double> C_tilde_flat(ord_npno2_off[N_ord], 0.0);
-    std::vector<double> D_tilde_flat(ord_npno2_off[N_ord], 0.0);
-    std::vector<double> K_flat(in_.t2_offsets[N], 0.0);
-    std::vector<double> A_flat(in_.t2_offsets[N], 0.0);
-    std::vector<double> G_tilde_mat((size_t)nocc * nocc, 0.0);
+    // Scratch buffers.  These are function-local STATIC: their sizes are
+    // cycle-invariant (fixed by the pair/PNO structure), so we allocate the
+    // buffer once and `.assign(size, 0.0)` each cycle to re-zero in place.
+    // This is behaviourally identical to per-call `vector(size, 0.0)` but
+    // avoids the ~40 GiB malloc/free churn every cycle.  That churn was the
+    // real cost on large systems (e.g. MOBH35 rxn_12): each cycle's fresh
+    // allocations forced the kernel to evict the cc_ints mmap page-cache,
+    // which was then re-read from NVMe (~121 GiB/cycle of block I/O).  With
+    // the buffers persistent the cc_ints cache stays warm.  The driver calls
+    // this serially (one cycle at a time, single solver), so the statics are
+    // safe; one run per process keeps the retained capacity bounded.
+    static std::vector<double> dressed_iQa; dressed_iQa.assign(dressed_qa_off[N], 0.0);
+    static std::vector<double> dressed_jQa; dressed_jQa.assign(dressed_qa_off[N], 0.0);
+    static std::vector<double> dressed_iQk; dressed_iQk.assign(dressed_qk_off[N], 0.0);
+    static std::vector<double> dressed_jQk; dressed_jQk.assign(dressed_qk_off[N], 0.0);
+    static std::vector<double> Fab_flat; Fab_flat.assign(in_.t2_offsets[N], 0.0);
+    static std::vector<double> d_flat; d_flat.assign((size_t)N * 2, 0.0);
+    static std::vector<double> Fkj_mat; Fkj_mat.assign((size_t)nocc * nocc, 0.0);
+    static std::vector<double> Fij_bar_mat; Fij_bar_mat.assign((size_t)nocc * nocc, 0.0);
+    static std::vector<double> foo_t1_mat; foo_t1_mat.assign((size_t)nocc * nocc, 0.0);
+    static std::vector<double> Fia_bar_flat; Fia_bar_flat.assign(fia_bar_off[N], 0.0);
+    static std::vector<double> B_tilde_flat; B_tilde_flat.assign(b_tilde_off[N], 0.0);
+    static std::vector<double> C_tilde_flat; C_tilde_flat.assign(ord_npno2_off[N_ord], 0.0);
+    static std::vector<double> D_tilde_flat; D_tilde_flat.assign(ord_npno2_off[N_ord], 0.0);
+    static std::vector<double> K_flat; K_flat.assign(in_.t2_offsets[N], 0.0);
+    static std::vector<double> A_flat; A_flat.assign(in_.t2_offsets[N], 0.0);
+    static std::vector<double> G_tilde_mat; G_tilde_mat.assign((size_t)nocc * nocc, 0.0);
 
     // Per-phase profiling (set DLPNO_CCSD_PROFILE=1 to enable).
     const bool _profile = (std::getenv("DLPNO_CCSD_PROFILE") != nullptr
@@ -1505,7 +1590,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     //         + A + C (per ordered pair, no init)
     //         + per_kl B+A2 (if plan provided).
     // ------------------------------------------------------------------
-    std::vector<double> R1_buf((size_t)R1_total, 0.0);
+    static std::vector<double> R1_buf; R1_buf.assign((size_t)R1_total, 0.0);
 
     // Stages 1-3.
     run_phase_t1_residual_stages123_into(R1_buf.data());
@@ -1521,8 +1606,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             if (p_ii < 0) continue;
             const int npno_ii = in_.n_pno_per_pair[p_ii];
             if (npno_ii == 0) continue;
-            const double *T_full = in_.T1_in_pair_full.data
-                                    + in_.T1_in_pair_full.offsets[p_ii];
+            const double *T_full = fps_ptr(in_.T1_in_pair_full, p_ii);
             const int64_t r1_off = in_.pno_offsets[i];
             for (int a = 0; a < npno_ii; ++a) {
                 double s = 0.0;
@@ -1556,7 +1640,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
         for (int64_t ti = 0; ti < total_inner; ++ti) {
             contrib_total += p_plan->n_pno_ii_arr[ti];
         }
-        std::vector<double> contrib_flat((size_t)contrib_total, 0.0);
+        static std::vector<double> contrib_flat; contrib_flat.assign((size_t)contrib_total, 0.0);
 
         PerKlOutputs perkl_out;
         perkl_out.contrib_flat = contrib_flat.data();
@@ -1583,7 +1667,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     //   (b) Otherwise → native build: K + ladder + plan-cached R2
     //       contributions (BE/CD/G_term/t3+t4) wired here.
     // ------------------------------------------------------------------
-    std::vector<double> R2_buf((size_t)R2_total, 0.0);
+    static std::vector<double> R2_buf; R2_buf.assign((size_t)R2_total, 0.0);
     if (in_.R2_external != nullptr) {
         std::memcpy(R2_buf.data(), in_.R2_external,
                     (size_t)R2_total * sizeof(double));
@@ -1597,12 +1681,12 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
         // ----------------------------------------------------------------
 
         // Hoisted flat buffers (empty when feature disabled).
-        std::vector<double> flat_G_ij_buf, flat_G_ji_buf;
+        static std::vector<double> flat_G_ij_buf, flat_G_ji_buf;
         bool have_g_term = false;
-        std::vector<double> flat_B, flat_E;
+        static std::vector<double> flat_B, flat_E;
         bool have_be = false;
-        std::vector<double> flat_C_ij_buf, flat_C_ji_buf;
-        std::vector<double> flat_D_ij_buf, flat_D_ji_buf;
+        static std::vector<double> flat_C_ij_buf, flat_C_ji_buf;
+        static std::vector<double> flat_D_ij_buf, flat_D_ji_buf;
         bool have_cd = false;
         _tick(&_t_r2_kload);  // K + A already populated by run_phase_k_ladder_into
 
@@ -1622,7 +1706,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             const int64_t *tile_off_ik =
                 (const int64_t *)g_ik_local.tile_off;
             const int64_t total_tiles_ik = tile_off_ik[N_ik];
-            std::vector<double> tiles_ik_buf((size_t)total_tiles_ik, 0.0);
+            static std::vector<double> tiles_ik_buf; tiles_ik_buf.assign((size_t)total_tiles_ik, 0.0);
             GTermOutputs gout_ik;
             gout_ik.tiles_flat = tiles_ik_buf.data();
             run_phase_g_term_into(&g_ik_local, &gout_ik);
@@ -1646,7 +1730,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             const int64_t *tile_off_jk =
                 (const int64_t *)g_jk_local.tile_off;
             const int64_t total_tiles_jk = tile_off_jk[N_jk];
-            std::vector<double> tiles_jk_buf((size_t)total_tiles_jk, 0.0);
+            static std::vector<double> tiles_jk_buf; tiles_jk_buf.assign((size_t)total_tiles_jk, 0.0);
             GTermOutputs gout_jk;
             gout_jk.tiles_flat = tiles_jk_buf.data();
             run_phase_g_term_into(&g_jk_local, &gout_jk);
@@ -1779,28 +1863,28 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             const CTermInputs *c_plan_orig = plans->c_term_plan;
             const int N_c = c_plan_orig->N;
             const int64_t *c_tile_off = (const int64_t *)c_plan_orig->tile_off;
-            std::vector<double> c_tiles_buf((size_t)c_tile_off[N_c], 0.0);
+            static std::vector<double> c_tiles_buf; c_tiles_buf.assign((size_t)c_tile_off[N_c], 0.0);
             // If c_term_ct_ord_pair_idx is provided, build ct_flat from
             // class's native C_tilde_flat (post-Phase 2).  Otherwise use
             // the user-provided ct_flat (from PySCF dict gather).
             CTermInputs c_plan = *c_plan_orig;
-            std::vector<double> ct_flat_local;
+            // Offset-alias ct directly into C_tilde_flat (the native per-
+            // ordered-pair C_tilde) instead of gathering a per-item copy.
+            // The kernel reads ct = ct_flat + ct_off[n]; pointing ct_flat at
+            // C_tilde_flat and ct_off[n] at ord_npno2_off[o] reads the same
+            // bytes with zero duplication.  Each item's C_tilde block is
+            // (n_ct x n_ct) = (npno_o x npno_o) where o is its ordered pair,
+            // so sizes match.  Eliminates the ~per-item-duplicated ct gather
+            // (a multi-GiB CCSD-cycle buffer on TM complexes).
+            static std::vector<int64_t> ct_src_off;
             if (plans->c_term_ct_ord_pair_idx != nullptr) {
-                const int64_t *c_ct_off = (const int64_t *)c_plan_orig->ct_off;
-                const int *c_n_ct = (const int *)c_plan_orig->n_ct_arr;
-                ct_flat_local.assign((size_t)c_ct_off[N_c], 0.0);
+                ct_src_off.assign((size_t)N_c, 0);
                 for (int n = 0; n < N_c; ++n) {
                     const int o = plans->c_term_ct_ord_pair_idx[n];
-                    if (o < 0) continue;
-                    const int n_ct = c_n_ct[n];
-                    const int64_t src = ord_npno2_off[o];
-                    const int64_t dst = c_ct_off[n];
-                    const int64_t sz = (int64_t)n_ct * n_ct;
-                    for (int64_t e = 0; e < sz; ++e) {
-                        ct_flat_local[dst + e] = C_tilde_flat[src + e];
-                    }
+                    ct_src_off[n] = (o >= 0) ? ord_npno2_off[o] : 0;
                 }
-                c_plan.ct_flat = ct_flat_local.data();
+                c_plan.ct_flat = C_tilde_flat.data();
+                c_plan.ct_off  = (const long *)ct_src_off.data();
             }
             CTermOutputs c_out;
             c_out.tiles_flat = c_tiles_buf.data();
@@ -1829,25 +1913,21 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             const DTermInputs *d_plan_orig = plans->d_term_plan;
             const int N_d = d_plan_orig->N;
             const int64_t *d_tile_off = (const int64_t *)d_plan_orig->tile_off;
-            std::vector<double> d_tiles_buf((size_t)d_tile_off[N_d], 0.0);
+            static std::vector<double> d_tiles_buf; d_tiles_buf.assign((size_t)d_tile_off[N_d], 0.0);
             DTermInputs d_plan = *d_plan_orig;
-            std::vector<double> dt_flat_local;
+            // Offset-alias dt into D_tilde_flat (per-ordered-pair D_tilde),
+            // same as the c-side ct alias: read dt = dt_flat + dt_off[n] with
+            // dt_flat = D_tilde_flat and dt_off[n] = ord_npno2_off[o].  No
+            // per-item-duplicated copy.
+            static std::vector<int64_t> dt_src_off;
             if (plans->d_term_dt_ord_pair_idx != nullptr) {
-                const int64_t *d_dt_off = (const int64_t *)d_plan_orig->dt_off;
-                const int *d_n_B = (const int *)d_plan_orig->n_B_arr;
-                dt_flat_local.assign((size_t)d_dt_off[N_d], 0.0);
+                dt_src_off.assign((size_t)N_d, 0);
                 for (int n = 0; n < N_d; ++n) {
                     const int o = plans->d_term_dt_ord_pair_idx[n];
-                    if (o < 0) continue;
-                    const int n_B = d_n_B[n];
-                    const int64_t src = ord_npno2_off[o];
-                    const int64_t dst = d_dt_off[n];
-                    const int64_t sz = (int64_t)n_B * n_B;
-                    for (int64_t e = 0; e < sz; ++e) {
-                        dt_flat_local[dst + e] = D_tilde_flat[src + e];
-                    }
+                    dt_src_off[n] = (o >= 0) ? ord_npno2_off[o] : 0;
                 }
-                d_plan.dt_flat = dt_flat_local.data();
+                d_plan.dt_flat = D_tilde_flat.data();
+                d_plan.dt_off  = (const long *)dt_src_off.data();
             }
             DTermOutputs d_out;
             d_out.tiles_flat = d_tiles_buf.data();
@@ -2016,11 +2096,11 @@ void DLPNOCCSDSolver::run_phase_t1_residual_stages123_into(double *R1_flat) {
         const int64_t per_q = (int64_t)nlmo_p * npno_ii;
         const int n_local = (per_q > 0) ? (int)(qma_size / per_q) : 0;
 
-        const double *Qma = in_.Qma.data + in_.Qma.offsets[p_ii];
-        const double *Qab = in_.Qab.data + in_.Qab.offsets[p_ii];
-        const double *Qia = in_.i_Qa.data + in_.i_Qa.offsets[p_ii];
-        const double *Qik = in_.i_Qk.data + in_.i_Qk.offsets[p_ii];
-        const double *T_n = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p_ii];
+        const double *Qma = fps_ptr(in_.Qma, p_ii);
+        const double *Qab = fps_ptr(in_.Qab, p_ii);
+        const double *Qia = fps_ptr(in_.i_Qa, p_ii);
+        const double *Qik = fps_ptr(in_.i_Qk, p_ii);
+        const double *T_n = fps_ptr(in_.T1_in_pair, p_ii);
         const double *t1_i = in_.T1_flat + in_.pno_offsets[i];
         const double *e_pno = in_.e_pno_flat + in_.pno_offsets[p_ii];
 
@@ -2111,9 +2191,8 @@ void DLPNOCCSDSolver::run_phase_t1_residual_AC_init_into(
             const int npno_im = in_.n_pno_per_pair[p_im];
             if (npno_im == 0) continue;
 
-            const double *K = in_.K_iajb.data + in_.K_iajb.offsets[p_im];
-            const double *T_full = in_.T1_in_pair_full.data
-                                    + in_.T1_in_pair_full.offsets[p_im];
+            const double *K = fps_ptr(in_.K_iajb, p_im);
+            const double *T_full = fps_ptr(in_.T1_in_pair_full, p_im);
             const double *t1_m = T_full + (int64_t)m_o * npno_im;
 
             double *lt1_o = lt1_flat.data() + lt1_offsets[o];
@@ -2166,8 +2245,7 @@ void DLPNOCCSDSolver::run_phase_t1_residual_AC_init_into(
 
             // Look up S_PNO(p_canon, p_ii).  Skip if not stored.
             const int64_t s_idx = (int64_t)p_canon * N_canon + p_ii;
-            const int64_t s_off = in_.S_pno_offsets[s_idx];
-            const int64_t s_size = in_.S_pno_offsets[s_idx + 1] - s_off;
+            int64_t s_off, s_size; s_pno_lookup(in_, s_idx, s_off, s_size);
             if (s_size != (int64_t)npno_p * (int64_t)npno_ii) continue;
             const double *S_p = in_.S_pno_data + s_off;
 
@@ -2251,8 +2329,7 @@ void DLPNOCCSDSolver::run_phase_t1_residual_AC_init_into(
             //   2. Else: legacy LT1-chain inline (strong-only).
             std::vector<double> fkc_dress((size_t)npno_p, 0.0);
             if (in_.Fkc_per_ordered.data != nullptr) {
-                const double *Fkc_o = in_.Fkc_per_ordered.data
-                                       + in_.Fkc_per_ordered.offsets[o];
+                const double *Fkc_o = fps_ptr(in_.Fkc_per_ordered, o);
                 for (int a = 0; a < npno_p; ++a) fkc_dress[a] = Fkc_o[a];
             } else {
                 for (int m_ = 0; m_ < nocc; ++m_) {
@@ -2270,8 +2347,7 @@ void DLPNOCCSDSolver::run_phase_t1_residual_AC_init_into(
                         }
                     } else {
                         const int64_t s_idx = (int64_t)p_canon * N_canon + p_im;
-                        const int64_t s_off = in_.S_pno_offsets[s_idx];
-                        const int64_t s_size = in_.S_pno_offsets[s_idx + 1] - s_off;
+                        int64_t s_off, s_size; s_pno_lookup(in_, s_idx, s_off, s_size);
                         if (s_size != (int64_t)npno_p * npno_im) continue;
                         const double *S_p_im = in_.S_pno_data + s_off;
                         for (int a = 0; a < npno_p; ++a) {
@@ -2303,8 +2379,7 @@ void DLPNOCCSDSolver::run_phase_t1_residual_AC_init_into(
                 }
             } else {
                 const int64_t s_idx2 = (int64_t)p_ii * N_canon + p_canon;
-                const int64_t s_off2 = in_.S_pno_offsets[s_idx2];
-                const int64_t s_size2 = in_.S_pno_offsets[s_idx2 + 1] - s_off2;
+                int64_t s_off2, s_size2; s_pno_lookup(in_, s_idx2, s_off2, s_size2);
                 if (s_size2 != (int64_t)npno_ii * npno_p) continue;
                 const double *S_ii_ki = in_.S_pno_data + s_off2;
                 for (int a = 0; a < npno_ii; ++a) {
@@ -2347,8 +2422,8 @@ void DLPNOCCSDSolver::run_phase_t1_fock_fia_bar_into(FiaBarOutputs *out) {
         const int64_t per_q = (int64_t)nlmo * (int64_t)npno;
         const int n_local = (per_q > 0) ? (int)(qma_size / per_q) : 0;
 
-        const double *Qma = in_.Qma.data + in_.Qma.offsets[p];
-        const double *T1l = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        const double *Qma = fps_ptr(in_.Qma, p);
+        const double *T1l = fps_ptr(in_.T1_in_pair, p);
         double *Fia_bar = out->Fia_bar.data + out->Fia_bar.offsets[p];
 
         // Zero output up front (covers the n_local == 0 case too).
@@ -2522,7 +2597,7 @@ void DLPNOCCSDSolver::run_phase_update_amps_and_energy_into(
 
         const double *T2_p =
             in_.T2_flat + in_.t2_offsets[p];
-        const double *K_p = in_.K_iajb.data + in_.K_iajb.offsets[p];
+        const double *K_p = fps_ptr(in_.K_iajb, p);
 
         // Project T1_flat[i] from (i,i)'s PNO basis to pair p's PNO basis
         // via S_PNO(p, (i,i)) which has shape (npno_p, npno_ii).  When
@@ -2542,7 +2617,7 @@ void DLPNOCCSDSolver::run_phase_update_amps_and_energy_into(
                 if (lmo_list[k] == j) j_in_p = k;
             }
             if (i_in_p < 0 || j_in_p < 0) continue;
-            const double *T1_pair = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+            const double *T1_pair = fps_ptr(in_.T1_in_pair, p);
             for (int a = 0; a < npno; ++a) {
                 t1_i_in_p[a] = T1_pair[(int64_t)i_in_p * npno + a];
                 t1_j_in_p[a] = T1_pair[(int64_t)j_in_p * npno + a];
@@ -2554,8 +2629,7 @@ void DLPNOCCSDSolver::run_phase_update_amps_and_energy_into(
                 for (int a = 0; a < npno; ++a) t1_i_in_p[a] = T1_i_native[a];
             } else {
                 const int64_t s_idx = (int64_t)p * N_canon + p_ii;
-                const int64_t s_off = in_.S_pno_offsets[s_idx];
-                const int64_t s_size = in_.S_pno_offsets[s_idx + 1] - s_off;
+                int64_t s_off, s_size; s_pno_lookup(in_, s_idx, s_off, s_size);
                 if (s_size == (int64_t)npno * npno_ii) {
                     const double *S = in_.S_pno_data + s_off;
                     const double *T1_i_native = in_.T1_flat + in_.pno_offsets[i];
@@ -2575,8 +2649,7 @@ void DLPNOCCSDSolver::run_phase_update_amps_and_energy_into(
                 for (int a = 0; a < npno; ++a) t1_j_in_p[a] = T1_j_native[a];
             } else {
                 const int64_t s_idx = (int64_t)p * N_canon + p_jj;
-                const int64_t s_off = in_.S_pno_offsets[s_idx];
-                const int64_t s_size = in_.S_pno_offsets[s_idx + 1] - s_off;
+                int64_t s_off, s_size; s_pno_lookup(in_, s_idx, s_off, s_size);
                 if (s_size == (int64_t)npno * npno_jj) {
                     const double *S = in_.S_pno_data + s_off;
                     const double *T1_j_native = in_.T1_flat + in_.pno_offsets[j];
@@ -2632,9 +2705,9 @@ void DLPNOCCSDSolver::run_phase_k_ladder_into(
                             + t1_dressed->i_Qa_t1.offsets[p];
         const double *jQa = t1_dressed->j_Qa_t1.data
                             + t1_dressed->j_Qa_t1.offsets[p];
-        const double *Qma = in_.Qma.data + in_.Qma.offsets[p];
-        const double *Qab = in_.Qab.data + in_.Qab.offsets[p];
-        const double *T1l = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        const double *Qma = fps_ptr(in_.Qma, p);
+        const double *Qab = fps_ptr(in_.Qab, p);
+        const double *T1l = fps_ptr(in_.T1_in_pair, p);
         const double *T2  = in_.T2_flat + in_.t2_offsets[p];
 
         double *K_out = out->K.data + out->K.offsets[p];
@@ -2803,6 +2876,7 @@ void DLPNOCCSDSolver::run_phase_c_term_into(
         plan->S_big_flat, plan->S_mid_flat,
         plan->J_bold_flat, plan->S_outer_flat,
         plan->ct_flat, plan->t2_flat,
+        plan->t2_trans,
         STB_sc.data(),   STB_stride,
         GAMMA_sc.data(), GAMMA_stride,
         GT_sc.data(),    GT_stride,
@@ -2817,11 +2891,14 @@ void DLPNOCCSDSolver::run_phase_d_term_into(
         num_threads = solver_team_size();
         if (plan->N > 0 && num_threads > plan->N) num_threads = plan->N;
     #endif
+    const size_t U_stride    = (size_t)plan->max_n_A * plan->max_n_A;
     const size_t SU_stride   = (size_t)plan->max_n_pno * plan->max_n_A;
     const size_t UP_stride   = (size_t)plan->max_n_pno * plan->max_n_B;
     const size_t SCD_stride  = (size_t)plan->max_n_pno * plan->max_n_B;
     const size_t Bint_stride = (size_t)plan->max_n_pno * plan->max_n_A;
 
+    // U scratch only needed when computing u in-kernel from aliased t2.
+    std::vector<double> U_sc(plan->u_base ? (size_t)num_threads * U_stride : 0);
     std::vector<double> SU_sc((size_t)num_threads * SU_stride);
     std::vector<double> UP_sc((size_t)num_threads * UP_stride);
     std::vector<double> SCD_sc((size_t)num_threads * SCD_stride);
@@ -2834,6 +2911,8 @@ void DLPNOCCSDSolver::run_phase_d_term_into(
         plan->dt_off, plan->KJ_off, plan->tile_off,
         plan->S_a_flat, plan->S_b_flat, plan->S_c_flat,
         plan->KJ_flat, plan->u_flat, plan->dt_flat,
+        plan->u_base, plan->u_canon_off, plan->u_trans,
+        U_sc.data(), U_stride,
         SU_sc.data(),   SU_stride,
         UP_sc.data(),   UP_stride,
         SCD_sc.data(),  SCD_stride,
@@ -2965,9 +3044,9 @@ void DLPNOCCSDSolver::run_phase_t1_fock_finalize_into(
         const int n_local = (per_q > 0) ? (int)(qma_size / per_q) : 0;
         if (n_local == 0) continue;
 
-        const double *Qma = in_.Qma.data + in_.Qma.offsets[p_jj];
+        const double *Qma = fps_ptr(in_.Qma, p_jj);
         const double *T1_local =
-            in_.T1_in_pair.data + in_.T1_in_pair.offsets[p_jj];
+            fps_ptr(in_.T1_in_pair, p_jj);
 
         // Find j's row position in this pair's lmo_list.
         int j_in_p = -1;
@@ -3089,9 +3168,9 @@ void DLPNOCCSDSolver::run_phase_d_tilde_ph1_into(DTildeOutputs *out) {
 
         // Orientation for K_bar: pick "_ij" if canonical FIRST index is i.
         const FlatPairStore &kb = (can_i == i) ? in_.K_bar_ij : in_.K_bar_ji;
-        K_bar_src[o]  = kb.data + kb.offsets[p];
+        K_bar_src[o]  = fps_ptr(kb, p);
         K_bar_size[o] = kb.offsets[p + 1] - kb.offsets[p];
-        K_bar_chem_src[o] = in_.K_bar_chem.data + in_.K_bar_chem.offsets[p];
+        K_bar_chem_src[o] = fps_ptr(in_.K_bar_chem, p);
 
         kt_total   += K_tilde_chem_size[o];
         M_total    += (int64_t)nlmo * (int64_t)npno;
@@ -3139,7 +3218,7 @@ void DLPNOCCSDSolver::run_phase_d_tilde_ph1_into(DTildeOutputs *out) {
         }
 
         // t1[i] = T1_in_pair[p] row at i_in_p (length npno).
-        const double *T1pair = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        const double *T1pair = fps_ptr(in_.T1_in_pair, p);
         double *t1 = t1_flat.data() + t1_off[o];
         const double *t1_row_src = T1pair + (int64_t)i_in_p * npno;
         std::memcpy(t1, t1_row_src, (size_t)npno * sizeof(double));
@@ -3220,7 +3299,7 @@ void DLPNOCCSDSolver::run_phase_c_tilde_ph1_into(CTildeOutputs *out) {
                                                 : in_.K_tilde_chem_j;
         K_tilde_chem_src[o]  = kt.data + kt.offsets[p];
         K_tilde_chem_size[o] = kt.offsets[p + 1] - kt.offsets[p];
-        K_bar_chem_src[o]    = in_.K_bar_chem.data + in_.K_bar_chem.offsets[p];
+        K_bar_chem_src[o]    = fps_ptr(in_.K_bar_chem, p);
 
         kt_total  += K_tilde_chem_size[o];
         Kbc_total += (int64_t)nlmo * (int64_t)npno;
@@ -3258,7 +3337,7 @@ void DLPNOCCSDSolver::run_phase_c_tilde_ph1_into(CTildeOutputs *out) {
         std::memcpy(Kbc_flat.data() + Kbc_off[o], K_bar_chem_src[o],
                     (size_t)mn * sizeof(double));
 
-        const double *T1pair = in_.T1_in_pair.data + in_.T1_in_pair.offsets[p];
+        const double *T1pair = fps_ptr(in_.T1_in_pair, p);
         const double *t1_row = T1pair + (int64_t)i_in_p * npno;
         std::memcpy(t1_flat.data() + t1_off[o], t1_row,
                     (size_t)npno * sizeof(double));
@@ -3296,7 +3375,7 @@ void DLPNOCCSDSolver::run_phase_b_tilde_into(
         const size_t n_local = (size_t)(qma_size / per_q);
         if (n_local == 0) continue;
 
-        const double *Qma_p = in_.Qma.data + in_.Qma.offsets[p];
+        const double *Qma_p = fps_ptr(in_.Qma, p);
         const double *T2_p  = in_.T2_flat + in_.t2_offsets[p];
         const double *iQk   = t1_dressed->i_Qk_t1.data
                               + t1_dressed->i_Qk_t1.offsets[p];

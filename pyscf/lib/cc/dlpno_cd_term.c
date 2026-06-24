@@ -42,6 +42,12 @@ void DLPNOc_term_batched(const int     N,
                          const double *S_outer_flat,
                          const double *ct_flat,
                          const double *t2_flat,
+                         /* t2 offset-alias: when t2_trans != NULL, t2_flat is
+                          * the CANONICAL per-pair t2 buffer and t2_off[n] is
+                          * the canonical offset; the per-item transpose is
+                          * applied by flipping the GT dgemm flag instead of
+                          * materialising a gathered (duplicated) t2 copy. */
+                         const unsigned char *t2_trans,
                          double       *STB_scratch,
                          const size_t  STB_stride,
                          double       *GAMMA_scratch,
@@ -104,8 +110,16 @@ void DLPNOc_term_batched(const int     N,
          * GT = gamma @ t2^T.
          * F: GT_F[e, a] = sum_d t2_F[d, e] * gamma_F[d, a] = t2_F^T @ gamma_F
          * dgemm('T', 'N', n_other, n_pno, n_other, 1, t2, n_other, gamma, n_other, 0, GT, n_other)
+         *
+         * Offset-aliased t2 (t2_trans != NULL): t2 is the canonical t2[key];
+         * an item flagged transpose wants t2[key].T here, which is exactly
+         * t2 read with the OPPOSITE dgemm flag.  So gathered-non-transpose
+         * and aliased-transpose both reduce to flipping T<->N: legacy gather
+         * stored t2 (flag T) or t2.T (flag T on the pre-transposed copy);
+         * aliased reads t2 always and uses flag N when the item is transpose.
          */
-        dgemm_(&T_flag, &N_flag,
+        const char t2_flag = (t2_trans != NULL && t2_trans[n]) ? N_flag : T_flag;
+        dgemm_(&t2_flag, &N_flag,
                &int_n_other, &int_n_pno, &int_n_other,
                &one, t2, &int_n_other,
                GAMMA, &int_n_other,
@@ -141,6 +155,16 @@ void DLPNOd_term_batched(const int     N,
                          const double *KJ_flat,
                          const double *u_flat,
                          const double *dt_flat,
+                         /* u offset-alias: when u_base != NULL, u is computed
+                          * per item as u = 2*t2_d - t2_d^T from the CANONICAL
+                          * t2[key] at u_base + u_canon_off[n] (t2_d = t2[key]
+                          * transposed iff u_trans[n]) into U_scratch, instead
+                          * of materialising a gathered (duplicated) u copy. */
+                         const double *u_base,
+                         const long   *u_canon_off,
+                         const unsigned char *u_trans,
+                         double       *U_scratch,
+                         const size_t  U_stride,
                          double       *SU_scratch,
                          const size_t  SU_stride,
                          double       *UP_scratch,
@@ -167,7 +191,28 @@ void DLPNOd_term_batched(const int     N,
         const int n_B   = n_B_arr[n];
 
         const double *S_a = S_a_flat + S_a_off[n];
-        const double *u   = u_flat   + u_off[n];
+        const double *u;
+        if (u_base != NULL) {
+            /* Compute u = 2*t2_d - t2_d^T into per-thread scratch, where
+             * t2_d = t2[key] (transposed iff u_trans[n]).  u is n_A x n_A
+             * row-major (same layout the gather produced). */
+            const double *t2s = u_base + u_canon_off[n];
+            double *U = U_scratch + (size_t)tid * U_stride;
+            const int nA = n_A;
+            const int tr = (u_trans != NULL && u_trans[n]);
+            for (int a = 0; a < nA; ++a) {
+                for (int b = 0; b < nA; ++b) {
+                    const double t2d_ab = tr ? t2s[(size_t)b * nA + a]
+                                             : t2s[(size_t)a * nA + b];
+                    const double t2d_ba = tr ? t2s[(size_t)a * nA + b]
+                                             : t2s[(size_t)b * nA + a];
+                    U[(size_t)a * nA + b] = 2.0 * t2d_ab - t2d_ba;
+                }
+            }
+            u = U;
+        } else {
+            u = u_flat + u_off[n];
+        }
         const double *S_b = S_b_flat + S_b_off[n];
         const double *S_c = S_c_flat + S_c_off[n];
         const double *dt  = dt_flat  + dt_off[n];

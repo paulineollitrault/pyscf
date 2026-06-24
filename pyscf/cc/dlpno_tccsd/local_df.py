@@ -1847,7 +1847,8 @@ def t1_ints(cc_ints, t1_pno, pno_spaces, S_pno_cache, keys, nocc,
 
 def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
             S_pno_cache, F_lmo, eps_lmo, foo_t2, keys, nocc, _pool=None,
-            pair_lmo_idx=None, t1_cache=None):
+            pair_lmo_idx=None, t1_cache=None, cc_ints_flat=None,
+            pair_index=None):
     """Build dressed Fock matrices matching Psi4 t1_fock().
 
     Returns:
@@ -1912,13 +1913,46 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
             e_pno_list = [None] * N
             lmo_idx_list = [None] * N
 
+            # Zero-copy Qab: when the driver passes the cc_ints flat store,
+            # ci['Qab'] is already a view into one contiguous buffer.  The C
+            # kernel reads each pair's Qab at Qab_flat[Qab_off[p]:] and
+            # computes its size from n_local/npno itself (it never uses
+            # Qab_off[p+1]), so we can point Qab_flat straight at the store
+            # buffer and pass per-pair START offsets — no second copy of the
+            # dominant cc_ints tensor, and no cycle-0 gather spike.
+            _qab_store = (cc_ints_flat.get('Qab')
+                          if (cc_ints_flat is not None and pair_index is not None)
+                          else None)
+            # Zero-copy Qma: same idea, but Qma is read per-pair with the
+            # lmo-domain slice ci['Qma'][:, _lmo_idx_in_p, :].  That equals
+            # the full stored Qma view only when the slice is the identity
+            # over p_lmos (Phase-III storage axis == pair_lmo_idx makes this
+            # always true).  Cheap pre-pass guards it; any non-identity pair
+            # falls the whole field back to the gather path (still correct).
+            _qma_store = (cc_ints_flat.get('Qma')
+                          if (cc_ints_flat is not None and pair_index is not None)
+                          else None)
+            _qma_zerocopy = _qma_store is not None
+            if _qma_zerocopy:
+                for key in valid_keys:
+                    ci = cc_ints[key]
+                    _li = np.asarray(ci['p_lmos_dense'])[
+                        np.asarray(_pair_domain(key), dtype=np.intp)]
+                    if (_li.size != ci['Qma'].shape[1]
+                            or not np.array_equal(_li, np.arange(_li.size))):
+                        _qma_zerocopy = False
+                        break
+            if os.environ.get('DLPNO_DEBUG_ZEROCOPY'):
+                print(f'  [t1_fock zerocopy] Qab={_qab_store is not None} '
+                      f'Qma={_qma_zerocopy}', flush=True)
+
             for p, key in enumerate(valid_keys):
                 ci = cc_ints[key]
                 i, j = key
                 npno = pno_spaces[key]['n_pno']
                 lmo_idx = np.asarray(_pair_domain(key), dtype=np.intp)
                 nlmo = lmo_idx.size
-                n_local = ci['Qma'].shape[0]
+                n_local = ci['n_local']  # metadata (weak pairs drop raw Qma)
 
                 lmo_idx_list[p] = lmo_idx
                 # K_bar_chem/ij/ji are reduced to (nlmo_p, npno); translate
@@ -1933,9 +1967,11 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
                 K_ij_list[p] = (np.ascontiguousarray(
                                 ci['K_bar_ij'][_lmo_idx_in_p])
                                 if need_dji else K_ji_list[p])
-                Qma_list[p] = np.ascontiguousarray(
-                    ci['Qma'][:, _lmo_idx_in_p, :])
-                Qab_list[p] = np.ascontiguousarray(ci['Qab'])
+                if not _qma_zerocopy:
+                    Qma_list[p] = np.ascontiguousarray(
+                        ci['Qma'][:, _lmo_idx_in_p, :])
+                if _qab_store is None:
+                    Qab_list[p] = np.ascontiguousarray(ci['Qab'])
                 e_pno_list[p] = np.ascontiguousarray(pno_spaces[key]['e_pno'])
 
                 nlmo_arr[p] = nlmo
@@ -1953,12 +1989,42 @@ def t1_fock(cc_ints, dressed_ints, t1_pno, fov_pno, pno_spaces,
                     buf[offsets[idx]:offsets[idx + 1]] = a.ravel()
                 return buf, offsets
 
-            K_chem_flat, K_chem_off = _flat(K_chem_list)
-            K_ji_flat, K_ji_off = _flat(K_ji_list)
-            K_ij_flat, K_ij_off = _flat(K_ij_list)
-            Qma_flat, Qma_off = _flat(Qma_list)
-            Qab_flat, Qab_off = _flat(Qab_list)
-            e_pno_flat, e_pno_off = _flat(e_pno_list)
+            # Free each per-pair list immediately after concatenating it into
+            # its flat buffer.  The lists are dead afterwards (the C kernel
+            # consumes only the flat buffers), so freeing them as we go avoids
+            # holding (cc_ints view + per-pair list copy + concatenated flat)
+            # all at once — that triple-copy of Qma/Qab was a ~60 GiB cycle-0
+            # spike on TM complexes.
+            K_chem_flat, K_chem_off = _flat(K_chem_list); del K_chem_list
+            K_ji_flat, K_ji_off = _flat(K_ji_list); del K_ji_list
+            K_ij_flat, K_ij_off = _flat(K_ij_list); del K_ij_list
+            def _store_offsets(store):
+                # Per-pair START offsets into a shared FlatTensorStore buffer,
+                # in valid_keys order.  The C kernel computes each pair's size
+                # from n_local/nlmo/npno itself, so only starts are needed.
+                _soff = store.offsets
+                _c2i = pair_index.canonical_to_idx
+                off = np.empty(N + 1, dtype=np.int64)
+                for p, key in enumerate(valid_keys):
+                    off[p] = _soff[_c2i[(min(key), max(key))]]
+                _lastk = valid_keys[-1]
+                off[N] = _soff[_c2i[(min(_lastk), max(_lastk))] + 1]
+                return off
+
+            if _qma_zerocopy:
+                Qma_flat = _qma_store.buffer
+                Qma_off = _store_offsets(_qma_store)
+                del Qma_list
+            else:
+                Qma_flat, Qma_off = _flat(Qma_list); del Qma_list
+            if _qab_store is None:
+                Qab_flat, Qab_off = _flat(Qab_list); del Qab_list
+            else:
+                # Alias the shared store buffer; per-pair START offsets only.
+                Qab_flat = _qab_store.buffer
+                Qab_off = _store_offsets(_qab_store)
+                del Qab_list
+            e_pno_flat, e_pno_off = _flat(e_pno_list); del e_pno_list
 
             # T1 offsets (reused each cycle, buffer rebuilt below)
             T1_sizes = (nlmo_arr.astype(np.int64) * npno_arr.astype(np.int64))

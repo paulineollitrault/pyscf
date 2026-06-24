@@ -152,13 +152,11 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
         # Cache p_lmos_dense per canonical pair so the triple loop
         # doesn't re-fetch from cc_ints[key] dicts.
         canon_p_dense = [None] * n_canon
-        canon_Qma = [None] * n_canon
         for canon_idx, key in enumerate(canonical_pairs):
             ci = cc_ints.get(key)
             if ci is None:
                 continue
             canon_p_dense[canon_idx] = ci['p_lmos_dense']
-            canon_Qma[canon_idx] = ci['Qma']
 
         # Map canon_idx → S_pno_cache PairIndex idx for flat-tier lookup.
         S_pi = S_pno_cache._pi
@@ -292,11 +290,15 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
         kil_offsets[1:] = np.cumsum(kil_sizes)
         K_il_pool = np.empty(int(kil_offsets[-1]))
         for (canon_il_, i_, l_), kil_idx in kil_seen.items():
-            Qma_il = canon_Qma[canon_il_]
-            p_dense = canon_p_dense[canon_il_]
-            l1 = int(p_dense[i_])
-            l2 = int(p_dense[l_])
-            K_il_arr = Qma_il[:, l1, :].T @ Qma_il[:, l2, :]
+            # K_il = (i a | l b) for pair (i_, l_)'s own endpoints.  Since
+            # canon_il_ == canon_lut[i_, l_], this is exactly that pair's
+            # stored K_iajb = q_iv.T @ q_jv (transpose when i_ > l_, i.e. when
+            # the canonical key orders l_ first).  Sourcing it from the
+            # contracted K_iajb field instead of the raw Qma lets weak pairs
+            # drop their (q|ma) integrals (matching Psi4).
+            key_il = canonical_pairs[canon_il_]
+            K = cc_ints[key_il]['K_iajb']
+            K_il_arr = K if i_ <= l_ else K.T
             K_il_pool[kil_offsets[kil_idx]:kil_offsets[kil_idx + 1]] = (
                 K_il_arr.ravel())
         _g_t_kil = _gtime.perf_counter() - _t_kil0
@@ -1273,7 +1275,7 @@ def build_D_tilde_batched(
         _term2_precomputed=None, cc_ints=None,
         pair_lmo_idx=None, _pool=None,
         S_pao_full=None, s1e=None,
-        t1_cache=None, omp_threads=None):
+        t1_cache=None, omp_threads=None, ktc_store=None):
     """Drop-in replacement for ``build_D_tilde`` with Terms 3+4 batched.
 
     Phase 1 runs Terms 1 and 2 per-pair via the reference ``_process_ik``
@@ -1471,6 +1473,19 @@ def build_D_tilde_batched(
             key_ik_list = [None] * N
             i_idx_list = [None] * N
 
+            # Zero-copy K_tilde_chem via the shared combined buffer (see
+            # compute_C_tilde_batched / build_combined_ktilde_store).
+            _use_ktc = ktc_store is not None
+            if _use_ktc:
+                for ik in covered_pairs:
+                    _i, _k = ik
+                    _key = (min(_i, _k), max(_i, _k))
+                    _d = (ktc_store['off_i'] if _key[0] == _k
+                          else ktc_store['off_j'])
+                    if _key not in _d:
+                        _use_ktc = False
+                        break
+
             for p, ik in enumerate(covered_pairs):
                 i_idx, k_idx = ik
                 key_ik = (min(i_idx, k_idx), max(i_idx, k_idx))
@@ -1481,14 +1496,15 @@ def build_D_tilde_batched(
                 else:
                     ll_idx = np.arange(nocc, dtype=np.intp)
                 n_domain = ll_idx.size
-                n_local = ci['Qma'].shape[0]
+                n_local = ci['n_local']  # metadata (weak pairs drop raw Qma)
 
                 is_k_first = (key_ik[0] == k_idx)
                 is_i_first = (key_ik[0] == i_idx)
                 # K_tilde_chem precomputed in cc_ints — shared across
                 # compute_C_tilde / build_D_tilde / T1 residual.
-                K_tilde_chem_list[p] = (ci['K_tilde_chem_i'] if is_k_first
-                                        else ci['K_tilde_chem_j'])
+                if not _use_ktc:
+                    K_tilde_chem_list[p] = (ci['K_tilde_chem_i'] if is_k_first
+                                            else ci['K_tilde_chem_j'])
 
                 # M_static = 2 * K_bar_ij_or_ji[ll_idx] - K_bar_chem[ll_idx]
                 # All three K_bar_* are reduced to (nlmo_p, npno); translate
@@ -1518,7 +1534,18 @@ def build_D_tilde_batched(
                     buf[offsets[idx]:offsets[idx + 1]] = a.ravel()
                 return buf, offsets
 
-            K_tilde_chem_flat, K_tilde_chem_off = _flat(K_tilde_chem_list)
+            if _use_ktc:
+                K_tilde_chem_flat = ktc_store['buf']
+                K_tilde_chem_off = np.empty(N + 1, dtype=np.int64)
+                for p, ik in enumerate(covered_pairs):
+                    _i, _k = ik
+                    _key = (min(_i, _k), max(_i, _k))
+                    _d = (ktc_store['off_i'] if _key[0] == _k
+                          else ktc_store['off_j'])
+                    K_tilde_chem_off[p] = _d[_key]
+                K_tilde_chem_off[N] = ktc_store['buf'].size
+            else:
+                K_tilde_chem_flat, K_tilde_chem_off = _flat(K_tilde_chem_list)
             M_static_flat, M_static_off = _flat(M_static_list)
 
             t1_sizes = n_pno_arr.astype(np.int64)
@@ -2000,7 +2027,7 @@ def compute_C_tilde_batched(
         pair_lmo_idx=None, _pool=None,
         S_pao_full=None, s1e=None,
         blas_threads=32, omp_threads=None,
-        t1_cache=None):
+        t1_cache=None, ktc_store=None):
     """Drop-in replacement for compute_C_tilde with Terms 3+4 batched.
 
     Signature matches compute_C_tilde exactly plus one kwarg
@@ -2139,6 +2166,20 @@ def compute_C_tilde_batched(
             key_ki_list = [None] * N
             i_idx_list = [None] * N
 
+            # Zero-copy K_tilde_chem: when the shared combined buffer covers
+            # every selected (i-or-j) variant for these pairs, read it via
+            # offsets instead of gathering+retaining a per-plan copy.
+            _use_ktc = ktc_store is not None
+            if _use_ktc:
+                for ki in covered_pairs:
+                    _k, _i = ki
+                    _key = (min(_k, _i), max(_k, _i))
+                    _d = (ktc_store['off_i'] if _key[0] == _k
+                          else ktc_store['off_j'])
+                    if _key not in _d:
+                        _use_ktc = False
+                        break
+
             for p, ki in enumerate(covered_pairs):
                 k, i = ki
                 key_ki = (min(k, i), max(k, i))
@@ -2149,15 +2190,16 @@ def compute_C_tilde_batched(
                 else:
                     ll_idx = np.arange(nocc, dtype=np.intp)
                 n_domain = ll_idx.size
-                n_local = ci_ki['Qma'].shape[0]
+                n_local = ci_ki['n_local']  # metadata (weak pairs drop raw Qma)
 
                 is_k_first = (key_ki[0] == k)
                 # K_tilde_chem precomputed in cc_ints (local_df.py
                 # compute_cc_integrals_sparse) — same tensor as Psi4
                 # K_tilde_chem_[ki] (ccsd.cc:1402). Shared with build_D_tilde
                 # and the T1 residual.
-                K_tilde_chem_list[p] = (ci_ki['K_tilde_chem_i'] if is_k_first
-                                        else ci_ki['K_tilde_chem_j'])
+                if not _use_ktc:
+                    K_tilde_chem_list[p] = (ci_ki['K_tilde_chem_i'] if is_k_first
+                                            else ci_ki['K_tilde_chem_j'])
                 # K_bar_chem[l, c] = sum_L q_pair[L] * Qma[L, l, c];
                 # reduced to (nlmo_p, npno) in cc_ints. Translate global
                 # ll_idx -> position within p_lmos before indexing.
@@ -2182,7 +2224,18 @@ def compute_C_tilde_batched(
                     buf[offsets[idx]:offsets[idx + 1]] = a.ravel()
                 return buf, offsets
 
-            K_tilde_chem_flat, K_tilde_chem_off = _flat(K_tilde_chem_list)
+            if _use_ktc:
+                K_tilde_chem_flat = ktc_store['buf']
+                K_tilde_chem_off = np.empty(N + 1, dtype=np.int64)
+                for p, ki in enumerate(covered_pairs):
+                    _k, _i = ki
+                    _key = (min(_k, _i), max(_k, _i))
+                    _d = (ktc_store['off_i'] if _key[0] == _k
+                          else ktc_store['off_j'])
+                    K_tilde_chem_off[p] = _d[_key]
+                K_tilde_chem_off[N] = ktc_store['buf'].size
+            else:
+                K_tilde_chem_flat, K_tilde_chem_off = _flat(K_tilde_chem_list)
             K_bar_chem_slice_flat, K_bar_chem_slice_off = _flat(
                 K_bar_chem_slice_list)
 
@@ -2663,15 +2716,34 @@ def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         # Required master flats unavailable; can't run gathered mode.
         _gathered_mode = False
 
+    # Deferred-stack mode (default ON): the per-task S_arr/K_arr stacks
+    # COPY S (a view into S_pno_cache) and K (cached in cc_ints) once per
+    # task — with heavy task repetition this is the dominant cycle-0
+    # transient (~55 GiB on MOBH35 rxn_12) and it is retained in the plan
+    # cache.  Instead store light ref-lists here and rebuild each bucket's
+    # stack on demand in compute_B_E_batched, so the peak is one bucket, not
+    # all.
+    #
+    # STATUS: EXPERIMENTAL / default OFF.  The per-bucket stacks are
+    # byte-identical to the all-at-once S_arr/K_arr (verified over every
+    # item), yet enabling this reliably destabilizes the C++-class DIIS to
+    # NaN downstream — an unresolved interaction with which arrays are
+    # retained-vs-copied, on top of the BE kernel's ~1e-7 OMP
+    # nondeterminism.  Do not enable until root-caused.  Opt in with
+    # DLPNO_BE_DEFER_STACK=1.
+    _defer_stack = os.environ.get('DLPNO_BE_DEFER_STACK', '0') == '1'
+
     buckets = []
     for (n_ij, n_kl), items in items_by_shape.items():
         N = len(items)
-        if _gathered_mode:
+        if _gathered_mode or _defer_stack:
             S_arr = None
             K_arr = None
         else:
             S_arr = np.empty((N, n_ij, n_kl))
             K_arr = np.empty((N, n_kl, n_kl))
+        S_list = [] if (_defer_stack and not _gathered_mode) else None
+        K_list = [] if (_defer_stack and not _gathered_mode) else None
         same_arr = np.empty(N, dtype=np.uint8)
         item_idx = np.empty(N, dtype=np.intp)
         kl_keys = []
@@ -2691,7 +2763,10 @@ def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         B_kl_off = np.empty(N, dtype=np.int64)
         B_lk_off = np.empty(N, dtype=np.int64)
         for n, (key_ij, key_kl, k, l, same, S, K_kl) in enumerate(items):
-            if not _gathered_mode:
+            if _defer_stack and not _gathered_mode:
+                S_list.append(S)
+                K_list.append(K_kl)
+            elif not _gathered_mode:
                 S_arr[n] = S
                 K_arr[n] = K_kl
             # DEBUG: validate offset-based reads match the ground-truth
@@ -2771,6 +2846,7 @@ def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         buckets.append({
             'n_ij': n_ij, 'n_kl': n_kl,
             'S': S_arr, 'K': K_arr,
+            'S_list': S_list, 'K_list': K_list,
             'S_off': S_off if S_off_valid else None,
             'K_off': K_off if K_off_valid else None,
             'same': same_arr, 'item_idx': item_idx,
@@ -2788,8 +2864,15 @@ def _build_be_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         'B_pair_nlmo': B_pair_nlmo,
         'has_flat_t2': has_flat_t2,
         'gathered_mode': _gathered_mode,
-        'S_pno_master': _S_pno_buf if _gathered_mode else None,
-        'K_iajb_master': _K_iajb_buf if _gathered_mode else None,
+        # Masters exposed whenever available (not only in full gathered mode),
+        # so the C++-class consumer can read S/K via offsets even when cycle-0
+        # used the deferred-stack path.  `class_gathered` tells the class to
+        # take that memory-light route (no per-bucket S_c/K_c rebuild/cache).
+        'S_pno_master': _S_pno_buf,
+        'K_iajb_master': _K_iajb_buf,
+        'class_gathered': bool(
+            _defer_stack and has_flat_t2
+            and _S_pno_buf is not None and _K_iajb_buf is not None),
     }
 
 
@@ -2894,6 +2977,20 @@ def compute_B_E_batched(
                     flat_B[n_ij], flat_E[n_ij],
                 )
                 continue
+            # Non-gathered paths need stacked S/K.  In deferred mode these
+            # were not materialized in the plan (to keep the cache light);
+            # build this bucket's stacks now from the ref-lists and let them
+            # fall out of scope at the next iteration (peak = one bucket).
+            _S = bucket['S']
+            _K = bucket['K']
+            if _S is None and bucket.get('S_list') is not None:
+                _S = np.empty((N, n_ij, n_kl))
+                _K = np.empty((N, n_kl, n_kl))
+                _Sl = bucket['S_list']
+                _Kl = bucket['K_list']
+                for _n in range(N):
+                    _S[_n] = _Sl[_n]
+                    _K[_n] = _Kl[_n]
             if _use_v2:
                 # Session 14a fast path: all per-item gathers fold into C.
                 import ctypes as _ct
@@ -2907,10 +3004,10 @@ def compute_B_E_batched(
                         + [_ct.c_size_t] * 3 + [_ct.c_int])
                     compute_B_E_batched._libcc_v2 = _libcc
                 _libcc.DLPNObe_kernel_v2(
-                    bucket['S'].ctypes.data_as(_ct.c_void_p),
+                    _S.ctypes.data_as(_ct.c_void_p),
                     t2_pno_all._buffer.ctypes.data_as(_ct.c_void_p),
                     bucket['t2_off'].ctypes.data_as(_ct.c_void_p),
-                    bucket['K'].ctypes.data_as(_ct.c_void_p),
+                    _K.ctypes.data_as(_ct.c_void_p),
                     B_flat.ctypes.data_as(_ct.c_void_p),
                     bucket['B_kl_off'].ctypes.data_as(_ct.c_void_p),
                     bucket['B_lk_off'].ctypes.data_as(_ct.c_void_p),
@@ -2949,9 +3046,9 @@ def compute_B_E_batched(
                 _libcc.DLPNObe_kernel.argtypes = (
                     [_ct.c_void_p] * 9 + [_ct.c_size_t] * 3 + [_ct.c_int])
                 compute_B_E_batched._libcc = _libcc
-            S_c = np.ascontiguousarray(bucket['S'])
+            S_c = np.ascontiguousarray(_S)
             T_c = np.ascontiguousarray(T_arr)
-            K_c = np.ascontiguousarray(bucket['K'])
+            K_c = np.ascontiguousarray(_K)
             beta_kl_c = np.ascontiguousarray(beta_kl_arr)
             beta_lk_c = np.ascontiguousarray(beta_lk_arr)
             same_c = np.ascontiguousarray(bucket['same']).astype(np.uint8, copy=False)
@@ -3273,12 +3370,15 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
     # homogeneous and we can hand it straight to the Cython kernel
     # without the old mask + ascontiguousarray(sel) split pass.  Items
     # are partitioned by ``it['side']`` (0 = ij, 1 = ji) before packing.
-    def _pack_c(items, n_pno, n_ct, n_other, side):
+    def _pack_c(items, n_pno, n_ct, n_other, side,
+                gathered_S=False, gathered_J=False):
         N = len(items)
-        S_big = np.empty((N, n_pno, n_ct))
-        S_mid = np.empty((N, n_ct, n_other))
-        S_outer = np.empty((N, n_pno, n_other))
-        J_bold = np.empty((N, n_pno, n_other))
+        # Stacked S/J copies are DEAD when the bv reads via offsets (gathered);
+        # skip them entirely to save the per-bucket anon (the CCSD-cycle hog).
+        S_big = None if gathered_S else np.empty((N, n_pno, n_ct))
+        S_mid = None if gathered_S else np.empty((N, n_ct, n_other))
+        S_outer = None if gathered_S else np.empty((N, n_pno, n_other))
+        J_bold = None if gathered_J else np.empty((N, n_pno, n_other))
         S_big_off   = np.empty(N, dtype=np.int64)
         S_mid_off   = np.empty(N, dtype=np.int64)
         S_outer_off = np.empty(N, dtype=np.int64)
@@ -3288,10 +3388,12 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         t2_trans = np.empty(N, dtype=np.uint8)
         item_idx = np.empty(N, dtype=np.intp)
         for n, it in enumerate(items):
-            S_big[n] = it['S_big']
-            S_mid[n] = it['S_mid']
-            S_outer[n] = it['S_outer']
-            J_bold[n] = it['J_bold']
+            if not gathered_S:
+                S_big[n] = it['S_big']
+                S_mid[n] = it['S_mid']
+                S_outer[n] = it['S_outer']
+            if not gathered_J:
+                J_bold[n] = it['J_bold']
             S_big_off[n]   = it['S_big_off']
             S_mid_off[n]   = it['S_mid_off']
             S_outer_off[n] = it['S_outer_off']
@@ -3311,12 +3413,13 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
             'item_idx': item_idx,
         }
 
-    def _pack_d(items, n_pno, n_A, n_B, side):
+    def _pack_d(items, n_pno, n_A, n_B, side,
+                gathered_S=False, gathered_J=False):
         N = len(items)
-        S_a = np.empty((N, n_pno, n_A))
-        S_b = np.empty((N, n_A, n_B))
-        S_c = np.empty((N, n_pno, n_B))
-        KJ = np.empty((N, n_pno, n_A))
+        S_a = None if gathered_S else np.empty((N, n_pno, n_A))
+        S_b = None if gathered_S else np.empty((N, n_A, n_B))
+        S_c = None if gathered_S else np.empty((N, n_pno, n_B))
+        KJ = None if gathered_J else np.empty((N, n_pno, n_A))
         S_a_off = np.empty(N, dtype=np.int64)
         S_b_off = np.empty(N, dtype=np.int64)
         S_c_off = np.empty(N, dtype=np.int64)
@@ -3326,10 +3429,12 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         t2_trans = np.empty(N, dtype=np.uint8)
         item_idx = np.empty(N, dtype=np.intp)
         for n, it in enumerate(items):
-            S_a[n] = it['S_a']
-            S_b[n] = it['S_b']
-            S_c[n] = it['S_c']
-            KJ[n] = it['KJ']
+            if not gathered_S:
+                S_a[n] = it['S_a']
+                S_b[n] = it['S_b']
+                S_c[n] = it['S_c']
+            if not gathered_J:
+                KJ[n] = it['KJ']
             S_a_off[n] = it['S_a_off']
             S_b_off[n] = it['S_b_off']
             S_c_off[n] = it['S_c_off']
@@ -3353,21 +3458,60 @@ def _build_cd_plan(strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
         ji = [it for it in items if it['side'] == 'ji']
         return ij, ji
 
+    # Plan-level gathered-S / gathered-J determination.  MUST mirror the
+    # conditions in _get_or_build_cd_batched_view: when S_pno_master is present
+    # and every item's S offset is valid (>=0), the bv reads S via offsets into
+    # S_pno_master and the per-bucket stacked S copies (bucket['S_big'] etc.)
+    # are NEVER read.  Likewise J via J_master.  Those stacked copies are the
+    # dominant CCSD-cycle anonymous memory on TM complexes (tens of GiB on
+    # MOBH35 rxn_12) — skipping them stops the cc_ints/S_pno mmaps from
+    # thrashing the page cache.  If a mismatch ever set a needed copy to None,
+    # the bv's non-gathered path subscripts None -> loud crash (not silent
+    # corruption), caught by the water-10 anchor.
+    _cd_gathered_S = bool(_has_flat_S)
+    if _cd_gathered_S:
+        for _items in c_items_by_shape.values():
+            if any(it['S_big_off'] < 0 or it['S_mid_off'] < 0
+                   or it['S_outer_off'] < 0 for it in _items):
+                _cd_gathered_S = False
+                break
+    if _cd_gathered_S:
+        for _items in d_items_by_shape.values():
+            if any(it['S_a_off'] < 0 or it['S_b_off'] < 0
+                   or it['S_c_off'] < 0 for it in _items):
+                _cd_gathered_S = False
+                break
+    _cd_gathered_J = len(_J_master_pieces) > 0
+    if os.environ.get('DLPNO_MEM_PROBE'):
+        _nc = sum(len(v) for v in c_items_by_shape.values())
+        _nd = sum(len(v) for v in d_items_by_shape.values())
+        print(f'  [cd_gathered] S={_cd_gathered_S} J={_cd_gathered_J} '
+              f'(c_items={_nc} d_items={_nd}) -> S/J copies '
+              f'{"SKIPPED" if _cd_gathered_S else "BUILT"}', flush=True)
+
     c_buckets = []
     for shape, items in c_items_by_shape.items():
         ij_items, ji_items = _split_by_side(items)
         if ij_items:
-            c_buckets.append(_pack_c(ij_items, *shape, side=0))
+            c_buckets.append(_pack_c(ij_items, *shape, side=0,
+                                     gathered_S=_cd_gathered_S,
+                                     gathered_J=_cd_gathered_J))
         if ji_items:
-            c_buckets.append(_pack_c(ji_items, *shape, side=1))
+            c_buckets.append(_pack_c(ji_items, *shape, side=1,
+                                     gathered_S=_cd_gathered_S,
+                                     gathered_J=_cd_gathered_J))
 
     d_buckets = []
     for shape, items in d_items_by_shape.items():
         ij_items, ji_items = _split_by_side(items)
         if ij_items:
-            d_buckets.append(_pack_d(ij_items, *shape, side=0))
+            d_buckets.append(_pack_d(ij_items, *shape, side=0,
+                                     gathered_S=_cd_gathered_S,
+                                     gathered_J=_cd_gathered_J))
         if ji_items:
-            d_buckets.append(_pack_d(ji_items, *shape, side=1))
+            d_buckets.append(_pack_d(ji_items, *shape, side=1,
+                                     gathered_S=_cd_gathered_S,
+                                     gathered_J=_cd_gathered_J))
 
     J_master = (np.concatenate(_J_master_pieces)
                 if _J_master_pieces else np.zeros(0))
@@ -3421,6 +3565,16 @@ def _get_or_build_t34_batched_view(plan, t1_cache, t2_pno_all=None):
                     break
             if not _gathered_S:
                 break
+    if os.environ.get('DLPNO_T34_PROBE'):
+        _master_ok = plan.get('S_pno_master') is not None
+        _nneg = 0
+        for b in (plan.get('t3', []) + plan.get('t4', [])):
+            for key in ('S_off', 'S_ki_li_off', 'S_li_kl_off', 'S_kl_ki_off'):
+                a = b.get(key)
+                if a is not None:
+                    _nneg += int(np.sum(np.asarray(a) < 0))
+        print(f'  [t34_probe] gathered_S={_gathered_S} master={_master_ok} '
+              f'neg_slots={_nneg}', flush=True)
 
     # Gathered-K: plan-build deduplicated K (and L_lk/L_lk.T for D_tilde)
     # by (pair_key, l1, l2[, tag]) into ``plan['K_master']``; each bucket
@@ -4173,14 +4327,14 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
                 _libcc.DLPNOc_term_batched.restype = None
                 _libcc.DLPNOc_term_batched.argtypes = (
                     [_ct.c_int]
-                    + [_ct.c_void_p] * 16
+                    + [_ct.c_void_p] * 17   # +1: t2_trans (NULL = legacy gather)
                     + [_ct.c_void_p, _ct.c_size_t] * 3
                     + [_ct.c_void_p, _ct.c_int])
                 _libcc.DLPNOd_term_batched.restype = None
                 _libcc.DLPNOd_term_batched.argtypes = (
                     [_ct.c_int]
-                    + [_ct.c_void_p] * 16
-                    + [_ct.c_void_p, _ct.c_size_t] * 4
+                    + [_ct.c_void_p] * 19   # +3: u_base, u_canon_off, u_trans
+                    + [_ct.c_void_p, _ct.c_size_t] * 5  # +1: U_scratch
                     + [_ct.c_void_p, _ct.c_int])
                 compute_CD_terms_batched._libcc = _libcc
             c_t2_off_view = np.ascontiguousarray(bv['c_t2_off'][:c_N])
@@ -4203,6 +4357,7 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
                 bv['c_S_outer_flat'].ctypes.data_as(_ct.c_void_p),
                 ct_flat.ctypes.data_as(_ct.c_void_p),
                 t2_flat.ctypes.data_as(_ct.c_void_p),
+                None,  # t2_trans NULL: t2_flat already gathered+transposed here
                 STB.ctypes.data_as(_ct.c_void_p), STB.shape[1],
                 GAMMA.ctypes.data_as(_ct.c_void_p), GAMMA.shape[1],
                 GT.ctypes.data_as(_ct.c_void_p), GT.shape[1],
@@ -4314,6 +4469,8 @@ def _run_cd_batched(plan, bv, t2_pno_all, C_tilde_cache, D_tilde_cache,
                 bv['d_KJ_flat'].ctypes.data_as(_ct.c_void_p),
                 u_flat.ctypes.data_as(_ct.c_void_p),
                 dt_flat.ctypes.data_as(_ct.c_void_p),
+                None, None, None,   # u_base NULL: u_flat already gathered here
+                None, _ct.c_size_t(0),   # U_scratch unused
                 SU.ctypes.data_as(_ct.c_void_p), SU.shape[1],
                 UP.ctypes.data_as(_ct.c_void_p), UP.shape[1],
                 SCD.ctypes.data_as(_ct.c_void_p), SCD.shape[1],

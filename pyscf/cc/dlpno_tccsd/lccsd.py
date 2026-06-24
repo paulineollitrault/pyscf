@@ -307,7 +307,7 @@ def _compute_ladder(t2_ij, C_pno_ij, with_df):
 
 
 def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
-                               _pool=None):
+                               _pool=None, keys_subset=None):
     """Per-pair local-aux T2-dressed Fock occ-occ from cc_ints['Qma'].
 
     Equivalent to _compute_foo_dressed but skips ovL_pno_cache / with_df
@@ -315,6 +315,15 @@ def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
     holds fitted (Q | m a) for all m∈nocc and a∈PNO_mq with Q in the
     pair's local aux. The contraction is identical in structure to the
     legacy version, just summed over local-aux instead of full naux.
+
+    Each pair (m,q) contributes purely from its OWN amplitude t2_pno_all[(m,q)]
+    and its OWN Qma — there is no cross-pair coupling.  ``keys_subset`` (if
+    given) restricts the sum to those pair keys.  This lets the driver split
+    the sum into a STRONG part (recomputed each CCSD cycle, since strong T2
+    changes) and a WEAK part (whose T2 is frozen at the MP2 value, so its
+    contribution is constant across iterations and is precomputed once).
+    Matching Psi4, this is what lets weak pairs avoid materialising raw
+    (q|ma) integrals during the iteration.
     """
     # Phase II port: pyscf/lib/cc/dlpno_foo_dressed.c (PySCF native style).
     # The C kernel takes Qma directly on the pair-domain axis (no scatter-back)
@@ -370,7 +379,8 @@ def _compute_foo_dressed_local(t2_pno_all, pno_spaces, nocc_lmo, cc_ints,
         return key_mq, (contrib_q, contrib_m, ci['p_lmos'])
 
     foo = np.zeros((nocc_lmo, nocc_lmo))
-    pair_list = list(t2_pno_all.keys())
+    pair_list = (list(keys_subset) if keys_subset is not None
+                 else list(t2_pno_all.keys()))
     if _pool is not None:
         results = list(_pool.map(_per_pair, pair_list))
     else:
@@ -1254,6 +1264,18 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                     'max_n_ki': _max_n_ki,
                 }
 
+        if os.environ.get('DLPNO_PACK_PROBE') and _batched_plan is not None:
+            _bp = _batched_plan
+            def _g(a):
+                return getattr(a, 'nbytes', 0) / 2**30
+            _sc = _bp.get('S_consolidated')
+            _shared = (_sc is S_pno_cache._buffer)
+            print(f'  [perkl_probe] S_consolidated={_g(_sc):.1f} GiB '
+                  f'(shared_buffer={_shared}) '
+                  f'K_iajb_static={_g(_bp.get("K_iajb_static")):.1f} GiB '
+                  f'K_bar_static={_g(_bp.get("K_bar_static")):.1f} GiB '
+                  f'overflow_copied={_S_local_off_running*8/2**30:.1f} GiB',
+                  flush=True)
         _pkl_plan = {'_ba_work': _ba_work,
                      '_per_task_plan': _per_task_plan,
                      '_batched_plan': _batched_plan}
@@ -1860,6 +1882,51 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         _log_mem as _drv_log_mem, _malloc_trim as _drv_malloc_trim)
     _drv_malloc_trim()
     _drv_log_mem('after_cc_ints')
+
+    # Weak pairs' T2 is frozen at the MP2 value, so their contribution to the
+    # T2-dressed Fock occ-occ (foo) is CONSTANT across all CCSD cycles.
+    # Precompute it ONCE here, while the weak-pair (q|ma) integrals are still
+    # resident, so they can be dropped before the iteration (matching Psi4,
+    # which never stores weak-pair raw DF).  The per-cycle foo then sums over
+    # strong pairs only and adds this constant.
+    _weak_keys_foo = [k for k in t2_pno_all if k not in _strong_keys_set]
+    _foo_weak_const = _compute_foo_dressed_local(
+        t2_pno_all, pno_spaces, nocc, _cc_ints,
+        _pool=_pool, keys_subset=_weak_keys_foo)
+
+    # Drop the large per-pair raw DF integrals (the n_local-axis tensors) for
+    # WEAK pairs — matching Psi4, which never materialises weak-pair (q|ab)/
+    # (q|ma).  No CCSD-cycle consumer reads them: the C++ solver skips weak
+    # pairs via is_strong_pair; the Python cycle-0 foo now uses the constant
+    # precomputed just above; G_tilde sources K_il from the contracted
+    # K_iajb.  The small contracted fields (K_iajb, K_bar_*, K_tilde_chem,
+    # J_*) are KEPT for weak pairs (Step-1 Fock dressing + energy need them).
+    # Setting each to a zero-size array (vs deleting the key) keeps every
+    # `ci[field]` access valid and frees the backing allocation.  This frees
+    # ~half of the resident cc_ints memory on compact / TM-complex systems.
+    # Fields dropped: Qab (the single largest, n_local*npno^2) + the four
+    # small n_local-axis tensors.  Validated bit-identical on water-10.
+    # NOTE: 'Qma' is intentionally NOT dropped — a (still-unlocated) consumer
+    # reads weak-pair Qma and zeroing it shifts the energy ~0.06 mEh.  Dropping
+    # it too (the other ~half of the weak raw-DF) is future work.  Override via
+    # DLPNO_DROP_FIELDS to experiment.
+    import os as _os_drop
+    _RAW_DF_FIELDS = tuple(f for f in _os_drop.environ.get(
+        'DLPNO_DROP_FIELDS', 'Qab,i_Qa,j_Qa,i_Qk,j_Qk').split(',') if f)
+    # Diagonal pairs (i,i) are treated as STRONG for raw-DF purposes (the C++
+    # solver's strong set is strong_pairs | {(i,i)}); only drop for genuinely
+    # weak (non-strong, non-diagonal) pairs.
+    _diag_set = {(_d, _d) for _d in range(nocc)}
+    _drop_keys = [_k for _k in _weak_keys_foo if _k not in _diag_set]
+    for _wk in _drop_keys:
+        _ci = _cc_ints.get(_wk)
+        if _ci is None:
+            continue
+        for _f in _RAW_DF_FIELDS:
+            _arr = _ci.get(_f)
+            if _arr is not None and _arr.shape[0] != 0:
+                _ci[_f] = np.empty((0,) + _arr.shape[1:], dtype=_arr.dtype)
+
     _t_post_ccints = _time_cc.perf_counter()
 
     # ------------------------------------------------------------------
@@ -1897,6 +1964,23 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # water-49) instead of keeping them pooled.
     _drv_malloc_trim()
     _drv_log_mem('after_cc_ints_flat')
+
+    # Pack K_tilde_chem_i/j (the n_pno³ Term-2 intermediates) into one shared
+    # buffer so compute_C_tilde_batched / build_D_tilde_batched read it via
+    # offsets instead of each retaining a gathered copy (was held ~4× on TM
+    # complexes; this collapses it to 1×).  Disable with
+    # DLPNO_KTILDE_COMBINE=0.
+    from pyscf.cc.dlpno_tccsd.pair_index import build_combined_ktilde_store
+    _ktc_store = None
+    if os.environ.get('DLPNO_KTILDE_COMBINE', '1') == '1':
+        _ktc_store = build_combined_ktilde_store(_cc_ints, _pair_index)
+        _ktc_mb = (_ktc_store['buf'].size * 8 / 2**20
+                   if _ktc_store is not None else 0.0)
+        print(f'  [ktilde_combine] store={"yes" if _ktc_store else "None"} '
+              f'buf={_ktc_mb:.1f} MB', flush=True)
+        if _ktc_store is not None:
+            _drv_malloc_trim()
+            _drv_log_mem('after_ktilde_combine')
 
     # Rebuild K_pno_cache from locally-fitted K_iajb (now a view
     # into the flattened Qab/K_iajb field store).
@@ -2077,8 +2161,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # which is what Phase 4's Cython kernels consume via
     # ``.buffer`` / ``.offsets`` / ``.index_matrix()``.
     from pyscf.cc.dlpno_tccsd.pair_index import FlatPairPairStore
+    _drv_log_mem('before_S_pno_flatten')
     S_pno_cache = FlatPairPairStore(_pair_index, initial=S_pno_cache)
     print(f'  [S_pno_cache] {S_pno_cache!r}', flush=True)
+    # The S_pno build churns millions of tiny per-partner arrays across the
+    # worker pool; glibc keeps that freed memory pooled in per-thread arenas
+    # (huge RSS bloat vs the ~10 GiB of live S_pno data).  Return it to the OS.
+    _drv_log_mem('after_S_pno_flatten')
+    _drv_malloc_trim()
+    _drv_log_mem('after_S_pno_trim')
 
     # ooL_3idx (full naux occ-occ), K_coul_cache (full naux exchange) and
     # J_oo (nocc^4) are NOT built. cc_ints['i_Qk', 'j_Qk', 'J_ij_kj',
@@ -2142,6 +2233,52 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         print(f'  [STAGE5_DBG] post-cc_ints setup before cycle loop: '
               f'{_time_cc.perf_counter() - _t_post_ccints:.2f}s', flush=True)
         _drv_log_mem('before_cycle_loop')
+
+        # Cycle-0 plan-cache trimming for the C++-class drop-in.
+        #
+        # The batched residual builders (compute_C_tilde_batched,
+        # build_D_tilde_batched, build_G_tilde, t1_fock, compute_B_E_batched,
+        # compute_CD_terms_batched, compute_G_term_batched) each retain a
+        # plan cache on the function object for cross-cycle reuse.  But the
+        # C++ class takes over after cycle 0 (see below) and rebuilds its own
+        # plans, so on a large TM complex these caches just pin tens of GiB
+        # of duplicated cc_ints-derived data (K_tilde_chem, gathered K_iajb,
+        # ...) that stack up across the terms within cycle 0 and OOM.  Their
+        # *outputs* are captured separately, so we free the internal plans
+        # between terms — capping the cycle-0 peak instead of accumulating.
+        # EXPERIMENTAL / default OFF: naive clearing corrupts results (the
+        # plans are consumed downstream, e.g. by compute_residual / the class
+        # drop-in), so this is opt-in only while a safe subset is identified.
+        # Set DLPNO_DROPIN_FREE_PLANS=<mask> to enable specific clear points.
+        _dropin_free_plans = (os.environ.get('DLPNO_DROPIN_FREE_PLANS', '0')
+                              == '1')
+
+        # Map of clearable cycle-0 plan caches.  ``which`` selects a subset
+        # so we can isolate exactly which clears are safe (some plans are
+        # consumed downstream by compute_residual / the class drop-in).
+        def _free_cycle0_plan_caches(which='ctilde_dtilde'):
+            from pyscf.cc.dlpno_tccsd import residual as _res
+            from pyscf.cc.dlpno_tccsd.local_df import t1_fock as _t1f
+            _all = {
+                'ctilde': (_res.compute_C_tilde_batched, ('_ph1_plan', '_plan_cache')),
+                'dtilde': (_res.build_D_tilde_batched,   ('_ph1_plan', '_plan_cache')),
+                'gtilde': (_res.build_G_tilde,           ('_batched_plan',)),
+                'be':     (_res.compute_B_E_batched,     ('_plan_cache',)),
+                'cd':     (_res.compute_CD_terms_batched,('_plan_cache',)),
+                'gterm':  (_res.compute_G_term_batched,  ('_plan_cache',)),
+                't1fock': (_t1f,                         ('_batched_plan',)),
+            }
+            _sel = {'ctilde_dtilde': ('ctilde', 'dtilde'),
+                    'all': tuple(_all)}.get(which, (which,))
+            _targets = [_all[k] for k in _sel if k in _all]
+            for _fn, _attrs in _targets:
+                for _a in _attrs:
+                    if getattr(_fn, _a, None) is not None:
+                        setattr(_fn, _a, None)
+            import gc as _gc
+            _gc.collect()
+            _drv_malloc_trim()
+
         _t_loop_start = _time.perf_counter() if False else _time_cc.perf_counter()
         for cycle in range(this_max):
             # Phase 1: pre-project t1 into every pair's PNO basis once
@@ -2189,14 +2326,16 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _t_foo = _time.perf_counter()
                 foo_total = _compute_foo_dressed_local(
                     t2_pno_all, pno_spaces, nocc, _cc_ints,
-                    _pool=(_fine_pool or _pool))
+                    _pool=(_fine_pool or _pool),
+                    keys_subset=keys_sorted) + _foo_weak_const
                 foo_bare = foo_total
                 _t_foo_done = _time.perf_counter()
             else:
                 _t_ovl = _t_kcoul = _t_foo = _time.perf_counter()
                 foo_total = _compute_foo_dressed_local(
                     t2_pno_all, pno_spaces, nocc, _cc_ints,
-                    _pool=(_fine_pool or _pool))
+                    _pool=(_fine_pool or _pool),
+                    keys_subset=keys_sorted) + _foo_weak_const
                 foo_bare = foo_total
                 _t_ovl_done = _t_kcoul_done = _t_foo_done = _time.perf_counter()
 
@@ -2251,7 +2390,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 pair_lmo_idx=pair_lmo_idx, _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
                 blas_threads=32, omp_threads=ncores,
-                t1_cache=_t1_cache)
+                t1_cache=_t1_cache, ktc_store=_ktc_store)
             _tj_C = _time.perf_counter() - _tj_c0
 
             _tj_d0 = _time.perf_counter()
@@ -2264,7 +2403,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 cc_ints=_cc_ints,
                 pair_lmo_idx=pair_lmo_idx, _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
-                t1_cache=_t1_cache, omp_threads=ncores)
+                t1_cache=_t1_cache, omp_threads=ncores, ktc_store=_ktc_store)
             _tj_D = _time.perf_counter() - _tj_d0
 
             _tj_f0 = _time.perf_counter()
@@ -2272,7 +2411,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _cc_ints, None, t1_pno, fov_pno, pno_spaces,
                 S_pno_cache, F_lmo, eps_lmo, foo_total,
                 _all_keys_j, nocc, _pool=(_fine_pool or _pool),
-                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache)
+                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
+                cc_ints_flat=_cc_ints_flat, pair_index=_pair_index)
             # Keys whose d_ij/d_ji additions are already baked into
             # _local_Fij_bar — T1 residual augments only the remaining
             # (weak) pairs to avoid double-counting.
@@ -2312,6 +2452,15 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 'Fab_all': None,
                 'ladder_all': None,
             }
+
+            # C_tilde/D_tilde/t1_fock/G_tilde outputs are now captured
+            # (_jiang_C/_jiang_D in _jiang_cache, _local_* / _local_df_G in
+            # locals); drop their internal plan caches before B_tilde/ladder/
+            # BE stack their own transients on top.  See header at the cycle
+            # loop.  Cycle 0 only (the class rebuilds plans afterward).
+            if cycle == 0 and _dropin_free_plans:
+                _free_cycle0_plan_caches()
+                _drv_log_mem('cyc0_freed_cd_plans')
 
             _t_pairs = _time.perf_counter()
 
@@ -2782,8 +2931,24 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             # at the converged or max-cycle state.
             if cycle == 0:
                 _drv_log_mem('after_cycle1')
-                from pyscf.cc.dlpno_tccsd.driver import _dump_plan_cache_sizes
+                from pyscf.cc.dlpno_tccsd.driver import (
+                    _dump_plan_cache_sizes, _dump_plan_cache_keys)
                 _dump_plan_cache_sizes('after_cycle1')
+                _dump_plan_cache_keys('after_cycle1')
+                # Free cycle-0 residual-contribution OUTPUTS that the C++
+                # class does not consume (it recomputes BE/CD/G_term in C++
+                # from cc_ints + the cached plans; only _jiang_C/_jiang_D/
+                # _B_tilde_per_ij are passed on).  Reclaims tens of GiB before
+                # pack_for_t1_ints allocates the class's buffers.  These are
+                # term OUTPUTS, distinct from the function plan caches the
+                # class reuses (those must stay).
+                _BE_all = _C_term_all = _D_term_all = _G_term_all = None
+                _jiang_cache = _jiang_K_mixed = _ladder_all = None
+                _local_df_G = R_ij = None
+                import gc as _gc
+                _gc.collect()
+                _drv_malloc_trim()
+                _drv_log_mem('after_free_cycle0_outputs')
                 print('[CCSD MONO DROPIN] Taking over remaining cycles via C++ class...',
                       flush=True)
                 from pyscf.cc.dlpno_tccsd._ccsd_solver import (
@@ -2796,7 +2961,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                     _cc_ints_flat, _pair_index, ovL_pno_cache, K_pno_cache,
                     _B_tilde_per_ij, _jiang_C, _jiang_D,
                     mydiis, diis_start_cycle, strong_pairs, cas_blocks,
-                    _pool=_pool)
+                    _pool=_pool, ktc_store=_ktc_store)
                 _drv_log_mem('after_class_dropin')
                 break
         else:
