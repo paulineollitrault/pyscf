@@ -27,9 +27,6 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#if defined(__GLIBC__)
-#include <malloc.h>   // mallopt(M_ARENA_MAX), malloc_trim
-#endif
 
 // Forward decls of per-pair kernels implemented in dlpno_*.c (compiled as C;
 // declared here as extern "C" to suppress C++ mangling).
@@ -287,40 +284,6 @@ static int solver_team_size() {
     return (team < cap) ? team : cap;
 #else
     return 1;
-#endif
-}
-
-// --- glibc malloc-arena control -------------------------------------------
-// On a high-core box glibc spins up to 8*ncores per-thread arenas, each of
-// which retains freed chunks in its own free-lists rather than returning
-// them to the OS.  The CCSD cycle allocates/frees many small per-item
-// temporaries inside OMP loops, so those retained chunks accumulate into
-// tens of GiB of brk-arena that never shrinks (observed [heap]=34 GiB / 12k
-// VMAs on rxn_12).  Capping the arena count concentrates allocations into
-// fewer arenas → far less cross-thread retention, which lowers the LIVE
-// per-cycle peak (the retention happens continuously, not just at cycle end).
-// Default cap 4; override with DLPNO_MALLOC_ARENA_MAX (0 disables the cap).
-// Numerically inert — only affects the allocator's bookkeeping.
-static void solver_cap_malloc_arenas_once() {
-#if defined(__GLIBC__)
-    static bool done = false;
-    if (done) return;
-    done = true;
-    int cap = 4;
-    const char *env = std::getenv("DLPNO_MALLOC_ARENA_MAX");
-    if (env != nullptr && env[0] != '\0') cap = std::atoi(env);
-    if (cap > 0) mallopt(M_ARENA_MAX, cap);
-#endif
-}
-
-// Return freed brk pages to the OS at cycle boundaries.  The mid-cycle peak
-// is dominated by retained (not live) free chunks; trimming between cycles
-// keeps the inter-cycle baseline from creeping up.  Opt-in (off by default)
-// since trim+refault adds a small per-cycle cost.
-static void solver_malloc_trim_if_requested() {
-#if defined(__GLIBC__)
-    const char *env = std::getenv("DLPNO_CYCLE_MALLOC_TRIM");
-    if (env != nullptr && env[0] == '1') malloc_trim(0);
 #endif
 }
 
@@ -3861,12 +3824,8 @@ int DLPNOcompute_lccsd_run_one_cycle(
     pyscf_dlpno_ccsd::RunCycleOutputs *out) {
     if (in == nullptr || plans == nullptr || out == nullptr) return -2;
     if (out->R1_flat == nullptr || out->R2_flat == nullptr) return -3;
-    pyscf_dlpno_ccsd::solver_cap_malloc_arenas_once();
     pyscf_dlpno_ccsd::DLPNOCCSDSolver solver(*in);
     solver.run_one_cycle(plans, out);
-    // Solver's non-static per-cycle temporaries are freed by now; optionally
-    // hand the retained free pages back to the OS before the next cycle.
-    pyscf_dlpno_ccsd::solver_malloc_trim_if_requested();
     return 0;
 }
 
