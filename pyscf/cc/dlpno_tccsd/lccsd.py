@@ -1279,6 +1279,8 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
         _pkl_plan = {'_ba_work': _ba_work,
                      '_per_task_plan': _per_task_plan,
                      '_batched_plan': _batched_plan}
+        from pyscf.cc.dlpno_tccsd.pair_index import stream_plan_cache
+        _pkl_plan = stream_plan_cache(_pkl_plan, tag='per_kl')
         _pkl_cache_attr[_pkl_plan_key] = _pkl_plan
     _ba_work = _pkl_plan['_ba_work']
     _per_task_plan = _pkl_plan['_per_task_plan']

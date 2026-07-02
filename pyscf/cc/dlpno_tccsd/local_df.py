@@ -29,6 +29,23 @@ def _ccmem(label):
         pass
 
 
+def _mem_available_gib():
+    """Best-effort kernel MemAvailable in GiB (None if /proc unreadable).
+
+    Read where base + sparse-DF are already resident, so it is the true
+    headroom the cc_ints pool-map grows into. Undercounts glibc-retained free
+    heap, so it errs toward a smaller budget (more throttling) => OOM-safe.
+    """
+    try:
+        with open('/proc/meminfo') as _fh:
+            for _ln in _fh:
+                if _ln.startswith('MemAvailable:'):
+                    return int(_ln.split()[1]) / 1048576.0  # kB -> GiB
+    except OSError:
+        pass
+    return None
+
+
 def build_screening_maps(mol, auxmol, C_lmo, pao_domains, s1e, strong_pair_keys,
                          T_CUT_MKN=1e-3, T_CUT_CLMO=1e-3, C_pao=None,
                          _pool=None):
@@ -838,6 +855,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     _t_screening = _ccints_setup_time.perf_counter() - _t_setup0
     _ccmem('cc_ints:after_screening_maps')
     _t_setup0 = _ccints_setup_time.perf_counter()
+    _owns_sparse = sparse_arrays is None
     if sparse_arrays is None:
         sparse_arrays = build_sparse_df_arrays(
             mol, auxmol, C_lmo, C_pao, screening_maps, _pool=_pool)
@@ -888,6 +906,22 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         qij_atom[A] = qj
         qia_atom[A] = qa
         qab_atom[A] = qb
+    # Streaming step #2: the per-aux-Q sparse arrays (qij/qia/qab) are now
+    # redundant — the per-atom stacks above hold np.stack *copies*, and the
+    # downstream pair loop reads only qij_atom/qia_atom/qab_atom (no qij[Q]
+    # access past this point).  Holding the per-Q lists alive through the
+    # cc_ints pool-map nearly doubles the peak (per-Q list + per-atom stack
+    # both resident).  Drop our references now so the ~half they occupy is
+    # reclaimed before the pool-map (≈38 GiB on MOBH35-12/def2-tzvp).  Only
+    # clear the dict if we built it (don't free a caller-shared object).
+    del _stacks
+    qij = qia = qab = None
+    if _owns_sparse:
+        sparse_arrays.clear()
+    sparse_arrays = None
+    import gc as _gc
+    _gc.collect()
+    _ccmem('cc_ints:after_free_perQ')
     # Map global Q → position within its atom's Q-stack
     aux_pos_in_atom = -np.ones(naux, dtype=np.int64)
     for A in range(natm):
@@ -1639,11 +1673,34 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         return int(30 * _nloc * _npno * _npno * 8)
 
     # Per-pair-concurrency RAM budget for the cc_ints build (env-tunable).
-    # Default 110 GiB: caps the cc_ints transient peak near ~183 GiB on a
-    # def2-QZVPP / Pt-complex run (vs ~210 GiB unthrottled) with only a
-    # small cc_ints-build slowdown. Lower it (e.g. 85) for more headroom,
-    # raise it (e.g. 150) to minimise throttling on a large-RAM host.
-    _budget = float(os.environ.get('DLPNO_CCINTS_MEM_GIB', '110')) * 2**30
+    # The budget caps the summed in-flight per-pair working sets; the cc_ints
+    # RESULT accumulates alongside, so the measured peak ~= budget + overhead
+    # (base + sparse-DF + result). Calibration: budget 110 -> peak ~183 GiB on
+    # a def2-QZVPP / Pt run (overhead ~73), vs ~210 unthrottled.
+    #   DLPNO_CCINTS_MEM_GIB=<number>  explicit budget in GiB (DEFAULT 110)
+    #   DLPNO_CCINTS_MEM_GIB=auto      size from live MemAvailable (read here,
+    #     where base + sparse-DF are resident, so it is the true headroom):
+    #         budget = MemAvailable*frac - reserve   (floor 16 GiB)
+    #     frac<1 leaves room for the accumulating result; frac=0.6 reproduces
+    #     the qzvpp overhead ratio. Mirrors the (T) DLPNO_T_MAX_WORKERS=auto cap.
+    #   DLPNO_CCINTS_MEM_FRAC        auto fraction of MemAvailable (default 0.6)
+    #   DLPNO_CCINTS_MEM_RESERVE_GB  auto margin kept free (default 8)
+    _bud_env = os.environ.get('DLPNO_CCINTS_MEM_GIB', '110')
+    if _bud_env.strip().lower() == 'auto':
+        _avail = _mem_available_gib()
+        if _avail:
+            _frac = float(os.environ.get('DLPNO_CCINTS_MEM_FRAC', '0.6'))
+            _resv = float(os.environ.get('DLPNO_CCINTS_MEM_RESERVE_GB', '8'))
+            _bud_gib = max(16.0, _avail * _frac - _resv)
+        else:
+            _bud_gib = 110.0
+        if os.environ.get('DLPNO_MEM_PROBE'):
+            print(f'  [CCMEM/cc_ints_budget] auto: MemAvailable='
+                  f'{(_avail or 0):.0f} GiB frac={os.environ.get("DLPNO_CCINTS_MEM_FRAC","0.6")}'
+                  f' -> budget={_bud_gib:.0f} GiB', flush=True)
+    else:
+        _bud_gib = float(_bud_env)
+    _budget = _bud_gib * 2**30
     _ests = {_k: _pair_mem_estimate(_k) for _k in keys}
     _have_submit = _pool is not None and hasattr(_pool, 'submit')
 

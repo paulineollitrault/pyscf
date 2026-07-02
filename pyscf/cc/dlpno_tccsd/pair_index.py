@@ -513,6 +513,218 @@ def _madvise_dontneed(buf):
         pass
 
 
+def _plan_stream_on():
+    """True if CCSD-cycle plan buffers should be NVMe-backed (Stage 1).
+
+    Gated by DLPNO_STREAM_PLANS (or the umbrella DLPNO_CCINTS_MMAP, so the
+    existing 'turn streaming on' flag also streams the plan caches).
+    """
+    return bool(os.environ.get('DLPNO_STREAM_PLANS')
+                or os.environ.get('DLPNO_CCINTS_MMAP'))
+
+
+def stream_empty(shape, dtype=np.float64, tag='plan'):
+    """np.empty, but NVMe-memmap-backed when plan-streaming is on and the
+    buffer is large (Stage 1).
+
+    CCSD-cycle plan buffers (gathered K / S stacks etc.) are write-once,
+    read-every-cycle — the same profile as cc_ints.  Backing them with a
+    file-mapped buffer turns them from anon RAM (which the OOM killer counts)
+    into clean file pages the kernel can EVICT under memory pressure, then
+    re-fault on the next cycle's read.  Numerically identical: same bytes, the
+    C kernels read through the same raw pointer.
+
+    Threshold DLPNO_STREAM_PLAN_MIN_MB (default 128 MiB) keeps tiny buffers in
+    RAM (not worth a file).  Returns a normal np.empty otherwise.
+    """
+    shape = tuple(int(d) for d in (shape if isinstance(shape, (tuple, list))
+                                   else (shape,)))
+    nelem = 1
+    for d in shape:
+        nelem *= d
+    itemsize = np.dtype(dtype).itemsize
+    _min = float(os.environ.get('DLPNO_STREAM_PLAN_MIN_MB', '128')) * (1 << 20)
+    if _plan_stream_on() and nelem * itemsize > _min:
+        _td = os.environ.get('PYSCF_TMPDIR') or tempfile.gettempdir()
+        _fd, _path = tempfile.mkstemp(suffix='.' + tag, prefix='dlpno_plan_',
+                                      dir=_td)
+        os.close(_fd)
+        buf = np.memmap(_path, dtype=dtype, mode='w+', shape=shape)
+        # Do NOT unlink here: an unlinked inode + madvise(DONTNEED) re-fault
+        # corrupts data (unlike a live file). Match the cc_ints/S_pno stores
+        # (which keep the path) and clean the files at interpreter exit.
+        _register_plan_tmpfile(_path)
+        return buf
+    return np.empty(shape, dtype=dtype)
+
+
+_PLAN_TMPFILES = []
+
+
+def _register_plan_tmpfile(path):
+    """Track a plan-stream backing file for best-effort removal at exit."""
+    if not _PLAN_TMPFILES:
+        import atexit
+
+        def _cleanup():
+            for _p in _PLAN_TMPFILES:
+                try:
+                    os.unlink(_p)
+                except OSError:
+                    pass
+        atexit.register(_cleanup)
+    _PLAN_TMPFILES.append(path)
+
+
+def stream_settle(buf):
+    """After a stream_empty() buffer is fully written, flush its dirty pages to
+    disk and drop them from RAM (they re-fault on read).  No-op for a normal
+    ndarray.  Call once the plan buffer's fill loop is complete."""
+    if isinstance(buf, np.memmap):
+        buf.flush()
+        if not os.environ.get('DLPNO_STREAM_NO_MADVISE'):
+            _madvise_dontneed(buf)
+
+
+def stream_plan_cache(plan, tag='plancache'):
+    """Consolidate a built plan cache's large OWNED float64 arrays into one
+    NVMe-backed buffer (Stage 1), replacing them with views.
+
+    Why not stream_empty per array: the BE/CD/C~/D~/G-term plans are built as
+    MANY small per-shape bucket arrays, each below the per-buffer threshold but
+    summing to tens of GiB of anon RAM held read-only across ALL CCSD cycles.
+    This walks the finished plan, packs every large *owned* (base is None),
+    non-memmap, C-contiguous float64 array into a single memmap, and points the
+    plan at views into it — so the whole plan becomes OS-EVICTABLE file pages
+    instead of anon (which the OOM killer counts).  Arrays that are already
+    views/aliases (e.g. into the mmap'd cc_ints / S_pno masters) have base != None
+    and are LEFT UNTOUCHED, preserving the existing zero-copy dedup.
+
+    Incremental copy+free keeps the transient ~= plan size (no 2x spike).
+    Numerically identical (same bytes; C kernels read the same layout through
+    the view's raw pointer).  No-op unless plan-streaming is on.
+    """
+    if plan is None or not _plan_stream_on():
+        return plan
+    _min_arr = float(os.environ.get('DLPNO_STREAM_PLAN_ARR_MIN_MB', '1')) \
+        * (1 << 20)
+    _min_total = float(os.environ.get('DLPNO_STREAM_PLAN_MIN_MB', '128')) \
+        * (1 << 20)
+
+    def _eligible(a):
+        return (isinstance(a, np.ndarray) and not isinstance(a, np.memmap)
+                and a.dtype == np.float64 and a.base is None
+                and a.flags['C_CONTIGUOUS'] and a.nbytes >= _min_arr)
+
+    _dbg = {} if os.environ.get('DLPNO_STREAM_PLAN_DEBUG') else None
+    _dbg_masters = {}   # id(root) -> nbytes, for arrays reached only via views
+
+    def _root_base(a):
+        b = a
+        while isinstance(getattr(b, 'base', None), np.ndarray):
+            b = b.base
+        return b
+
+    def _categorize(a):
+        if isinstance(a, np.memmap):
+            k = 'memmap'
+        elif a.dtype != np.float64:
+            k = 'nonf64'
+        elif a.base is not None:
+            k = 'view'
+            r = _root_base(a)
+            if not isinstance(r, np.memmap):
+                _dbg_masters[id(r)] = int(r.nbytes)
+        elif not a.flags['C_CONTIGUOUS']:
+            k = 'noncontig'
+        elif a.nbytes < _min_arr:
+            k = 'small'
+        else:
+            k = 'caught'
+        e = _dbg.setdefault(k, [0, 0])
+        e[0] += 1
+        e[1] += int(a.nbytes)
+
+    # Pass 1: collect unique eligible arrays by identity (mirror driver's
+    # _walk_bytes: recurse dict / list / tuple / set, capped depth).
+    order = []          # unique eligible arrays, in first-seen order
+    ids = set()
+    seen = set()
+
+    def _collect(obj, depth=0):
+        if depth > 8 or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        if isinstance(obj, np.ndarray):
+            if _dbg is not None:
+                _categorize(obj)
+            if _eligible(obj) and id(obj) not in ids:
+                ids.add(id(obj))
+                order.append(obj)
+            return
+        if isinstance(obj, dict):
+            for v in obj.values():
+                _collect(v, depth + 1)
+        elif isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                _collect(v, depth + 1)
+
+    _collect(plan)
+    if _dbg is not None:
+        _mtot = sum(_dbg_masters.values())
+        _s = '  '.join(f'{k}={v[1]/2**30:.2f}G/{v[0]}' for k, v in _dbg.items())
+        print(f'  [PLANSTREAM/{tag}] {_s}  view_masters={_mtot/2**30:.2f}G/'
+              f'{len(_dbg_masters)}', flush=True)
+    if not order:
+        return plan
+    total = sum(a.size for a in order)
+    if total * 8 < _min_total:
+        return plan
+    # Pack into one memmap; build id(arr) -> view map.
+    buf = stream_empty((total,), tag=tag)
+    views = {}
+    off = 0
+    for a in order:
+        n = a.size
+        buf[off:off + n] = a.ravel()
+        views[id(a)] = buf[off:off + n].reshape(a.shape)  # base -> buf (kept)
+        off += n
+    stream_settle(buf)
+    del order          # drop our refs; plan still holds originals until rebuild
+
+    # Pass 2: rebuild the structure, swapping each collected array for its view.
+    # dict/list mutated in place; tuples rebuilt (immutable). As each parent's
+    # last reference to an original is replaced, that anon array is freed.
+    rebuilt = {}
+
+    def _rebuild(obj, depth=0):
+        vid = views.get(id(obj))
+        if vid is not None:
+            return vid
+        if depth > 8:
+            return obj
+        oid = id(obj)
+        if oid in rebuilt:
+            return rebuilt[oid]
+        if isinstance(obj, dict):
+            rebuilt[oid] = obj
+            for k in list(obj.keys()):
+                obj[k] = _rebuild(obj[k], depth + 1)
+            return obj
+        if isinstance(obj, list):
+            rebuilt[oid] = obj
+            for i in range(len(obj)):
+                obj[i] = _rebuild(obj[i], depth + 1)
+            return obj
+        if isinstance(obj, tuple):
+            new = tuple(_rebuild(x, depth + 1) for x in obj)
+            rebuilt[oid] = new
+            return new
+        return obj
+
+    return _rebuild(plan)
+
+
 class FlatPairPairStore:
     """Sparse ``(pair_a, pair_b) -> ndarray`` store with flat backing.
 

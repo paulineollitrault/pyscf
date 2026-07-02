@@ -16,6 +16,7 @@ from pyscf.cc.dlpno_tccsd.lccsd import (
 from pyscf.cc.dlpno_tccsd.local_df import (
     get_local_K, get_local_ovL, get_local_ooL_vec,
 )
+from pyscf.cc.dlpno_tccsd.pair_index import stream_plan_cache
 
 
 def _omp_threads_ctx(n_threads):
@@ -569,7 +570,7 @@ def build_G_tilde(t2_pno_all, t1_pno, pno_spaces, nocc,
             'triple_T2_pair_idx': triple_T2_pair_idx_arr,
             'num_threads': min(32, len(ij_slots)) if ij_slots else 1,
         }
-        build_G_tilde._batched_plan = plan
+        build_G_tilde._batched_plan = stream_plan_cache(plan, tag='gtilde')
 
     if plan.get('empty'):
         return G
@@ -978,6 +979,7 @@ def compute_G_term_batched(strong_keys, t2_pno_all, pno_spaces,
         plan = _build_g_term_plan(
             strong_keys, pno_spaces, pair_lmo_idx,
             t2_pno_all, S_pno_cache, nocc)
+        plan = stream_plan_cache(plan, tag='gterm')
         _cache[plan_key] = plan
 
     # Flat output: one (n_pairs_in_n_ij, n_ij, n_ij) buffer per n_ij.
@@ -1676,6 +1678,7 @@ def build_D_tilde_batched(
         plan = _build_d_tilde_t34_plan(
             all_pairs, pno_spaces, pair_lmo_idx, t2_pno_all,
             S_pno_cache, cc_ints, _s_pno_get, nocc)
+        plan = stream_plan_cache(plan, tag='plan')
         _cache_attr[plan_key] = plan
 
     from pyscf.cc.dlpno_tccsd._c_tilde_cy import (
@@ -2400,6 +2403,7 @@ def compute_C_tilde_batched(
         plan = _build_c_tilde_t34_plan(
             all_pairs, pno_spaces, pair_lmo_idx, t2_pno_all,
             S_pno_cache, cc_ints, _s_pno_get, nocc)
+        plan = stream_plan_cache(plan, tag='plan')
         _cache_attr[plan_key] = plan
 
     # ------------------------------------------------------------------
@@ -2910,6 +2914,7 @@ def compute_B_E_batched(
         plan = _build_be_plan(
             strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
             cc_ints, _s_pno_get, nocc, S_pno_cache=S_pno_cache)
+        plan = stream_plan_cache(plan, tag='plan')
         _cache_attr[plan_key] = plan
 
     # Flat output buffers, one per n_ij bucket.
@@ -4550,6 +4555,7 @@ def compute_CD_terms_batched(
             strong_keys, t2_pno_all, pno_spaces, pair_lmo_idx,
             cc_ints, K_ij_kj_all, K_coul_cache,
             _s_pno_get, nocc, S_pno_cache=S_pno_cache)
+        plan = stream_plan_cache(plan, tag='plan')
         _cache_attr[plan_key] = plan
 
     # Flat output buffers per n_pno — one for each of C_ij, C_ji, D_ij, D_ji.

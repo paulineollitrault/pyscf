@@ -38,6 +38,77 @@ from pyscf.lib import logger
 from pyscf.ao2mo import _ao2mo
 
 
+def _tmem(label):
+    """Print [TMEM/<label>] process RSS if DLPNO_MEM_PROBE=1 (triples phase)."""
+    if os.environ.get('DLPNO_MEM_PROBE'):
+        try:
+            with open('/proc/self/statm') as _fh:
+                _rss = int(_fh.read().split()[1]) * 4096 / (1024**3)
+            print(f'  [TMEM/{label}] RSS={_rss:.2f} GiB', flush=True)
+        except Exception:
+            pass
+
+
+def _mem_available_gb():
+    """Best-effort kernel MemAvailable in GiB (None if /proc unreadable).
+
+    MemAvailable already subtracts everything resident (base + sparse-DF are
+    live when we read it before the energy pass) and adds back reclaimable
+    page cache, so it is the true headroom the per-triple working sets can
+    grow into. It does NOT count glibc-retained freed heap as available, so
+    it errs on the safe (fewer-threads) side vs the real peak — good for OOM.
+    """
+    try:
+        with open('/proc/meminfo') as _fh:
+            for _ln in _fh:
+                if _ln.startswith('MemAvailable:'):
+                    return int(_ln.split()[1]) / (1024 ** 2)  # kB -> GiB
+    except Exception:
+        pass
+    return None
+
+
+def _t_worker_count(pool_workers, n_tno_max=None):
+    """Number of parallel workers for the (T) energy pass, memory-aware.
+
+    The (T) peak is working-set-bound: RSS ~= base + sparse_DF + W * nthreads,
+    where W is the per-thread C scratch (dlpno_triples_orch.c), grow-and-keep
+    to the largest triple: W ~= 8 * (3*n_tno^2*naux + ~12*n_tno^3) bytes.  So
+    the memory-safe worker count is  N = MemAvailable / W  (base and sparse_DF
+    are already resident when MemAvailable is read).
+
+    Knobs (all optional; if none set -> use the whole pool, i.e. no change):
+      DLPNO_T_MAX_WORKERS    explicit int hard cap (the robust throttle), or
+                             'auto' to force the memory calc below.
+      DLPNO_MEM_BUDGET_GB    headroom to fill; default = live MemAvailable.
+                             Setting it (without DLPNO_T_MAX_WORKERS) also
+                             enables auto sizing.
+      DLPNO_T_GB_PER_WORKER  per-thread working set W in GiB (default 5.0;
+                             basis/system dependent, ~4.5 measured on
+                             rxn_12/def2-TZVP, n_tno_max~180).
+      DLPNO_T_MEM_RESERVE_GB safety margin kept free (default 8.0).
+    """
+    _env = os.environ.get('DLPNO_T_MAX_WORKERS')
+    _budget_env = os.environ.get('DLPNO_MEM_BUDGET_GB')
+    if _env and _env.lower() != 'auto':
+        try:
+            return max(1, min(int(_env), pool_workers))   # explicit hard cap
+        except ValueError:
+            pass
+    _auto = (_env is not None and _env.lower() == 'auto') \
+        or _budget_env is not None
+    if not _auto:
+        return pool_workers               # no request -> unchanged behaviour
+    # --- auto sizing ---
+    budget = float(_budget_env) if _budget_env else _mem_available_gb()
+    if not budget or budget <= 0:
+        return pool_workers
+    gbpw = float(os.environ.get('DLPNO_T_GB_PER_WORKER', '5.0'))
+    reserve = float(os.environ.get('DLPNO_T_MEM_RESERVE_GB', '8.0'))
+    n = int((budget - reserve) / max(gbpw, 1e-6))
+    return max(1, min(n, pool_workers))
+
+
 def _triple_pno_union(pno_spaces, i, j, k, s1e, t2_for_T=None,
                       T_CutTNO=1e-9, S_cut=1e-6):
     """Compute the TNO space from the averaged triplet density (Jiang 2024 eq.62).
@@ -817,6 +888,13 @@ def _build_pair_arena(_gak, pno_spaces, t2_for_T):
         if pk in t2_for_T and g_pno_n[p] > 0:
             g_T2_flat[g_T2_off[p]:g_T2_off[p + 1]] = np.ascontiguousarray(
                 t2_for_T[pk]).ravel()
+    # NOTE: an attempt to de-duplicate the amplitude/PNO storage here (repoint
+    # the per-pair pno_spaces/t2_for_T entries to zero-copy views into this flat
+    # arena and free the originals) was numerically neutral but gave NO RSS
+    # reduction: the freed per-pair arrays are small heap allocations (~tens of
+    # KB) that glibc retains rather than returning to the OS, and the (T)-entry
+    # base is dominated by glibc-retained-free CCSD pages (already reused by the
+    # energy pass), not live amplitude data.  Removed — see STREAMING_DEV.md.
     return (_gak, pair_to_idx, g_pao_n, g_pno_n,
             g_pp_off, g_pp_flat, g_X_off, g_X_flat,
             g_T2_off, g_T2_flat)
@@ -1751,8 +1829,13 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     # while the tight pass on surviving triples uses the full-accuracy thresholds.
     _T_CUT_MKN_TRIPLES     = 1e-2
     _T_CUT_DO_TRIPLES      = 1e-2
-    _T_CUT_MKN_TRIPLES_PRE = 1e-1    # 10× looser than tight
-    _T_CUT_DO_TRIPLES_PRE  = 2e-2    # 2× looser than tight
+    # Jiang JCP 2024 Table II: the (T0) prescreen loosens ONLY the TNO tolerance
+    # (T_CUT_TNO_PRE); the aux/PAO domains use the same T_CUT_MKN_TRIPLES /
+    # T_CUT_DO_TRIPLES = 1e-2 as the tight pass.  (Previously these were loosened
+    # to 1e-1 / 2e-2 as an in-house speed optimization, which altered the
+    # screened-triplet contribution vs Psi4.)
+    _T_CUT_MKN_TRIPLES_PRE = 1e-2    # match Table II (was 1e-1)
+    _T_CUT_DO_TRIPLES_PRE  = 1e-2    # match Table II (was 2e-2)
     _T_CUT_CLMO = 1e-3
     _auxmol = mf.with_df.auxmol if hasattr(mf.with_df, 'auxmol') else None
     _j2c_full = None
@@ -1967,20 +2050,53 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             sparse_df['qij_atom_flat'] = qij_flat
             sparse_df['qia_atom_flat'] = qia_flat
             sparse_df['qab_atom_flat'] = qab_flat
+            # Free the per-atom stack LISTS (qij_atom/qia_atom/qab_atom): they
+            # exist only to fill the flat buffers above.  The active per-triple
+            # energy kernel (_orch -> C) reads exclusively the *_atom_flat
+            # buffers; the sole reader of the stack lists,
+            # _build_triple_local_DF, is dead (never called).  These are LARGE
+            # arrays (qab_atom[A] ~ hundreds of MB, > mmap threshold -> returned
+            # to the OS on free), so dropping them reclaims the full stack
+            # footprint (~11 GiB on MOBH35-33/qzvpp) before the energy-pass peak.
+            sparse_df.pop('qij_atom', None)
+            sparse_df.pop('qia_atom', None)
+            sparse_df.pop('qab_atom', None)
+            del qij_stack, qia_stack, qab_stack
+            import gc as _gc
+            _gc.collect()
             sparse_df['qij_atom_off'] = qij_off
             sparse_df['qia_atom_off'] = qia_off
             sparse_df['qab_atom_off'] = qab_off
             sparse_df['qij_atom_n_aux'] = qij_n_aux
             sparse_df['qij_atom_n_lmo'] = qij_n_lmo
             sparse_df['qab_atom_n_pao'] = qab_n_pao
+            # Streaming #2: the per-aux-Q lists (qij/qia/qab) are now redundant
+            # — the per-atom stacks + flats above are np.stack/concat copies and
+            # the triples loop consumes only qij_atom / qij_atom_flat.  Free them
+            # for the PRESCREEN/subset pass (tight_sparse is not None).  For the
+            # TIGHT build keep them: the prescreen derivation still slices them;
+            # the caller frees them immediately after that (see below).
+            if tight_sparse is not None:
+                sparse_df['qij'] = sparse_df['qia'] = sparse_df['qab'] = None
             _bi("flat per-atom stacks")
             return lmo_aux_mask, pao_domains, screening, sparse_df
 
+        # (T) entry: the CCSD cc_ints are freed by run_lccsd but glibc retains
+        # the pages (no trim between CCSD and (T)).  Trim now so the (T) build
+        # starts from the true live floor, not the cc_ints high-water mark.
+        _tmem('T_entry')
+        try:
+            from pyscf.cc.dlpno_tccsd.driver import _malloc_trim as _mt0
+            _mt0()
+        except Exception:
+            pass
+        _tmem('T_entry_after_trim')
         # Tight infrastructure (used for the final (T) pass on surviving triples).
         _lmo_aux_mask, _pao_domains, _screening, _sparse_df = \
             _build_triples_infrastructure(
                 _T_CUT_MKN_TRIPLES, _T_CUT_DO_TRIPLES, 'tight')
         _tp("build TIGHT sparse-DF infra")
+        _tmem('after_tight_sparse')
         _j2c_full = _auxmol.intor('int2c2e')
         _S_pao_full = C_pao.T @ s1e @ C_pao
         _F_pao_full = C_pao.T @ fock_ao @ C_pao
@@ -1993,11 +2109,20 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                     _T_CUT_MKN_TRIPLES_PRE, _T_CUT_DO_TRIPLES_PRE, 'prescreen',
                     tight_sparse=_sparse_df, tight_screen=_screening)
             _tp("build PRESCREEN sparse-DF infra")
+            _tmem('after_prescreen_sparse')
         else:
             _lmo_aux_mask_pre = _lmo_aux_mask
             _pao_domains_pre = _pao_domains
             _screening_pre = _screening
             _sparse_df_pre = _sparse_df
+        # Streaming #2: the TIGHT per-aux-Q lists were retained only so the
+        # prescreen subset above could slice them (derive_subset_sparse_df).
+        # Both (T) passes consume the per-atom flats (qij_atom_flat), never the
+        # per-Q lists, so drop them now — on MOBH35-12 this is the largest
+        # freeable transient of the (T) phase.
+        if _sparse_df is not None:
+            _sparse_df['qij'] = _sparse_df['qia'] = _sparse_df['qab'] = None
+        _tmem('after_free_tight_perQ')
     else:
         _lmo_aux_mask = None
         _sparse_df = None
@@ -2013,6 +2138,7 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     # Diagnostic: per-triple screening tightness. naux_ijk / naux_full and
     # len(triple_domain) / nocc tell us whether aux-Q and occupied domains
     # are O(1) per triple (good scaling) or growing with system size (bad).
+    _n_tno_max_sampled = None
     if valid_triples:
         _naux_tot = _lmo_aux_mask.shape[1] if _lmo_aux_mask is not None else 0
         _ss_aux, _ss_dom, _ss_pao = [], [], []
@@ -2066,11 +2192,42 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                 except Exception:
                     pass
             if _ss_tno:
+                _n_tno_max_sampled = max(_ss_tno)
                 print(f'  (T) n_tno (sampled {len(_ss_tno)}): '
                       f'avg={np.mean(_ss_tno):.1f}  min={min(_ss_tno)}  '
-                      f'max={max(_ss_tno)}',
+                      f'max={_n_tno_max_sampled}',
                       flush=True)
     _tp("diagnostic stats + 30-tno sample")
+
+    # ------------------------------------------------------------------
+    # Memory-aware (T) worker count. The (T) energy pass is the RSS peak of
+    # the whole calculation; its footprint is base + sparse_DF + W*nthreads
+    # (W = per-triple C scratch). Cap the number of concurrent triples so
+    # that peak fits the box. Default (no env set) = whole shared pool, i.e.
+    # unchanged behaviour. See _t_worker_count for the knobs.
+    # ------------------------------------------------------------------
+    _pool_workers = (getattr(_pool, '_max_workers', ncores)
+                     if _pool is not None else 1)
+    _t_workers = _t_worker_count(_pool_workers, _n_tno_max_sampled)
+    _tpool = _pool
+    _tpool_owned = False
+    if _pool is not None and _t_workers < _pool_workers:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        _tpool = _TPE(max_workers=_t_workers)
+        _tpool_owned = True
+    # The OMP backend (DLPNO_TRIPLE_OMP=1) has its own thread knob and does
+    # NOT use the Python pool; propagate the cap to it unless the user pinned
+    # it explicitly.
+    if (os.environ.get('DLPNO_TRIPLE_OMP') == '1'
+            and _t_workers != _pool_workers
+            and os.environ.get('DLPNO_TRIPLES_OMP_THREADS') is None):
+        os.environ['DLPNO_TRIPLES_OMP_THREADS'] = str(_t_workers)
+    if _t_workers != _pool_workers or os.environ.get('DLPNO_MEM_PROBE'):
+        _ma = _mem_available_gb()
+        print(f'  (T) energy-pass workers: {_t_workers} / pool {_pool_workers}'
+              f'  (MemAvailable {_ma:.0f} GiB)' if _ma is not None
+              else f'  (T) energy-pass workers: {_t_workers} / pool '
+                   f'{_pool_workers}', flush=True)
 
     triple_kwargs = dict(
         pno_spaces=pno_spaces, t2_for_T=t2_for_T,
@@ -2130,8 +2287,8 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                 _pre_kwargs.get('nonneg_set'),
                 _pre_kwargs['T_CutTNO'],
                 _pre_kwargs.get('t1_pno')))
-        elif _pool is not None:
-            _et_pre = list(_pool.map(_pre_triple, valid_triples))
+        elif _tpool is not None:
+            _et_pre = list(_tpool.map(_pre_triple, valid_triples))
         else:
             _et_pre = [_pre_triple(ijk) for ijk in valid_triples]
         _tp("PRESCREEN pass (whole call)")
@@ -2151,6 +2308,24 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
               flush=True)
         valid_triples = _kept
         _tp("prescreen filter")
+        # Streaming #2: the PRESCREEN sparse-DF infrastructure (per-atom flats
+        # qij_atom_flat/etc.) is consumed only by the prescreen pass above; the
+        # main (T) energy pass uses the TIGHT _sparse_df.  These are large
+        # contiguous (mmap-backed) arrays, so freeing them here returns memory
+        # to the OS before the energy-pass peak (~11.6 GiB on MOBH35-12/svp).
+        # Guard: when no prescreen ran, _sparse_df_pre IS _sparse_df (the tight
+        # set the main pass needs) — never free that.
+        if (_sparse_df_pre is not None
+                and _sparse_df_pre is not _sparse_df):
+            _sparse_df_pre.clear()
+        _sparse_df_pre = None
+        _lmo_aux_mask_pre = _pao_domains_pre = _screening_pre = None
+        try:
+            from pyscf.cc.dlpno_tccsd.driver import _malloc_trim as _mt
+            _mt()
+        except Exception:
+            pass
+        _tmem('after_free_prescreen_infra')
 
     # Degenerate occupied triples: pairs (i,k) with i<k capture
     # {i,i,k} and {i,k,k} contributions (60% of canonical (T)).
@@ -2163,6 +2338,7 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
 
     # Reuse the shared pool from the driver (same threads as LCCSD stage).
     # Set BLAS to single-thread during pool phase, restore after.
+    _tmem('before_energy_pass')
     if (os.environ.get('DLPNO_TRIPLE_OMP', '0') == '1'
             and triple_kwargs.get('sparse_df') is not None
             and triple_kwargs.get('S_pao_full') is not None):
@@ -2178,21 +2354,25 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             triple_kwargs['T_CutTNO'],
             triple_kwargs.get('t1_pno')))
         _tp("ENERGY pass distinct (OMP)")
-        if _pool is not None:
-            et_degen_values = list(_pool.map(_do_degen, valid_pairs))
+        if _tpool is not None:
+            et_degen_values = list(_tpool.map(_do_degen, valid_pairs))
         else:
             et_degen_values = [_do_degen(ik) for ik in valid_pairs]
         _tp("ENERGY pass degenerate (pool)")
-    elif _pool is not None:
-        et_values = list(_pool.map(_do_triple, valid_triples))
+    elif _tpool is not None:
+        et_values = list(_tpool.map(_do_triple, valid_triples))
         _tp("ENERGY pass distinct (pool)")
-        et_degen_values = list(_pool.map(_do_degen, valid_pairs))
+        et_degen_values = list(_tpool.map(_do_degen, valid_pairs))
         _tp("ENERGY pass degenerate (pool)")
     else:
         et_values = [_do_triple(ijk) for ijk in valid_triples]
         _tp("ENERGY pass distinct (serial)")
         et_degen_values = [_do_degen(ik) for ik in valid_pairs]
         _tp("ENERGY pass degenerate (serial)")
+
+    if _tpool_owned:
+        _tpool.shutdown(wait=True)
+        _tpool = None
 
     e_t_distinct = sum(et_values)
     n_triples = sum(1 for v in et_values if v != 0.0)
