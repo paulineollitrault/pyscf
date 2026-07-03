@@ -351,6 +351,7 @@ class FlatTensorStore:
             os.close(_fd)
             self._buffer = np.memmap(self._mmap_path, dtype=self.dtype,
                                      mode='w+', shape=(_total,))
+            _register_plan_tmpfile(self._mmap_path)   # remove at exit
         else:
             self._buffer = np.zeros(_total, dtype=self.dtype)
 
@@ -818,6 +819,7 @@ class FlatPairPairStore:
             os.close(_fd)
             self._buffer = np.memmap(self._mmap_path, dtype=self.dtype,
                                      mode='w+', shape=(_total,))
+            _register_plan_tmpfile(self._mmap_path)   # remove at exit
         else:
             self._buffer = np.empty(_total, dtype=self.dtype)
 
