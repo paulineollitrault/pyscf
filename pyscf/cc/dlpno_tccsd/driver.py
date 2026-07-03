@@ -958,53 +958,63 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # without it, ncores workers × 64 BLAS threads exceeds OpenBLAS'
     # internal memory-region cap and triggers BLAS allocation errors.
     # ------------------------------------------------------------------
-    print('  Stage 6: (T) correction...', flush=True)
-    _log_mem('stage6_enter')
-    _t_triples_start = _time.time()
+    # DLPNO_SKIP_TRIPLES=1: compute HF+CCSD only, set e_t=0. For CBS-"full"
+    # extrapolation the (T) correction is taken from the SMALL bases
+    # (SVP/TZVP), so running (T) at TZVPP/QZVPP is wasted work (~60% of wall).
+    if _os.environ.get('DLPNO_SKIP_TRIPLES'):
+        e_t = 0.0
+        _t_triples = 0.0
+        print('  Stage 6: (T) SKIPPED (DLPNO_SKIP_TRIPLES=1)', flush=True)
+        if _owns_pool and _shared_pool is not None:
+            _shared_pool.shutdown(wait=True)
+    else:
+        print('  Stage 6: (T) correction...', flush=True)
+        _log_mem('stage6_enter')
+        _t_triples_start = _time.time()
 
-    C_cas_vir_t = None if no_cas else mo_loc[:, vir_cas_idx]
+        C_cas_vir_t = None if no_cas else mo_loc[:, vir_cas_idx]
 
-    _blas_ctx_t = (threadpool_limits(limits=1, user_api='blas')
-                   if threadpool_limits is not None and _shared_pool is not None
-                   else None)
-    if _blas_ctx_t is not None:
-        _blas_ctx_t.__enter__()
-    try:
-        if use_t1_iterations:
-            e_t = run_lccsd_t1_iterations(
-                mf, C_lmo, pno_spaces,
-                strong_pairs=strong_pairs,
-                t2_pno_all=t2_pno_all,
-                t1_pno=t1_pno,
-                occ_cas_idx=occ_cas_idx,
-                C_cas_vir=C_cas_vir_t,
-                T_CutTNO=1e-9,
-                ncores=ncores, verbose=verbose,
-                _pool=_shared_pool)
-        else:
-            e_t = run_lccsd_t_ext(
-                mf, C_lmo, pno_spaces,
-                strong_pairs=strong_pairs,
-                t2_pno_all=t2_pno_all,
-                t1_pno=t1_pno,
-                occ_cas_idx=occ_cas_idx,
-                C_cas_vir=C_cas_vir_t,
-                vir_cas_idx=vir_cas_idx,
-                negligible_pairs=negligible_pairs,
-                weak_pairs=weak_pairs,
-                C_pao=C_pao,
-                doi_iu=doi_iu,
-                ncores=ncores, verbose=verbose,
-                _pool=_shared_pool)
-    finally:
+        _blas_ctx_t = (threadpool_limits(limits=1, user_api='blas')
+                       if threadpool_limits is not None and _shared_pool is not None
+                       else None)
         if _blas_ctx_t is not None:
-            _blas_ctx_t.__exit__(None, None, None)
+            _blas_ctx_t.__enter__()
+        try:
+            if use_t1_iterations:
+                e_t = run_lccsd_t1_iterations(
+                    mf, C_lmo, pno_spaces,
+                    strong_pairs=strong_pairs,
+                    t2_pno_all=t2_pno_all,
+                    t1_pno=t1_pno,
+                    occ_cas_idx=occ_cas_idx,
+                    C_cas_vir=C_cas_vir_t,
+                    T_CutTNO=1e-9,
+                    ncores=ncores, verbose=verbose,
+                    _pool=_shared_pool)
+            else:
+                e_t = run_lccsd_t_ext(
+                    mf, C_lmo, pno_spaces,
+                    strong_pairs=strong_pairs,
+                    t2_pno_all=t2_pno_all,
+                    t1_pno=t1_pno,
+                    occ_cas_idx=occ_cas_idx,
+                    C_cas_vir=C_cas_vir_t,
+                    vir_cas_idx=vir_cas_idx,
+                    negligible_pairs=negligible_pairs,
+                    weak_pairs=weak_pairs,
+                    C_pao=C_pao,
+                    doi_iu=doi_iu,
+                    ncores=ncores, verbose=verbose,
+                    _pool=_shared_pool)
+        finally:
+            if _blas_ctx_t is not None:
+                _blas_ctx_t.__exit__(None, None, None)
 
-    _t_triples = _time.time() - _t_triples_start
-    if _owns_pool and _shared_pool is not None:
-        _shared_pool.shutdown(wait=True)
-    log.info('E(T) external = %.15g', e_t)
-    print(f'  Stage 6 wall time: {_t_triples:.2f} s', flush=True)
+        _t_triples = _time.time() - _t_triples_start
+        if _owns_pool and _shared_pool is not None:
+            _shared_pool.shutdown(wait=True)
+        log.info('E(T) external = %.15g', e_t)
+        print(f'  Stage 6 wall time: {_t_triples:.2f} s', flush=True)
 
     # ------------------------------------------------------------------
     # Total energy
