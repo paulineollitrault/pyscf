@@ -1866,12 +1866,20 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         else:
             _pao_domains.append(np.zeros(0, dtype=int))
     _s5_tick('pre-cc_ints prep (auxmol, j2c, pao_domains)')
+    # Build the pair index up front so Stage 2 can pre-size the flat cc_ints
+    # stores and stream them to NVMe DURING the build (the same index the
+    # kernels use, so the store's per-pair layout matches exactly).
+    from pyscf.cc.dlpno_tccsd.pair_index import PairIndex as _PairIndex
+    _pair_index = _PairIndex(
+        list(t2_pno_all.keys()), pno_spaces, pair_lmo_idx, nocc)
+    _prebuilt_flat = {}   # populated by compute when flat-field streaming is on
     _cc_ints = compute_cc_integrals_sparse(
         mf.mol, _auxmol, C_lmo, C_pao, pno_spaces, pair_aux_idx,
         _j2c, _all_keys_cc, nocc, s1e=s1e,
         pao_domains=_pao_domains, strong_pair_keys=_all_keys_cc,
         T_CUT_MKN=_t_mkn, T_CUT_CLMO=_t_clmo,
         pair_lmo_idx=pair_lmo_idx,
+        pair_index=_pair_index, out_flat_stores=_prebuilt_flat,
         _pool=_pool)
     _s5_tick('compute_cc_integrals_sparse')
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
@@ -1944,19 +1952,20 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         flatten_cc_ints_fields,
     )
     _t_pi = _time_cc.perf_counter()
-    _pair_index = PairIndex(
-        list(t2_pno_all.keys()), pno_spaces, pair_lmo_idx, nocc)
     assert_consistent_with_dicts(
         _pair_index, pno_spaces, pair_lmo_idx)
     print(f'  [pair_index] {_pair_index!r}', flush=True)
 
-    # Phase 2e: flatten the 12 tensor fields of cc_ints onto shared
-    # per-field FlatTensorStore buffers.  The dict keeps its structure;
-    # each field's per-pair ndarray becomes a view into a contiguous
-    # buffer.  The `_cc_ints_flat` handle is kept around for Phase 4's
-    # Cython kernels (``.buffer`` / ``.offsets`` / ``.shapes``).
+    # Phase 2e: flatten the tensor fields of cc_ints onto shared per-field
+    # FlatTensorStore buffers.  Stage 2 already streamed the flat fields to
+    # NVMe DURING the build (_prebuilt_flat populated) — reuse those stores and
+    # skip the post-build flatten.  Otherwise (old path) flatten now.
     _t_flat = _time_cc.perf_counter()
-    _cc_ints_flat = flatten_cc_ints_fields(_cc_ints, _pair_index, _pool=_pool)
+    if _prebuilt_flat:
+        _cc_ints_flat = _prebuilt_flat
+    else:
+        _cc_ints_flat = flatten_cc_ints_fields(_cc_ints, _pair_index,
+                                               _pool=_pool)
     print(f'  [cc_ints_flat] {len(_cc_ints_flat)} fields flattened, '
           f'{_time_cc.perf_counter() - _t_flat:.2f}s '
           f'total_buffer={sum(s.buffer.size for s in _cc_ints_flat.values())*8/2**20:.1f} MB',

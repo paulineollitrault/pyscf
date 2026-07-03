@@ -797,6 +797,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                                 T_CUT_MKN=1e-3, T_CUT_CLMO=1e-3,
                                 screening_maps=None, sparse_arrays=None,
                                 pair_lmo_idx=None,
+                                pair_index=None, out_flat_stores=None,
                                 _pool=None):
     """Per-pair fitted intermediates via sparse per-aux-Q sparse storage.
 
@@ -1711,6 +1712,66 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                   f'est_min={_szs[0]:.2f} est_med={_szs[len(_szs)//2]:.2f} '
                   f'est_max={_szs[-1]:.2f} est_sum={sum(_szs):.1f} GiB '
                   f'budget={_budget/2**30:.0f} GiB', flush=True)
+    # ------------------------------------------------------------------
+    # Stage 2: stream the flat cc_ints fields to NVMe DURING the build, so the
+    # result never fully materialises in anon RAM (the tzvpp cc_ints-build OOM
+    # wall). Pre-size one memmap FlatTensorStore per flat field from metadata
+    # (shapes are exact functions of n_local / npno / nlmo_p — verified), then
+    # fill + view each pair's field as it completes so the per-pair anon
+    # original is freed immediately. Gated by DLPNO_CCINTS_MMAP + a caller
+    # pair_index/out dict (else = old dict-then-flatten path, unchanged).
+    # ------------------------------------------------------------------
+    _stream_flat = (out_flat_stores is not None and pair_index is not None
+                    and bool(os.environ.get('DLPNO_CCINTS_MMAP')))
+    _flat_stores = None
+    _canon2idx = None
+    if _stream_flat:
+        from pyscf.cc.dlpno_tccsd.pair_index import FlatTensorStore as _FTS
+        _canon = pair_index.canonical_keys
+        _canon2idx = pair_index.canonical_to_idx
+
+        def _npno_of(_k):
+            _xp = pno_spaces.get(_k, {}).get('X_pno')
+            return int(_xp.shape[1]) if _xp is not None else 0
+
+        def _nloc_of(_k):
+            return (len(np.asarray(pair_aux_idx[_k]))
+                    if _k in pair_aux_idx else 0)
+
+        def _nlmo_of(_k):
+            return (len(pair_lmo_idx[_k])
+                    if pair_lmo_idx is not None and _k in pair_lmo_idx else 0)
+
+        _field_shape = {
+            'Qab':  lambda k: (_nloc_of(k), _npno_of(k), _npno_of(k)),
+            'Qma':  lambda k: (_nloc_of(k), _nlmo_of(k), _npno_of(k)),
+            'i_Qa': lambda k: (_nloc_of(k), _npno_of(k)),
+            'j_Qa': lambda k: (_nloc_of(k), _npno_of(k)),
+            'i_Qk': lambda k: (_nloc_of(k), _nlmo_of(k)),
+            'j_Qk': lambda k: (_nloc_of(k), _nlmo_of(k)),
+            'K_iajb':     lambda k: (_npno_of(k), _npno_of(k)),
+            'K_bar_ij':   lambda k: (_nlmo_of(k), _npno_of(k)),
+            'K_bar_ji':   lambda k: (_nlmo_of(k), _npno_of(k)),
+            'J_ijab':     lambda k: (_npno_of(k), _npno_of(k)),
+            'K_bar_chem': lambda k: (_nlmo_of(k), _npno_of(k)),
+        }
+        _flat_stores = {}
+        for _f, _sf in _field_shape.items():
+            _flat_stores[_f] = _FTS(
+                pair_index, shape_fn=(lambda p, _sf=_sf: _sf(_canon[p])))
+        out_flat_stores.update(_flat_stores)
+
+    def _stash(_k, _entry):
+        if _flat_stores is not None and isinstance(_entry, dict):
+            _p = _canon2idx.get((min(_k), max(_k)))
+            if _p is not None:
+                for _f, _st in _flat_stores.items():
+                    _a = _entry.get(_f)
+                    if _a is not None:
+                        _st[_k] = _a               # copy into mmap store
+                        _entry[_f] = _st.at(_p)    # view (frees anon original)
+        cc_ints[_k] = _entry
+
     _ccmem('cc_ints:before_pool_map')
     _t_pool_start = _ccints_setup_time.perf_counter()
     if _have_submit and sum(_ests.values()) > _budget:
@@ -1740,16 +1801,58 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             for _fut in _done:
                 _committed -= _running.pop(_fut)
                 k, entry = _fut.result()
-                cc_ints[k] = entry
+                _stash(k, entry)
     elif _pool is not None:
         for k, entry in _pool.map(_process_pair, keys):
-            cc_ints[k] = entry
+            _stash(k, entry)
     else:
         for key in keys:
             k, entry = _process_pair(key)
-            cc_ints[k] = entry
+            _stash(k, entry)
+    if _flat_stores is not None:
+        # Flush dirty pages so the per-field buffers become CLEAN/file-backed
+        # (evictable under pressure); the cycle kernels re-fault them on read.
+        for _st in _flat_stores.values():
+            if getattr(_st, '_mmap_path', None) is not None:
+                _st._buffer.flush()
     _t_pool_wall = _ccints_setup_time.perf_counter() - _t_pool_start
     _ccmem('cc_ints:after_pool_map')
+    if os.environ.get('DLPNO_CCINTS_FIELD_PROBE'):
+        _fb = {}
+        for _e in cc_ints.values():
+            if not isinstance(_e, dict):
+                continue
+            for _f, _v in _e.items():
+                if hasattr(_v, 'nbytes'):
+                    _fb[_f] = _fb.get(_f, 0) + int(_v.nbytes)
+                elif isinstance(_v, dict):
+                    _s = sum(int(_a.nbytes) for _a in _v.values()
+                             if hasattr(_a, 'nbytes'))
+                    _fb[_f] = _fb.get(_f, 0) + _s
+        _tot = sum(_fb.values())
+        _top = sorted(_fb.items(), key=lambda x: -x[1])
+        print('  [CCINTS_FIELDS] total=%.2fG  ' % (_tot / 2**30)
+              + '  '.join('%s=%.2fG' % (_k, _v / 2**30) for _k, _v in _top[:12]),
+              flush=True)
+        for _k0 in keys:
+            _e0 = cc_ints.get(_k0)
+            if isinstance(_e0, dict) and _e0.get('Qab') is not None:
+                _nl = int(_e0.get('n_local', -1))
+                _npno = pno_spaces.get(_k0, {}).get('X_pno')
+                _npno = _npno.shape[1] if _npno is not None else -1
+                _nlmo = (len(pair_lmo_idx[_k0]) if pair_lmo_idx is not None
+                         and _k0 in pair_lmo_idx else -1)
+                _naux = (len(np.asarray(pair_aux_idx[_k0]))
+                         if _k0 in pair_aux_idx else -1)
+                print('  [CCINTS_SHAPE] key=%s naux=%d npno=%d nlmo_p=%d | '
+                      % (_k0, _naux, _npno, _nlmo)
+                      + '  '.join('%s=%s' % (_f, _e0[_f].shape) for _f in
+                                  ('Qab', 'Qma', 'i_Qa', 'j_Qa', 'i_Qk',
+                                   'j_Qk', 'K_iajb', 'K_bar_ij', 'K_bar_ji',
+                                   'K_bar_chem', 'J_ijab')
+                                  if _e0.get(_f) is not None),
+                      flush=True)
+                break
 
 
 

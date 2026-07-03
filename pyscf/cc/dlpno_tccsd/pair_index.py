@@ -1225,7 +1225,11 @@ def build_combined_ktilde_store(cc_ints, pair_index):
     if total == 0:
         return None
 
-    buf = np.empty(total, dtype=np.float64)
+    # NVMe-back the combined K_tilde_chem buffer when streaming is on: it is
+    # n_pno^3 per pair, written once here and only READ by the C~/D~ builders
+    # every cycle, so as file-backed pages the OS can evict it under pressure
+    # (it was plain anon RAM before — a large slice of the cc_ints-era floor).
+    buf = stream_empty((total,), tag='ktilde')
     # Copy each source array into the buffer, then replace the dict slot with
     # a view so the original (held only by that slot) is freed.
     for (key, which, size, shape) in plan:
@@ -1233,6 +1237,7 @@ def build_combined_ktilde_store(cc_ints, pair_index):
         entry = cc_ints[key]
         buf[start:start + size] = np.ascontiguousarray(entry[which]).ravel()
         entry[which] = buf[start:start + size].reshape(shape)
+    stream_settle(buf)
 
     return {'buf': buf, 'off_i': off_i, 'off_j': off_j}
 
