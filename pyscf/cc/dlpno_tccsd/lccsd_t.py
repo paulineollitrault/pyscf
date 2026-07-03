@@ -2026,9 +2026,18 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                     qab_off[A + 1] = qab_off[A] + qab_stack[A].size
                 else:
                     qab_off[A + 1] = qab_off[A]
-            qij_flat = np.empty(int(qij_off[-1]), dtype=np.float64)
-            qia_flat = np.empty(int(qia_off[-1]), dtype=np.float64)
-            qab_flat = np.empty(int(qab_off[-1]), dtype=np.float64)
+            # Stage 3: NVMe-back the (T) sparse-DF flats (qij/qia/qab_atom_flat)
+            # when streaming is on. On a large basis the TIGHT + PRESCREEN
+            # sparse-DF coexist (~2x) and are the (T)-build anon peak (rxn_12/
+            # def2-tzvpp OOM'd here at anon 254). As file-backed pages they are
+            # written once here, read per-triple in the energy pass, and the OS
+            # can evict them under pressure. Pool workers write DISJOINT slabs
+            # (safe on a memmap). flush() after fill -> clean/evictable.
+            from pyscf.cc.dlpno_tccsd.pair_index import (
+                stream_empty as _stream_empty)
+            qij_flat = _stream_empty((int(qij_off[-1]),), tag='tqij')
+            qia_flat = _stream_empty((int(qia_off[-1]),), tag='tqia')
+            qab_flat = _stream_empty((int(qab_off[-1]),), tag='tqab')
             # Per-atom flat copy: each atom writes a disjoint slab of each
             # flat array — independent. Pool-parallel for the same reason
             # the np.stack loop above is.
@@ -2047,6 +2056,9 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             else:
                 for A in range(_natm):
                     _flat_one_atom(A)
+            for _b in (qij_flat, qia_flat, qab_flat):
+                if isinstance(_b, np.memmap):
+                    _b.flush()   # dirty -> clean/file-backed (evictable)
             sparse_df['qij_atom_flat'] = qij_flat
             sparse_df['qia_atom_flat'] = qia_flat
             sparse_df['qab_atom_flat'] = qab_flat
