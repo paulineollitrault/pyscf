@@ -298,12 +298,13 @@ class FlatTensorStore:
     """
 
     __slots__ = ("_pi", "_buffer", "_offsets", "_shapes", "_ndim", "dtype",
-                 "_views", "_canon_to_idx", "_mmap_path")
+                 "_views", "_canon_to_idx", "_mmap_path", "_spill")
 
-    def __init__(self, pair_index, shape_fn, dtype=np.float64):
+    def __init__(self, pair_index, shape_fn, dtype=np.float64, spill=None):
         self._pi = pair_index
         self.dtype = np.dtype(dtype)
         self._mmap_path = None
+        self._spill = spill      # None=adaptive, True=force NVMe, False=force RAM
         n_pairs = pair_index.n_pairs
 
         # First pass: determine per-pair shapes + common rank + sizes.
@@ -335,16 +336,15 @@ class FlatTensorStore:
         self._offsets = np.zeros(n_pairs + 1, dtype=np.int64)
         self._offsets[1:] = np.cumsum(sizes)
         _total = int(self._offsets[-1])
-        # Low-memory mode: back the buffer with a memmap on PYSCF_TMPDIR (a
-        # real NVMe disk).  cc_ints is the dominant Stage-5 base allocation
-        # (~79 GiB on a TM complex); paging it out keeps it off the resident
-        # set.  Crucially the buffer is written once during flatten then read
-        # only — so its file-backed pages are CLEAN and the kernel can evict
-        # them under memory pressure (e.g. while the C++-class pack builds its
-        # own copy), giving automatic "use-and-free" without a code rewrite.
-        # The Cython/C kernels read it through the same raw pointer; the OS
-        # pages it transparently.  Enable with DLPNO_CCINTS_MMAP=1.
-        if os.environ.get('DLPNO_CCINTS_MMAP') and _total > 0:
+        # Adaptive: NVMe-back this buffer only when keeping it in anon RAM would
+        # near the OOM ceiling (RAM-first; disk only when RAM is not enough).
+        # Written once, read-only after — so file-backed pages are CLEAN and the
+        # OS evicts/re-faults them transparently; the C kernels read the same
+        # raw pointer.  spill=None -> adaptive; True/False -> forced (a caller
+        # making a whole-cc_ints group decision passes it explicitly).
+        _spill = (self._spill if self._spill is not None
+                  else _should_spill(_total * self.dtype.itemsize))
+        if _spill and _total > 0:
             _tmpdir = os.environ.get('PYSCF_TMPDIR') or tempfile.gettempdir()
             _fd, self._mmap_path = tempfile.mkstemp(
                 suffix='.ccflat', prefix='dlpno_', dir=_tmpdir)
@@ -515,37 +515,107 @@ def _madvise_dontneed(buf):
 
 
 def _plan_stream_on():
-    """True if CCSD-cycle plan buffers should be NVMe-backed (Stage 1).
+    """True if streaming is enabled at all (mode != off)."""
+    return _stream_mode() != 'off'
 
-    Gated by DLPNO_STREAM_PLANS (or the umbrella DLPNO_CCINTS_MMAP, so the
-    existing 'turn streaming on' flag also streams the plan caches).
+
+def _mem_total_gib():
+    try:
+        with open('/proc/meminfo') as _f:
+            for _ln in _f:
+                if _ln.startswith('MemTotal:'):
+                    return int(_ln.split()[1]) / 1048576.0
+    except OSError:
+        pass
+    return None
+
+
+def _anon_rss_gib():
+    """Process ANON resident memory (GiB) — the OOM-killer-relevant number.
+    File-backed (evictable) pages are excluded, so this is what actually
+    approaches the physical-RAM ceiling as we allocate."""
+    try:
+        with open('/proc/self/status') as _f:
+            for _ln in _f:
+                if _ln.startswith('RssAnon:'):
+                    return int(_ln.split()[1]) / 1048576.0
+    except OSError:
+        pass
+    return None
+
+
+def _stream_mode():
+    """'off' | 'auto' | 'force' — how big read-mostly tensors choose RAM vs NVMe.
+
+      off   : never spill (all anon RAM) — the DEFAULT, unchanged behaviour.
+      auto  : spill a tensor group to NVMe ONLY when keeping it in RAM would
+              push process anon past MemTotal-reserve (RAM-first; disk only when
+              RAM is not enough). The legacy DLPNO_CCINTS_MMAP / DLPNO_SPNO_MMAP
+              / DLPNO_STREAM_PLANS flags now select this adaptive mode.
+      force : always spill (for correctness validation on small systems).
     """
-    return bool(os.environ.get('DLPNO_STREAM_PLANS')
-                or os.environ.get('DLPNO_CCINTS_MMAP'))
+    _v = os.environ.get('DLPNO_STREAM', '').strip().lower()
+    if _v in ('off', 'auto', 'force'):
+        return _v
+    if os.environ.get('DLPNO_STREAM_FORCE'):
+        return 'force'
+    if (os.environ.get('DLPNO_CCINTS_MMAP')
+            or os.environ.get('DLPNO_SPNO_MMAP')
+            or os.environ.get('DLPNO_STREAM_PLANS')):
+        return 'auto'
+    return 'off'
 
 
-def stream_empty(shape, dtype=np.float64, tag='plan'):
-    """np.empty, but NVMe-memmap-backed when plan-streaming is on and the
-    buffer is large (Stage 1).
+def _should_spill(nbytes, pending=0):
+    """Adaptive RAM-vs-NVMe decision for a tensor group of ``nbytes`` bytes.
 
-    CCSD-cycle plan buffers (gathered K / S stacks etc.) are write-once,
-    read-every-cycle — the same profile as cc_ints.  Backing them with a
-    file-mapped buffer turns them from anon RAM (which the OOM killer counts)
-    into clean file pages the kernel can EVICT under memory pressure, then
-    re-fault on the next cycle's read.  Numerically identical: same bytes, the
-    C kernels read through the same raw pointer.
+    ``pending`` (GiB) = RAM reserved by earlier buffers of the SAME batch that
+    are allocated (np.empty, lazy) but not yet faulted, so not yet reflected in
+    anon RSS — the caller threads this through so a batch is judged as a whole.
 
-    Threshold DLPNO_STREAM_PLAN_MIN_MB (default 128 MiB) keeps tiny buffers in
-    RAM (not worth a file).  Returns a normal np.empty otherwise.
+    Spill only when  anon_RSS + pending + nbytes  >  MemTotal - reserve
+    (reserve = DLPNO_STREAM_RESERVE_GB, default 48 GiB, headroom for downstream
+    phases + OOM margin).  So a group stays in RAM until anon nears the ceiling.
+    """
+    _m = _stream_mode()
+    if _m == 'off':
+        return False
+    if _m == 'force':
+        return True
+    _anon = _anon_rss_gib()
+    _total = _mem_total_gib()
+    if _anon is None or _total is None:
+        return True   # cannot measure -> be safe, spill
+    _reserve = float(os.environ.get('DLPNO_STREAM_RESERVE_GB', '48'))
+    return (_anon + pending + nbytes / 2**30) > (_total - _reserve)
+
+
+def stream_empty(shape, dtype=np.float64, tag='plan', spill=None):
+    """np.empty, but NVMe-memmap-backed when RAM is not enough to hold it.
+
+    These buffers (gathered K/S plan stacks, (T) sparse-DF flats, PNO/LMP2
+    tensors) are write-once, read-many.  As file-mapped pages they are EVICTABLE
+    under memory pressure and re-faulted on read — numerically identical (same
+    bytes; C kernels read the same raw pointer), but they no longer count as
+    anon RAM against the OOM ceiling.
+
+    Adaptive (spill=None): keep in RAM unless _should_spill says the process anon
+    would exceed MemTotal-reserve — so small/medium systems run fully in RAM
+    (no disk I/O) and only large ones spill.  Callers making a whole-group
+    decision pass spill=True/False explicitly.  Tiny buffers (< MIN_MB) never
+    spill on the adaptive path (not worth a file).
     """
     shape = tuple(int(d) for d in (shape if isinstance(shape, (tuple, list))
                                    else (shape,)))
     nelem = 1
     for d in shape:
         nelem *= d
-    itemsize = np.dtype(dtype).itemsize
-    _min = float(os.environ.get('DLPNO_STREAM_PLAN_MIN_MB', '128')) * (1 << 20)
-    if _plan_stream_on() and nelem * itemsize > _min:
+    nbytes = nelem * np.dtype(dtype).itemsize
+    if spill is None:
+        _min = float(os.environ.get('DLPNO_STREAM_PLAN_MIN_MB', '128')) \
+            * (1 << 20)
+        spill = nbytes > _min and _should_spill(nbytes)
+    if spill and nbytes > 0:
         _td = os.environ.get('PYSCF_TMPDIR') or tempfile.gettempdir()
         _fd, _path = tempfile.mkstemp(suffix='.' + tag, prefix='dlpno_plan_',
                                       dir=_td)
@@ -681,8 +751,14 @@ def stream_plan_cache(plan, tag='plancache'):
     total = sum(a.size for a in order)
     if total * 8 < _min_total:
         return plan
+    # Adaptive: only consolidate+spill this plan when keeping it in RAM would
+    # near the anon ceiling. Otherwise leave the plan untouched (all RAM) — no
+    # copy, no disk. (A whole-plan group decision, so pass spill= explicitly.)
+    _spill = _should_spill(total * 8)
+    if not _spill:
+        return plan
     # Pack into one memmap; build id(arr) -> view map.
-    buf = stream_empty((total,), tag=tag)
+    buf = stream_empty((total,), tag=tag, spill=True)
     views = {}
     off = 0
     for a in order:
@@ -779,10 +855,10 @@ class FlatPairPairStore:
         # (tens of GiB); paging it to NVMe keeps it out of the resident set.
         # The C++ solver / Cython kernels read it through the same raw
         # pointer, so the memmap is transparent (the OS pages it in/out).
-        # When enabled we also POP each source array out of ``initial`` as it
+        # When spilling we also POP each source array out of ``initial`` as it
         # is written so the source dict and the buffer never both stay
         # resident — this is what reduces the *construction* peak.
-        _mmap = bool(os.environ.get('DLPNO_SPNO_MMAP'))
+        # _mmap decided adaptively once _total is known (see below).
 
         # Pass 1: resolve (idx_a, idx_b) + shapes WITHOUT retaining the arrays
         # (so memmap mode can free them incrementally in pass 2).
@@ -812,6 +888,8 @@ class FlatPairPairStore:
         self._offsets = np.zeros(n + 1, dtype=np.int64)
         self._offsets[1:] = np.cumsum(sizes)
         _total = int(self._offsets[-1])
+        # Adaptive: spill S_pno to NVMe only when RAM is not enough.
+        _mmap = _should_spill(_total * self.dtype.itemsize)
         if _mmap and _total > 0:
             _tmpdir = os.environ.get('PYSCF_TMPDIR') or tempfile.gettempdir()
             _fd, self._mmap_path = tempfile.mkstemp(

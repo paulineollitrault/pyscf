@@ -1755,10 +1755,28 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             'J_ijab':     lambda k: (_npno_of(k), _npno_of(k)),
             'K_bar_chem': lambda k: (_nlmo_of(k), _npno_of(k)),
         }
+        # Whole-cc_ints group spill decision: sum the flat-field sizes and
+        # decide RAM-vs-NVMe ONCE (the stores are lazy, so a per-store live-anon
+        # check would let all fields pick RAM and then OOM on fill).
+        from pyscf.cc.dlpno_tccsd.pair_index import _should_spill as _shsp
+        _flat_total = 0
+        for _f, _sf in _field_shape.items():
+            for _k in _canon:
+                _sh = _sf(_k)
+                _n = 1
+                for _d in _sh:
+                    _n *= int(_d)
+                _flat_total += _n
+        _flat_spill = _shsp(_flat_total * 8)
+        if os.environ.get('DLPNO_MEM_PROBE'):
+            print('  [CCMEM/cc_ints_flat_spill] total=%.1f GiB -> %s'
+                  % (_flat_total * 8 / 2**30,
+                     'NVMe' if _flat_spill else 'RAM'), flush=True)
         _flat_stores = {}
         for _f, _sf in _field_shape.items():
             _flat_stores[_f] = _FTS(
-                pair_index, shape_fn=(lambda p, _sf=_sf: _sf(_canon[p])))
+                pair_index, shape_fn=(lambda p, _sf=_sf: _sf(_canon[p])),
+                spill=_flat_spill)
         out_flat_stores.update(_flat_stores)
 
     def _stash(_k, _entry):

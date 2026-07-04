@@ -47,8 +47,9 @@ def _build_flat_from_per_pair(per_pair_arrays, ownership):
     # copy's pages flush/evict under pressure during the build, and the C++
     # solver reads it through the same raw pointer.  >1 GiB fields only (tiny
     # fields aren't worth a file).
+    from pyscf.cc.dlpno_tccsd.pair_index import _should_spill as _shsp
     _min_bytes = float(os.environ.get('DLPNO_PACK_MMAP_MIN_MB', '1024')) * (1 << 20)
-    _mmap = bool(os.environ.get('DLPNO_CCINTS_MMAP')) and _total * 8 > _min_bytes
+    _mmap = _total * 8 > _min_bytes and _shsp(_total * 8)
     if _mmap:
         _tmpdir = os.environ.get('PYSCF_TMPDIR') or tempfile.gettempdir()
         _fd, _path = tempfile.mkstemp(

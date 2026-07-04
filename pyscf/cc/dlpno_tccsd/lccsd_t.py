@@ -2034,10 +2034,14 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             # can evict them under pressure. Pool workers write DISJOINT slabs
             # (safe on a memmap). flush() after fill -> clean/evictable.
             from pyscf.cc.dlpno_tccsd.pair_index import (
-                stream_empty as _stream_empty)
-            qij_flat = _stream_empty((int(qij_off[-1]),), tag='tqij')
-            qia_flat = _stream_empty((int(qia_off[-1]),), tag='tqia')
-            qab_flat = _stream_empty((int(qab_off[-1]),), tag='tqab')
+                stream_empty as _stream_empty, _should_spill as _shsp)
+            # Whole (T) sparse-DF group decision (RAM-first; the 3 flats spill
+            # together only when RAM is not enough).
+            _tsp = _shsp((int(qij_off[-1]) + int(qia_off[-1])
+                          + int(qab_off[-1])) * 8)
+            qij_flat = _stream_empty((int(qij_off[-1]),), tag='tqij', spill=_tsp)
+            qia_flat = _stream_empty((int(qia_off[-1]),), tag='tqia', spill=_tsp)
+            qab_flat = _stream_empty((int(qab_off[-1]),), tag='tqab', spill=_tsp)
             # Per-atom flat copy: each atom writes a disjoint slab of each
             # flat array — independent. Pool-parallel for the same reason
             # the np.stack loop above is.
