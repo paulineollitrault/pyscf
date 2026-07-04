@@ -39,7 +39,7 @@ from pyscf.cc.dlpno_tccsd.local_orbs import (
 # DF integral builder (ported from Ye's lnocc/lno.py _init_mp_df_eris)
 # ---------------------------------------------------------------------------
 
-def _build_ovL(with_df, C_occ, C_vir, max_memory=4000):
+def _build_ovL(with_df, C_occ, C_vir, max_memory=4000, spill=None):
     """Build (occ,vir|L) three-index DF tensor.
 
     Returns ovL[i,a,L] of shape (nocc, nvir, naux).
@@ -65,7 +65,11 @@ def _build_ovL(with_df, C_occ, C_vir, max_memory=4000):
     mo = np.asarray(np.hstack((C_occ, C_vir)), order='F')
     ijslice = (0, nocc, nocc, nmo)
 
-    ovL = np.empty((nocc, nvir, naux))
+    # Stage 4: NVMe-back this big (nocc,nvir,naux) DF tensor when RAM is not
+    # enough (adaptive). It is written once here then read in the PNO/LMP2
+    # contractions; as a memmap it is evictable (kernels read the same pointer).
+    from pyscf.cc.dlpno_tccsd.pair_index import stream_empty as _stream_empty
+    ovL = _stream_empty((nocc, nvir, naux), tag='ovL', spill=spill)
     buf = None
     p1 = 0
     for Lpq in with_df.loop():
@@ -76,6 +80,8 @@ def _build_ovL(with_df, C_occ, C_vir, max_memory=4000):
         ovL[:, :, p0:p1] = buf.reshape(nL, nocc, nvir).transpose(1, 2, 0)
         Lpq = None
 
+    if isinstance(ovL, np.memmap):
+        ovL.flush()   # dirty -> clean/file-backed (evictable)
     return ovL
 
 
@@ -336,8 +342,22 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         import time as _t_pno_pre
         def _pmark_pre(label, t0):
             pass
+        # Stage 4 group decision: ovL and _raw_lmo_pao are the two big DF-3index
+        # tensors of the PNO/LMP2 setup (each nocc*npao*naux; ~100+ GiB each on
+        # def2-QZVPP — the qzvpp OOM wall). They coexist, so decide RAM-vs-NVMe
+        # for the pair ONCE (RAM-first; spill only when RAM is not enough).
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            stream_empty as _s4_empty, _should_spill as _s4_should_spill)
+        _s4_bytes = (C_lmo.shape[1] * C_pao.shape[1]
+                     * mf.with_df.get_naoaux()) * 8
+        _s4_spill = _s4_should_spill(2 * _s4_bytes)
+        if os.environ.get('DLPNO_MEM_PROBE'):
+            print('  [MEM/pno_df_spill] ovL+raw ~%.1f GiB -> %s'
+                  % (2 * _s4_bytes / 2**30, 'NVMe' if _s4_spill else 'RAM'),
+                  flush=True)
         _t = _t_pno_pre.perf_counter()
-        ovL = _build_ovL(mf.with_df, C_lmo, C_pao, max_memory=mf.max_memory)
+        ovL = _build_ovL(mf.with_df, C_lmo, C_pao, max_memory=mf.max_memory,
+                         spill=_s4_spill)
         _pmark_pre('_build_ovL', _t)
         # ovL[i, a, L]: i = LMO index, a = PAO index (global), L = aux index
         use_df = True
@@ -358,8 +378,8 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         _nocc_lmo_loc = C_lmo.shape[1]
         _npao_loc = C_pao.shape[1]
         nao_loc = mf.mol.nao_nr()
-        _raw_lmo_pao = np.empty((_nocc_lmo_loc, _naux, _npao_loc),
-                                 dtype=np.float64)
+        _raw_lmo_pao = _s4_empty((_nocc_lmo_loc, _naux, _npao_loc),
+                                 tag='rawlp', spill=_s4_spill)
 
         # Auxiliary-shell offsets: aux_loc[k]..aux_loc[k+1] is the AO range
         # of shell k (within auxmol's own shell numbering).
@@ -418,6 +438,8 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         else:
             for arg in args:
                 _aux_block(arg)
+        if isinstance(_raw_lmo_pao, np.memmap):
+            _raw_lmo_pao.flush()   # dirty -> clean/file-backed (evictable)
         _pmark_pre("intor('int3c2e') + half + LMO transform (blocked)", _t)
     else:
         log.info('Building LMO/PAO exact 4-index integrals (no density fitting)...')
