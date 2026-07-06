@@ -1829,8 +1829,16 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     # original is freed immediately. Gated by DLPNO_CCINTS_MMAP + a caller
     # pair_index/out dict (else = old dict-then-flatten path, unchanged).
     # ------------------------------------------------------------------
+    # Activate the per-pair flat-store output path under the unified adaptive
+    # streaming flag (DLPNO_STREAM=auto/force) as well as the legacy
+    # DLPNO_CCINTS_MMAP.  Without this, DLPNO_STREAM=auto streamed the sparse-DF
+    # inputs but the per-pair cc_ints OUTPUT still accumulated in the RAM dict
+    # (est_sum ~7.4 TiB of transients on rxn_12/qzvpp) -> OOM in the pool-map.
+    # The RAM-vs-NVMe choice for the stores is the adaptive _flat_spill below.
+    from pyscf.cc.dlpno_tccsd.pair_index import _stream_mode as _cc_stream_mode
     _stream_flat = (out_flat_stores is not None and pair_index is not None
-                    and bool(os.environ.get('DLPNO_CCINTS_MMAP')))
+                    and (bool(os.environ.get('DLPNO_CCINTS_MMAP'))
+                         or _cc_stream_mode() != 'off'))
     _flat_stores = None
     _canon2idx = None
     if _stream_flat:
