@@ -343,7 +343,7 @@ def _compute_schwarz_data(mol, auxmol, _pool=None):
 
 
 def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps, _pool=None,
-                            ints_tolerance=1.0e-10):
+                            ints_tolerance=1.0e-10, spill=None):
     """Build sparse per-aux DF integrals qij_[Q], qia_[Q], qab_[Q].
 
     Architecture (mirrors Psi4 dlpnobase.cc::compute_qij/qia/qab):
@@ -479,19 +479,82 @@ def build_sparse_df_arrays(mol, auxmol, C_lmo, C_pao, maps, _pool=None,
 
     Q_shells = list(range(auxmol.nbas))
 
+    # The full per-aux-Q sparse-DF set (qij/qia/qab over all naux) is the single
+    # largest allocation of the DLPNO-CCSD/(T) integral setup: ~216 GiB on
+    # rxn_12/def2-qzvpp, where collecting all of it into RAM at once OOM-killed
+    # the run.  The per-Q shapes are known up front from the screening maps
+    # (each Q's block is sized by its center atom's ext-LMO/PAO domain), so pack
+    # the results into three contiguous, per-Q-offset flat buffers via the
+    # adaptive stream path (NVMe-backed + evictable when anon would exceed
+    # MemTotal-reserve; plain RAM on small systems).  Results are scattered as
+    # they arrive (imap) so the per-shell worker arrays are freed immediately —
+    # the peak is the in-flight pool chunk, not the whole naux set.  qij/qia/qab
+    # are returned as views into the flats (downstream reads are unchanged).
+    _q_center = np.empty(naux, dtype=np.int64)
+    for _Qsh in range(auxmol.nbas):
+        _q_center[aux_shell_loc[_Qsh]:aux_shell_loc[_Qsh + 1]] = \
+            aux_shell_to_atom[_Qsh]
+    _nl_of_Q = np.array([len(riatom_to_lmos_ext[_c]) for _c in _q_center],
+                        dtype=np.int64)
+    _np_of_Q = np.array([len(riatom_to_paos_ext[_c]) for _c in _q_center],
+                        dtype=np.int64)
+    _qij_off = np.zeros(naux + 1, dtype=np.int64)
+    _qij_off[1:] = np.cumsum(_nl_of_Q * _nl_of_Q)
+    _qia_off = np.zeros(naux + 1, dtype=np.int64)
+    _qia_off[1:] = np.cumsum(_nl_of_Q * _np_of_Q)
+    _qab_off = np.zeros(naux + 1, dtype=np.int64)
+    _qab_off[1:] = np.cumsum(_np_of_Q * _np_of_Q)
+
+    from pyscf.cc.dlpno_tccsd.pair_index import (
+        stream_empty as _bsda_stream_empty,
+        stream_settle as _bsda_settle,
+        _should_spill as _bsda_should_spill)
+    _bsda_total = (int(_qij_off[-1]) + int(_qia_off[-1])
+                   + int(_qab_off[-1])) * 8
+    _bsda_spill = (spill if spill is not None
+                   else _bsda_should_spill(_bsda_total))
+    _qij_flat = _bsda_stream_empty((int(_qij_off[-1]),), tag='bsda_qij',
+                                   spill=_bsda_spill)
+    _qia_flat = _bsda_stream_empty((int(_qia_off[-1]),), tag='bsda_qia',
+                                   spill=_bsda_spill)
+    _qab_flat = _bsda_stream_empty((int(_qab_off[-1]),), tag='bsda_qab',
+                                   spill=_bsda_spill)
+
+    def _scatter(shell_results):
+        for Q, qij_Q, qia_Q, qab_Q in shell_results:
+            _nl = int(_nl_of_Q[Q])
+            _np = int(_np_of_Q[Q])
+            a, b = int(_qij_off[Q]), int(_qij_off[Q + 1])
+            _qij_flat[a:b] = qij_Q.ravel()
+            qij[Q] = _qij_flat[a:b].reshape(_nl, _nl)
+            a, b = int(_qia_off[Q]), int(_qia_off[Q + 1])
+            _qia_flat[a:b] = qia_Q.ravel()
+            qia[Q] = _qia_flat[a:b].reshape(_nl, _np)
+            a, b = int(_qab_off[Q]), int(_qab_off[Q + 1])
+            _qab_flat[a:b] = qab_Q.ravel()
+            qab[Q] = _qab_flat[a:b].reshape(_np, _np)
+
     if _pool is not None:
         _ps = getattr(_pool, '_processes', 64) or 64
         chunksize = max(1, len(Q_shells) // (_ps * 4))
-        all_results = list(_pool.map(_process_shell, Q_shells, chunksize=chunksize))
+        # ThreadPoolExecutor.map yields results in submission order as they
+        # complete; scatter each into the flats and drop it, so the per-shell
+        # worker arrays never accumulate into the full naux set.
+        for shell_results in _pool.map(_process_shell, Q_shells,
+                                       chunksize=chunksize):
+            _scatter(shell_results)
     else:
-        all_results = [_process_shell(Q_sh) for Q_sh in Q_shells]
-    for shell_results in all_results:
-        for Q, qij_Q, qia_Q, qab_Q in shell_results:
-            qij[Q] = qij_Q
-            qia[Q] = qia_Q
-            qab[Q] = qab_Q
+        for Q_sh in Q_shells:
+            _scatter(_process_shell(Q_sh))
 
-    return {'qij': qij, 'qia': qia, 'qab': qab}
+    # Flush+evict the flats (re-fault on read); no-op when kept in RAM.
+    _bsda_settle(_qij_flat)
+    _bsda_settle(_qia_flat)
+    _bsda_settle(_qab_flat)
+
+    return {'qij': qij, 'qia': qia, 'qab': qab,
+            '_qij_flat': _qij_flat, '_qia_flat': _qia_flat,
+            '_qab_flat': _qab_flat}
 
 
 def derive_subset_sparse_df(tight_sparse, tight_maps, sub_maps):
@@ -885,37 +948,82 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     qij_atom = [None] * natm
     qia_atom = [None] * natm
     qab_atom = [None] * natm
-    # Per-atom np.stack of qij/qia/qab columns is independent across atoms.
-    # Match the lccsd_t.py path that pool-parallelises the same shape; on
-    # water-22 the serial loop was ~0.5 s and scales O(N²).
+    # Per-atom regrouping of the per-Q sparse-DF (qij/qia/qab), stacked over
+    # each atom's aux functions.  This is the SAME volume as the per-Q set
+    # (~216 GiB on rxn_12/def2-qzvpp) and is the persistent structure the
+    # downstream pair loop's C kernels read (one atom's stack per pair).  Pack
+    # it into three contiguous, per-atom-offset flat buffers on the adaptive
+    # stream path (NVMe-backed + evictable when anon would exceed
+    # MemTotal-reserve; plain RAM on small systems), writing each Q's block
+    # directly (no np.stack temporary), and free the per-Q flat once packed.
+    _nQ_at = np.array([len(aux_at_atom[A]) for A in range(natm)], dtype=np.int64)
+    _nl_at = np.array([len(riatom_to_lmos_ext[A]) for A in range(natm)],
+                      dtype=np.int64)
+    _np_at = np.array([len(riatom_to_paos_ext[A]) for A in range(natm)],
+                      dtype=np.int64)
+    _valid_at = (_nQ_at > 0) & (_nl_at > 0) & (_np_at > 0)
+    _qijA_sz = np.where(_valid_at, _nQ_at * _nl_at * _nl_at, 0)
+    _qiaA_sz = np.where(_valid_at, _nQ_at * _nl_at * _np_at, 0)
+    _qabA_sz = np.where(_valid_at, _nQ_at * _np_at * _np_at, 0)
+    _qijA_off = np.zeros(natm + 1, dtype=np.int64)
+    _qijA_off[1:] = np.cumsum(_qijA_sz)
+    _qiaA_off = np.zeros(natm + 1, dtype=np.int64)
+    _qiaA_off[1:] = np.cumsum(_qiaA_sz)
+    _qabA_off = np.zeros(natm + 1, dtype=np.int64)
+    _qabA_off[1:] = np.cumsum(_qabA_sz)
+
+    from pyscf.cc.dlpno_tccsd.pair_index import (
+        stream_empty as _sa_stream_empty, stream_settle as _sa_settle,
+        _should_spill as _sa_should_spill)
+    _sa_total = (int(_qijA_off[-1]) + int(_qiaA_off[-1])
+                 + int(_qabA_off[-1])) * 8
+    _sa_spill = _sa_should_spill(_sa_total)
+    _qij_atom_flat = _sa_stream_empty((int(_qijA_off[-1]),), tag='qijA',
+                                      spill=_sa_spill)
+    _qia_atom_flat = _sa_stream_empty((int(_qiaA_off[-1]),), tag='qiaA',
+                                      spill=_sa_spill)
+    _qab_atom_flat = _sa_stream_empty((int(_qabA_off[-1]),), tag='qabA',
+                                      spill=_sa_spill)
+
     def _stack_atom(A):
+        if not _valid_at[A]:
+            return
         Qs = aux_at_atom[A]
-        if len(Qs) == 0:
-            return None, None, None
-        nl = len(riatom_to_lmos_ext[A])
-        np_ = len(riatom_to_paos_ext[A])
-        if nl == 0 or np_ == 0:
-            return None, None, None
-        return (np.stack([qij[Q] for Q in Qs]),
-                np.stack([qia[Q] for Q in Qs]),
-                np.stack([qab[Q] for Q in Qs]))
+        nl = int(_nl_at[A])
+        np_ = int(_np_at[A])
+        bij = int(_qijA_off[A]); bia = int(_qiaA_off[A]); bab = int(_qabA_off[A])
+        sij = nl * nl; sia = nl * np_; sab = np_ * np_
+        for pos, Q in enumerate(Qs):
+            _qij_atom_flat[bij + pos * sij: bij + (pos + 1) * sij] = qij[Q].ravel()
+            _qia_atom_flat[bia + pos * sia: bia + (pos + 1) * sia] = qia[Q].ravel()
+            _qab_atom_flat[bab + pos * sab: bab + (pos + 1) * sab] = qab[Q].ravel()
+
     if _pool is not None and natm > 1:
-        _stacks = list(_pool.map(_stack_atom, range(natm)))
+        list(_pool.map(_stack_atom, range(natm)))
     else:
-        _stacks = [_stack_atom(A) for A in range(natm)]
-    for A, (qj, qa, qb) in enumerate(_stacks):
-        qij_atom[A] = qj
-        qia_atom[A] = qa
-        qab_atom[A] = qb
-    # Streaming step #2: the per-aux-Q sparse arrays (qij/qia/qab) are now
-    # redundant — the per-atom stacks above hold np.stack *copies*, and the
-    # downstream pair loop reads only qij_atom/qia_atom/qab_atom (no qij[Q]
-    # access past this point).  Holding the per-Q lists alive through the
-    # cc_ints pool-map nearly doubles the peak (per-Q list + per-atom stack
-    # both resident).  Drop our references now so the ~half they occupy is
-    # reclaimed before the pool-map (≈38 GiB on MOBH35-12/def2-tzvp).  Only
-    # clear the dict if we built it (don't free a caller-shared object).
-    del _stacks
+        for A in range(natm):
+            _stack_atom(A)
+
+    # Views into the packed per-atom flats (contiguous per atom).
+    for A in range(natm):
+        if not _valid_at[A]:
+            continue
+        nl = int(_nl_at[A]); np_ = int(_np_at[A]); nQ = int(_nQ_at[A])
+        qij_atom[A] = _qij_atom_flat[
+            _qijA_off[A]:_qijA_off[A + 1]].reshape(nQ, nl, nl)
+        qia_atom[A] = _qia_atom_flat[
+            _qiaA_off[A]:_qiaA_off[A + 1]].reshape(nQ, nl, np_)
+        qab_atom[A] = _qab_atom_flat[
+            _qabA_off[A]:_qabA_off[A + 1]].reshape(nQ, np_, np_)
+
+    _sa_settle(_qij_atom_flat)
+    _sa_settle(_qia_atom_flat)
+    _sa_settle(_qab_atom_flat)
+
+    # The per-aux-Q sparse arrays (qij/qia/qab, incl. their backing flat) are
+    # now fully captured in the per-atom flats and never read past this point.
+    # Drop them (frees the per-Q flat — ~half the peak) before the pool-map.
+    # Only clear the dict if we built it (don't free a caller-shared object).
     qij = qia = qab = None
     if _owns_sparse:
         sparse_arrays.clear()
