@@ -657,6 +657,54 @@ def stream_settle(buf):
             _madvise_dontneed(buf)
 
 
+def stream_empty_transient(shape, dtype=np.float64, tag='trans', spill=None):
+    """Like stream_empty(), but for a SHORT-LIVED per-pair buffer that the
+    caller frees itself via free_transient() rather than at interpreter exit.
+
+    The cc_ints per-pair cross buffers (raw_cross) are write-once (filled
+    across the centerQ loop) / read-once (by the cross_partner assembly) and
+    then discarded.  Backing them on NVMe turns the ~30x-per-pair anon
+    transient into evictable file pages (so it no longer counts against the
+    OOM ceiling), but because there is one per pair (thousands total) they
+    MUST be unlinked as each pair completes — hence a dedicated helper that
+    does NOT register the file for atexit cleanup.
+
+    Returns (buf, path); path is None when kept in RAM.  Zero-initialised in
+    both paths (a fresh mmap file reads as zeros)."""
+    shape = tuple(int(d) for d in (shape if isinstance(shape, (tuple, list))
+                                   else (shape,)))
+    nelem = 1
+    for d in shape:
+        nelem *= d
+    nbytes = nelem * np.dtype(dtype).itemsize
+    if spill is None:
+        _min = float(os.environ.get('DLPNO_STREAM_PLAN_MIN_MB', '128')) \
+            * (1 << 20)
+        spill = nbytes > _min and _should_spill(nbytes)
+    if spill and nbytes > 0:
+        _td = os.environ.get('PYSCF_TMPDIR') or tempfile.gettempdir()
+        _fd, _path = tempfile.mkstemp(suffix='.' + tag, prefix='dlpno_trans_',
+                                      dir=_td)
+        os.close(_fd)
+        buf = np.memmap(_path, dtype=dtype, mode='w+', shape=shape)
+        return buf, _path
+    return np.zeros(shape, dtype=dtype), None
+
+
+def free_transient(buf, path):
+    """Release a stream_empty_transient() buffer and unlink its backing file.
+    No-op for the RAM path (path is None)."""
+    if path is not None and isinstance(buf, np.memmap):
+        try:
+            buf._mmap.close()
+        except Exception:
+            pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def stream_plan_cache(plan, tag='plancache'):
     """Consolidate a built plan cache's large OWNED float64 arrays into one
     NVMe-backed buffer (Stage 1), replacing them with views.

@@ -1222,7 +1222,16 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     pp_flat[pp_off[p]:pp_off[p + 1]] = (
                         np.asarray(pp_p, dtype=np.int64))
                     X_flat[X_off[p]:X_off[p + 1]] = X_p.ravel()
-                raw_cross_flat = np.zeros(int(cross_off[-1]))
+                # raw_cross_flat is the single largest per-pair transient
+                # (n_local x npno x sum_partner n_kj — the ~30x cross-integral
+                # buffer).  Back it on NVMe when RAM is tight so it stops
+                # counting against the OOM ceiling; it is write-once (centerQ
+                # loop) / read-once (cross_partner) and unlinked as soon as
+                # this pair's assembly finishes (free_transient below).
+                from pyscf.cc.dlpno_tccsd.pair_index import (
+                    stream_empty_transient as _set_trans)
+                raw_cross_flat, _rc_path = _set_trans(
+                    (int(cross_off[-1]),), np.float64, tag='rawcross')
                 raw_kv_flat    = np.zeros(int(kv_off[-1]))
                 return {
                     'k_arr': k_arr, 'n_kj_arr': n_kj_arr,
@@ -1230,6 +1239,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     'X_off': X_off, 'X_flat': X_flat,
                     'cross_off': cross_off, 'kv_off': kv_off,
                     'raw_cross_flat': raw_cross_flat,
+                    'raw_cross_path': _rc_path,
                     'raw_kv_flat': raw_kv_flat,
                 }
             _t_pf_start = 0.0
@@ -1695,6 +1705,16 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 kj_partners, _kj_flat, q_io_c, Z_iv)
             J_ki_byk, K_ki_byk = _run_one_side(
                 ki_partners, _ki_flat, q_jo_c, Z_jv)
+            # raw_cross is now fully consumed (its J/K outputs were copied out);
+            # unlink its NVMe backing immediately so the per-pair transient
+            # does not accumulate across the thousands of pairs.
+            from pyscf.cc.dlpno_tccsd.pair_index import (
+                free_transient as _free_trans)
+            for _fb in (_kj_flat, _ki_flat):
+                if _fb is not None and _fb.get('raw_cross_path') is not None:
+                    _free_trans(_fb['raw_cross_flat'], _fb['raw_cross_path'])
+                    _fb['raw_cross_flat'] = None
+                    _fb['raw_cross_path'] = None
             J_ij_kj      = {(key, k): J_kj_byk[k] for k in J_kj_byk}
             K_ij_kj_dict = {(key, k): K_kj_byk[k] for k in K_kj_byk}
             J_ji_ki      = {(key, k): J_ki_byk[k] for k in J_ki_byk}
