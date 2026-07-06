@@ -1043,12 +1043,29 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         target_task_starts[0] = 0
         target_task_starts[1:] = np.cumsum(n_tasks_per_pair)
 
-        # Vectorised S_flat assembly: np.concatenate is C-implemented and
-        # much faster than per-chunk slice assignment in a Python loop.
-        if _S_chunks:
-            S_flat = np.concatenate(_S_chunks)
-        else:
-            S_flat = np.empty(_s_total)
+        # S_flat is the single largest LMP2 array: the concatenated cross-pair
+        # PNO overlaps, typically ~30-40x the amplitude size (Sb/Q ~ 37x on
+        # rxn_33 tzvpp; the dominant term at large basis).  It is READ-ONLY
+        # throughout the iterative solver, so build it in an adaptively-streamed
+        # buffer (NVMe-backed + evictable when RAM is tight, plain RAM
+        # otherwise) and fill it chunk-by-chunk while releasing the source
+        # chunks.  This also drops the np.concatenate that transiently DOUBLED
+        # S (a full extra copy alongside _S_chunks at peak).
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            stream_empty as _lmp2_stream_empty,
+            stream_settle as _lmp2_stream_settle,
+            _should_spill as _lmp2_should_spill)
+        _S_spill = _lmp2_should_spill(int(_s_total) * 8)
+        S_flat = _lmp2_stream_empty((int(_s_total),), np.float64,
+                                    tag='lmp2_S', spill=_S_spill)
+        _s_off = 0
+        for _ci in range(len(_S_chunks)):
+            _ch = _S_chunks[_ci]
+            S_flat[_s_off:_s_off + _ch.size] = _ch
+            _s_off += _ch.size
+            _S_chunks[_ci] = None          # release each source chunk eagerly
+        _S_chunks = []
+        _lmp2_stream_settle(S_flat)        # flush+evict in place (returns None)
         _t_plan_sflat = (_pno_time.perf_counter() - _t_plan_start
                          - _t_plan_setup - _t_plan_keys - _t_plan_enum)
 
@@ -1085,6 +1102,41 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             'N_p': N_p,
             'n_threads': min(16, N_p) if N_p > 0 else 1,
         }
+
+        if os.environ.get('DLPNO_MEM_PROBE'):
+            _Qb = int(T2_offsets[-1]) * 8 / 1024**3
+            _Sb = int(_s_total) * 8 / 1024**3
+            _psc = len(pno_S_cache)
+            _nch = len(_S_chunks)
+            _rss = 0.0
+            try:
+                with open('/proc/self/status') as _fm:
+                    for _ln in _fm:
+                        if _ln.startswith('VmRSS:'):
+                            _rss = int(_ln.split()[1]) / 1024**2
+                            break
+            except Exception:
+                pass
+            print(f'  [MEM/lmp2_plan] flat-T2(Q)={_Qb:.2f} GiB  '
+                  f'S_flat(Sb)={_Sb:.2f} GiB  Sb/Q={_Sb/max(_Qb,1e-9):.1f}x  '
+                  f'pno_S_cache={_psc} entries  _S_chunks={_nch}  '
+                  f'persistent_flats(4Q+Sb)={4*_Qb+_Sb:.2f} GiB  '
+                  f'RSS={_rss:.2f} GiB', flush=True)
+
+        # The C residual kernel reads ONLY S_flat; the per-pair pno_S_cache
+        # dict is now fully redundant (it was a second full copy of S — the
+        # single biggest anon overhead in the LMP2 phase, ~1x S_flat).  Drop
+        # it so only S_flat (adaptively streamable) remains.  The fallback
+        # Python residual path (which still reads pno_S_cache) only runs when
+        # no C plan was built, so this is safe here.
+        pno_S_cache = {}
+        import gc as _gc_lmp2
+        _gc_lmp2.collect()
+        try:
+            import ctypes as _ct_trim
+            _ct_trim.CDLL('libc.so.6').malloc_trim(0)
+        except Exception:
+            pass
 
     # DIIS setup (matching Psi4 line 700)
     from pyscf.lib.diis import DIIS
