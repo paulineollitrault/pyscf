@@ -1224,14 +1224,27 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     X_flat[X_off[p]:X_off[p + 1]] = X_p.ravel()
                 # raw_cross_flat is the single largest per-pair transient
                 # (n_local x npno x sum_partner n_kj — the ~30x cross-integral
-                # buffer).  Back it on NVMe when RAM is tight so it stops
-                # counting against the OOM ceiling; it is write-once (centerQ
-                # loop) / read-once (cross_partner) and unlinked as soon as
-                # this pair's assembly finishes (free_transient below).
+                # buffer).  Back it on NVMe so it stops counting against the OOM
+                # ceiling; it is write-once (centerQ loop) / read-once
+                # (cross_partner) and unlinked as soon as this pair's assembly
+                # finishes (free_transient below).  The spill decision is NOT
+                # the per-buffer adaptive _should_spill: with many pairs in
+                # flight (est mult lowered to 6 precisely because raw_cross is
+                # off anon), a per-pair "does MY buffer fit right now" check
+                # races — every concurrent pair sees low anon, all pick RAM,
+                # and they OOM together.  Instead spill unconditionally whenever
+                # streaming is enabled (and the buffer clears the min size), so
+                # the reduced est stays honest.
                 from pyscf.cc.dlpno_tccsd.pair_index import (
-                    stream_empty_transient as _set_trans)
+                    stream_empty_transient as _set_trans,
+                    _stream_mode as _rc_sm)
+                _rc_bytes = int(cross_off[-1]) * 8
+                _rc_min = float(os.environ.get(
+                    'DLPNO_STREAM_PLAN_MIN_MB', '128')) * (1 << 20)
+                _rc_spill = (_rc_bytes > _rc_min) and (_rc_sm() != 'off')
                 raw_cross_flat, _rc_path = _set_trans(
-                    (int(cross_off[-1]),), np.float64, tag='rawcross')
+                    (int(cross_off[-1]),), np.float64, tag='rawcross',
+                    spill=_rc_spill)
                 raw_kv_flat    = np.zeros(int(kv_off[-1]))
                 return {
                     'k_arr': k_arr, 'n_kj_arr': n_kj_arr,
@@ -1789,6 +1802,19 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
     # only the few big pairs run with reduced concurrency. When the whole
     # job fits in one wave (small systems / bases) this is exactly the old
     # behaviour — no barrier, no slowdown.
+    # Per-pair transient = <mult> x raw_ab.  The 30x default was calibrated
+    # with the partner-cross buffers (raw_cross) resident in anon RAM.  When
+    # raw_cross is NVMe-streamed (DLPNO_STREAM=auto/force), those ~25x of the
+    # footprint become evictable file pages and the true anon transient drops
+    # to ~raw_ab + raw_ma + the entry (~5x); lowering the multiplier lets the
+    # budget scheduler admit many more pairs concurrently (recovers pool-map
+    # parallelism).  Override with DLPNO_CCINTS_TRANSIENT_MULT.
+    from pyscf.cc.dlpno_tccsd.pair_index import _stream_mode as _cc_sm
+    if os.environ.get('DLPNO_CCINTS_TRANSIENT_MULT'):
+        _trans_mult = float(os.environ['DLPNO_CCINTS_TRANSIENT_MULT'])
+    else:
+        _trans_mult = 8.0 if _cc_sm() != 'off' else 30.0
+
     def _pair_mem_estimate(_k):
         """Rough per-pair transient working set, in bytes."""
         _xp = pno_spaces.get(_k, {}).get('X_pno')
@@ -1796,10 +1822,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             return 0
         _npno = _xp.shape[1]
         _nloc = len(np.asarray(pair_aux_idx[_k]))
-        # raw_ab (n_local,npno,npno) is the cheap-to-evaluate proxy; the
-        # full footprint (partner-cross flat buffers, raw_ma, the entry)
-        # was calibrated against the measured 64-way peak at ~30x raw_ab.
-        return int(30 * _nloc * _npno * _npno * 8)
+        return int(_trans_mult * _nloc * _npno * _npno * 8)
 
     # Per-pair-concurrency RAM budget for the cc_ints build (env-tunable).
     # The budget caps the summed in-flight per-pair working sets; the cc_ints
