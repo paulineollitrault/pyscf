@@ -29,6 +29,7 @@
 
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 #include "vhf/fblas.h"
 
 void DLPNObuild_S_pno_for_pair(
@@ -113,4 +114,72 @@ void DLPNObuild_S_pno_for_pair(
         free(S_sub);
         free(T);
     }
+}
+
+/* DLPNObuild_S_pno_hoisted — half-transform-hoisted variant.
+ *
+ * The per-partner dominant work above is the (n_pao_a x n_pao_b x n_pno_b)
+ * dgemm T = S_pao_sub @ X_b plus the n_pao_a*n_pao_b element gather.  But
+ * T's rows are a PURE ROW SUBSET of Y_b = S_pao_full[:, pp_b] @ X_b, which
+ * depends only on pair b.  The caller hoists Y_b once per pair (pool-
+ * parallel, ~2 GFLOP/pair-set) and this kernel does, per partner, only:
+ *     Ysub[u, :] = Y_b[pp_a[u], :]        (n_pao_a row memcpys)
+ *     S_out     = X_a^T @ Ysub            (n_pno_a x n_pno_b, k=n_pao_a)
+ * ~9x fewer FLOPs and ~10x less gather traffic than the direct kernel;
+ * bit-exact same contraction (matches ORCA's "pair/pair overlap" cost).
+ *
+ * Y_flat: concat of Y_b blocks, each row-major (n_pao_total, n_pno_b),
+ * partner_Y_off[p] = element offset of partner p's block.
+ */
+void DLPNObuild_S_pno_hoisted(
+        const long   *pp_a,                  /* (n_pao_a,) */
+        const double *X_a,                   /* (n_pao_a, n_pno_a) row-major */
+        const int     n_pao_a,
+        const int     n_pno_a,
+        const int     n_partners,
+        const int    *partner_n_pno,
+        const long   *partner_Y_off,
+        const double *Y_flat,
+        const long   *S_out_off,
+        double       *S_out_flat,
+        const size_t  n_pao_total)
+{
+    if (n_partners <= 0 || n_pao_a <= 0 || n_pno_a <= 0) return;
+
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0;
+
+    int max_npno_b = 0;
+    for (int p = 0; p < n_partners; p++) {
+        if (partner_n_pno[p] > max_npno_b) max_npno_b = partner_n_pno[p];
+    }
+    if (max_npno_b <= 0) return;
+    double *Ysub = (double *)malloc(sizeof(double)
+                                    * (size_t)n_pao_a * max_npno_b);
+
+    int int_n_pao_a = n_pao_a;
+    int int_n_pno_a = n_pno_a;
+    for (int p = 0; p < n_partners; p++) {
+        const int n_pno_b = partner_n_pno[p];
+        if (n_pno_b <= 0) continue;
+        const double *Y_b = Y_flat + partner_Y_off[p];
+        double *S_out = S_out_flat + S_out_off[p];
+
+        for (int u = 0; u < n_pao_a; u++) {
+            memcpy(Ysub + (size_t)u * n_pno_b,
+                   Y_b + (size_t)pp_a[u] * n_pno_b,
+                   sizeof(double) * n_pno_b);
+        }
+
+        /* Same BLAS shape as the direct kernel's final dgemm:
+         * S_out(row-major n_pno_a x n_pno_b) = X_a^T @ Ysub. */
+        int int_n_pno_b = n_pno_b;
+        dgemm_(&N_flag, &T_flag,
+               &int_n_pno_b, &int_n_pno_a, &int_n_pao_a,
+               &one, Ysub, &int_n_pno_b,
+               X_a, &int_n_pno_a,
+               &zero, S_out, &int_n_pno_b);
+    }
+
+    free(Ysub);
 }

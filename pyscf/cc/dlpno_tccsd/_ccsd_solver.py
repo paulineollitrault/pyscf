@@ -464,6 +464,14 @@ class PyBEInputs(ctypes.Structure):
         ('S_off',       ctypes.c_void_p),
         ('T_off',       ctypes.c_void_p),
         ('K_off',       ctypes.c_void_p),
+        # UK hoist: K_master/K_off point at the per-cycle UK master
+        # (T2-canonical layout); kernel skips its internal UK build.
+        ('uk_hoisted',  ctypes.c_int),
+        # BE screening (v3): per-item ||T_kl||/||UK_kl||; in-kernel test
+        # (|bkl|+|blk|)*t2n + ukn < tau with the FRESH per-cycle betas.
+        ('scr_t2n',     ctypes.c_void_p),
+        ('scr_ukn',     ctypes.c_void_p),
+        ('scr_tau',     ctypes.c_double),
     ]
 
 
@@ -695,6 +703,9 @@ class PyT4Inputs(ctypes.Structure):
         ('max_n_ki',       ctypes.c_int),
         ('max_n_li',       ctypes.c_int),
         ('max_n_kl',       ctypes.c_int),
+        # magnitude screening: per-item bound ptr (NULL = off) + threshold
+        ('bound',          ctypes.c_void_p),
+        ('tau',            ctypes.c_double),
     ]
 
 
@@ -713,11 +724,14 @@ _libcc.DLPNOcompute_lccsd_phase_t4.argtypes = [
 
 
 _libcc.DLPNOt4_kernel_batched.restype = None
+# NOTE: signature includes trailing (bound_ptr, tau) screening args.
 _libcc.DLPNOt4_kernel_batched.argtypes = (
     [ctypes.c_int]                            # N
     + [ctypes.c_void_p] * 14                  # 3 shape + 6 offsets + 5 buffers
     + [ctypes.c_void_p, ctypes.c_size_t] * 3  # 3 scratch
-    + [ctypes.c_void_p, ctypes.c_double, ctypes.c_int])  # tiles_flat, scale, num_threads
+    + [ctypes.c_void_p, ctypes.c_double,       # tiles_flat, scale
+       ctypes.c_void_p, ctypes.c_double,       # bound (NULL=off), tau
+       ctypes.c_int])                          # num_threads
 
 
 class PyKLadderInputs(ctypes.Structure):
@@ -839,6 +853,28 @@ class PyRunCycleInputs(ctypes.Structure):
         # Per-CD-item ordered-pair index for native ct_flat/dt_flat gather.
         ('c_term_ct_ord_pair_idx',    ctypes.c_void_p),
         ('d_term_dt_ord_pair_idx',    ctypes.c_void_p),
+        # BE slot-cat (cross-bucket slot-sorted kernel; DLPNO_BE_SLOTCAT).
+        ('bes_S_cat',         ctypes.c_void_p),
+        ('bes_T_master',      ctypes.c_void_p),
+        ('bes_UK_master',     ctypes.c_void_p),
+        ('bes_T_off',         ctypes.c_void_p),
+        ('bes_item_nkl',      ctypes.c_void_p),
+        ('bes_item_k0',       ctypes.c_void_p),
+        ('bes_same',          ctypes.c_void_p),
+        ('bes_beta0_kl',      ctypes.c_void_p),
+        ('bes_beta0_lk',      ctypes.c_void_p),
+        ('bes_p_ij',          ctypes.c_void_p),
+        ('bes_dense_k',       ctypes.c_void_p),
+        ('bes_dense_l',       ctypes.c_void_p),
+        ('bes_slot_ptr',      ctypes.c_void_p),
+        ('bes_slot_scat_off', ctypes.c_void_p),
+        ('bes_slot_KT',       ctypes.c_void_p),
+        ('bes_slot_nij',      ctypes.c_void_p),
+        ('bes_slot_out_off',  ctypes.c_void_p),
+        ('bes_n_slots',       ctypes.c_int64),
+        ('bes_max_nkl',       ctypes.c_int),
+        ('bes_max_nij',       ctypes.c_int),
+        ('bes_hcap',          ctypes.c_int64),
     ]
 
 
@@ -1114,6 +1150,38 @@ def _build_t34_plan(plan_obj, side, t1_cache, t2_pno_all, ord_idx_lookup,
         t4_struct.S_kl_ki_flat  = bv['t4_S_kl_ki_flat'].ctypes.data
         t4_struct.t2_flat       = t2_flat.ctypes.data
         t4_struct.scale         = float(t4_scale)
+        # Magnitude screening (DLPNO_T4_SCREEN_TAU > 0): rigorous per-item
+        # bound  ||contrib||_F <= |scale| * ||t2_li||_F * ||K_kl||_F
+        # (PNO-overlap 2-norms <= 1).  K norms are cycle-invariant (cached
+        # on bv); t2 norms recomputed each cycle from the freshly gathered
+        # t2_flat.  tau=0 (default) -> bound=NULL -> bit-exact legacy path.
+        _tau_t4 = float(os.environ.get('DLPNO_T4_SCREEN_TAU', '0') or 0)
+        t4_struct.tau = _tau_t4
+        t4_struct.bound = None
+        if _tau_t4 > 0.0:
+            from pyscf.cc.dlpno_tccsd._wm_scatter_cy import norms_by_offsets
+            _Kn = bv.get('_t4_K_norms')
+            if _Kn is None:
+                _Kn = np.empty(t4_N)
+                norms_by_offsets(bv['t4_K_flat'],
+                                 np.ascontiguousarray(bv['t4_K_off']),
+                                 bv['t4_n_kl'], _Kn)
+                bv['_t4_K_norms'] = _Kn
+            _t2n = bv.get('_t4_t2_norms_buf')
+            if _t2n is None:
+                _t2n = np.empty(t4_N)
+                bv['_t4_t2_norms_buf'] = _t2n
+            norms_by_offsets(t2_flat,
+                             np.ascontiguousarray(bv['t4_t2_off'][:t4_N]),
+                             bv['t4_n_li'], _t2n)
+            _t4_bound = bv.get('_t4_bound_buf')
+            if _t4_bound is None:
+                _t4_bound = np.empty(t4_N)
+                bv['_t4_bound_buf'] = _t4_bound
+            np.multiply(_Kn, _t2n, out=_t4_bound)
+            _t4_bound *= abs(float(t4_scale))
+            t4_struct.bound = _t4_bound.ctypes.data
+            own.extend([_Kn, _t2n, _t4_bound])
         t4_struct.max_n_ki      = int(bv['t4_n_ki'].max(initial=1))
         t4_struct.max_n_li      = int(bv['t4_n_li'].max(initial=1))
         t4_struct.max_n_kl      = int(bv['t4_n_kl'].max(initial=1))
@@ -1204,7 +1272,103 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
     be_n_buckets = 0
     be_n_unique = 0
     be_owned_buckets = []
+    bes = None
+    # UK hoist (DLPNO_BE_UK_HOIST=1): build UK = K^T(2T-T^T)[+K(2T^T-T)]
+    # once per canonical pair per cycle instead of per (ij,kl) item —
+    # exact reordering (neither we nor Psi4 exploited this); drops the BE
+    # item from 6 to 4 dgemms and its TT/UK scratch builds.
+    _uk_master_buf = None
+    if (be_plan is not None
+            and os.environ.get('DLPNO_BE_UK_HOIST', '1') == '1'
+            and be_plan.get('uk_k_off') is not None
+            and be_plan.get('K_iajb_master') is not None
+            and hasattr(t2_pno_all, '_buffer')):
+        from pyscf.cc.dlpno_tccsd._wm_scatter_cy import build_uk_master
+        _uk_n_arr = be_plan['uk_n']
+        _uk_t2off = be_plan.get('_uk_t2_off_c')
+        if _uk_t2off is None:
+            _uk_t2off = np.ascontiguousarray(
+                np.asarray(t2_pno_all._offsets, dtype=np.int64)[
+                    :_uk_n_arr.shape[0]])
+            be_plan['_uk_t2_off_c'] = _uk_t2off
+        _uk_master_buf = be_plan.get('_uk_master_buf')
+        if _uk_master_buf is None:
+            _uk_master_buf = np.empty(int(t2_pno_all._buffer.shape[0]))
+            be_plan['_uk_master_buf'] = _uk_master_buf
+        _uk_maxn = int(_uk_n_arr.max(initial=1))
+        _uk_scr = be_plan.get('_uk_scratch')
+        if _uk_scr is None or _uk_scr.shape[1] < 2 * _uk_maxn * _uk_maxn:
+            _uk_scr = np.empty((32, 2 * _uk_maxn * _uk_maxn))
+            be_plan['_uk_scratch'] = _uk_scr
+        build_uk_master(
+            np.asarray(t2_pno_all._buffer), _uk_t2off,
+            np.asarray(be_plan['K_iajb_master']), be_plan['uk_k_off'],
+            _uk_n_arr, be_plan['uk_same'], _uk_scr, _uk_master_buf, 32)
+        be_owned_buckets.append(_uk_master_buf)
+    # BE magnitude screening (DLPNO_BE_SCREEN_TAU > 0; needs the UK hoist
+    # for ||UK|| norms): per-canonical-pair Frobenius norms of T2 and UK,
+    # gathered per item at bucket-wiring time below.
+    _be_scr_tau = 0.0
+    _be_t2norm_pair = None
+    _be_uknorm_pair = None
+    if _uk_master_buf is not None:
+        _be_scr_tau = float(os.environ.get('DLPNO_BE_SCREEN_TAU', '0') or 0)
+        if _be_scr_tau > 0.0:
+            from pyscf.cc.dlpno_tccsd._wm_scatter_cy import norms_by_offsets
+            _uk_n_arr = be_plan['uk_n']
+            _uk_t2off = be_plan['_uk_t2_off_c']
+            _be_t2norm_pair = be_plan.get('_be_t2norm_buf')
+            if _be_t2norm_pair is None:
+                _be_t2norm_pair = np.empty(_uk_n_arr.shape[0])
+                be_plan['_be_t2norm_buf'] = _be_t2norm_pair
+            _be_uknorm_pair = be_plan.get('_be_uknorm_buf')
+            if _be_uknorm_pair is None:
+                _be_uknorm_pair = np.empty(_uk_n_arr.shape[0])
+                be_plan['_be_uknorm_buf'] = _be_uknorm_pair
+            norms_by_offsets(np.asarray(t2_pno_all._buffer), _uk_t2off,
+                             _uk_n_arr, _be_t2norm_pair)
+            norms_by_offsets(_uk_master_buf, _uk_t2off,
+                             _uk_n_arr, _be_uknorm_pair)
     if be_plan is not None:
+        if os.environ.get('DLPNO_BE_STATS') and not be_plan.get('_stats_done'):
+            be_plan['_stats_done'] = True
+            _tot_N = _tot_fl = _tot_by = 0
+            _hist = {}
+            for _bk in be_plan['buckets']:
+                _ni, _nk = _bk['n_ij'], _bk['n_kl']
+                _Nb = len(_bk['kl_keys'])
+                _tot_N += _Nb
+                # 4 dgemms: 2x (nk^2 * ni) + 2x (ni^2 * nk), 2 flops/MAC
+                _tot_fl += _Nb * (4 * _nk * _nk * _ni + 4 * _ni * _ni * _nk)
+                # gathered reads: S (ni*nk) + T (nk^2) + UK (nk^2), 8 B each
+                _tot_by += _Nb * 8 * (_ni * _nk + 2 * _nk * _nk)
+                _hist[(_ni, _nk)] = _hist.get((_ni, _nk), 0) + _Nb
+            print(f'[BE_STATS] buckets={len(be_plan["buckets"])} items={_tot_N} '
+                  f'flops={_tot_fl/1e9:.2f}G read={_tot_by/1e9:.2f}GB', flush=True)
+            _top = sorted(_hist.items(), key=lambda kv: -kv[1] * (kv[0][0] * kv[0][1]))[:12]
+            for (_ni, _nk), _Nb in _top:
+                print(f'[BE_STATS]   n_ij={_ni:4d} n_kl={_nk:4d} N={_Nb}', flush=True)
+        # BE slot-cat eligibility (DLPNO_BE_SLOTCAT, default ON): needs the
+        # master flats + per-item offsets (mode-independent, present
+        # whenever the S_pno/K_iajb stores share base buffers), the UK
+        # hoist master, and no BE screening.  When eligible, the bucket
+        # loop below builds the LIGHT gathered-style inv (no stacked
+        # S_c/K_c copies, no per-cycle T_buf refill) even outside
+        # DLPNO_BE_GATHERED mode.
+        bes = be_plan.get('_bes_cache')
+        _bes_env_on = (os.environ.get('DLPNO_BE_SLOTCAT', '1') != '0')
+        _bes_eligible = (
+            bes is not None
+            or (_bes_env_on
+                and _uk_master_buf is not None
+                and _be_t2norm_pair is None
+                and be_plan.get('S_pno_master') is not None
+                and be_plan.get('K_iajb_master') is not None
+                and hasattr(t2_pno_all, '_buffer')
+                and all(bk.get('S_off') is not None
+                        and bk.get('K_off') is not None
+                        and bk.get('t2_off') is not None
+                        for bk in be_plan['buckets'])))
         unique_n_ij = sorted(be_plan['pairs_by_n_ij'].keys())
         n_unique = len(unique_n_ij)
         flat_off = np.zeros(n_unique + 1, dtype=np.int64)
@@ -1260,13 +1424,17 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                     p_ij_arr[n]    = key_to_p.get(key_ij_n, -1)
                     dense_k_arr[n] = dk
                     dense_l_arr[n] = dl
-                beta_kl_arr = np.empty(N_b)
-                beta_lk_arr = np.empty(N_b)
+                # zeros, not empty: pack-time betas are refreshed in-class
+                # for p>=0 items, but the slot-cat beta0 fallback READS
+                # these for p<0/nlmo==0 items — garbage here would be a
+                # silent landmine (none exist at current systems, but).
+                beta_kl_arr = np.zeros(N_b)
+                beta_lk_arr = np.zeros(N_b)
                 same_c = np.ascontiguousarray(bucket['same']).astype(
                     np.uint8, copy=False)
                 idx_c = np.ascontiguousarray(bucket['item_idx']).astype(
                     np.int64, copy=False)
-                if _be_gathered:
+                if _be_gathered or _bes_eligible:
                     # No stacked arrays; cache the offset arrays + master
                     # pointers used by every cycle.
                     S_off_c = np.ascontiguousarray(
@@ -1340,11 +1508,63 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                 buckets_arr[b_idx].S_master = be_plan[
                     'S_pno_master'].ctypes.data
                 buckets_arr[b_idx].T_master = t2_pno_all._buffer.ctypes.data
-                buckets_arr[b_idx].K_master = be_plan[
-                    'K_iajb_master'].ctypes.data
+                if _uk_master_buf is not None:
+                    # UK hoist: K slot carries the per-cycle UK master;
+                    # per-item offsets are the T2-canonical ones (UK has
+                    # T2's layout).  Kernel skips its internal UK build.
+                    buckets_arr[b_idx].K_master = _uk_master_buf.ctypes.data
+                    buckets_arr[b_idx].K_off   = inv['T_off_c'].ctypes.data
+                    buckets_arr[b_idx].uk_hoisted = 1
+                else:
+                    buckets_arr[b_idx].K_master = be_plan[
+                        'K_iajb_master'].ctypes.data
+                    buckets_arr[b_idx].K_off   = inv['K_off_c'].ctypes.data
+                    buckets_arr[b_idx].uk_hoisted = 0
+                # BE screening: per-item ||T_kl|| / ||UK_kl|| gathered from
+                # the per-pair norms (item -> pair via its T2-canonical
+                # offset; the index map is cycle-invariant and cached).
+                buckets_arr[b_idx].scr_t2n = None
+                buckets_arr[b_idx].scr_ukn = None
+                buckets_arr[b_idx].scr_tau = 0.0
+                if _be_t2norm_pair is not None:
+                    _pi_map = inv.get('_scr_pair_idx')
+                    if _pi_map is None:
+                        _pi_map = np.searchsorted(
+                            _uk_t2off, np.asarray(inv['T_off_c']))
+                        inv['_scr_pair_idx'] = _pi_map
+                    # Static per-item ||S_ij,kl||^2 — the LOCALITY factor
+                    # (distant items decay through S, not beta/T).  Folded
+                    # into the norm arrays so the kernel test is unchanged.
+                    _s2 = inv.get('_scr_s2')
+                    if _s2 is None:
+                        from pyscf.cc.dlpno_tccsd._wm_scatter_cy import (
+                            norms_by_offsets_rect)
+                        _Nb_i = _pi_map.shape[0]
+                        _s2 = np.empty(_Nb_i)
+                        _nr = np.full(_Nb_i, int(n_ij), dtype=np.int32)
+                        _nc = np.full(_Nb_i, int(n_kl), dtype=np.int32)
+                        norms_by_offsets_rect(
+                            np.asarray(be_plan['S_pno_master']),
+                            np.ascontiguousarray(inv['S_off_c']),
+                            _nr, _nc, _s2)
+                        np.square(_s2, out=_s2)
+                        inv['_scr_s2'] = _s2
+                    _s_t2n = inv.get('_scr_t2n_buf')
+                    if _s_t2n is None:
+                        _s_t2n = np.empty(_pi_map.shape[0])
+                        inv['_scr_t2n_buf'] = _s_t2n
+                        inv['_scr_ukn_buf'] = np.empty(_pi_map.shape[0])
+                    _s_ukn = inv['_scr_ukn_buf']
+                    np.take(_be_t2norm_pair, _pi_map, out=_s_t2n)
+                    np.take(_be_uknorm_pair, _pi_map, out=_s_ukn)
+                    _s_t2n *= _s2
+                    _s_ukn *= _s2
+                    buckets_arr[b_idx].scr_t2n = _s_t2n.ctypes.data
+                    buckets_arr[b_idx].scr_ukn = _s_ukn.ctypes.data
+                    buckets_arr[b_idx].scr_tau = _be_scr_tau
+                    be_owned_buckets.extend([_s_t2n, _s_ukn, _s2])
                 buckets_arr[b_idx].S_off    = inv['S_off_c'].ctypes.data
                 buckets_arr[b_idx].T_off    = inv['T_off_c'].ctypes.data
-                buckets_arr[b_idx].K_off    = inv['K_off_c'].ctypes.data
                 be_owned_buckets.extend([
                     beta_kl_arr, beta_lk_arr, same_c, idx_c,
                     p_ij_arr, dense_k_arr, dense_l_arr,
@@ -1395,6 +1615,109 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
                 be_pair_n_ij_idx_arr[p] = unique_n_ij.index(n_ij)
                 be_pair_slot_arr[p] = slot
         own.extend([be_pair_n_ij_idx_arr, be_pair_slot_arr])
+
+        # ---- BE slot-cat plan (DLPNO_BE_SLOTCAT, default ON) ----
+        # Cross-bucket item sort by global output slot + a slot-sorted
+        # contiguous copy of the S blocks (S_cat) so the second
+        # half-transform runs as one fat dgemm per slot.  Cycle-invariant;
+        # built once and cached on be_plan.  Requires gathered mode with
+        # the UK hoist and no BE screening (falls back to buckets else).
+        if (bes is None and _bes_eligible
+                and all(bk['n_ij'] in unique_n_ij for bk in buckets)):
+            _gi_of = {v: i for i, v in enumerate(unique_n_ij)}
+            _grp_np = np.array(
+                [len(be_plan['pairs_by_n_ij'][v]) for v in unique_n_ij],
+                dtype=np.int64)
+            _slot_base = np.zeros(n_unique + 1, dtype=np.int64)
+            np.cumsum(_grp_np, out=_slot_base[1:])
+            n_slots_tot = int(_slot_base[-1])
+
+            _gs, _toff, _soff, _nkl, _same = [], [], [], [], []
+            _b0k, _b0l, _pij, _dk, _dl = [], [], [], [], []
+            for bk in buckets:
+                inv_b = bk['_inv_cache']
+                gi = _gi_of[bk['n_ij']]
+                _gs.append(_slot_base[gi]
+                           + np.asarray(inv_b['idx_c'], dtype=np.int64))
+                _toff.append(np.asarray(inv_b['T_off_c'], dtype=np.int64))
+                _soff.append(np.asarray(inv_b['S_off_c'], dtype=np.int64))
+                _nkl.append(np.full(len(bk['kl_keys']), bk['n_kl'],
+                                    dtype=np.int32))
+                _same.append(np.asarray(inv_b['same_c'], dtype=np.uint8))
+                _b0k.append(np.asarray(inv_b['beta_kl'], dtype=np.float64))
+                _b0l.append(np.asarray(inv_b['beta_lk'], dtype=np.float64))
+                _pij.append(np.asarray(inv_b['p_ij_arr'], dtype=np.int32))
+                _dk.append(np.asarray(inv_b['dense_k_arr'], dtype=np.int32))
+                _dl.append(np.asarray(inv_b['dense_l_arr'], dtype=np.int32))
+            gslot = np.concatenate(_gs)
+            order = np.argsort(gslot, kind='stable')
+            gslot = np.ascontiguousarray(gslot[order])
+            s_T_off = np.ascontiguousarray(np.concatenate(_toff)[order])
+            s_S_off = np.ascontiguousarray(np.concatenate(_soff)[order])
+            s_nkl = np.ascontiguousarray(np.concatenate(_nkl)[order])
+            s_same = np.ascontiguousarray(np.concatenate(_same)[order])
+            s_b0k = np.ascontiguousarray(np.concatenate(_b0k)[order])
+            s_b0l = np.ascontiguousarray(np.concatenate(_b0l)[order])
+            s_pij = np.ascontiguousarray(np.concatenate(_pij)[order])
+            s_dk = np.ascontiguousarray(np.concatenate(_dk)[order])
+            s_dl = np.ascontiguousarray(np.concatenate(_dl)[order])
+            del _gs, _toff, _soff, _nkl, _same, _b0k, _b0l, _pij, _dk, _dl
+
+            counts = np.bincount(gslot, minlength=n_slots_tot)
+            slot_ptr = np.zeros(n_slots_tot + 1, dtype=np.int64)
+            np.cumsum(counts, out=slot_ptr[1:])
+            _kend = np.cumsum(s_nkl.astype(np.int64))
+            _k0g = _kend - s_nkl               # global row index (unsplit)
+            _slot_k_start = np.zeros(n_slots_tot, dtype=np.int64)
+            _nz = counts > 0
+            _slot_k_start[_nz] = _k0g[slot_ptr[:-1][_nz]]
+            item_k0 = np.ascontiguousarray(
+                _k0g - np.repeat(_slot_k_start, counts))
+            slot_KT = np.zeros(n_slots_tot, dtype=np.int64)
+            np.add.at(slot_KT, gslot, s_nkl.astype(np.int64))
+            slot_nij = np.zeros(n_slots_tot, dtype=np.int32)
+            slot_out_off = np.zeros(n_slots_tot, dtype=np.int64)
+            for gi, v in enumerate(unique_n_ij):
+                b0, b1 = int(_slot_base[gi]), int(_slot_base[gi + 1])
+                slot_nij[b0:b1] = v
+                slot_out_off[b0:b1] = (int(flat_off[gi])
+                                       + np.arange(b1 - b0, dtype=np.int64)
+                                       * (v * v))
+            _panel = slot_nij.astype(np.int64) * slot_KT
+            slot_scat_off = np.zeros(n_slots_tot, dtype=np.int64)
+            np.cumsum(_panel[:-1], out=slot_scat_off[1:])
+            _scat_total = int(_panel.sum())
+            S_cat = np.empty(_scat_total)
+            from pyscf.cc.dlpno_tccsd._wm_scatter_cy import build_scat_master
+            build_scat_master(
+                np.asarray(be_plan['S_pno_master']).ravel(), s_S_off,
+                np.ascontiguousarray(slot_nij[gslot]), s_nkl,
+                np.ascontiguousarray(slot_scat_off[gslot]), item_k0,
+                np.ascontiguousarray(slot_KT[gslot]), S_cat)
+            max_nkl = int(s_nkl.max(initial=1))
+            max_nij = int(slot_nij.max(initial=1))
+            hcap = int(min(max(int(slot_KT.max(initial=1)), max_nkl), 8192))
+            hcap = max(hcap, max_nkl)
+            bes = dict(S_cat=S_cat, T_off=s_T_off, item_nkl=s_nkl,
+                       item_k0=item_k0, same=s_same, beta0_kl=s_b0k,
+                       beta0_lk=s_b0l, p_ij=s_pij, dense_k=s_dk,
+                       dense_l=s_dl, slot_ptr=slot_ptr,
+                       slot_scat_off=slot_scat_off, slot_KT=slot_KT,
+                       slot_nij=slot_nij, slot_out_off=slot_out_off,
+                       n_slots=n_slots_tot, max_nkl=max_nkl,
+                       max_nij=max_nij, hcap=hcap,
+                       T_master_buf=t2_pno_all._buffer,
+                       UK_master_buf=_uk_master_buf)
+            be_plan['_bes_cache'] = bes
+            print(f'[BE-SLOTCAT] plan built: items={len(gslot)} '
+                  f'slots={n_slots_tot} S_cat={_scat_total*8/1e9:.2f}GB '
+                  f'hcap={hcap}', flush=True)
+        if bes is not None and (not _bes_env_on
+                                or _uk_master_buf is None
+                                or _be_t2norm_pair is not None):
+            bes = None    # config changed mid-run: fall back to buckets
+        if bes is not None:
+            own.extend(list(bes.values()))
 
     # ----------------------- CD -----------------------
     cd_cache = getattr(compute_CD_terms_batched, '_plan_cache', None)
@@ -1588,6 +1911,7 @@ def _build_native_r2_plans(t2_pno_all, key_to_p, keys_reorder,
         'be_flat_off_per_n_ij': be_flat_off,
         'be_pair_n_ij_idx': be_pair_n_ij_idx_arr,
         'be_pair_slot': be_pair_slot_arr,
+        'bes': bes,
         'c_plan': c_plan_struct, 'd_plan': d_plan_struct,
         'c_target_ij': c_target_ij_arr, 'c_target_ji': c_target_ji_arr,
         'd_target_ij': d_target_ij_arr, 'd_target_ji': d_target_ji_arr,
@@ -1921,6 +2245,11 @@ def run_remaining_cycles_via_class(
     if _omp_ctx is not None:
         _omp_ctx.__enter__()
 
+    # ORCA-parity dual stopping criterion (see the check in the loop).
+    _conv_orca = os.environ.get('DLPNO_CONV_ORCA', '1') != '0'
+    _tol_e = float(os.environ.get('DLPNO_TOL_E', '1e-8'))
+    _tol_err = float(os.environ.get('DLPNO_TOL_ERR', '5e-7'))
+
     for cycle in range(cycle_start, max_cycle):
         _t_cyc_start = _time.perf_counter()
 
@@ -2016,6 +2345,29 @@ def run_remaining_cycles_via_class(
             if natives['be_pair_n_ij_idx'] is not None else None)
         plans.be_pair_slot = (natives['be_pair_slot'].ctypes.data
             if natives['be_pair_slot'] is not None else None)
+        _bes = natives.get('bes')
+        if _bes is not None:
+            plans.bes_S_cat = _bes['S_cat'].ctypes.data
+            plans.bes_T_master = _bes['T_master_buf'].ctypes.data
+            plans.bes_UK_master = _bes['UK_master_buf'].ctypes.data
+            plans.bes_T_off = _bes['T_off'].ctypes.data
+            plans.bes_item_nkl = _bes['item_nkl'].ctypes.data
+            plans.bes_item_k0 = _bes['item_k0'].ctypes.data
+            plans.bes_same = _bes['same'].ctypes.data
+            plans.bes_beta0_kl = _bes['beta0_kl'].ctypes.data
+            plans.bes_beta0_lk = _bes['beta0_lk'].ctypes.data
+            plans.bes_p_ij = _bes['p_ij'].ctypes.data
+            plans.bes_dense_k = _bes['dense_k'].ctypes.data
+            plans.bes_dense_l = _bes['dense_l'].ctypes.data
+            plans.bes_slot_ptr = _bes['slot_ptr'].ctypes.data
+            plans.bes_slot_scat_off = _bes['slot_scat_off'].ctypes.data
+            plans.bes_slot_KT = _bes['slot_KT'].ctypes.data
+            plans.bes_slot_nij = _bes['slot_nij'].ctypes.data
+            plans.bes_slot_out_off = _bes['slot_out_off'].ctypes.data
+            plans.bes_n_slots = int(_bes['n_slots'])
+            plans.bes_max_nkl = int(_bes['max_nkl'])
+            plans.bes_max_nij = int(_bes['max_nij'])
+            plans.bes_hcap = int(_bes['hcap'])
         if natives['c_plan'] is not None:
             plans.c_term_plan = ctypes.pointer(natives['c_plan'])
             plans.c_term_target_pair_idx_ij = natives['c_target_ij'].ctypes.data
@@ -2077,6 +2429,7 @@ def run_remaining_cycles_via_class(
             err_vec[off:off + n_p * n_p] = r2k.ravel()
             off += n_p * n_p
         dT = float(np.max(np.abs(amp_new - amp_old)))
+        r_max = float(np.max(np.abs(err_vec))) if err_vec.size else 0.0
 
         _t_diis0 = _time.perf_counter()
         if cycle >= diis_start_cycle and err_vec.size > 0:
@@ -2108,25 +2461,40 @@ def run_remaining_cycles_via_class(
 
         _dt = _time.perf_counter() - _t_cyc_start
         print(f'  Cycle {cycle + 1:3d} [class]: dT={dT:.3e}  '
-              f'E_corr={e_cyc:.10f}  dE={dE:.2e}  '
+              f'E_corr={e_cyc:.10f}  dE={dE:.2e}  Rmax={r_max:.2e}  '
               f'[{_dt:.2f}s: t1cache={_t_t1cache:.2f} plans={_t_plans:.2f} '
               f'run_cyc={_t_run:.2f} diis={_t_diis:.2f} sync={_t_sync:.2f}]',
               flush=True)
 
         del native_own
 
-        if dT < this_tol:
-            print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (amplitude, class).',
-                  flush=True)
-            if _omp_ctx is not None:
-                _omp_ctx.__exit__(None, None, None)
-            return cycle, e_cyc
-        if cycle > 5 and dE < this_tol:
-            print(f'  DLPNO-CCSD converged in {cycle + 1} cycles (energy, dE={dE:.2e}, class).',
-                  flush=True)
-            if _omp_ctx is not None:
-                _omp_ctx.__exit__(None, None, None)
-            return cycle, e_cyc
+        # ORCA-style dual stopping criterion (DLPNO_CONV_ORCA, default ON):
+        # converge only when BOTH the energy change AND the max raw
+        # residual are below tolerance — mirrors ORCA MDCI (TolE=1e-8 Eh,
+        # TolErr=5e-7) and removes the ±2-4-cycle luck of the
+        # dE-plateau-only rule.  DLPNO_CONV_ORCA=0 restores the legacy
+        # dT/dE stopping.  Tolerances: DLPNO_TOL_E / DLPNO_TOL_ERR.
+        if _conv_orca:
+            if cycle > cycle_start and dE < _tol_e and r_max < _tol_err:
+                print(f'  DLPNO-CCSD converged in {cycle + 1} cycles '
+                      f'(dual, dE={dE:.2e} Rmax={r_max:.2e}, class).',
+                      flush=True)
+                if _omp_ctx is not None:
+                    _omp_ctx.__exit__(None, None, None)
+                return cycle, e_cyc
+        else:
+            if dT < this_tol:
+                print(f'  DLPNO-CCSD converged in {cycle + 1} cycles '
+                      f'(amplitude, class).', flush=True)
+                if _omp_ctx is not None:
+                    _omp_ctx.__exit__(None, None, None)
+                return cycle, e_cyc
+            if cycle > 5 and dE < this_tol:
+                print(f'  DLPNO-CCSD converged in {cycle + 1} cycles '
+                      f'(energy, dE={dE:.2e}, class).', flush=True)
+                if _omp_ctx is not None:
+                    _omp_ctx.__exit__(None, None, None)
+                return cycle, e_cyc
 
     if _omp_ctx is not None:
         _omp_ctx.__exit__(None, None, None)

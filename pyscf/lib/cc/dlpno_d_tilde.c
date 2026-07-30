@@ -129,3 +129,76 @@ void DLPNOcompute_D_tilde_ph1_batched(
         free(part2);
     }
 }
+
+
+/* v2: alias-friendly variant (see dlpno_c_tilde.c v2).  K_tilde from the
+ * two orientation masters via per-item selector; t1/T1_rows via offsets
+ * into the T1_in_pair master; M_static stays a (small, cycle-invariant,
+ * caller-cached) flat.  Kills the per-cycle GB-scale kt staging pack. */
+void DLPNOcompute_D_tilde_ph1_batched_v2(
+        const double *kt_flat_i,
+        const double *kt_flat_j,
+        const unsigned char *kt_sel,
+        const long   *K_tilde_chem_offsets,
+        const double *M_static_flat,
+        const long   *M_static_offsets,
+        const double *t1_master,
+        const long   *t1_offsets,             /* row offset incl. i_in_p */
+        const long   *T1_rows_offsets,        /* pair block offset */
+        const int    *n_pno_arr,
+        const int    *n_domain_arr,
+        double       *D_flat,
+        const long   *D_offsets,
+        const size_t  N)
+{
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0, neg_one = -1.0;
+    const int int_one = 1;
+
+#pragma omp parallel for schedule(dynamic, 1)
+    for (size_t p = 0; p < N; p++) {
+        const int n_pno    = n_pno_arr[p];
+        int int_npno2      = n_pno * n_pno;
+        int int_n_pno      = n_pno;
+        int int_n_domain   = n_domain_arr[p];
+        double *D_out = D_flat + D_offsets[p];
+        if (n_pno == 0) continue;
+
+        const double *kt_base = kt_sel[p] ? kt_flat_j : kt_flat_i;
+        const double *K_tilde_chem = kt_base + K_tilde_chem_offsets[p];
+        const double *M_static = M_static_flat + M_static_offsets[p];
+        const double *t1       = t1_master + t1_offsets[p];
+        const double *T1_rows  = t1_master + T1_rows_offsets[p];
+
+        double *part1 = (double *)malloc(sizeof(double) * (size_t)int_npno2);
+        double *part2 = (double *)malloc(sizeof(double) * (size_t)int_npno2);
+
+        memset(D_out, 0, sizeof(double) * (size_t)int_npno2);
+
+        dgemv_(&T_flag, &int_n_pno, &int_npno2,
+               &one, K_tilde_chem, &int_n_pno,
+               t1, &int_one,
+               &zero, part1, &int_one);
+
+        dgemv_(&N_flag, &int_npno2, &int_n_pno,
+               &one, K_tilde_chem, &int_npno2,
+               t1, &int_one,
+               &zero, part2, &int_one);
+
+        for (int a = 0; a < n_pno; a++) {
+            for (int b = 0; b < n_pno; b++) {
+                D_out[a * n_pno + b] +=
+                    2.0 * part1[b * n_pno + a] - part2[b * n_pno + a];
+            }
+        }
+
+        dgemm_(&N_flag, &T_flag,
+               &int_n_pno, &int_n_pno, &int_n_domain,
+               &neg_one, M_static, &int_n_pno,
+               T1_rows, &int_n_pno,
+               &one, D_out, &int_n_pno);
+
+        free(part1);
+        free(part2);
+    }
+}

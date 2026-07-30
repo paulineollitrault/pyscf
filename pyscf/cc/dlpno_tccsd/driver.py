@@ -70,9 +70,16 @@ def _malloc_trim():
 
 
 def _log_mem(label):
-    """Print [MEM/<label>] RSS=X GiB tmpfs=Y GiB if DLPNO_MEM_PROBE=1."""
+    """Print [MEM/<label>] RSS=X GiB tmpfs=Y GiB if DLPNO_MEM_PROBE=1.
+    Each line also carries dt=<seconds since previous _log_mem call> so the
+    probe doubles as a coarse phase profiler between markers."""
     if not _os.environ.get('DLPNO_MEM_PROBE'):
         return
+    import time as _t_mod
+    _now = _t_mod.perf_counter()
+    _prev = getattr(_log_mem, '_last_t', None)
+    _log_mem._last_t = _now
+    _dt = f' dt={_now - _prev:.2f}s' if _prev is not None else ''
     try:
         with open('/proc/self/status') as _f:
             _txt = _f.read()
@@ -88,7 +95,7 @@ def _log_mem(label):
         _tmpfs = (_st.f_blocks - _st.f_bfree) * _st.f_frsize // (1024 ** 2)
         print(f'  [MEM/{label}] RSS={_rss/1024:.2f} GiB '
               f'(anon={_anon/1024:.2f} file={_file/1024:.2f}) '
-              f'tmpfs={_tmpfs/1024:.2f} GiB', flush=True)
+              f'tmpfs={_tmpfs/1024:.2f} GiB{_dt}', flush=True)
     except Exception:
         pass
 
@@ -1015,6 +1022,16 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
             _shared_pool.shutdown(wait=True)
         log.info('E(T) external = %.15g', e_t)
         print(f'  Stage 6 wall time: {_t_triples:.2f} s', flush=True)
+        if _os.environ.get('DLPNO_TRIPLE_PROF') == '1':
+            import ctypes as _ct_tp
+            from pyscf import lib as _plib_tp
+            _ltc = _plib_tp.load_library('libcc')
+            _tpf = (_ct_tp.c_double * 12)()
+            _ltc.DLPNOtriples_prof_get(_tpf)
+            _tpn = ['tno', 'aux_jhi', 'df', 'u_cache', 't2_block', 'K_ab',
+                    'K_ooov', 'K_for_V', 't1_lmo', 'w3_marshal', 'w3_kernel', 'df_qvv']
+            print('  [TRIPLE_PROF] thread-sec: ' + ' '.join(
+                f'{n}={v:.0f}' for n, v in zip(_tpn, _tpf)), flush=True)
 
     # ------------------------------------------------------------------
     # Total energy
@@ -1026,8 +1043,32 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
     # e_mp2_prescreened: SC-MP2 contribution from pairs eliminated at the
     # crude SC-MP2 prescreen step BEFORE LMP2 iteration (Psi4's
     # "Crude Prescreening" eliminated pairs).
+    # PNO truncation correction (Psi4 ccsd.cc:2929 `+ de_pno_total_`):
+    # MP2-level pair energy lost to PNO truncation, per pair.  Strong
+    # pairs carry both truncation stages ('de_pno'); weak pairs (whose
+    # MP2 energy is evaluated pre-stage-2) only stage 1 ('de_pno_p1').
+    # The reference implementations include this term; the port
+    # historically dropped it.  DLPNO_PNO_CORRECTION=0 restores the old
+    # (uncorrected) energies.
+    e_pno_corr = 0.0
+    if _os.environ.get('DLPNO_PNO_CORRECTION', '1') != '0':
+        for _pk in strong_pairs:
+            _pd = pno_spaces.get(_pk)
+            if _pd is None:
+                continue
+            _de = _pd.get('de_pno', 0.0)
+            e_pno_corr += _de * (1.0 if _pk[0] == _pk[1] else 2.0)
+        for _pk in weak_pairs:
+            _pd = pno_spaces.get(_pk)
+            if _pd is None:
+                continue
+            _de = _pd.get('de_pno_p1', 0.0)
+            e_pno_corr += _de * (1.0 if _pk[0] == _pk[1] else 2.0)
+        print(f'  PNO truncation correction: {e_pno_corr:.8f} Eh',
+              flush=True)
+
     e_total = (mf.e_tot + e_tccsd + e_lmp2_weak + e_lmp2_negligible
-               + e_mp2_prescreened + e_t)
+               + e_mp2_prescreened + e_t + e_pno_corr)
     print(f'  Crude prescreen SC-MP2 correction: '
           f'{e_mp2_prescreened:.6e} Eh', flush=True)
 
@@ -1048,6 +1089,7 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
         'e_mp2_prescreened': e_mp2_prescreened,
         'e_tccsd':      e_tccsd,
         'e_t':          e_t,
+        'e_pno_corr':   e_pno_corr,
         'e_total':      e_total,
         # Timings (wall time in seconds)
         't_localization': _t_loc,

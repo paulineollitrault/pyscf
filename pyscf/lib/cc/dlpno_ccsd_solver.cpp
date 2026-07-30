@@ -126,6 +126,35 @@ extern "C" void DLPNObe_kernel_gathered(
     const long *idx,
     double *out_B, double *out_E,
     size_t N, size_t n_ij, size_t n_kl,
+    int uk_hoisted,
+    int num_threads);
+
+extern "C" void DLPNObe_kernel_gathered_v3(
+    const double *S_master, const long *S_off,
+    const double *T_master, const long *T_off,
+    const double *K_master, const long *K_off,
+    const double *beta_kl, const double *beta_lk,
+    const unsigned char *same, const long *idx,
+    double *out_B, double *out_E,
+    size_t N, size_t n_ij, size_t n_kl,
+    size_t n_slots,
+    int uk_hoisted,
+    const double *scr_t2n, const double *scr_ukn, double scr_tau,
+    int num_threads);
+
+extern "C" void DLPNObe_kernel_slotcat(
+    const double *S_cat,
+    const double *T_master, const double *UK_master,
+    const long *T_off, const int *item_nkl, const long *item_k0,
+    const unsigned char *same,
+    const double *beta0_kl, const double *beta0_lk,
+    const int *p_ij, const int *dense_k, const int *dense_l,
+    const double *B_tilde_flat, const long *b_tilde_off,
+    const int *nlmo_arr,
+    const long *slot_ptr, const long *slot_scat_off,
+    const long *slot_KT, const int *slot_nij, const long *slot_out_off,
+    double *out_B, double *out_E,
+    size_t n_slots, int max_nkl, int max_nij, long hcap,
     int num_threads);
 
 extern "C" void DLPNOc_term_batched(
@@ -168,7 +197,50 @@ extern "C" void DLPNOt4_kernel_batched(
     double *tmp3_scratch, size_t tmp3_stride,
     double *tiles_flat,
     double scale,
+    const double *bound,
+    double tau,
     int num_threads);
+
+extern "C" void DLPNOt3_kernel_fused(
+    int N, const int *n_kl_arr, const int *n_ki_arr,
+    const long *K_off, const long *S_off,
+    const long *t1i_off, const long *T1l_off,
+    const double *K_flat, const double *S_flat, const double *t1_flat,
+    double *Kt1_scratch, size_t Kt1_stride,
+    double *Kt1_ki_scratch, size_t Kt1_ki_stride,
+    const int *targets, const long *dst_off, double *dst_flat,
+    size_t n_slots, int num_threads);
+
+extern "C" void DLPNOt4_kernel_fused(
+    int N, const int *n_ki_arr, const int *n_li_arr, const int *n_kl_arr,
+    const long *S_ki_li_off, const long *t2_off, const long *S_li_kl_off,
+    const long *K_off, const long *S_kl_ki_off,
+    const double *S_ki_li_flat, const double *S_li_kl_flat,
+    const double *K_flat, const double *S_kl_ki_flat, const double *t2_flat,
+    double *tmp1_scratch, size_t tmp1_stride,
+    double *tmp2_scratch, size_t tmp2_stride,
+    double *tmp3_scratch, size_t tmp3_stride,
+    double scale, const double *bound, double tau,
+    const int *targets, const long *dst_off, double *dst_flat,
+    size_t n_slots, int num_threads);
+
+extern "C" void DLPNOcompute_C_tilde_ph1_batched_v2(
+    const double *kt_flat_i, const double *kt_flat_j,
+    const unsigned char *kt_sel, const long *K_tilde_chem_offsets,
+    const double *K_bar_chem_flat, const long *K_bar_chem_offsets,
+    const double *t1_master, const long *t1_ki_offsets,
+    const long *T1_local_offsets,
+    const int *n_pno_arr, const int *n_domain_arr,
+    double *C_flat, const long *C_offsets, size_t N);
+
+extern "C" void DLPNOcompute_D_tilde_ph1_batched_v2(
+    const double *kt_flat_i, const double *kt_flat_j,
+    const unsigned char *kt_sel, const long *K_tilde_chem_offsets,
+    const double *M_static_flat, const long *M_static_offsets,
+    const double *t1_master, const long *t1_offsets,
+    const long *T1_rows_offsets,
+    const int *n_pno_arr, const int *n_domain_arr,
+    double *D_flat, const long *D_offsets, size_t N);
 
 extern "C" void DLPNOg_term_batched(
     int N,
@@ -603,6 +675,14 @@ struct BEInputs {
     const long          *S_off;      // (N,) element offset into S_master
     const long          *T_off;      // (N,) element offset into T_master
     const long          *K_off;      // (N,) element offset into K_master
+    // UK hoist: when set, K_master/K_off point at the per-cycle UK master
+    // (T2 canonical layout) and the kernel skips its internal UK build.
+    int                  uk_hoisted;
+    // BE magnitude screening (v3 path only): per-item ||T_kl|| and ||UK_kl||
+    // norms; kernel tests (|bkl|+|blk|)*t2n + ukn < tau with FRESH betas.
+    const double        *scr_t2n;
+    const double        *scr_ukn;
+    double               scr_tau;
 };
 
 struct BEOutputs {
@@ -740,6 +820,8 @@ struct T4Inputs {
     int max_n_ki;
     int max_n_li;
     int max_n_kl;
+    const double *bound;   /* per-item screening bound; NULL = off */
+    double tau;            /* screening threshold */
 };
 
 struct T4Outputs {
@@ -934,6 +1016,34 @@ struct RunCycleInputs {
     // D_tilde_flat at the start of CD step (replacing PySCF dict gather).
     const int *c_term_ct_ord_pair_idx;
     const int *d_term_dt_ord_pair_idx;
+
+    // -- BE slot-cat (cross-bucket slot-sorted kernel; DLPNO_BE_SLOTCAT).
+    // When bes_S_cat is non-null, Phase A.2 runs DLPNObe_kernel_slotcat
+    // ONCE over all items (pre-sorted by global output slot) instead of
+    // the serial per-bucket loop + beta refresh.  Betas are read from
+    // B_tilde_flat in-kernel.  All arrays are cycle-invariant except the
+    // T2/UK masters, whose buffers are stable across cycles.
+    const double *bes_S_cat;
+    const double *bes_T_master;
+    const double *bes_UK_master;
+    const int64_t *bes_T_off;
+    const int *bes_item_nkl;
+    const int64_t *bes_item_k0;
+    const unsigned char *bes_same;
+    const double *bes_beta0_kl;
+    const double *bes_beta0_lk;
+    const int *bes_p_ij;
+    const int *bes_dense_k;
+    const int *bes_dense_l;
+    const int64_t *bes_slot_ptr;
+    const int64_t *bes_slot_scat_off;
+    const int64_t *bes_slot_KT;
+    const int *bes_slot_nij;
+    const int64_t *bes_slot_out_off;
+    int64_t bes_n_slots;
+    int bes_max_nkl;
+    int bes_max_nij;
+    int64_t bes_hcap;
 };
 
 struct RunCycleOutputs {
@@ -1456,10 +1566,39 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
     // D_tilde_flat, accumulating per-item tiles to the targeted ordered
     // pair's slot.  PySCF residual.py:_run_t34_batched scatter is += tile
     // (sign absorbed in the kernel via -T1l for t3; t4_scale for t4).
+    static const bool _t34_fused = [](){
+        const char *e = std::getenv("DLPNO_T34_FUSED");
+        return !(e != nullptr && e[0] == '0');   // default ON
+    }();
     auto _scatter_t3_into = [&](const T3Inputs *t3p, const int *targets,
                                   std::vector<double> &dst_flat) {
         if (t3p == nullptr || targets == nullptr) return;
         const int N_t = t3p->N;
+        if (_t34_fused) {
+            // Fused path: accumulate directly into dst_flat, grouped by
+            // target — no tiles staging (was ~90% of p6b wall).
+            int nt = 1;
+            #ifdef _OPENMP
+                nt = solver_team_size();
+                if (N_t > 0 && nt > N_t) nt = N_t;
+            #endif
+            const size_t Kt1_stride = (size_t)t3p->max_n_kl;
+            const size_t Kt1_ki_stride = (size_t)t3p->max_n_ki;
+            std::vector<double> Kt1_sc((size_t)nt * Kt1_stride);
+            std::vector<double> Kt1_ki_sc((size_t)nt * Kt1_ki_stride);
+            DLPNOt3_kernel_fused(
+                N_t,
+                (const int *)t3p->n_kl_arr, (const int *)t3p->n_ki_arr,
+                (const long *)t3p->K_off, (const long *)t3p->S_off,
+                (const long *)t3p->t1i_off, (const long *)t3p->T1l_off,
+                t3p->K_flat, t3p->S_flat, t3p->t1_flat,
+                Kt1_sc.data(), Kt1_stride,
+                Kt1_ki_sc.data(), Kt1_ki_stride,
+                targets, (const long *)ord_npno2_off.data(),
+                dst_flat.data(), ord_npno2_off.size(),
+                nt);
+            return;
+        }
         const int64_t *tile_off = (const int64_t *)t3p->tile_off;
         const int *n_ki_arr = (const int *)t3p->n_ki_arr;
         std::vector<double> tiles((size_t)tile_off[N_t], 0.0);
@@ -1493,6 +1632,33 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                                   std::vector<double> &dst_flat) {
         if (t4p == nullptr || targets == nullptr) return;
         const int N_t = t4p->N;
+        if (_t34_fused) {
+            int nt = 1;
+            #ifdef _OPENMP
+                nt = solver_team_size();
+                if (N_t > 0 && nt > N_t) nt = N_t;
+            #endif
+            const size_t s1 = (size_t)t4p->max_n_ki * t4p->max_n_li;
+            const size_t s2 = (size_t)t4p->max_n_ki * t4p->max_n_kl;
+            std::vector<double> t1_sc((size_t)nt * s1);
+            std::vector<double> t2_sc((size_t)nt * s2);
+            std::vector<double> t3_sc((size_t)nt * s2);
+            DLPNOt4_kernel_fused(
+                N_t,
+                (const int *)t4p->n_ki_arr, (const int *)t4p->n_li_arr,
+                (const int *)t4p->n_kl_arr,
+                (const long *)t4p->S_ki_li_off, (const long *)t4p->t2_off,
+                (const long *)t4p->S_li_kl_off, (const long *)t4p->K_off,
+                (const long *)t4p->S_kl_ki_off,
+                t4p->S_ki_li_flat, t4p->S_li_kl_flat,
+                t4p->K_flat, t4p->S_kl_ki_flat, t4p->t2_flat,
+                t1_sc.data(), s1, t2_sc.data(), s2, t3_sc.data(), s2,
+                t4p->scale, t4p->bound, t4p->tau,
+                targets, (const long *)ord_npno2_off.data(),
+                dst_flat.data(), ord_npno2_off.size(),
+                nt);
+            return;
+        }
         const int64_t *tile_off = (const int64_t *)t4p->tile_off;
         const int *n_ki_arr = (const int *)t4p->n_ki_arr;
         std::vector<double> tiles((size_t)tile_off[N_t], 0.0);
@@ -1759,6 +1925,42 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             flat_E.assign((size_t)total_flat, 0.0);
             have_be = true;
 
+            // BE slot-cat fast path: one cross-bucket kernel, betas read
+            // from B_tilde_flat in-kernel (replaces refresh + bucket loop).
+            static const bool _bes_enabled = [](){
+                const char *e = std::getenv("DLPNO_BE_SLOTCAT");
+                return !(e != nullptr && e[0] == '0');   // default ON
+            }();
+            const bool use_bes = _bes_enabled
+                && plans->bes_S_cat != nullptr
+                && plans->bes_n_slots > 0;
+            if (use_bes) {
+                int nt = 1;
+#ifdef _OPENMP
+                nt = solver_team_size();
+#endif
+                DLPNObe_kernel_slotcat(
+                    plans->bes_S_cat,
+                    plans->bes_T_master, plans->bes_UK_master,
+                    (const long *)plans->bes_T_off,
+                    plans->bes_item_nkl,
+                    (const long *)plans->bes_item_k0,
+                    plans->bes_same,
+                    plans->bes_beta0_kl, plans->bes_beta0_lk,
+                    plans->bes_p_ij, plans->bes_dense_k, plans->bes_dense_l,
+                    B_tilde_flat.data(),
+                    (const long *)b_tilde_off.data(), nlmo_arr.data(),
+                    (const long *)plans->bes_slot_ptr,
+                    (const long *)plans->bes_slot_scat_off,
+                    (const long *)plans->bes_slot_KT,
+                    plans->bes_slot_nij,
+                    (const long *)plans->bes_slot_out_off,
+                    flat_B.data(), flat_E.data(),
+                    (size_t)plans->bes_n_slots,
+                    plans->bes_max_nkl, plans->bes_max_nij,
+                    (long)plans->bes_hcap, nt);
+            }
+
             // BE-bucket beta_kl/lk refresh from native B_tilde_flat.  The
             // dict-extracted values were populated at pack time from
             // cycle-0 B_tilde and are stale for cycle 1+.  Phase 5 rebuilt
@@ -1767,6 +1969,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
             // dense_l_arr (LMO-domain indices into the pair's nlmo basis).
             // Each bucket's beta_kl/beta_lk arrays are distinct memory; the
             // refresh is read-only on shared B_tilde_flat → trivially parallel.
+            if (!use_bes) {
             #pragma omp parallel for schedule(dynamic, 1)
             for (int b = 0; b < plans->be_n_buckets; ++b) {
                 const BEInputs *bucket = &plans->be_plan_buckets[b];
@@ -1838,6 +2041,7 @@ void DLPNOCCSDSolver::run_one_cycle(const RunCycleInputs *plans,
                     run_phase_be_into(bucket, &out);
                 }
             }
+            }   // !use_bes
             // BE per-pair scatter is fused below (Phase B).
         }
         _tick(&_t_r2_be);
@@ -2828,6 +3032,8 @@ void DLPNOCCSDSolver::run_phase_t4_into(
         tmp3_sc.data(), tmp3_stride,
         out->tiles_flat,
         plan->scale,
+        plan->bound,
+        plan->tau,
         num_threads);
 }
 
@@ -2930,15 +3136,35 @@ void DLPNOCCSDSolver::run_phase_be_into(
     #endif
     if (plan->S_master != nullptr && plan->T_master != nullptr
             && plan->K_master != nullptr) {
-        DLPNObe_kernel_gathered(
-            plan->S_master, plan->S_off,
-            plan->T_master, plan->T_off,
-            plan->K_master, plan->K_off,
-            plan->beta_kl, plan->beta_lk,
-            plan->same, plan->idx,
-            out->out_B, out->out_E,
-            (size_t)plan->N, (size_t)plan->n_ij, (size_t)plan->n_kl,
-            num_threads);
+        static const bool _be_g_v3 = [](){
+            const char *e = std::getenv("DLPNO_BE_GATHERED_V3");
+            return !(e != nullptr && e[0] == '0');   // default ON
+        }();
+        if (_be_g_v3) {
+            DLPNObe_kernel_gathered_v3(
+                plan->S_master, plan->S_off,
+                plan->T_master, plan->T_off,
+                plan->K_master, plan->K_off,
+                plan->beta_kl, plan->beta_lk,
+                plan->same, plan->idx,
+                out->out_B, out->out_E,
+                (size_t)plan->N, (size_t)plan->n_ij, (size_t)plan->n_kl,
+                (size_t)plan->n_slots,
+                plan->uk_hoisted,
+                plan->scr_t2n, plan->scr_ukn, plan->scr_tau,
+                num_threads);
+        } else {
+            DLPNObe_kernel_gathered(
+                plan->S_master, plan->S_off,
+                plan->T_master, plan->T_off,
+                plan->K_master, plan->K_off,
+                plan->beta_kl, plan->beta_lk,
+                plan->same, plan->idx,
+                out->out_B, out->out_E,
+                (size_t)plan->N, (size_t)plan->n_ij, (size_t)plan->n_kl,
+                plan->uk_hoisted,
+                num_threads);
+        }
     } else {
         DLPNObe_kernel(
             plan->S, plan->T, plan->K,
@@ -3118,9 +3344,118 @@ void DLPNOCCSDSolver::run_phase_t1_fock_finalize_into(
     }
 }
 
+namespace {
+// Phase-6 alias caches: every quantity here is CYCLE-INVARIANT for a given
+// run (offsets/selectors/M derive from static pair structure and static
+// integrals).  Keyed on the kt_i master pointer + N; single-threaded access
+// (run_one_cycle is called serially per cycle).
+struct Ph1AliasCache {
+    const double *key_data = nullptr;
+    long key_N = -1;
+    std::vector<int> n_pno, n_domain;
+    bool shared_built = false;
+    std::vector<unsigned char> c_sel;
+    std::vector<long> c_kt_off, c_kbc_off, c_t1_off, c_T1l_off;
+    bool c_built = false;
+    std::vector<unsigned char> d_sel;
+    std::vector<long> d_kt_off, d_M_off, d_t1_off, d_T1r_off;
+    std::vector<double> d_M;
+    bool d_built = false;
+};
+Ph1AliasCache g_ph1_cache;
+
+bool ph1_alias_enabled() {
+    static const bool on = [](){
+        const char *e = std::getenv("DLPNO_PH1_ALIAS");
+        return !(e != nullptr && e[0] == '0');   // default ON
+    }();
+    return on;
+}
+}  // namespace
+
 void DLPNOCCSDSolver::run_phase_d_tilde_ph1_into(DTildeOutputs *out) {
     const int N = in_.n_ordered_pairs;
     const int nocc = in_.nocc;
+
+    if (ph1_alias_enabled()) {
+        Ph1AliasCache &C = g_ph1_cache;
+        if (C.key_data != in_.K_tilde_chem_i.data || C.key_N != (long)N) {
+            C = Ph1AliasCache();
+            C.key_data = in_.K_tilde_chem_i.data;
+            C.key_N = (long)N;
+        }
+        if (!C.d_built) {
+            C.d_sel.resize(N); C.d_kt_off.resize(N);
+            C.d_M_off.assign(N + 1, 0);
+            C.d_t1_off.assign(N, 0); C.d_T1r_off.assign(N, 0);
+            if (!C.shared_built) {
+                C.n_pno.resize(N); C.n_domain.resize(N);
+            }
+            for (int o = 0; o < N; ++o) {
+                const int i = in_.ordered_pair_i_idx[o];
+                const int k = in_.ordered_pair_k_idx[o];
+                const int p = in_.i_j_to_ij[i * nocc + k];
+                const int can_i = in_.ij_to_i_j[2 * p];
+                const bool is_weak = (in_.is_strong_pair != nullptr
+                                       && p >= 0
+                                       && in_.is_strong_pair[p] == 0);
+                const int npno = is_weak ? 0 : in_.n_pno_per_pair[p];
+                const long lmo_off = in_.pair_lmo_idx_offsets[p];
+                const int nlmo = is_weak ? 0
+                    : (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+                if (!C.shared_built) {
+                    C.n_pno[o] = npno; C.n_domain[o] = nlmo;
+                }
+                C.d_M_off[o + 1] = C.d_M_off[o] + (long)nlmo * npno;
+                if (npno == 0) { C.d_sel[o] = 0; C.d_kt_off[o] = 0; continue; }
+                C.d_sel[o] = (can_i == k) ? 0 : 1;
+                const FlatPairStore &kt = C.d_sel[o]
+                    ? in_.K_tilde_chem_j : in_.K_tilde_chem_i;
+                C.d_kt_off[o] = kt.offsets[p];
+                const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
+                int i_in_p = -1;
+                for (int kk = 0; kk < nlmo; ++kk) {
+                    if (lmo_list[kk] == i) { i_in_p = kk; break; }
+                }
+                const long t1_block = in_.T1_in_pair.block_start
+                    ? in_.T1_in_pair.block_start[p]
+                    : in_.T1_in_pair.offsets[p];
+                C.d_t1_off[o]  = t1_block + (long)i_in_p * npno;
+                C.d_T1r_off[o] = t1_block;
+            }
+            C.shared_built = true;
+            // M_static = 2*K_bar(orientation) - K_bar_chem — static.
+            C.d_M.resize((size_t)C.d_M_off[N]);
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int o = 0; o < N; ++o) {
+                const int npno = C.n_pno[o];
+                if (npno == 0) continue;
+                const int i = in_.ordered_pair_i_idx[o];
+                const int k = in_.ordered_pair_k_idx[o];
+                const int p = in_.i_j_to_ij[i * nocc + k];
+                const int can_i = in_.ij_to_i_j[2 * p];
+                const FlatPairStore &kb = (can_i == i)
+                    ? in_.K_bar_ij : in_.K_bar_ji;
+                const double *Kb = fps_ptr(kb, p);
+                const double *Kc = fps_ptr(in_.K_bar_chem, p);
+                double *M = C.d_M.data() + C.d_M_off[o];
+                const long mn = (long)C.n_domain[o] * npno;
+                for (long e = 0; e < mn; ++e) {
+                    M[e] = 2.0 * Kb[e] - Kc[e];
+                }
+            }
+            C.d_built = true;
+        }
+        DLPNOcompute_D_tilde_ph1_batched_v2(
+            in_.K_tilde_chem_i.data, in_.K_tilde_chem_j.data,
+            C.d_sel.data(), C.d_kt_off.data(),
+            C.d_M.data(), C.d_M_off.data(),
+            in_.T1_in_pair.data, C.d_t1_off.data(), C.d_T1r_off.data(),
+            C.n_pno.data(), C.n_domain.data(),
+            out->D_tilde.data, (const long *)out->D_tilde.offsets,
+            (size_t)N);
+        return;
+    }
 
     // Per-ordered-pair sizing + canonical mapping.
     std::vector<int> can_p_arr(N);
@@ -3258,6 +3593,68 @@ void DLPNOCCSDSolver::run_phase_g_tilde_inner_into(
 void DLPNOCCSDSolver::run_phase_c_tilde_ph1_into(CTildeOutputs *out) {
     const int N = in_.n_ordered_pairs;
     const int nocc = in_.nocc;
+
+    if (ph1_alias_enabled()) {
+        Ph1AliasCache &C = g_ph1_cache;
+        if (C.key_data != in_.K_tilde_chem_i.data || C.key_N != (long)N) {
+            C = Ph1AliasCache();
+            C.key_data = in_.K_tilde_chem_i.data;
+            C.key_N = (long)N;
+        }
+        if (!C.c_built) {
+            C.c_sel.resize(N); C.c_kt_off.resize(N);
+            C.c_kbc_off.assign(N, 0);
+            C.c_t1_off.assign(N, 0); C.c_T1l_off.assign(N, 0);
+            if (!C.shared_built) {
+                C.n_pno.resize(N); C.n_domain.resize(N);
+            }
+            for (int o = 0; o < N; ++o) {
+                const int a = in_.ordered_pair_i_idx[o];
+                const int b = in_.ordered_pair_k_idx[o];
+                const int p = in_.i_j_to_ij[a * nocc + b];
+                const int can_a = in_.ij_to_i_j[2 * p];
+                const bool is_weak = (in_.is_strong_pair != nullptr
+                                       && p >= 0
+                                       && in_.is_strong_pair[p] == 0);
+                const int npno = is_weak ? 0 : in_.n_pno_per_pair[p];
+                const long lmo_off = in_.pair_lmo_idx_offsets[p];
+                const int nlmo = is_weak ? 0
+                    : (int)(in_.pair_lmo_idx_offsets[p + 1] - lmo_off);
+                if (!C.shared_built) {
+                    C.n_pno[o] = npno; C.n_domain[o] = nlmo;
+                }
+                if (npno == 0) { C.c_sel[o] = 0; C.c_kt_off[o] = 0; continue; }
+                C.c_sel[o] = (can_a == a) ? 0 : 1;
+                const FlatPairStore &kt = C.c_sel[o]
+                    ? in_.K_tilde_chem_j : in_.K_tilde_chem_i;
+                C.c_kt_off[o] = kt.offsets[p];
+                C.c_kbc_off[o] = in_.K_bar_chem.block_start
+                    ? in_.K_bar_chem.block_start[p]
+                    : in_.K_bar_chem.offsets[p];
+                const int *lmo_list = in_.pair_lmo_idx_flat + lmo_off;
+                int i_in_p = -1;
+                for (int kk = 0; kk < nlmo; ++kk) {
+                    if (lmo_list[kk] == b) { i_in_p = kk; break; }
+                }
+                const long t1_block = in_.T1_in_pair.block_start
+                    ? in_.T1_in_pair.block_start[p]
+                    : in_.T1_in_pair.offsets[p];
+                C.c_t1_off[o]  = t1_block + (long)i_in_p * npno;
+                C.c_T1l_off[o] = t1_block;
+            }
+            C.shared_built = true;
+            C.c_built = true;
+        }
+        DLPNOcompute_C_tilde_ph1_batched_v2(
+            in_.K_tilde_chem_i.data, in_.K_tilde_chem_j.data,
+            C.c_sel.data(), C.c_kt_off.data(),
+            in_.K_bar_chem.data, C.c_kbc_off.data(),
+            in_.T1_in_pair.data, C.c_t1_off.data(), C.c_T1l_off.data(),
+            C.n_pno.data(), C.n_domain.data(),
+            out->C_tilde.data, (const long *)out->C_tilde.offsets,
+            (size_t)N);
+        return;
+    }
 
     std::vector<int> can_p_arr(N);
     std::vector<int> n_pno_arr(N), n_domain_arr(N);

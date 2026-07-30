@@ -37,6 +37,37 @@
 #include <stdlib.h>
 #include <string.h>
 #include "vhf/fblas.h"
+#include <time.h>
+
+/* In-kernel step attribution (DLPNO_CENTERQ_PROF=1): nanosecond
+ * accumulators summed across all pool threads via relaxed atomics.
+ * Slots: 0=s1 scatter, 1=s2 iv/jv, 2=s3 ma, 3=s5 gather, 4=s5 dgemm,
+ * 5=s4 raw_ab.  Read+reset from Python via DLPNOcenterQ_prof_get. */
+static long _cq_prof_ns[8];
+static int _cq_prof_on = -1;
+
+static inline double _cq_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + 1e-9 * ts.tv_nsec;
+}
+
+static inline void _cq_add(int slot, double t0)
+{
+    if (_cq_prof_on > 0) {
+        long dns = (long)((_cq_now() - t0) * 1e9);
+        __atomic_fetch_add(&_cq_prof_ns[slot], dns, __ATOMIC_RELAXED);
+    }
+}
+
+void DLPNOcenterQ_prof_get(double *out8)
+{
+    for (int i = 0; i < 8; i++) {
+        out8[i] = _cq_prof_ns[i] * 1e-9;
+        _cq_prof_ns[i] = 0;
+    }
+}
 
 static int _dlpno_cmp_long(const void *a, const void *b) {
     long la = *(const long *)a;
@@ -134,6 +165,30 @@ void DLPNOpair_centerQ_step(
     const int has_j = (j_s >= 0);
     const int has_pair_paos = (npp_ij > 0);
 
+    if (_cq_prof_on < 0) {
+        const char *_e = getenv("DLPNO_CENTERQ_PROF");
+        _cq_prof_on = (_e != NULL && _e[0] == '1') ? 1 : 0;
+    }
+    double _t_sec = _cq_prof_on ? _cq_now() : 0.0;
+
+    /* Run-encode ij_u_in_Q once (pair PAO page positions come in
+     * per-atom contiguous stretches): steps 2/3 gathers become run-wise
+     * memcpy instead of per-element loads. */
+    long *ru_u0 = NULL, *ru_s0 = NULL, *ru_ln = NULL;
+    int n_ru = 0;
+    if (has_pair_paos) {
+        ru_u0 = (long *)malloc(sizeof(long) * npp_ij);
+        ru_s0 = (long *)malloc(sizeof(long) * npp_ij);
+        ru_ln = (long *)malloc(sizeof(long) * npp_ij);
+        for (long u = 0; u < (long)npp_ij; ) {
+            long u0 = u, s0 = ij_u_in_Q[u];
+            u++;
+            while (u < (long)npp_ij && ij_u_in_Q[u] == s0 + (u - u0)) u++;
+            ru_u0[n_ru] = u0; ru_s0[n_ru] = s0; ru_ln[n_ru] = u - u0;
+            n_ru++;
+        }
+    }
+
     /* ------------------------------------------------------------------
      * Step 1: raw_io / raw_jo / raw_pair — pure scatter, no BLAS.
      * ------------------------------------------------------------------ */
@@ -167,6 +222,7 @@ void DLPNOpair_centerQ_step(
         }
     }
 
+    _cq_add(0, _t_sec);
     if (!has_pair_paos) return;
 
     const char N_flag = 'N', T_flag = 'T';
@@ -181,6 +237,7 @@ void DLPNOpair_centerQ_step(
      * Stack across Q's: qia_i_stack[Q, u] = qia[atom_pos[Q]][i_s][ij_u_in_Q[u]].
      * Then raw_iv_local = qia_i_stack @ X_ij_slice (nQp, npp_ij) @ (npp_ij, npno).
      * ------------------------------------------------------------------ */
+    _t_sec = _cq_prof_on ? _cq_now() : 0.0;
     if (has_i || has_j) {
         const size_t stack_sz = nQp * npp_ij;
         double *qia_i_stack = (has_i) ? (double *)malloc(sizeof(double) * stack_sz) : NULL;
@@ -194,15 +251,17 @@ void DLPNOpair_centerQ_step(
             if (has_i) {
                 const double *qia_qi = qia_q_ptr + (size_t)i_s * qia_l;
                 double *out = qia_i_stack + q * npp_ij;
-                for (size_t u = 0; u < npp_ij; u++) {
-                    out[u] = qia_qi[ij_u_in_Q[u]];
+                for (int r = 0; r < n_ru; r++) {
+                    memcpy(out + ru_u0[r], qia_qi + ru_s0[r],
+                           sizeof(double) * ru_ln[r]);
                 }
             }
             if (has_j) {
                 const double *qia_qj = qia_q_ptr + (size_t)j_s * qia_l;
                 double *out = qia_j_stack + q * npp_ij;
-                for (size_t u = 0; u < npp_ij; u++) {
-                    out[u] = qia_qj[ij_u_in_Q[u]];
+                for (int r = 0; r < n_ru; r++) {
+                    memcpy(out + ru_u0[r], qia_qj + ru_s0[r],
+                           sizeof(double) * ru_ln[r]);
                 }
             }
         }
@@ -238,6 +297,7 @@ void DLPNOpair_centerQ_step(
         }
         if (qia_i_stack) free(qia_i_stack);
         if (qia_j_stack) free(qia_j_stack);
+        _cq_add(1, _t_sec);
         if (iv_local) free(iv_local);
         if (jv_local) free(jv_local);
     }
@@ -248,6 +308,7 @@ void DLPNOpair_centerQ_step(
      * the LMO axis: qia_k_stack[Q, k, u] then ONE DGEMM gives result
      * (Q, k, a) which is scattered into raw_ma.
      * ------------------------------------------------------------------ */
+    _t_sec = _cq_prof_on ? _cq_now() : 0.0;
     if (n_kept > 0) {
         const size_t stack_sz = nQp * n_kept * npp_ij;
         double *qia_k_stack = (double *)malloc(sizeof(double) * stack_sz);
@@ -260,8 +321,9 @@ void DLPNOpair_centerQ_step(
                 const long lmo_pos = ext_kept_pos[k];
                 const double *qia_qk = qia_q_ptr + (size_t)lmo_pos * qia_l;
                 double *out = qia_k_stack + (q * n_kept + k) * npp_ij;
-                for (size_t u = 0; u < npp_ij; u++) {
-                    out[u] = qia_qk[ij_u_in_Q[u]];
+                for (int r = 0; r < n_ru; r++) {
+                    memcpy(out + ru_u0[r], qia_qk + ru_s0[r],
+                           sizeof(double) * ru_ln[r]);
                 }
             }
         }
@@ -290,16 +352,158 @@ void DLPNOpair_centerQ_step(
 
         free(qia_k_stack);
         free(ma_local);
+        _cq_add(2, _t_sec);
     }
 
     /* ------------------------------------------------------------------
-     * Step 4: raw_ab — pre-gather qab[ij_u_in_Q[*], ij_u_in_Q[*]] for each Q
-     * to (nQp, npp_ij, npp_ij), then per-Q two-step:
-     *   tmp = X.T @ qab_gather              (npno, npp_ij)
-     *   ab  = tmp @ X                        (npno, npno)
-     * Total per Q: 2 small DGEMMs.
+     * Step 5: proj_ij_out[q, a, v_red]
+     *     = sum_u X[u, a] * qab[q, ij_u_in_Q[u], pair_used_in_Q[v_red]]
+     * FULL-ROW path (DLPNO_S5_FULLROW, default ON): both the pair PAO
+     * rows (ij_u_in_Q) and the used columns come in contiguous runs, so
+     * instead of gathering an (npp x n_red) block we dgemm DIRECTLY on
+     * the page's contiguous row-blocks at full width (ld = np_full;
+     * zero copies, streaming reads), accumulating over row-runs, then
+     * run-select the n_red columns of the small (npno x np_full)
+     * result.  Same FLOPs to within np_full/n_red (~1.0-1.1 on compact
+     * systems).  DLPNO_S5_FULLROW=0 restores the gather+dgemm path.
      * ------------------------------------------------------------------ */
-    {
+    if (n_red > 0) {
+        int int_n_red = (int)n_red;
+        static int _s5_fullrow = -1;
+        if (_s5_fullrow < 0) {
+            const char *_e5 = getenv("DLPNO_S5_FULLROW");
+            _s5_fullrow = !(_e5 != NULL && _e5[0] == '0');
+        }
+        double *proj_full = _s5_fullrow
+            ? (double *)malloc(sizeof(double) * npno * np_full) : NULL;
+        double *qab_row_gather = _s5_fullrow ? NULL
+            : (double *)malloc(sizeof(double) * npp_ij * n_red);
+        /* Run-encode pair_used_in_Q once (page-local PAO positions come
+         * in ascending contiguous per-atom stretches). */
+        long *r5_v0 = (long *)malloc(sizeof(long) * n_red);
+        long *r5_s0 = (long *)malloc(sizeof(long) * n_red);
+        long *r5_ln = (long *)malloc(sizeof(long) * n_red);
+        int n_r5 = 0;
+        for (long v = 0; v < (long)n_red; ) {
+            long v0 = v, s0 = pair_used_in_Q[v];
+            v++;
+            while (v < (long)n_red && pair_used_in_Q[v] == s0 + (v - v0)) v++;
+            r5_v0[n_r5] = v0; r5_s0[n_r5] = s0; r5_ln[n_r5] = v - v0;
+            n_r5++;
+        }
+
+        for (size_t q = 0; q < nQp; q++) {
+            const size_t pg = (size_t)atom_pos[q];
+            const double *qab_q_ptr = qab_b + pg * qab_q;
+
+            if (_s5_fullrow) {
+                _t_sec = _cq_prof_on ? _cq_now() : 0.0;
+                int int_np_full = (int)np_full;
+                for (int r = 0; r < n_ru; r++) {
+                    int int_ln = (int)ru_ln[r];
+                    const double bet = (r == 0) ? 0.0 : 1.0;
+                    dgemm_(&N_flag, &T_flag,
+                           &int_np_full, &int_npno, &int_ln,
+                           &one, qab_q_ptr + (size_t)ru_s0[r] * qab_u,
+                           &int_np_full,
+                           X_ij_slice + (size_t)ru_u0[r] * X_row,
+                           &int_npno,
+                           &bet, proj_full, &int_np_full);
+                }
+                _cq_add(4, _t_sec);
+                _t_sec = _cq_prof_on ? _cq_now() : 0.0;
+                double *proj_row_out = proj_ij_out + q * proj_q;
+                for (size_t a = 0; a < npno; a++) {
+                    const double *pf = proj_full + a * np_full;
+                    double *po = proj_row_out + a * n_red;
+                    for (int r = 0; r < n_r5; r++) {
+                        memcpy(po + r5_v0[r], pf + r5_s0[r],
+                               sizeof(double) * r5_ln[r]);
+                    }
+                }
+                _cq_add(3, _t_sec);
+            } else {
+                _t_sec = _cq_prof_on ? _cq_now() : 0.0;
+                for (size_t u = 0; u < npp_ij; u++) {
+                    const double *src_row = qab_q_ptr
+                        + (size_t)ij_u_in_Q[u] * qab_u;
+                    double *dst_row = qab_row_gather + u * n_red;
+                    for (int r = 0; r < n_r5; r++) {
+                        memcpy(dst_row + r5_v0[r], src_row + r5_s0[r],
+                               sizeof(double) * r5_ln[r]);
+                    }
+                }
+                _cq_add(3, _t_sec);
+                _t_sec = _cq_prof_on ? _cq_now() : 0.0;
+                dgemm_(&N_flag, &T_flag,
+                       &int_n_red, &int_npno, &int_npp_ij,
+                       &one, qab_row_gather, &int_n_red,
+                       X_ij_slice, &int_npno,
+                       &zero, proj_ij_out + q * proj_q, &int_n_red);
+                _cq_add(4, _t_sec);
+            }
+        }
+
+        if (qab_row_gather) free(qab_row_gather);
+        if (proj_full) free(proj_full);
+        free(r5_v0); free(r5_s0); free(r5_ln);
+    }
+
+    /* ------------------------------------------------------------------
+     * Step 4 (FUSED with step 5): raw_ab reuses proj.
+     * The pair's own PAOs are a subset of pair_used (the union includes
+     * pair_paos_ij), so step 5's proj[q][a, v_red] already contains the
+     * half-transform X^T @ qab at the pair's own columns:
+     *     tmp[a, u] = proj[q][a, pair_used_inv[ij_u_in_Q[u]]]
+     * raw_ab = tmp @ X then needs only ONE dgemm per Q — the npp x npp
+     * gather and the npp^2 x npno first dgemm are eliminated (exact).
+     * Falls back to the legacy gather path when proj was not computed.
+     * ------------------------------------------------------------------ */
+    /* DLPNO_CENTERQ_FUSE=0 forces the legacy step-4 gather path (kept for
+     * A/B isolation: the fused path won 22% at TZVPP but is suspected of
+     * regressing small-basis runs). */
+    static int _fuse_on = -1;
+    if (_fuse_on < 0) {
+        const char *_e = getenv("DLPNO_CENTERQ_FUSE");
+        _fuse_on = !(_e != NULL && _e[0] == '0');
+    }
+    _t_sec = _cq_prof_on ? _cq_now() : 0.0;
+    if (_fuse_on && n_red > 0 && proj_ij_out != NULL) {
+        double *tmp = (double *)malloc(sizeof(double) * npno * npp_ij);
+        long *red_cols = (long *)malloc(sizeof(long) * npp_ij);
+        /* local page-position -> reduced-index inverse (pair's own PAOs
+         * are guaranteed inside pair_used, so every lookup resolves) */
+        long *inv_loc = (long *)malloc(sizeof(long) * np_full);
+        for (size_t i = 0; i < np_full; i++) inv_loc[i] = -1;
+        for (size_t vr = 0; vr < (size_t)n_red; vr++) {
+            inv_loc[pair_used_in_Q[vr]] = (long)vr;
+        }
+        for (size_t u = 0; u < npp_ij; u++) {
+            red_cols[u] = inv_loc[ij_u_in_Q[u]];
+        }
+        free(inv_loc);
+        for (size_t q = 0; q < nQp; q++) {
+            const size_t row_lq = (size_t)local_Q[q];
+            const double *proj_row = proj_ij_out + q * proj_q;
+            /* tmp[a, u] = proj_row[a, red_cols[u]] (npno x npp column gather) */
+            for (size_t a = 0; a < npno; a++) {
+                const double *pr = proj_row + a * n_red;
+                double *tr = tmp + a * npp_ij;
+                for (size_t u = 0; u < npp_ij; u++) {
+                    tr[u] = pr[red_cols[u]];
+                }
+            }
+            /* ab[a, b] = sum_v tmp[a, v] * X[v, b]  — same BLAS call as legacy */
+            dgemm_(&N_flag, &N_flag,
+                   &int_npno, &int_npno, &int_npp_ij,
+                   &one, X_ij_slice, &int_npno,
+                   tmp, &int_npp_ij,
+                   &zero, raw_ab + row_lq * ab_row, &int_npno);
+        }
+        free(tmp);
+        free(red_cols);
+    } else {
+{
         double *qab_gather = (double *)malloc(sizeof(double) * npp_ij * npp_ij);
         double *tmp = (double *)malloc(sizeof(double) * npno * npp_ij);
 
@@ -347,42 +551,9 @@ void DLPNOpair_centerQ_step(
         free(tmp);
     }
 
-    /* ------------------------------------------------------------------
-     * Step 5: proj_ij_out[q, a, v_red] = sum_u X[u, a] * qab[q, ij_u_in_Q[u], pair_used_in_Q[v_red]]
-     * Per Q: gather qab[ij_u_in_Q[u], pair_used_in_Q[v_red]] → (npp_ij, n_red),
-     *        then proj[a, v_red] = X.T @ qab_gather  (npno, n_red)
-     *
-     * n_red ≤ np_full collapses the v axis to only the PAOs that some
-     * partner actually consumes downstream — eliminates the O(N) np_full
-     * dependency in proj_ij build. The DLPNOpartners_centerQ_step kernel
-     * then reads proj_ij at red positions via pair_used_inv.
-     * ------------------------------------------------------------------ */
-    if (n_red > 0) {
-        int int_n_red = (int)n_red;
-        double *qab_row_gather = (double *)malloc(sizeof(double) * npp_ij * n_red);
+    _cq_add(5, _t_sec);
+    if (ru_u0) { free(ru_u0); free(ru_s0); free(ru_ln); }
 
-        for (size_t q = 0; q < nQp; q++) {
-            const size_t pg = (size_t)atom_pos[q];
-            const double *qab_q_ptr = qab_b + pg * qab_q;
 
-            /* qab_row_gather[u, v_red] = qab[ij_u_in_Q[u], pair_used_in_Q[v_red]] */
-            for (size_t u = 0; u < npp_ij; u++) {
-                const double *src_row = qab_q_ptr + (size_t)ij_u_in_Q[u] * qab_u;
-                double *dst_row = qab_row_gather + u * n_red;
-                for (size_t vr = 0; vr < n_red; vr++) {
-                    dst_row[vr] = src_row[pair_used_in_Q[vr]];
-                }
-            }
-
-            /* dgemm('N', 'T', n_red, npno, npp_ij, 1, qab_row_gather, n_red,
-             *       X, npno, 0, proj_ij_out + q*proj_q, n_red) */
-            dgemm_(&N_flag, &T_flag,
-                   &int_n_red, &int_npno, &int_npp_ij,
-                   &one, qab_row_gather, &int_n_red,
-                   X_ij_slice, &int_npno,
-                   &zero, proj_ij_out + q * proj_q, &int_n_red);
-        }
-
-        free(qab_row_gather);
     }
 }

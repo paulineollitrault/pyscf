@@ -1189,6 +1189,20 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         # absolute offsets.  After the centerQ loop ends, the contents are
         # copied back into the per-k dicts (raw_cross_kj[k] etc.) for the
         # downstream cross_partner kernel to consume.
+        #
+        # AUX-FIRST mode (DLPNO_CROSS_AUXFIRST=1): skip the per-partner
+        # raw_cross build entirely.  The centerQ sweep stores each proj
+        # block; after the local fit the aux axis is contracted ONCE per
+        # block (Psi4 ccsd.cc:1569 ordering) into W/M tensors on the
+        # pair_used PAO axis, and the per-partner J/K become tiny aux-free
+        # dgemms.  Removes the ~20-35x FLOP excess of carrying the aux
+        # axis through every partner transform AND the raw_cross transient.
+        # Default ON since 2026-07-17: every production/bench reference was
+        # measured with this path (verified exact; 3-4x faster cc_ints and
+        # no raw_cross transient).  DLPNO_CROSS_AUXFIRST=0 restores legacy.
+        _auxfirst = _use_centerQ_c and os.environ.get(
+            'DLPNO_CROSS_AUXFIRST', '1') == '1'
+        _replay = []
         if _use_centerQ_c:
             def _build_partner_flat(partner_data, n_partners):
                 if n_partners == 0:
@@ -1262,8 +1276,10 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
             _ki_pdat = [(k, pno_spaces[key]['X_pno'],
                          np.asarray(pno_spaces[key]['pair_paos']), n_ki)
                         for k, key, n_ki in ki_partners]
-            _kj_flat = _build_partner_flat(_kj_pdat, len(kj_partners))
-            _ki_flat = _build_partner_flat(_ki_pdat, len(ki_partners))
+            _kj_flat = (None if _auxfirst else
+                        _build_partner_flat(_kj_pdat, len(kj_partners)))
+            _ki_flat = (None if _auxfirst else
+                        _build_partner_flat(_ki_pdat, len(ki_partners)))
 
         pair_paos_ij = np.asarray(pair_paos_ij)
 
@@ -1528,7 +1544,15 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                 _nao_pao_total = riatom_to_paos_ext_dense.shape[1]
 
                 _t_pn_start = 0.0
-                if _kj_flat is not None and do_proj:
+                if _auxfirst and do_proj and (kj_partners or ki_partners):
+                    # Store this centerQ's proj block + index metadata for
+                    # the post-fit aux-first contraction.  qia pages are
+                    # persistent per-atom stacks — only references kept.
+                    _replay.append((
+                        local_Q_long, _atom_pos_long, centerQ,
+                        _proj_c, _pair_used_in_Q.copy(),
+                        _lmos_dense_at, _paos_dense_at))
+                if (not _auxfirst) and _kj_flat is not None and do_proj:
                     _libcc_centerQ.DLPNOpartners_centerQ_step(
                         _proj_c.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _qia_full.ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1551,7 +1575,7 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         _kj_flat['raw_cross_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                         _kj_flat['raw_kv_flat'].ctypes.data_as(_ctypes_cQ.c_void_p),
                     )
-                if _ki_flat is not None and do_proj:
+                if (not _auxfirst) and _ki_flat is not None and do_proj:
                     _libcc_centerQ.DLPNOpartners_centerQ_step(
                         _proj_c.ctypes.data_as(_ctypes_cQ.c_void_p),
                         _qia_full.ctypes.data_as(_ctypes_cQ.c_void_p),
@@ -1614,19 +1638,53 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         _t_jhi_start = 0.0
         # Apply local J^{-1/2}
         j2c_local = j2c[np.ix_(aux_idx, aux_idx)]
-        eigvals, eigvecs = np.linalg.eigh(j2c_local)
-        keep = eigvals > 1e-14
-        jhi = (eigvecs[:, keep] * (1.0 / np.sqrt(eigvals[keep]))) \
-            @ eigvecs[:, keep].T
+        # Local fit.  Under AUXFIRST use Cholesky (Psi4 ccsd.cc C_DGESV
+        # style): J = L L^T, q = L^{-1} raw.  Every downstream contraction
+        # of the fitted tensors is symmetric in the fit (A^T J^{-1} B), so
+        # L^{-1} is numerically equivalent to the explicit J^{-1/2} while
+        # costing n^3/3 instead of ~11 n^3 (eigh + form + apply).  The
+        # legacy raw_cross path keeps eigh (its C assemble kernel needs the
+        # dense jhi matrix); eigh is also the fallback for near-singular
+        # local metrics.
+        _cho = None
+        jhi = None
+        if _auxfirst and os.environ.get('DLPNO_LOCAL_FIT_CHO', '0') == '1':
+            try:
+                import scipy.linalg as _sla
+                _cho = _sla.cholesky(j2c_local, lower=True,
+                                     check_finite=False)
+            except Exception:
+                _cho = None
+        if _cho is None:
+            eigvals, eigvecs = np.linalg.eigh(j2c_local)
+            keep = eigvals > 1e-14
+            jhi = (eigvecs[:, keep] * (1.0 / np.sqrt(eigvals[keep]))) \
+                @ eigvecs[:, keep].T
 
-        q_iv = jhi @ raw_iv
-        q_jv = jhi @ raw_jv
-        q_io_pfit = jhi @ raw_io                # (n_local, nlmo_p) p_lmos-axis
-        q_jo_pfit = jhi @ raw_jo
-        q_pair = jhi @ raw_pair
-        Qma_pfit = (jhi @ raw_ma.reshape(n_local, -1)
-                    ).reshape(n_local, nlmo_p, npno)
-        Qab = (jhi @ raw_ab.reshape(n_local, -1)).reshape(n_local, npno, npno)
+        if _cho is not None:
+            import scipy.linalg as _sla
+            def _fit_L(x):
+                return _sla.solve_triangular(_cho, x, lower=True,
+                                             check_finite=False)
+            q_iv = _fit_L(raw_iv)
+            q_jv = _fit_L(raw_jv)
+            q_io_pfit = _fit_L(raw_io)          # (n_local, nlmo_p)
+            q_jo_pfit = _fit_L(raw_jo)
+            q_pair = _fit_L(raw_pair)
+            Qma_pfit = _fit_L(raw_ma.reshape(n_local, -1)).reshape(
+                n_local, nlmo_p, npno)
+            Qab = _fit_L(raw_ab.reshape(n_local, -1)).reshape(
+                n_local, npno, npno)
+        else:
+            q_iv = jhi @ raw_iv
+            q_jv = jhi @ raw_jv
+            q_io_pfit = jhi @ raw_io            # (n_local, nlmo_p) p_lmos-axis
+            q_jo_pfit = jhi @ raw_jo
+            q_pair = jhi @ raw_pair
+            Qma_pfit = (jhi @ raw_ma.reshape(n_local, -1)
+                        ).reshape(n_local, nlmo_p, npno)
+            Qab = (jhi @ raw_ab.reshape(n_local, -1)
+                   ).reshape(n_local, npno, npno)
 
         # Working axis = storage axis (pair_lmo_idx). No crop needed —
         # the centerQ loop already populated rows only for LMOs in p_lmos.
@@ -1656,7 +1714,270 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
         # pyscf/lib/cc/dlpno_cross_partner.c). Same math as the per-
         # partner Python loop below; eliminates ~24K Python ctypes
         # dispatches per CCSD run on water-10. ===
-        if _use_centerQ_c and (kj_partners or ki_partners):
+        if _auxfirst and (kj_partners or ki_partners):
+            # === AUX-FIRST cross-partner assembly (Psi4 ccsd.cc:1569
+            # ordering).  Contract the aux axis ONCE per stored proj block:
+            #   W_x[k,a,u] = sum_Q (J^-1 raw_xo)[Q,k] * proj[Q,a,u]
+            #   M_x[k,a,u] = sum_Q (J^-1 raw_xv)[Q,a] * qia[Q,k,u]
+            # (u indexes pair_used_pao_global), then per partner the final
+            # J/K are aux-free dgemms on tiny operands:
+            #   J_ij_kj[k] = W_i[k_loc][:, cols_k] @ X_k
+            #   K_ij_kj[k] = M_i[k_loc][:, cols_k] @ X_k
+            # Numerically identical to the raw_cross path: same contraction,
+            # reordered so the aux index dies before any partner transform.
+            n_red_g = int(pair_used_pao_global.size)
+            # T = J^-1 raw_o, Z = (J^-1 raw_v)^T — via the Cholesky factor
+            # (J^-1 = L^-T L^-1, and q = L^-1 raw is already in hand) or
+            # the dense jhi on the eigh fallback.
+            if _cho is not None:
+                import scipy.linalg as _sla
+                T_i = _sla.solve_triangular(_cho, q_io, lower=True,
+                                            trans='T', check_finite=False)
+                T_j = _sla.solve_triangular(_cho, q_jo, lower=True,
+                                            trans='T', check_finite=False)
+                Z_iv = np.ascontiguousarray(_sla.solve_triangular(
+                    _cho, q_iv, lower=True, trans='T',
+                    check_finite=False).T)
+                Z_jv = np.ascontiguousarray(_sla.solve_triangular(
+                    _cho, q_jv, lower=True, trans='T',
+                    check_finite=False).T)
+            else:
+                T_i = jhi @ q_io      # = J^-1 raw_io   (n_local, nlmo_p)
+                T_j = jhi @ q_jo
+                Z_iv = q_iv.T @ jhi   # = (J^-1 raw_iv)^T  (npno, n_local)
+                Z_jv = q_jv.T @ jhi
+            W_i = np.zeros((nlmo_p, npno, n_red_g))
+            W_j = np.zeros((nlmo_p, npno, n_red_g))
+            M_i = np.zeros((nlmo_p, npno, n_red_g))
+            M_j = np.zeros((nlmo_p, npno, n_red_g))
+            _all_k = np.unique(np.asarray(
+                [k for k, _kk, _n in kj_partners]
+                + [k for k, _kk, _n in ki_partners], dtype=np.int64))
+            _npno_range = np.arange(npno)
+            # Fuse the i/j sides into single dgemms (halves dispatch count).
+            T_ij = np.hstack((T_i, T_j))            # (n_local, 2*nlmo_p)
+            Z_ijv = np.vstack((Z_iv, Z_jv))         # (2*npno, n_local)
+            # nogil gather/scatter kernels: the dgemms release the GIL, but
+            # the fancy-index scatter-adds/gathers around them were the
+            # measured 2/3 of cc_ints at small basis.  Fallback = numpy.
+            try:
+                from pyscf.cc.dlpno_tccsd._wm_scatter_cy import (
+                    scatter_add_lastaxis as _sc_add,
+                    gather_qia as _gq,
+                    scatter_add_rows_lastaxis as _sc_rows)
+            except ImportError:
+                _sc_add = _gq = _sc_rows = None
+            # Native-C replay (DLPNO_WM_REPLAY_C, default ON): one nogil
+            # kernel per pair replicates the replay loop + partner
+            # transforms below exactly — the numpy glue around them held
+            # the GIL 55% of cc_ints wall across the 32-worker pool.
+            _wm_c = (os.environ.get('DLPNO_WM_REPLAY_C', '1') != '0'
+                     and _libcc_centerQ is not None)
+            if _wm_c:
+                import ctypes as _ctwm
+                _n_it = len(_replay)
+                _i_nQp = np.empty(_n_it, dtype=np.int64)
+                _i_nred = np.empty(_n_it, dtype=np.int64)
+                _lq_off = np.zeros(_n_it, dtype=np.int64)
+                _ap_off = np.zeros(_n_it, dtype=np.int64)
+                _pj_off = np.zeros(_n_it, dtype=np.int64)
+                _us_off = np.zeros(_n_it, dtype=np.int64)
+                _page_nl = np.empty(_n_it, dtype=np.int64)
+                _page_np = np.empty(_n_it, dtype=np.int64)
+                _PT = _ctwm.c_void_p * max(_n_it, 1)
+                _page_ptrs = _PT(); _lda_ptrs = _PT(); _pda_ptrs = _PT()
+                _lqs = []; _aps = []; _pjs = []; _uss = []
+                _lqr = _apr = _pjr = _usr = 0
+                for _ii, (_lq, _apos, _cq, _pj, _used, _lda,
+                          _pda) in enumerate(_replay):
+                    _i_nQp[_ii] = _lq.size
+                    _i_nred[_ii] = _used.size
+                    _lq_off[_ii] = _lqr; _lqr += _lq.size
+                    _ap_off[_ii] = _apr; _apr += _apos.size
+                    _pj_off[_ii] = _pjr; _pjr += _pj.size
+                    _us_off[_ii] = _usr; _usr += _used.size
+                    _pg = qia_atom[_cq]
+                    _page_ptrs[_ii] = _pg.ctypes.data
+                    _page_nl[_ii] = _pg.shape[1]
+                    _page_np[_ii] = _pg.shape[2]
+                    _lda_ptrs[_ii] = _lda.ctypes.data
+                    _pda_ptrs[_ii] = _pda.ctypes.data
+                    _lqs.append(_lq); _aps.append(_apos)
+                    _pjs.append(_pj.ravel()); _uss.append(_used)
+                _z64 = np.zeros(0, dtype=np.int64)
+                _lq_flat = np.concatenate(_lqs) if _lqs else _z64
+                _ap_flat = np.concatenate(_aps) if _aps else _z64
+                _pj_flat = (np.concatenate(_pjs) if _pjs
+                            else np.zeros(0))
+                _us_flat = np.concatenate(_uss) if _uss else _z64
+                _pug_c = np.ascontiguousarray(pair_used_pao_global,
+                                              dtype=np.int64)
+
+                def _side_arrays(_partners):
+                    _n = len(_partners)
+                    _kk = np.empty(_n, dtype=np.int64)
+                    _na = np.empty(_n, dtype=np.int64)
+                    _npn = np.empty(_n, dtype=np.int64)
+                    _Xp = (_ctwm.c_void_p * max(_n, 1))()
+                    _pps = []
+                    _ppo = np.zeros(_n, dtype=np.int64)
+                    _jo = np.zeros(_n + 1, dtype=np.int64)
+                    _keep = []
+                    _ppr = 0
+                    for _t, (_k, _key_k, _n_k) in enumerate(_partners):
+                        _pd_k = pno_spaces[_key_k]
+                        _X_k = np.ascontiguousarray(_pd_k['X_pno'])
+                        _pp_k = np.ascontiguousarray(
+                            np.asarray(_pd_k['pair_paos'],
+                                       dtype=np.int64))
+                        _kk[_t] = _k
+                        _na[_t] = _pp_k.size
+                        _npn[_t] = _X_k.shape[1]
+                        _Xp[_t] = _X_k.ctypes.data
+                        _keep.append((_X_k, _pp_k))
+                        _pps.append(_pp_k)
+                        _ppo[_t] = _ppr; _ppr += _pp_k.size
+                        _jo[_t + 1] = _jo[_t] + npno * _X_k.shape[1]
+                    _ppf = np.concatenate(_pps) if _pps else _z64
+                    return (_kk, _na, _npn, _Xp, _ppf, _ppo, _jo, _keep)
+
+                (_kjk, _kjna, _kjnp, _kjX, _kjppf, _kjppo, _kjJo,
+                 _kj_keep) = _side_arrays(kj_partners)
+                (_kik, _kina, _kinp, _kiX, _kippf, _kippo, _kiJo,
+                 _ki_keep) = _side_arrays(ki_partners)
+                _Jkj = np.zeros(int(_kjJo[-1]))
+                _Kkj = np.zeros(int(_kjJo[-1]))
+                _Jki = np.zeros(int(_kiJo[-1]))
+                _Kki = np.zeros(int(_kiJo[-1]))
+                _pld = np.ascontiguousarray(p_lmos_dense,
+                                            dtype=np.int64)
+                _allk_c = np.ascontiguousarray(_all_k, dtype=np.int64)
+                _vp = _ctwm.c_void_p
+                _libcc_centerQ.DLPNOwm_replay_pair(
+                    _ctwm.c_int(_n_it),
+                    _i_nQp.ctypes.data_as(_vp),
+                    _i_nred.ctypes.data_as(_vp),
+                    _lq_flat.ctypes.data_as(_vp),
+                    _lq_off.ctypes.data_as(_vp),
+                    _ap_flat.ctypes.data_as(_vp),
+                    _ap_off.ctypes.data_as(_vp),
+                    _page_ptrs, _page_nl.ctypes.data_as(_vp),
+                    _page_np.ctypes.data_as(_vp),
+                    _pj_flat.ctypes.data_as(_vp),
+                    _pj_off.ctypes.data_as(_vp),
+                    _us_flat.ctypes.data_as(_vp),
+                    _us_off.ctypes.data_as(_vp),
+                    _lda_ptrs, _pda_ptrs,
+                    T_ij.ctypes.data_as(_vp),
+                    Z_ijv.ctypes.data_as(_vp),
+                    _pug_c.ctypes.data_as(_vp),
+                    _ctwm.c_long(int(n_red_g)),
+                    _allk_c.ctypes.data_as(_vp),
+                    _ctwm.c_int(int(_allk_c.size)),
+                    _pld.ctypes.data_as(_vp),
+                    _ctwm.c_int(int(nlmo_p)), _ctwm.c_int(int(npno)),
+                    _ctwm.c_long(int(T_ij.shape[0])),
+                    W_i.ctypes.data_as(_vp), W_j.ctypes.data_as(_vp),
+                    M_i.ctypes.data_as(_vp), M_j.ctypes.data_as(_vp),
+                    _ctwm.c_int(len(kj_partners)),
+                    _kjk.ctypes.data_as(_vp), _kjX,
+                    _kjna.ctypes.data_as(_vp),
+                    _kjnp.ctypes.data_as(_vp),
+                    _kjppf.ctypes.data_as(_vp),
+                    _kjppo.ctypes.data_as(_vp),
+                    _ctwm.c_int(len(ki_partners)),
+                    _kik.ctypes.data_as(_vp), _kiX,
+                    _kina.ctypes.data_as(_vp),
+                    _kinp.ctypes.data_as(_vp),
+                    _kippf.ctypes.data_as(_vp),
+                    _kippo.ctypes.data_as(_vp),
+                    _Jkj.ctypes.data_as(_vp),
+                    _kjJo.ctypes.data_as(_vp),
+                    _Kkj.ctypes.data_as(_vp),
+                    _Jki.ctypes.data_as(_vp),
+                    _kiJo.ctypes.data_as(_vp),
+                    _Kki.ctypes.data_as(_vp),
+                )
+                _replay.clear()
+                J_ij_kj = {}
+                K_ij_kj_dict = {}
+                for _t, (_k, _key_k, _n_k) in enumerate(kj_partners):
+                    _o0, _o1 = int(_kjJo[_t]), int(_kjJo[_t + 1])
+                    _nk = int(_kjnp[_t])
+                    J_ij_kj[(key, _k)] = _Jkj[_o0:_o1].reshape(npno, _nk)
+                    K_ij_kj_dict[(key, _k)] = _Kkj[_o0:_o1].reshape(
+                        npno, _nk)
+                J_ji_ki = {}
+                K_ji_ki_dict = {}
+                for _t, (_k, _key_k, _n_k) in enumerate(ki_partners):
+                    _o0, _o1 = int(_kiJo[_t]), int(_kiJo[_t + 1])
+                    _nk = int(_kinp[_t])
+                    J_ji_ki[(key, _k)] = _Jki[_o0:_o1].reshape(npno, _nk)
+                    K_ji_ki_dict[(key, _k)] = _Kki[_o0:_o1].reshape(
+                        npno, _nk)
+            else:
+                for (_lq, _apos, _cq, _pj, _used, _lda, _pda) in _replay:
+                    _n_red_c = int(_used.size)
+                    _nQp_b = int(_lq.size)
+                    _cols_g = np.ascontiguousarray(
+                        np.searchsorted(pair_used_pao_global, _used))
+                    # J side: ONE dgemm for both i and j kills the aux axis.
+                    _pj2 = _pj.reshape(_nQp_b, -1)
+                    _wij = np.ascontiguousarray((T_ij[_lq].T @ _pj2).reshape(
+                        2, nlmo_p, npno, _n_red_c))
+                    if _sc_add is not None:
+                        _sc_add(W_i, _wij[0], _cols_g)
+                        _sc_add(W_j, _wij[1], _cols_g)
+                    else:
+                        W_i[:, :, _cols_g] += _wij[0]
+                        W_j[:, :, _cols_g] += _wij[1]
+                    # K side: partner-LMO rows x pair_used cols of this atom's
+                    # persistent qia page.
+                    _k_rows = _lda[_all_k]
+                    _kmask = _k_rows >= 0
+                    if not np.any(_kmask):
+                        continue
+                    _ks = _all_k[_kmask]
+                    _krows = np.ascontiguousarray(_k_rows[_kmask])
+                    _pcols = np.ascontiguousarray(_pda[_used])
+                    if _gq is not None:
+                        _sub = np.empty((_nQp_b, _ks.size, _n_red_c))
+                        _gq(qia_atom[_cq], _apos, _krows, _pcols, _sub)
+                    else:
+                        _sub = qia_atom[_cq][np.ix_(_apos, _krows, _pcols)]
+                    _sub2 = _sub.reshape(_nQp_b, -1)
+                    _kl = np.ascontiguousarray(p_lmos_dense[_ks])
+                    # ONE dgemm for both i and j K-sides.
+                    _mij = np.ascontiguousarray((Z_ijv[:, _lq] @ _sub2).reshape(
+                        2, npno, _ks.size, _n_red_c))
+                    if _sc_rows is not None:
+                        _sc_rows(M_i, _mij[0], _kl, _cols_g)
+                        _sc_rows(M_j, _mij[1], _kl, _cols_g)
+                    else:
+                        M_i[np.ix_(_kl, _npno_range, _cols_g)] += (
+                            _mij[0].transpose(1, 0, 2))
+                        M_j[np.ix_(_kl, _npno_range, _cols_g)] += (
+                            _mij[1].transpose(1, 0, 2))
+                _replay.clear()
+                J_ij_kj = {}
+                K_ij_kj_dict = {}
+                for k, key_kj, n_kj in kj_partners:
+                    k_loc = int(p_lmos_dense[k])
+                    X_k = pno_spaces[key_kj]['X_pno']
+                    pp_k = np.asarray(pno_spaces[key_kj]['pair_paos'])
+                    cols_k = np.searchsorted(pair_used_pao_global, pp_k)
+                    J_ij_kj[(key, k)] = W_i[k_loc][:, cols_k] @ X_k
+                    K_ij_kj_dict[(key, k)] = M_i[k_loc][:, cols_k] @ X_k
+                J_ji_ki = {}
+                K_ji_ki_dict = {}
+                for k, key_ki, n_ki in ki_partners:
+                    k_loc = int(p_lmos_dense[k])
+                    X_k = pno_spaces[key_ki]['X_pno']
+                    pp_k = np.asarray(pno_spaces[key_ki]['pair_paos'])
+                    cols_k = np.searchsorted(pair_used_pao_global, pp_k)
+                    J_ji_ki[(key, k)] = W_j[k_loc][:, cols_k] @ X_k
+                    K_ji_ki_dict[(key, k)] = M_j[k_loc][:, cols_k] @ X_k
+        elif _use_centerQ_c and (kj_partners or ki_partners):
             # Z_iv = q_iv^T @ jhi  (npno, n_local), Z_jv = q_jv^T @ jhi
             Z_iv = np.ascontiguousarray(q_iv.T @ jhi)
             Z_jv = np.ascontiguousarray(q_jv.T @ jhi)

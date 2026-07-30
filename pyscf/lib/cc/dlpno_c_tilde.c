@@ -95,3 +95,59 @@ void DLPNOcompute_C_tilde_ph1_batched(
                &one, C_out, &int_n_pno);
     }
 }
+
+
+/* v2: alias-friendly variant — K_tilde comes from TWO orientation masters
+ * (the pack's K_tilde_chem_i / _j stores) selected per item, and the other
+ * operands are read via offsets into caller-owned masters.  Eliminates the
+ * per-cycle kt/Kbc/t1/T1l staging pack (fresh GB-scale vectors + memcpy
+ * every cycle — the dominant cost of phase 6). */
+void DLPNOcompute_C_tilde_ph1_batched_v2(
+        const double *kt_flat_i,
+        const double *kt_flat_j,
+        const unsigned char *kt_sel,          /* (N,) 0 -> _i, 1 -> _j */
+        const long   *K_tilde_chem_offsets,   /* into the selected master */
+        const double *K_bar_chem_flat,        /* K_bar_chem master */
+        const long   *K_bar_chem_offsets,
+        const double *t1_master,              /* T1_in_pair master */
+        const long   *t1_ki_offsets,          /* row offset (incl. i_in_p) */
+        const long   *T1_local_offsets,       /* pair block offset */
+        const int    *n_pno_arr,
+        const int    *n_domain_arr,
+        double       *C_flat,
+        const long   *C_offsets,
+        const size_t  N)
+{
+    const char N_flag = 'N', T_flag = 'T';
+    const double one = 1.0, zero = 0.0, neg_one = -1.0;
+    const int int_one = 1;
+
+#pragma omp parallel for schedule(dynamic, 1)
+    for (size_t p = 0; p < N; p++) {
+        const int n_pno    = n_pno_arr[p];
+        if (n_pno == 0) continue;
+        const int n_domain = n_domain_arr[p];
+        int int_npno2      = n_pno * n_pno;
+        int int_n_pno      = n_pno;
+        int int_n_domain   = n_domain;
+
+        const double *kt_base = kt_sel[p] ? kt_flat_j : kt_flat_i;
+        const double *K_tilde_chem     = kt_base + K_tilde_chem_offsets[p];
+        const double *K_bar_chem_slice =
+            K_bar_chem_flat + K_bar_chem_offsets[p];
+        const double *t1       = t1_master + t1_ki_offsets[p];
+        const double *T1_local = t1_master + T1_local_offsets[p];
+        double       *C_out    = C_flat + C_offsets[p];
+
+        dgemv_(&N_flag, &int_npno2, &int_n_pno,
+               &one, K_tilde_chem, &int_npno2,
+               t1, &int_one,
+               &zero, C_out, &int_one);
+
+        dgemm_(&N_flag, &T_flag,
+               &int_n_pno, &int_n_pno, &int_n_domain,
+               &neg_one, K_bar_chem_slice, &int_n_pno,
+               T1_local, &int_n_pno,
+               &one, C_out, &int_n_pno);
+    }
+}

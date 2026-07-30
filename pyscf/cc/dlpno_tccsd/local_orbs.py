@@ -662,11 +662,12 @@ def orthogonalize_pao_domain(C_pao, S_pao, domain_idx, S_cut=1e-6,
         if not np.any(keep):
             return np.zeros((C_pao.shape[0], 0)), np.zeros((n_dom, 0))
         X_sub = eigvecs[:, keep] / np.sqrt(eigvals[keep])
-        # 5. Pad back to full domain (in normalized basis)
+        # 5. Pad back to full domain (in normalized basis).  Vectorized
+        # scatter — the previous per-element Python double loop was
+        # ~n_pivots x n_orth iterations per pair under the GIL (the
+        # dominant cost of make_pnos at TZVPP).
         X_orth = np.zeros((n_dom, X_sub.shape[1]))
-        for m in range(X_sub.shape[1]):
-            for k_idx, p in enumerate(pivots):
-                X_orth[p, m] = X_sub[k_idx, m]
+        X_orth[np.asarray(pivots), :] = X_sub
         # Unroll normalization: scale rows by 1/sqrt(diag) (Psi4 line 87-88)
         X_orth = X_orth * norm[:, None]
 

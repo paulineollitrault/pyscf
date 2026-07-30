@@ -958,19 +958,30 @@ class FlatPairPairStore:
         # and the kernel can evict them under memory pressure.
         _flush_every = (4 << 30) // self.dtype.itemsize if _mmap else 0
         _since_flush = 0
-        for k, (ia, ib, okey, _shape) in enumerate(meta):
-            start = int(self._offsets[k])
-            end = int(self._offsets[k + 1])
-            if end > start:
-                arr = (initial.pop(okey) if _mmap else initial[okey])
-                self._buffer[start:end] = arr.ravel()
-                del arr
-                _since_flush += (end - start)
-                if _flush_every and _since_flush >= _flush_every:
-                    self._buffer.flush()
-                    _madvise_dontneed(self._buffer)
-                    _since_flush = 0
-            self._idx_matrix[ia, ib] = k
+        if not _mmap:
+            # RAM path: one vectorized concatenate instead of ~n_flat tiny
+            # Python-loop slice assignments (n_flat ~ 3M at a TM complex —
+            # the loop was Python-overhead-bound, minutes of one core).
+            if n > 0 and _total > 0:
+                self._buffer[:] = np.concatenate(
+                    [np.ravel(initial[m[2]]) for m in meta])
+            _ia = np.fromiter((m[0] for m in meta), dtype=np.intp, count=n)
+            _ib = np.fromiter((m[1] for m in meta), dtype=np.intp, count=n)
+            self._idx_matrix[_ia, _ib] = np.arange(n, dtype=np.int32)
+        else:
+            for k, (ia, ib, okey, _shape) in enumerate(meta):
+                start = int(self._offsets[k])
+                end = int(self._offsets[k + 1])
+                if end > start:
+                    arr = initial.pop(okey)
+                    self._buffer[start:end] = arr.ravel()
+                    del arr
+                    _since_flush += (end - start)
+                    if _flush_every and _since_flush >= _flush_every:
+                        self._buffer.flush()
+                        _madvise_dontneed(self._buffer)
+                        _since_flush = 0
+                self._idx_matrix[ia, ib] = k
         if _mmap and _total > 0:
             self._buffer.flush()
             _madvise_dontneed(self._buffer)
@@ -993,6 +1004,44 @@ class FlatPairPairStore:
                 )
         # Local ref avoids the attribute chase on every lookup.
         self._canon_to_idx = pair_index.canonical_to_idx
+
+    @classmethod
+    def from_filled(cls, pair_index, buffer, offsets, shapes, ia_arr, ib_arr,
+                    dtype=np.float64):
+        """Wrap an ALREADY-FILLED flat buffer as a store (zero-copy).
+
+        Used by the direct-write S_pno build: the C kernel writes each
+        pair's partner blocks straight into ``buffer`` at ``offsets``, so
+        the dict-of-copies + re-flatten construction path is skipped
+        entirely.  ``ia_arr``/``ib_arr`` give each entry's canonical pair
+        indices (same convention as the constructor's meta pass).
+        """
+        self = cls.__new__(cls)
+        self._pi = pair_index
+        self.dtype = np.dtype(dtype)
+        self._mmap_path = None
+        n = int(len(ia_arr))
+        self._n_flat = n
+        self._shapes = np.ascontiguousarray(shapes, dtype=np.int32)
+        self._offsets = np.ascontiguousarray(offsets, dtype=np.int64)
+        self._buffer = buffer
+        n_pairs = pair_index.n_pairs
+        self._idx_matrix = np.full((n_pairs, n_pairs), -1, dtype=np.int32)
+        self._idx_matrix[np.asarray(ia_arr, dtype=np.intp),
+                         np.asarray(ib_arr, dtype=np.intp)] = (
+            np.arange(n, dtype=np.int32))
+        self._overflow = {}
+        self._views = []
+        for k in range(n):
+            start = int(self._offsets[k])
+            end = int(self._offsets[k + 1])
+            shape = (int(self._shapes[k, 0]), int(self._shapes[k, 1]))
+            if end == start:
+                self._views.append(None)
+            else:
+                self._views.append(self._buffer[start:end].reshape(shape))
+        self._canon_to_idx = pair_index.canonical_to_idx
+        return self
 
     # ------------------------------------------------------------------
     # Helpers

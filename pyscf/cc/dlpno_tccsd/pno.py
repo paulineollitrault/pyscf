@@ -766,6 +766,13 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         # K and T2 in initial PNO basis
         K_pno = U_pno_kept.T @ K_sc @ U_pno_kept
         T2_pno = U_pno_kept.T @ T2_sc_init @ U_pno_kept
+        # PNO truncation correction, stage 1 (Psi4 ccsd.cc:690
+        # de_pno_ij = e_ij_initial - e_ij_trunc): SC-MP2 pair energy lost
+        # to this truncation.  Accumulated into the final energy by the
+        # driver (the reference implementations add this term; the port
+        # historically dropped it).
+        de_pno_p1 = e_ij_init - np.einsum(
+            'ab,ab->', K_pno, 2.0 * T2_pno - T2_pno.T)
         # PNO orbital energies (diagonal of F_pno)
         F_sc = np.diag(eps_sc)
         F_pno = U_pno_kept.T @ F_sc @ U_pno_kept
@@ -794,6 +801,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             'e_pno': e_pno_sc, 'K_pno': K_pno,
             'T2_pno': T2_pno, 'n_pno': n_pno_init,
             'e_ij': e_ij_init, 'domain_ij': domain_ij,
+            'de_pno_p1': float(de_pno_p1),
             'X_pno_final': X_pno_final,
             'X_pno_pair': X_pno_pair,
             'X_orth': X_orth_ij,
@@ -877,31 +885,47 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     # All factors are O(|domain|*npno) per pair — never materialises the
     # (nao, npno) C_pno tensor that scales as nao*N_pairs*npno (47 GB at
     # water-64 in the old AO-basis path).
+    # Half-transform hoist (same trick as the Stage-5 S_pno Y-hoist): the
+    # per-partner triple product X_ij^T @ S_pao[dom_ij, dom_kj] @ X_kj
+    # re-does the (dom x dom x npno) right half for every consumer of
+    # pair kj.  Hoist Y_kj = S_pao[:, dom_kj] @ X_kj once per pair; each
+    # partner term collapses to a fast row-take + ONE small dgemm:
+    #     S[ij, kj] = X_ij^T @ Y_kj[dom_ij]
+    # (kills the slow np.ix_ 2-D gather AND the dominant dgemm).
+    _key_list = list(initial_pno_data.keys())
+
+    def _spno_y_one(key):
+        d = initial_pno_data[key]
+        if d['n_pno'] == 0:
+            return key, None
+        return key, S_pao[:, d['domain_ij']] @ d['X_pno_pair']
+
+    if _pool is not None:
+        _spno_Y = dict(_pool.map(_spno_y_one, _key_list))
+    else:
+        _spno_Y = dict(_spno_y_one(k) for k in _key_list)
+
     def _spno_one(key_ij):
         i, j = key_ij
         data_ij = initial_pno_data[key_ij]
         out = {}
         if data_ij['n_pno'] == 0:
             return out
-        Xp_ij = data_ij['X_pno_pair']
+        XpT_ij = data_ij['X_pno_pair'].T
         dom_ij = data_ij['domain_ij']
         for k in _F_neigh_pre[i]:
             key_kj = (min(k, j), max(k, j))
-            data_kj = initial_pno_data.get(key_kj)
-            if data_kj is None or data_kj['n_pno'] == 0:
+            Y_kj = _spno_Y.get(key_kj)
+            if Y_kj is None:
                 continue
-            S_blk = S_pao[np.ix_(dom_ij, data_kj['domain_ij'])]
-            out[(key_ij, key_kj)] = Xp_ij.T @ S_blk @ data_kj['X_pno_pair']
+            out[(key_ij, key_kj)] = XpT_ij @ Y_kj[dom_ij]
         for k in _F_neigh_pre[j]:
             key_ik = (min(i, k), max(i, k))
-            data_ik = initial_pno_data.get(key_ik)
-            if data_ik is None or data_ik['n_pno'] == 0:
+            Y_ik = _spno_Y.get(key_ik)
+            if Y_ik is None:
                 continue
-            S_blk = S_pao[np.ix_(dom_ij, data_ik['domain_ij'])]
-            out[(key_ij, key_ik)] = Xp_ij.T @ S_blk @ data_ik['X_pno_pair']
+            out[(key_ij, key_ik)] = XpT_ij @ Y_ik[dom_ij]
         return out
-
-    _key_list = list(initial_pno_data.keys())
     # Stream results into pno_S_cache directly — DO NOT collect into an
     # `_all_outs` list (that doubles memory because the per-worker dicts
     # stay alive until the list iteration completes; at water-64 each
@@ -913,6 +937,7 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
     else:
         for k in _key_list:
             pno_S_cache.update(_spno_one(k))
+    _spno_Y = None   # free the hoisted half-transforms
     _t_spno_build = _pno_time.perf_counter() - _t_spno_start
     if os.environ.get('DLPNO_MEM_PROBE'):
         try:
@@ -1371,6 +1396,10 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             # (eigenvalues decrease, cumulative values only grow)
 
         n_pno = max(n_pno, 1)
+        # PNO truncation correction, stage 2 (Psi4 ccsd.cc:1110 `+=`):
+        # LMP2-level pair energy lost to the FINAL truncation.  e_pno_cum
+        # holds the kept-subspace energy after the selection loop.
+        de_pno_p3 = float(e_ij - e_pno_cum)
         if getattr(make_pnos, '_debug_phase3', False):
             print(f'PHASE3 pair({i},{j}): n_total={n_pno_total} n_kept={n_pno} '
                   f'top5_occ={pno_occ[:5].tolist()} '
@@ -1475,6 +1504,14 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             'K_pno': K_pno,
             'T2_pno': T2_pno,
             'e_mp2': e_ij,
+            # Truncation corrections: strong pairs (CCSD in the final
+            # truncated space) need stage1+stage2; weak pairs (whose MP2
+            # energy e_mp2 is computed in the PRE-stage-2 basis) need
+            # only stage 1.  CAS pairs: no correction.
+            'de_pno': (0.0 if is_cas_pair
+                       else pdata.get('de_pno_p1', 0.0) + de_pno_p3),
+            'de_pno_p1': (0.0 if is_cas_pair
+                          else pdata.get('de_pno_p1', 0.0)),
             'domain_ij': domain_ij,
             'X_orth': pdata['X_orth'],
             'U_full': U_full if not is_cas_pair else None,

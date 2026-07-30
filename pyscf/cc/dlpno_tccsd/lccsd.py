@@ -1107,6 +1107,40 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
 
             _S_buffer_size = int(S_pno_cache._buffer.shape[0])
 
+            # K_iajb aliasing: when every task's cc_ints K_iajb tile is a
+            # C-contiguous view into ONE flat master (the K_iajb
+            # FlatTensorStore._buffer), pass that master as K_iajb_static
+            # with per-task pointer-derived offsets instead of copying every
+            # tile (same trick as _build_be_plan's K_iajb_master).  ~n_tasks
+            # x n_kl^2 saved; the C kernel reads base+off either way.
+            def _root_base(a):
+                b = a
+                while getattr(b, 'base', None) is not None:
+                    b = b.base
+                return b
+            _K_iajb_alias_ok = True
+            _K_iajb_master_buf = None
+            for _arg in _ba_work:
+                _ci = cc_ints.get(_arg[0])
+                if _ci is None:
+                    continue
+                _v = _ci.get('K_iajb')
+                if (_v is None or not _v.flags['C_CONTIGUOUS']
+                        or _v.base is None):
+                    _K_iajb_alias_ok = False
+                    break
+                _rb = _root_base(_v)
+                if getattr(_rb, 'ndim', 0) != 1:
+                    _K_iajb_alias_ok = False
+                    break
+                if _K_iajb_master_buf is None:
+                    _K_iajb_master_buf = _rb
+                elif _rb is not _K_iajb_master_buf:
+                    _K_iajb_alias_ok = False
+                    break
+            if _K_iajb_master_buf is None:
+                _K_iajb_alias_ok = False
+
             for arg in _ba_work:
                 key_kl, k, l = arg
                 ci_kl = cc_ints.get(key_kl)
@@ -1122,13 +1156,19 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                     continue
                 n_kl = pno_spaces[key_kl]['n_pno']
                 canon_kl_idx = _canon_to_idx[key_kl]
-                # K_iajb_kl + K_bar_kl: copy into our own static flat
-                # buffers (own them, simpler than passing two cc_ints
-                # buffers + a k_first selector).
-                K_iajb_kl = np.ascontiguousarray(ci_kl['K_iajb'])
-                _b_K_iajb_pieces.append(K_iajb_kl.ravel())
-                _b_K_iajb_off.append(_b_K_iajb_off_running)
-                _b_K_iajb_off_running += K_iajb_kl.size
+                # K_iajb: alias into the flat master when possible (offset
+                # into _K_iajb_master_buf); otherwise copy into our own
+                # static flat buffer (legacy path).
+                if _K_iajb_alias_ok:
+                    _v_K = ci_kl['K_iajb']
+                    _b_K_iajb_off.append(
+                        (_v_K.ctypes.data
+                         - _K_iajb_master_buf.ctypes.data) // 8)
+                else:
+                    K_iajb_kl = np.ascontiguousarray(ci_kl['K_iajb'])
+                    _b_K_iajb_pieces.append(K_iajb_kl.ravel())
+                    _b_K_iajb_off.append(_b_K_iajb_off_running)
+                    _b_K_iajb_off_running += K_iajb_kl.size
                 # K_bar reduced (nlmo_p, n_kl) -> scatter to (nocc, n_kl)
                 # so the Cython kernel keeps its global-LMO iteration.
                 _K_bar_red = (ci_kl['K_bar_ij'] if key_kl[0] == k
@@ -1221,8 +1261,9 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
                         _b_T_n_l_ii_off.append(0)
                 _b_inner_off.append(_b_inner_off[-1] + n_inner_for_task)
 
-            if _b_K_iajb_pieces:
-                _K_iajb_static = np.concatenate(_b_K_iajb_pieces)
+            if _b_K_bar_pieces:
+                _K_iajb_static = (_K_iajb_master_buf if _K_iajb_alias_ok
+                                  else np.concatenate(_b_K_iajb_pieces))
                 _K_bar_static = np.concatenate(_b_K_bar_pieces)
                 # Consolidated S buffer: original flat tier + lazy overflow.
                 if _S_local_pieces:
@@ -1273,6 +1314,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
             print(f'  [perkl_probe] S_consolidated={_g(_sc):.1f} GiB '
                   f'(shared_buffer={_shared}) '
                   f'K_iajb_static={_g(_bp.get("K_iajb_static")):.1f} GiB '
+                  f'(aliased={_K_iajb_alias_ok}) '
                   f'K_bar_static={_g(_bp.get("K_bar_static")):.1f} GiB '
                   f'overflow_copied={_S_local_off_running*8/2**30:.1f} GiB',
                   flush=True)
@@ -1472,7 +1514,7 @@ def _compute_t1_residual(t1_pno, t2_pno_all, pno_spaces,
 def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                      fock_ao, eps_lmo, s1e, conv_tol, max_cycle,
                      t2_cas=None, occ_cas_idx=None, vir_cas_idx=None,
-                     mo_coeff_cas=None, diis_space=5,
+                     mo_coeff_cas=None, diis_space=8,
                      damping=0.5, diis_start_cycle=0,
                      C_pao=None, use_t1_transform=True,
                      ncores=1, negligible_pairs=None, _pool=None):
@@ -1882,6 +1924,17 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         pair_index=_pair_index, out_flat_stores=_prebuilt_flat,
         _pool=_pool)
     _s5_tick('compute_cc_integrals_sparse')
+    if os.environ.get('DLPNO_CENTERQ_PROF') == '1':
+        import ctypes as _ct_prof
+        from pyscf import lib as _plib_prof
+        _lc = _plib_prof.load_library('libcc')
+        _pf = (_ct_prof.c_double * 8)()
+        _lc.DLPNOcenterQ_prof_get(_pf)
+        _nm = ['s1_scatter', 's2_ivjv', 's3_ma', 's5_gather', 's5_dgemm',
+               's4_ab', '-', '-']
+        print('  [CENTERQ-PROF] ' + ' '.join(
+            f'{n}={v:.1f}s' for n, v in zip(_nm, _pf) if n != '-'),
+            flush=True)
     print(f'  Local DF integrals: {len(_cc_ints)} pairs, '
           f'{_time_cc.perf_counter() - _t_cc:.1f}s', flush=True)
     # Force release of pool-worker transient buffers (raw int3c2e shells,
@@ -2046,18 +2099,39 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
              _ct.c_int, _ct.c_int, _ct.c_int]
             + [_ct.c_void_p] * 8
             + [_ct.c_void_p, _ct.c_size_t])
+        _libcc_spno.DLPNObuild_S_pno_hoisted.restype = None
+        _libcc_spno.DLPNObuild_S_pno_hoisted.argtypes = (
+            [_ct.c_void_p, _ct.c_void_p,
+             _ct.c_int, _ct.c_int, _ct.c_int]
+            + [_ct.c_void_p] * 5
+            + [_ct.c_size_t])
         _S_pao_full_c = np.ascontiguousarray(S_pao_full)
         _n_pao_total = _S_pao_full_c.shape[0]
+        # Half-transform hoist (DLPNO_SPNO_HOIST, default ON): build
+        # Y_b = S_pao_full[:, pp_b] @ X_b once per pair; the per-partner
+        # kernel work drops to a row-gather + one (npno x npno) dgemm.
+        _spno_hoist = os.environ.get('DLPNO_SPNO_HOIST', '1') != '0'
 
-    def _build_one_key(key_ij):
+    def _partners_for(key_ij):
         if pair_lmo_idx is not None and key_ij in pair_lmo_idx:
             _dom = [int(x) for x in pair_lmo_idx[key_ij]]
-            _partner_keys = [
+            return [
                 (k, l) for k in _dom for l in _dom
                 if k <= l and (k, l) in _all_pair_set
             ]
+        return _all_pair_keys
+
+    # Direct-write context (set up below when eligible): the S_pno flat
+    # buffer is pre-allocated with FlatPairPairStore layout and each
+    # worker's C kernel writes its blocks in place — no per-partner
+    # copies, no dict merge, no re-flatten.
+    _direct_ctx = None
+
+    def _build_one_key(key_ij):
+        if _direct_ctx is not None and key_ij in _direct_ctx['base_off']:
+            _partner_keys = None   # partner split precomputed
         else:
-            _partner_keys = _all_pair_keys
+            _partner_keys = _partners_for(key_ij)
 
         if not _use_spno_c:
             out = {}
@@ -2080,15 +2154,19 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             return out
 
         # Filter partners to those with X_pno set (Psi4 path).
-        good = []
-        fallback = []
-        for key_kl in _partner_keys:
-            pd_b = pno_spaces[key_kl]
-            if (pd_b.get('X_pno') is not None
-                    and pd_b.get('pair_paos') is not None):
-                good.append(key_kl)
-            else:
-                fallback.append(key_kl)
+        if _partner_keys is None:
+            good = _direct_ctx['good'][key_ij]
+            fallback = _direct_ctx['fallback'][key_ij]
+        else:
+            good = []
+            fallback = []
+            for key_kl in _partner_keys:
+                pd_b = pno_spaces[key_kl]
+                if (pd_b.get('X_pno') is not None
+                        and pd_b.get('pair_paos') is not None):
+                    good.append(key_kl)
+                else:
+                    fallback.append(key_kl)
 
         out = {}
         for key_kl in fallback:
@@ -2107,52 +2185,207 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             pd_b = pno_spaces[key_kl]
             partner_n_pao[p] = int(np.asarray(pd_b['pair_paos']).size)
             partner_n_pno[p] = int(pd_b['X_pno'].shape[1])
-        pp_off = np.empty(n_partners + 1, dtype=np.int64)
-        pp_off[0] = 0
-        pp_off[1:] = np.cumsum(partner_n_pao.astype(np.int64))
-        X_sizes = (partner_n_pao.astype(np.int64)
-                   * partner_n_pno.astype(np.int64))
-        X_off = np.empty(n_partners + 1, dtype=np.int64)
-        X_off[0] = 0
-        X_off[1:] = np.cumsum(X_sizes)
+        # Per-partner offsets into the GLOBAL pp/X masters (packed once,
+        # before the pool.map).  The C kernel reads flat + off[p] with
+        # lengths from partner_n_*, so absolute offsets drop in unchanged —
+        # this deletes the per-key re-packing of every partner's arrays
+        # (each pair was re-packed ~nlmo_p times; the top setup hotspot).
         S_sizes = (partner_n_pno.astype(np.int64) * n_pno_a)
         S_off = np.empty(n_partners + 1, dtype=np.int64)
         S_off[0] = 0
         S_off[1:] = np.cumsum(S_sizes)
-
-        pp_flat = np.empty(int(pp_off[-1]), dtype=np.int64)
-        X_flat = np.empty(int(X_off[-1]))
-        for p, key_kl in enumerate(good):
-            pd_b = pno_spaces[key_kl]
-            pp_flat[pp_off[p]:pp_off[p + 1]] = np.asarray(
-                pd_b['pair_paos'], dtype=np.int64)
-            X_flat[X_off[p]:X_off[p + 1]] = np.ascontiguousarray(
-                pd_b['X_pno']).ravel()
-        S_flat = np.empty(int(S_off[-1]))
+        if _partner_keys is None:
+            # Direct mode: the kernel writes straight into the store's
+            # flat buffer at this key's base element offset.
+            _dst_base = _direct_ctx['base_off'][key_ij]
+            _S_dst = _ct.c_void_p(
+                _direct_ctx['buffer'].ctypes.data + _dst_base * 8)
+            S_flat = None
+        else:
+            S_flat = np.empty(int(S_off[-1]))
+            _S_dst = S_flat.ctypes.data_as(_ct.c_void_p)
 
         pp_a_arr = np.ascontiguousarray(pp_a, dtype=np.int64)
         X_a_arr  = np.ascontiguousarray(X_a_full)
-        _libcc_spno.DLPNObuild_S_pno_for_pair(
-            pp_a_arr.ctypes.data_as(_ct.c_void_p),
-            X_a_arr.ctypes.data_as(_ct.c_void_p),
-            int(n_pao_a), int(n_pno_a), int(n_partners),
-            partner_n_pao.ctypes.data_as(_ct.c_void_p),
-            partner_n_pno.ctypes.data_as(_ct.c_void_p),
-            pp_off.ctypes.data_as(_ct.c_void_p),
-            pp_flat.ctypes.data_as(_ct.c_void_p),
-            X_off.ctypes.data_as(_ct.c_void_p),
-            X_flat.ctypes.data_as(_ct.c_void_p),
-            S_off.ctypes.data_as(_ct.c_void_p),
-            S_flat.ctypes.data_as(_ct.c_void_p),
-            _S_pao_full_c.ctypes.data_as(_ct.c_void_p),
-            _n_pao_total,
-        )
+        if _g_Y_flat is not None and all(k in _gY_off_map for k in good):
+            Y_off = np.empty(n_partners + 1, dtype=np.int64)
+            for p, key_kl in enumerate(good):
+                Y_off[p] = _gY_off_map[key_kl]
+            Y_off[n_partners] = 0
+            _libcc_spno.DLPNObuild_S_pno_hoisted(
+                pp_a_arr.ctypes.data_as(_ct.c_void_p),
+                X_a_arr.ctypes.data_as(_ct.c_void_p),
+                int(n_pao_a), int(n_pno_a), int(n_partners),
+                partner_n_pno.ctypes.data_as(_ct.c_void_p),
+                Y_off.ctypes.data_as(_ct.c_void_p),
+                _g_Y_flat.ctypes.data_as(_ct.c_void_p),
+                S_off.ctypes.data_as(_ct.c_void_p),
+                _S_dst,
+                _n_pao_total,
+            )
+        else:
+            pp_off = np.empty(n_partners + 1, dtype=np.int64)
+            X_off = np.empty(n_partners + 1, dtype=np.int64)
+            for p, key_kl in enumerate(good):
+                pp_off[p] = _gpp_off_map[key_kl]
+                X_off[p] = _gX_off_map[key_kl]
+            pp_off[n_partners] = 0
+            X_off[n_partners] = 0
+            _libcc_spno.DLPNObuild_S_pno_for_pair(
+                pp_a_arr.ctypes.data_as(_ct.c_void_p),
+                X_a_arr.ctypes.data_as(_ct.c_void_p),
+                int(n_pao_a), int(n_pno_a), int(n_partners),
+                partner_n_pao.ctypes.data_as(_ct.c_void_p),
+                partner_n_pno.ctypes.data_as(_ct.c_void_p),
+                pp_off.ctypes.data_as(_ct.c_void_p),
+                _g_pp_flat.ctypes.data_as(_ct.c_void_p),
+                X_off.ctypes.data_as(_ct.c_void_p),
+                _g_X_flat.ctypes.data_as(_ct.c_void_p),
+                S_off.ctypes.data_as(_ct.c_void_p),
+                _S_dst,
+                _S_pao_full_c.ctypes.data_as(_ct.c_void_p),
+                _n_pao_total,
+            )
+        if _partner_keys is None:
+            return out   # good blocks live in the store buffer already
         for p, key_kl in enumerate(good):
             n_pno_b = int(partner_n_pno[p])
             out[(key_ij, key_kl)] = (
                 S_flat[S_off[p]:S_off[p + 1]]
                 .reshape(n_pno_a, n_pno_b).copy())
         return out
+
+    # Global partner flats for _build_one_key: pack every pair's pair_paos
+    # and X_pno ONCE.  (Previously re-packed per key under the GIL.)
+    _gpp_off_map = {}
+    _gX_off_map = {}
+    _g_pp_flat = np.zeros(0, dtype=np.int64)
+    _g_X_flat = np.zeros(0)
+    if _use_spno_c:
+        _g_pp_pieces = []
+        _g_X_pieces = []
+        _pp_run = 0
+        _X_run = 0
+        for _gk in _all_pair_keys:
+            _pd = pno_spaces[_gk]
+            _Xg = _pd.get('X_pno')
+            _ppg = _pd.get('pair_paos')
+            if _Xg is None or _ppg is None:
+                continue
+            _ppg = np.asarray(_ppg, dtype=np.int64)
+            _g_pp_pieces.append(_ppg)
+            _gpp_off_map[_gk] = _pp_run
+            _pp_run += _ppg.size
+            _Xr = np.ascontiguousarray(_Xg).ravel()
+            _g_X_pieces.append(_Xr)
+            _gX_off_map[_gk] = _X_run
+            _X_run += _Xr.size
+        if _g_pp_pieces:
+            _g_pp_flat = np.concatenate(_g_pp_pieces)
+            _g_X_flat = np.concatenate(_g_X_pieces)
+        del _g_pp_pieces, _g_X_pieces
+
+    # Y-hoist master for DLPNObuild_S_pno_hoisted: Y_b = S_pao[:, pp_b] @ X_b
+    # per pair (pool-parallel; ~n_pao_total x sum(n_pno) x 8 bytes).
+    _g_Y_flat = None
+    _gY_off_map = {}
+    if _use_spno_c and _spno_hoist and _gX_off_map:
+        _t_yh = _time_cc.perf_counter()
+        _y_keys = [k for k in _all_pair_keys if k in _gX_off_map]
+
+        def _y_one(_k):
+            _pd = pno_spaces[_k]
+            _pp = np.asarray(_pd['pair_paos'], dtype=np.int64)
+            return _S_pao_full_c[:, _pp] @ _pd['X_pno']
+
+        if _pool is not None:
+            _y_blocks = list(_pool.map(_y_one, _y_keys))
+        else:
+            _y_blocks = [_y_one(_k) for _k in _y_keys]
+        _y_run = 0
+        for _k, _yb in zip(_y_keys, _y_blocks):
+            _gY_off_map[_k] = _y_run
+            _y_run += _yb.size
+        _g_Y_flat = np.empty(_y_run)
+        _y_run = 0
+        for _yb in _y_blocks:
+            _g_Y_flat[_y_run:_y_run + _yb.size] = _yb.ravel()
+            _y_run += _yb.size
+        del _y_blocks
+        os.environ.get('DLPNO_STAGE5_DBG') and print(f'  [STAGE5_DBG] S_pno Y-hoist build: '
+              f'{_time_cc.perf_counter() - _t_yh:.2f}s '
+              f'({_g_Y_flat.size * 8 / 1e9:.2f} GB)', flush=True)
+
+    # Direct-write S_pno build (DLPNO_SPNO_DIRECT, default ON): lay out the
+    # FlatPairPairStore buffer up front (entry order = key-major, partner
+    # order = _partners_for) and let each worker's C kernel write in place.
+    # Eliminates ~n_flat tiny .copy()s, the serial dict merge and the
+    # dict->store re-flatten.  Skipped when the buffer must spill to NVMe
+    # (legacy path keeps the incremental-free construction) or when any
+    # pair lacks X_pno.
+    if (_use_spno_c
+            and os.environ.get('DLPNO_SPNO_DIRECT', '1') != '0'):
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            _should_spill as _spno_spill_fn)
+        _t_dm = _time_cc.perf_counter()
+        _dm_ok = True
+        _dm_good = {}
+        _dm_fb = {}
+        _dm_base = {}
+        _dm_ia = []
+        _dm_ib = []
+        _dm_na = []
+        _dm_nb = []
+        _c2i_spno = _pair_index.canonical_to_idx
+        for _ka in _all_pair_keys:
+            _pda = pno_spaces[_ka]
+            if _pda.get('X_pno') is None or _pda.get('pair_paos') is None:
+                _dm_ok = False
+                break
+            _na_a = int(_pda['X_pno'].shape[1])
+            _ia_a = _c2i_spno.get((min(_ka), max(_ka)))
+            if _ia_a is None:
+                _dm_ok = False
+                break
+            _good_a = []
+            _fb_a = []
+            for _kb in _partners_for(_ka):
+                _pdb = pno_spaces[_kb]
+                if (_pdb.get('X_pno') is not None
+                        and _pdb.get('pair_paos') is not None
+                        and (min(_kb), max(_kb)) in _c2i_spno):
+                    _good_a.append(_kb)
+                else:
+                    _fb_a.append(_kb)
+            _dm_good[_ka] = _good_a
+            _dm_fb[_ka] = _fb_a
+            _dm_base[_ka] = len(_dm_ia)          # first entry index
+            for _kb in _good_a:
+                _dm_ia.append(_ia_a)
+                _dm_ib.append(_c2i_spno[(min(_kb), max(_kb))])
+                _dm_na.append(_na_a)
+                _dm_nb.append(int(pno_spaces[_kb]['X_pno'].shape[1]))
+        if _dm_ok and _dm_ia:
+            _dm_na = np.asarray(_dm_na, dtype=np.int64)
+            _dm_nb = np.asarray(_dm_nb, dtype=np.int64)
+            _dm_off = np.zeros(len(_dm_na) + 1, dtype=np.int64)
+            np.cumsum(_dm_na * _dm_nb, out=_dm_off[1:])
+            _dm_total = int(_dm_off[-1])
+            if _spno_spill_fn(_dm_total * 8):
+                _dm_ok = False   # NVMe-spill regime: keep legacy build
+            else:
+                _dm_buffer = np.empty(_dm_total)
+                _direct_ctx = {
+                    'buffer': _dm_buffer,
+                    'base_off': {k: int(_dm_off[v])
+                                 for k, v in _dm_base.items()},
+                    'good': _dm_good,
+                    'fallback': _dm_fb,
+                }
+                os.environ.get('DLPNO_STAGE5_DBG') and print(f'  [STAGE5_DBG] S_pno direct layout: '
+                      f'{_time_cc.perf_counter() - _t_dm:.2f}s '
+                      f'entries={len(_dm_ia)} '
+                      f'buf={_dm_total * 8 / 1e9:.2f} GB', flush=True)
 
     _t_spno = _time_cc.perf_counter()
     S_pno_cache = {}
@@ -2162,9 +2395,27 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     else:
         for key_ij in _all_pair_keys:
             S_pno_cache.update(_build_one_key(key_ij))
-    print(f'  [STAGE5_DBG] S_pno_cache upfront build: '
+    if _direct_ctx is not None:
+        from pyscf.cc.dlpno_tccsd.pair_index import (
+            FlatPairPairStore as _FPPS_direct)
+        _store = _FPPS_direct.from_filled(
+            _pair_index, _direct_ctx['buffer'], _dm_off,
+            np.column_stack((_dm_na, _dm_nb)), _dm_ia, _dm_ib)
+        for _fk, _fv in S_pno_cache.items():
+            try:
+                _store[_fk] = _fv       # fallback entries -> overflow
+            except KeyError:
+                pass                    # non-canonical key: legacy skipped too
+        S_pno_cache = _store
+    os.environ.get('DLPNO_STAGE5_DBG') and print(f'  [STAGE5_DBG] S_pno_cache upfront build: '
           f'{_time_cc.perf_counter() - _t_spno:.2f}s '
           f'(pairs={len(_all_pair_keys)})', flush=True)
+    # The global partner masters are only needed during the upfront build
+    # (~1.4 GB at QZVPP) — drop them before the long-lived CCSD phase.
+    _g_pp_flat = _g_X_flat = None
+    _gpp_off_map = _gX_off_map = None
+    _g_Y_flat = None
+    _gY_off_map = None
 
     # Phase 2d: snapshot the upfront S_pno_cache into a flat
     # pair-of-pair buffer.  Any subsequent miss inside `_s_pno_getter`
@@ -2173,7 +2424,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
     # ``.buffer`` / ``.offsets`` / ``.index_matrix()``.
     from pyscf.cc.dlpno_tccsd.pair_index import FlatPairPairStore
     _drv_log_mem('before_S_pno_flatten')
-    S_pno_cache = FlatPairPairStore(_pair_index, initial=S_pno_cache)
+    if not isinstance(S_pno_cache, FlatPairPairStore):
+        S_pno_cache = FlatPairPairStore(_pair_index, initial=S_pno_cache)
     print(f'  [S_pno_cache] {S_pno_cache!r}', flush=True)
     # The S_pno build churns millions of tiny per-partner arrays across the
     # worker pool; glibc keeps that freed memory pooled in per-thread arenas
@@ -2229,7 +2481,9 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                   f'CAS scale = {scale:.2f}', flush=True)
 
         mydiis = lib.diis.DIIS()
-        mydiis.space = diis_space
+        # DLPNO_DIIS_SPACE overrides the default (5). ORCA-class codes use
+        # 7-12; larger space typically saves 3-5 CCSD iterations.
+        mydiis.space = int(os.environ.get('DLPNO_DIIS_SPACE') or diis_space)
         this_tol = conv_tol if boot_step == n_bootstrap - 1 else bootstrap_tol
         this_max = max(max_cycle, 100) if boot_step == n_bootstrap - 1 else max(30, max_cycle // 2)
 
@@ -2241,7 +2495,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
         # them here.  build_t1_cache is pulled in per-cycle.
         from pyscf.cc.dlpno_tccsd.pair_index import build_t1_cache
 
-        print(f'  [STAGE5_DBG] post-cc_ints setup before cycle loop: '
+        os.environ.get('DLPNO_STAGE5_DBG') and print(f'  [STAGE5_DBG] post-cc_ints setup before cycle loop: '
               f'{_time_cc.perf_counter() - _t_post_ccints:.2f}s', flush=True)
         _drv_log_mem('before_cycle_loop')
 
@@ -2291,7 +2545,19 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
             _drv_malloc_trim()
 
         _t_loop_start = _time.perf_counter() if False else _time_cc.perf_counter()
+        # class-from-cycle-0 (DLPNO_CLASS_FROM_CYCLE0, default ON): cycle 0
+        # only PRIMES the plan caches (each *_batched builder runs with
+        # _plan_only=True, skipping its compute) and hands the FULL
+        # iteration — starting from the MP2 amplitudes — to the C++ class.
+        # The skipped cycle-0 outputs (BE/CD/G_term/ladder/update) were
+        # never consumed by the class anyway; the class trajectory simply
+        # includes the step the Python cycle used to take.
+        _cyc0_prime_enabled = (
+            os.environ.get('DLPNO_CLASS_FROM_CYCLE0', '1') != '0'
+            and not cas_blocks)
+
         for cycle in range(this_max):
+            _cyc0_prime = (cycle == 0 and _cyc0_prime_enabled)
             # Phase 1: pre-project t1 into every pair's PNO basis once
             # per cycle, replacing ~1.5 M lazy _project_t1_to_pair calls.
             # ``_t1_cache[key]`` is a (nocc, n_pno[key]) matrix;
@@ -2401,7 +2667,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 pair_lmo_idx=pair_lmo_idx, _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
                 blas_threads=32, omp_threads=ncores,
-                t1_cache=_t1_cache, ktc_store=_ktc_store)
+                t1_cache=_t1_cache, ktc_store=_ktc_store,
+                _plan_only=_cyc0_prime)
             _tj_C = _time.perf_counter() - _tj_c0
 
             _tj_d0 = _time.perf_counter()
@@ -2414,16 +2681,26 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 cc_ints=_cc_ints,
                 pair_lmo_idx=pair_lmo_idx, _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
-                t1_cache=_t1_cache, omp_threads=ncores, ktc_store=_ktc_store)
+                t1_cache=_t1_cache, omp_threads=ncores, ktc_store=_ktc_store,
+                _plan_only=_cyc0_prime)
             _tj_D = _time.perf_counter() - _tj_d0
 
             _tj_f0 = _time.perf_counter()
-            _local_Fkj, _local_df_Fab, _local_foo_t1, _local_Fij_bar = t1_fock(
-                _cc_ints, None, t1_pno, fov_pno, pno_spaces,
-                S_pno_cache, F_lmo, eps_lmo, foo_total,
-                _all_keys_j, nocc, _pool=(_fine_pool or _pool),
-                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
-                cc_ints_flat=_cc_ints_flat, pair_index=_pair_index)
+            if _cyc0_prime:
+                # t1_fock's outputs feed build_G_tilde values (plan-only
+                # below needs none) and the Python t1 residual / update
+                # (both skipped in prime mode).  The class dresses its own
+                # Fock every cycle.
+                _local_Fkj = _local_df_Fab = None
+                _local_foo_t1 = _local_Fij_bar = None
+            else:
+                (_local_Fkj, _local_df_Fab, _local_foo_t1,
+                 _local_Fij_bar) = t1_fock(
+                    _cc_ints, None, t1_pno, fov_pno, pno_spaces,
+                    S_pno_cache, F_lmo, eps_lmo, foo_total,
+                    _all_keys_j, nocc, _pool=(_fine_pool or _pool),
+                    pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
+                    cc_ints_flat=_cc_ints_flat, pair_index=_pair_index)
             # Keys whose d_ij/d_ji additions are already baked into
             # _local_Fij_bar — T1 residual augments only the remaining
             # (weak) pairs to avoid double-counting.
@@ -2447,7 +2724,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _local_Fkj, _local_foo_t1,
                 cc_ints=_cc_ints,
                 S_pao_full=S_pao_full, s1e=s1e,
-                _pool=(_fine_pool or _pool))
+                _pool=(_fine_pool or _pool),
+                _plan_only=_cyc0_prime)
             _g_future = None
             _tj_FG = _time.perf_counter() - _tj_g0
 
@@ -2487,11 +2765,14 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 compute_ladder as _cL_fn,
             )
             _bt_pool = _fine_pool or _pool
-            _t1_dressed_all = _t1_ints_all(
-                _cc_ints, t1_pno, pno_spaces, S_pno_cache,
-                keys_sorted, nocc,
-                pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
-                _pool=_bt_pool)
+            if _cyc0_prime:
+                _t1_dressed_all = None   # consumers (B_tilde, update) skipped
+            else:
+                _t1_dressed_all = _t1_ints_all(
+                    _cc_ints, t1_pno, pno_spaces, S_pno_cache,
+                    keys_sorted, nocc,
+                    pair_lmo_idx=pair_lmo_idx, t1_cache=_t1_cache,
+                    _pool=_bt_pool)
 
             # B_tilde uses the shared dressed dict (no recomputation).
             def _bt_one(_key):
@@ -2502,7 +2783,26 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                     t1_cache=_t1_cache)
             _t_bt0 = _time.perf_counter()
             _B_tilde_per_ij = {}
-            if _bt_pool is not None:
+            if _cyc0_prime:
+                # STRUCTURAL B_tilde: the class pack reads only the
+                # (B_local, p_lmos_dense) SHAPE/mapping (dk/dl positions);
+                # beta VALUES are recomputed in-class from B_tilde_flat
+                # every cycle.  Mirror compute_B_tilde's exact structure
+                # (None iff cc_ints entry missing) with zero values.
+                for _k in keys_sorted:
+                    if _cc_ints.get(_k) is None:
+                        _B_tilde_per_ij[_k] = None
+                        continue
+                    if pair_lmo_idx is not None and _k in pair_lmo_idx:
+                        _li = np.asarray(pair_lmo_idx[_k])
+                    else:
+                        _li = np.arange(nocc)
+                    _nl_bt = len(_li)
+                    _pd_bt = np.full(nocc, -1, dtype=np.intp)
+                    _pd_bt[_li] = np.arange(_nl_bt, dtype=np.intp)
+                    _B_tilde_per_ij[_k] = (
+                        np.zeros((_nl_bt, _nl_bt)), _pd_bt)
+            elif _bt_pool is not None:
                 for _k, _bt in _bt_pool.map(_bt_one, keys_sorted):
                     _B_tilde_per_ij[_k] = _bt
             else:
@@ -2519,7 +2819,11 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                                     pair_lmo_idx=pair_lmo_idx,
                                     t1_cache=_t1_cache)
             _ladder_all = {}
-            if _bt_pool is not None:
+            # Ladder output feeds only _update_pair (skipped in prime mode;
+            # the class computes its own ladder term) — no plan to prime.
+            if _cyc0_prime:
+                pass
+            elif _bt_pool is not None:
                 for _k, _l in _bt_pool.map(_ladder_one, keys_sorted):
                     _ladder_all[_k] = _l
             else:
@@ -2538,7 +2842,7 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _cc_ints, _B_tilde_per_ij, pair_lmo_idx, nocc,
                 _pool=(_fine_pool or _pool),
                 S_pao_full=S_pao_full, s1e=s1e,
-                omp_threads=ncores)
+                omp_threads=ncores, _plan_only=_cyc0_prime)
             _BE_all = {'B': _B_dict, 'E': _E_dict}
             _t_be = _time.perf_counter() - _t_be0
 
@@ -2556,7 +2860,8 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
                 _cc_ints, _jiang_C, _jiang_D,
                 _jiang_K_mixed, K_coul_cache,
                 pair_lmo_idx, nocc,
-                S_pao_full=S_pao_full, s1e=s1e, omp_threads=ncores)
+                S_pao_full=S_pao_full, s1e=s1e, omp_threads=ncores,
+                _plan_only=_cyc0_prime)
             _t_cd = _time.perf_counter() - _t_cd0
 
             # Batched G_term: moved out of per-pair residual (profile
@@ -2577,14 +2882,47 @@ def _run_dlpno_lccsd(mf, C_lmo, pno_spaces, strong_pairs,
 
             from pyscf.cc.dlpno_tccsd.residual import compute_G_term_batched
             _t_g0 = _time.perf_counter()
+            # NOTE: the old `else jc['G_tilde']` fallback here was a latent
+            # dead reference (jc is defined later; _local_df_G was always
+            # non-None until prime mode).  In prime mode G_term is
+            # plan-only and never reads the G argument.
             _G_term_all = compute_G_term_batched(
                 keys_sorted, t2_pno_all, pno_spaces, S_pno_cache,
-                (_local_df_G if _local_df_G is not None
-                 else jc['G_tilde']),
+                _local_df_G,
                 pair_lmo_idx, nocc,
                 S_pao_full=S_pao_full, s1e=s1e,
-                _pool=_pool)
+                _pool=_pool, _plan_only=_cyc0_prime)
             _t_g = _time.perf_counter() - _t_g0
+
+            if _cyc0_prime:
+                # class-from-cycle-0: every plan cache the C++ class pack
+                # consumes is now primed (compute skipped above); hand the
+                # FULL iteration to the class from the MP2 amplitudes.
+                # Mirrors the cycle==0 takeover below — the freed outputs
+                # were never computed here.
+                _BE_all = _C_term_all = _D_term_all = _G_term_all = None
+                _jiang_cache = _jiang_K_mixed = _ladder_all = None
+                _local_df_G = None
+                import gc as _gc
+                _gc.collect()
+                _drv_malloc_trim()
+                _drv_log_mem('cyc0_prime_before_class')
+                print('[CCSD MONO DROPIN] cycle-0 prime: plan caches built, '
+                      'compute skipped; class iterates from MP2 amplitudes...',
+                      flush=True)
+                from pyscf.cc.dlpno_tccsd._ccsd_solver import (
+                    run_remaining_cycles_via_class)
+                _last_cycle, _e_corr = run_remaining_cycles_via_class(
+                    cycle, this_max, this_tol,
+                    t1_pno, t2_pno_all,
+                    _cc_ints, pno_spaces, pair_lmo_idx, F_lmo, eps_lmo,
+                    fov_pno, nocc, keys_sorted, S_pno_cache,
+                    _cc_ints_flat, _pair_index, ovL_pno_cache, K_pno_cache,
+                    _B_tilde_per_ij, {}, {},
+                    mydiis, diis_start_cycle, strong_pairs, cas_blocks,
+                    _pool=_pool, ktc_store=_ktc_store)
+                _drv_log_mem('after_class_dropin')
+                break
 
             # Accumulator for per-pair timing (thread-safe via list append)
             _pair_timings = {'fab': [], 'resid': [], 'btilde': []}
