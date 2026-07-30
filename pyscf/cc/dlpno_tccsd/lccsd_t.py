@@ -1665,7 +1665,7 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
                     vir_cas_idx=None,
                     cas_proj_thresh=0.5,
                     T_CutTNO=1e-9,
-                    T_CutTriplesWeak=1e-7,
+                    T_CutTriplesWeak=0.0,
                     ncores=1,
                     negligible_pairs=None,
                     weak_pairs=None,
@@ -1838,10 +1838,17 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     #   T_CUT_DO_TRIPLES  = 1e-2   (read_options.cc line 2575; applied to PAO domains)
     # The triples-stage thresholds are 10× LOOSER than CCSD to keep per-triple
     # aux/PAO domains small while not hurting (T) accuracy.
-    # A/B experiment knobs (default = production behavior):
+    # Threshold knobs (default = production behavior):
     #   DLPNO_T_TCUTTNO          TNO occupation cutoff (default 1e-9)
-    #   DLPNO_T_TCUTTRIPLESWEAK  SC-MP2 prescreen drop threshold; 0 disables
-    #                            the prescreen (all triples at tight TNO)
+    #   DLPNO_T_TCUTTRIPLESWEAK  SC-MP2 prescreen drop threshold. Default 0
+    #                            = prescreen DISABLED: every listed triple is
+    #                            computed once at the tight TNO cutoff.
+    #                            Measured on MOBH35-12 (tight preset), the
+    #                            prescreen pass costs more than the tight
+    #                            work it skips (SVP 691 s -> 507 s without
+    #                            it) AND its loose-TNO estimates for dropped
+    #                            triples lose up to 2.6 mEh at TZVP.  Set
+    #                            1e-7 to restore the Psi4-style prescreen.
     T_CutTNO = float(os.environ.get('DLPNO_T_TCUTTNO', T_CutTNO))
     T_CutTriplesWeak = float(
         os.environ.get('DLPNO_T_TCUTTRIPLESWEAK', T_CutTriplesWeak))
