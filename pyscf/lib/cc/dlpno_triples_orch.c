@@ -14,6 +14,7 @@
 
 #include <stddef.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <string.h>
 #include <math.h>
 #include <alloca.h>
@@ -91,6 +92,7 @@ void DLPNObuild_triple_qvv_pair(
         const double *qab_atom_flat,
         const long *riatom_to_paos_ext_dense,
         const double *jhi,
+        const long pair_id,
         double *q_vv_pair_sc);
 
 void DLPNObuild_U_for_triple(
@@ -569,10 +571,36 @@ typedef struct {
     double t1_lmo;       /* 3 matvecs */
     double w3_marshal;   /* W3 offset arrays */
     double w3_kernel;    /* DLPNOcompute_w3_energy */
+    double df_qvv;       /* qvv_pair builds (split out of df) */
 } TPhaseTime;
 static __thread TPhaseTime tpt = {0};
 static int tpt_enabled = 0;  /* gated by env var DLPNO_TRIPLE_PROF=1 */
 static TPhaseTime shared_tpt_sum = {0};
+static pthread_mutex_t _tpt_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Per-triple-path profiling: DLPNOcompute_one_triple_E_T0 is driven from
+ * Python pool threads (not the batched orchestrator), so tpt_enabled is
+ * initialised lazily there and each call flushes its thread-local tpt
+ * into shared_tpt_sum under a mutex (one lock per TRIPLE — negligible).
+ * Read + reset from Python via DLPNOtriples_prof_get. */
+void DLPNOtriples_prof_get(double *out12)
+{
+    pthread_mutex_lock(&_tpt_mutex);
+    out12[0] = shared_tpt_sum.tno;
+    out12[1] = shared_tpt_sum.aux_jhi;
+    out12[2] = shared_tpt_sum.df;
+    out12[3] = shared_tpt_sum.u_cache;
+    out12[4] = shared_tpt_sum.t2_block;
+    out12[5] = shared_tpt_sum.K_ab;
+    out12[6] = shared_tpt_sum.K_ooov;
+    out12[7] = shared_tpt_sum.K_for_V;
+    out12[8] = shared_tpt_sum.t1_lmo;
+    out12[9] = shared_tpt_sum.w3_marshal;
+    out12[10] = shared_tpt_sum.w3_kernel;
+    out12[11] = shared_tpt_sum.df_qvv;
+    shared_tpt_sum = (TPhaseTime){0};
+    pthread_mutex_unlock(&_tpt_mutex);
+}
 
 static double _now_sec(void) {
     struct timespec ts;
@@ -652,12 +680,23 @@ double DLPNOcompute_one_triple_E_T0(
          * from scratch.  Caller owns the buffers; we don't free. */
         const int pre_n_tno,
         const double *pre_X_tno_ijk,
-        const double *pre_eps_tno)
+        const double *pre_eps_tno,
+        /* (pair, atom) H-cache ids for ij/jk/ik — NULL or -1 disables */
+        const long *pair_ids_3)
 {
     if (n_pao_ijk == 0) return 0.0;
     const char Nc = 'N', Tc = 'T';
     const double one = 1.0, zero = 0.0;
     double _t_tic = 0.0;
+    if (tpt_enabled < 0 || tpt_enabled == 0) {
+        static int _tpt_env_checked = 0;
+        if (!_tpt_env_checked) {
+            const char *_e = getenv("DLPNO_TRIPLE_PROF");
+            tpt_enabled = (_e && _e[0] == '1') ? 1 : 0;
+            _tpt_env_checked = 1;
+        }
+    }
+    if (tpt_enabled) { tpt = (TPhaseTime){0}; }
 
     /* === Phase 1: TNO transform (or use precomputed) === */
     TIC;
@@ -747,6 +786,16 @@ double DLPNOcompute_one_triple_E_T0(
         const char *_env = getenv("DLPNO_TRIPLE_QVV_PAIR");
         _qvv_pair_enabled = (_env && _env[0] == '0') ? 0 : 1;
     }
+    /* Asymmetric DF fit (DLPNO_T_ASYMFIT, default ON): apply the metric
+     * fully on the small ov side and keep q_vv RAW — exact by
+     * associativity (q_vv pairs only with ovL in K_ovvv), removes the
+     * (n_tno*n_pno x naux x naux) dgemm that was 84%% of (T) time. */
+    static int _asymfit_enabled = -1;
+    if (_asymfit_enabled < 0) {
+        const char *_env2 = getenv("DLPNO_T_ASYMFIT");
+        _asymfit_enabled = (_env2 && _env2[0] == '0') ? 0 : 1;
+    }
+    const double *jhi_for_qvv = _asymfit_enabled ? NULL : jhi;
     ENSURE(ovL_sc, double, (size_t)3 * n * naux_ijk);
     if (!_qvv_pair_enabled) {
         ENSURE(vvL_sc, double, (size_t)n * n * naux_ijk);
@@ -773,6 +822,8 @@ double DLPNOcompute_one_triple_E_T0(
         qij_atom_flat, qia_atom_flat, qab_atom_flat,
         riatom_to_lmos_ext_dense, riatom_to_paos_ext_dense,
         jhi, ovL_sc, vvL_sc, ooL_sc);
+    TOC(df);
+    TIC;
 
     /* Per-pair q_vv build (Psi4-style restructure scaffold).
      * Replaces n_pao_ijk² factor in vvL with n_pao_ijk × n_pno_pair.
@@ -815,7 +866,8 @@ double DLPNOcompute_one_triple_E_T0(
                 X_tno_ijk, X_pno_ij,
                 center_atoms, center_off, local_Q_sorted, atom_pos_sorted,
                 qab_atom_off, qab_atom_n_pao, qab_atom_flat,
-                riatom_to_paos_ext_dense, jhi, q_vv_ij_sc);
+                riatom_to_paos_ext_dense, jhi_for_qvv,
+                pair_ids_3 ? pair_ids_3[0] : -1, q_vv_ij_sc);
         }
         if (n_pno_jk > 0 && n_pao_jk > 0) {
             DLPNObuild_triple_qvv_pair(
@@ -825,7 +877,8 @@ double DLPNOcompute_one_triple_E_T0(
                 X_tno_ijk, X_pno_jk,
                 center_atoms, center_off, local_Q_sorted, atom_pos_sorted,
                 qab_atom_off, qab_atom_n_pao, qab_atom_flat,
-                riatom_to_paos_ext_dense, jhi, q_vv_jk_sc);
+                riatom_to_paos_ext_dense, jhi_for_qvv,
+                pair_ids_3 ? pair_ids_3[1] : -1, q_vv_jk_sc);
         }
         if (n_pno_ik > 0 && n_pao_ik > 0) {
             DLPNObuild_triple_qvv_pair(
@@ -835,10 +888,11 @@ double DLPNOcompute_one_triple_E_T0(
                 X_tno_ijk, X_pno_ik,
                 center_atoms, center_off, local_Q_sorted, atom_pos_sorted,
                 qab_atom_off, qab_atom_n_pao, qab_atom_flat,
-                riatom_to_paos_ext_dense, jhi, q_vv_ik_sc);
+                riatom_to_paos_ext_dense, jhi_for_qvv,
+                pair_ids_3 ? pair_ids_3[2] : -1, q_vv_ik_sc);
         }
     }
-    TOC(df);
+    TOC(df_qvv);
 
     /* W_pao_tno + U cache */
     TIC;
@@ -1109,10 +1163,23 @@ double DLPNOcompute_one_triple_E_T0(
         const double *q_vv_for_ip[3] = {
             tscratch.q_vv_jk_sc, tscratch.q_vv_ik_sc, tscratch.q_vv_ij_sc};
         int int_naux2 = naux_ijk;
+        /* Asym fit: fully-fitted ov side, ovF = ovL_sc @ jhi^T
+         * (ovL_sc already carries one jhi).  (3n x naux^2) — trivial vs
+         * the removed vv-side metric apply. */
+        double *ovF = NULL;
+        if (_asymfit_enabled) {
+            ovF = (double *)malloc(sizeof(double) * (size_t)3 * n * naux_ijk);
+            int _rows_ovf = 3 * n;
+            dgemm_(&Tc, &Nc, &int_naux2, &_rows_ovf, &int_naux2,
+                   &one, jhi, &int_naux2,
+                   ovL_sc, &int_naux2,
+                   &zero, ovF, &int_naux2);
+        }
         for (int ip = 0; ip < 3; ip++) {
             const int n_pno_p = n_pno_for_ip[ip];
             if (n_pno_p == 0) continue;
-            const double *ovL_ip = ovL_sc + (size_t)ip * n * naux_ijk;
+            const double *ovL_ip = (_asymfit_enabled ? ovF : ovL_sc)
+                                   + (size_t)ip * n * naux_ijk;
             int int_N = n * n_pno_p;
             /* dgemm pattern matches K_ab build:
              *   K_ovvv (n, n × n_pno) row-major = ovL_ip @ q_vv.T
@@ -1126,6 +1193,7 @@ double DLPNOcompute_one_triple_E_T0(
                    ovL_ip, &int_naux2,
                    &zero, K_ovvv_for_ip[ip], &int_N);
         }
+        if (ovF) free(ovF);
     }
 
     /* K_ab_cache — skipped when QVV_PAIR=1 (W3 uses K_ovvv instead). */
@@ -1414,6 +1482,23 @@ double DLPNOcompute_one_triple_E_T0(
      * DLPNObuild_triple_tno_full's internal mallocs). */
     if (owns_tno) {
         free(X_tno_ijk); free(eps_tno);
+    }
+
+    if (tpt_enabled) {
+        pthread_mutex_lock(&_tpt_mutex);
+        shared_tpt_sum.tno        += tpt.tno;
+        shared_tpt_sum.aux_jhi    += tpt.aux_jhi;
+        shared_tpt_sum.df         += tpt.df;
+        shared_tpt_sum.u_cache    += tpt.u_cache;
+        shared_tpt_sum.t2_block   += tpt.t2_block;
+        shared_tpt_sum.K_ab       += tpt.K_ab;
+        shared_tpt_sum.K_ooov     += tpt.K_ooov;
+        shared_tpt_sum.K_for_V    += tpt.K_for_V;
+        shared_tpt_sum.t1_lmo     += tpt.t1_lmo;
+        shared_tpt_sum.w3_marshal += tpt.w3_marshal;
+        shared_tpt_sum.w3_kernel  += tpt.w3_kernel;
+        shared_tpt_sum.df_qvv     += tpt.df_qvv;
+        pthread_mutex_unlock(&_tpt_mutex);
     }
 
     return et_ijk;
@@ -1728,7 +1813,9 @@ double DLPNOcompute_E_T0_omp(
             /* Precomputed TNO from Phase A */
             n_tno_per_triple[t],
             X_tno_per_triple[t],
-            eps_per_triple[t]);
+            eps_per_triple[t],
+            /* no (pair, atom) H-cache on the OMP batched path */
+            NULL);
 
         et_per_triple[t] = et;
         E_T += et;

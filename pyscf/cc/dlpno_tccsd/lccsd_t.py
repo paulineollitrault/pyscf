@@ -898,6 +898,13 @@ def _build_pair_arena(_gak, pno_spaces, t2_for_T):
     return (_gak, pair_to_idx, g_pao_n, g_pno_n,
             g_pp_off, g_pp_flat, g_X_off, g_X_flat,
             g_T2_off, g_T2_flat)
+# Active (pair -> id) map for the C-level (pair, RI-atom) H-cache.  Set by
+# run_lccsd_t_ext around the TIGHT energy pass only (the prescreen pass uses
+# different loose integral stacks and must never share cache entries), read
+# concurrently by pool workers inside _orch.  None = cache disabled.
+_QVV_PAIR_ID_MAP = None
+
+
 def _orch(i, j, k, pno_spaces, t2_for_T,
                 C_pao, S_pao_full, F_pao_full, F_lmo,
                 sparse_df, screening, j2c_full, lmo_aux_mask,
@@ -949,6 +956,9 @@ def _orch(i, j, k, pno_spaces, t2_for_T,
 
     # 3. 3-pair arena
     keys_3 = [ij, jk, ik]
+    _pm = _QVV_PAIR_ID_MAP
+    pair_ids_3 = np.array([(_pm.get(key, -1) if _pm is not None else -1)
+                           for key in keys_3], dtype=np.int64)
     ij_lmos = [(i, j), (j, k), (i, k)]
     pair_paos_n_3 = np.zeros(3, dtype=np.int32)
     n_pno_arr_3   = np.zeros(3, dtype=np.int32)
@@ -1163,6 +1173,7 @@ def _orch(i, j, k, pno_spaces, t2_for_T,
             + [_ct.c_double, _ct.c_double] # T_CutTNO, S_cut_domain
             + [_ct.c_int]                  # pre_n_tno (0 = compute internally)
             + [_ct.c_void_p] * 2           # pre_X_tno_ijk, pre_eps_tno (NULL)
+            + [_ct.c_void_p]               # pair_ids_3 (H-cache; -1s disable)
         )
         _orch._libcc = _libcc
 
@@ -1219,6 +1230,7 @@ def _orch(i, j, k, pno_spaces, t2_for_T,
         lmo_aux_mask_c.ctypes.data_as(_ct.c_void_p),
         float(T_CutTNO), float(1e-8),
         0, None, None,  # pre_n_tno=0 (compute TNO internally)
+        pair_ids_3.ctypes.data_as(_ct.c_void_p),
     )
     return float(et)
 
@@ -1748,6 +1760,9 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     #       must be strong, else the triple is dropped.
     _negl_set = set((min(p), max(p)) for p in (negligible_pairs or []))
     _weak_set = set((min(p), max(p)) for p in (weak_pairs or []))
+    # Max weak pairs allowed in a kept triple: 2 (Psi4 rule). ORCA computes
+    # only triples with <= 1 weak pair; DLPNO_T_WEAKMAX=1 mimics that.
+    _weak_max = int(os.environ.get('DLPNO_T_WEAKMAX', '2'))
     _tT_set = set(k for k in t2_for_T.keys() if k not in _negl_set)
 
     # Build pair_lmo_idx locally — m is in pair (i,j)'s domain iff both
@@ -1778,7 +1793,7 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
             _n_before_weak_screen += 1
             weak_count = ((ij in _weak_set) + (ik in _weak_set) +
                           (jk in _weak_set))
-            if weak_count > 2:
+            if weak_count > _weak_max:
                 continue
             valid_triples.append((i, j, k))
     _n_all = nocc_lmo * (nocc_lmo - 1) * (nocc_lmo - 2) // 6
@@ -1823,6 +1838,14 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     #   T_CUT_DO_TRIPLES  = 1e-2   (read_options.cc line 2575; applied to PAO domains)
     # The triples-stage thresholds are 10× LOOSER than CCSD to keep per-triple
     # aux/PAO domains small while not hurting (T) accuracy.
+    # A/B experiment knobs (default = production behavior):
+    #   DLPNO_T_TCUTTNO          TNO occupation cutoff (default 1e-9)
+    #   DLPNO_T_TCUTTRIPLESWEAK  SC-MP2 prescreen drop threshold; 0 disables
+    #                            the prescreen (all triples at tight TNO)
+    T_CutTNO = float(os.environ.get('DLPNO_T_TCUTTNO', T_CutTNO))
+    T_CutTriplesWeak = float(
+        os.environ.get('DLPNO_T_TCUTTRIPLESWEAK', T_CutTriplesWeak))
+
     # Psi4 (T) thresholds — separate defaults for tight pass and (T0) prescreen.
     # read_options.cc L2565-2575. The PRE thresholds are deliberately looser so
     # the prescreen pass runs on a SMALLER sparse-DF infrastructure (cheap (T0)),
@@ -2355,6 +2378,69 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
     # Reuse the shared pool from the driver (same threads as LCCSD stage).
     # Set BLAS to single-thread during pool phase, restore after.
     _tmem('before_energy_pass')
+
+    # (pair, RI-atom) H-cache for the q_vv build (df_qvv was 82% of (T)
+    # wall; each strong pair is shared by ~33 triples).  Entries are built
+    # lazily in C by the first worker that touches a (pair, atom) slot.
+    # DLPNO_T_PAIRCACHE=0 disables; DLPNO_T_PAIRCACHE_GB caps memory.
+    global _QVV_PAIR_ID_MAP
+    _paircache_on = (os.environ.get('DLPNO_T_PAIRCACHE', '1') != '0'
+                     and _sparse_df is not None)
+    _qvvc_lib = None
+    if _paircache_on:
+        import ctypes as _ct_pc
+        from pyscf import lib as _pl_pc
+        _qvvc_lib = _pl_pc.load_library('libcc')
+        _qvvc_lib.DLPNOqvv_cache_init.argtypes = [
+            _ct_pc.c_long, _ct_pc.c_long, _ct_pc.c_double]
+        _qvvc_lib.DLPNOqvv_cache_free.argtypes = []
+        _qvvc_lib.DLPNOqvv_cache_stats.argtypes = [_ct_pc.c_void_p]
+        _pc_budget = float(os.environ.get('DLPNO_T_PAIRCACHE_GB', '150'))
+        # Priority admission: ids are handed out to pairs by descending
+        # triple-use count until the ESTIMATED cache footprint reaches the
+        # budget (the C side still enforces the hard cap).  Without this,
+        # first-touch order fills the budget with arbitrary pairs and the
+        # heavy-reuse ones get skipped.  Worst-case bytes per pair is
+        # 8 * n_pno * sum_A(pages_A*np_A); actual entries only materialize
+        # for atoms a triple actually touches — empirically ~half — hence
+        # the 0.5 factor on the estimate.
+        from collections import Counter as _Ctr
+        _pc_cnt = _Ctr()
+        for (_ti, _tj, _tk) in valid_triples:
+            for _pk in ((min(_ti, _tj), max(_ti, _tj)),
+                        (min(_tj, _tk), max(_tj, _tk)),
+                        (min(_ti, _tk), max(_ti, _tk))):
+                _pc_cnt[_pk] += 1
+        for (_di, _dk) in valid_pairs:      # degenerate (i,i,k) + (i,k,k)
+            _pc_cnt[(_di, _di)] += 1
+            _pc_cnt[(_dk, _dk)] += 1
+            _pc_cnt[(_di, _dk)] += 4
+        _qab_off = np.asarray(_sparse_df['qab_atom_off'])
+        _qab_np = np.asarray(_sparse_df['qab_atom_n_pao'], dtype=np.float64)
+        _pages_np = float(np.sum(np.divide(
+            np.diff(_qab_off), _qab_np, where=_qab_np > 0,
+            out=np.zeros_like(_qab_np))))          # sum_A pages_A * np_A
+        _budget_bytes = _pc_budget * 2**30
+        _pc_map = {}
+        _est = 0.0
+        for _pk, _n_use in _pc_cnt.most_common():
+            _pd = pno_spaces.get(_pk)
+            if _pd is None or _pd.get('X_pno') is None:
+                continue
+            _npno = int(_pd['X_pno'].shape[1])
+            if _npno == 0:
+                continue
+            _est_pk = 0.5 * 8.0 * _npno * _pages_np
+            if _est + _est_pk > _budget_bytes:
+                continue
+            _est += _est_pk
+            _pc_map[_pk] = len(_pc_map)
+        print(f'  (T) qvv pair-cache: admitting {len(_pc_map)} / '
+              f'{len(_pc_cnt)} pairs (est {_est/2**30:.1f} / '
+              f'{_pc_budget:.0f} GiB)', flush=True)
+        _qvvc_lib.DLPNOqvv_cache_init(max(len(_pc_map), 1),
+                                      int(mf.mol.natm), _pc_budget)
+        _QVV_PAIR_ID_MAP = _pc_map
     if (os.environ.get('DLPNO_TRIPLE_OMP', '0') == '1'
             and triple_kwargs.get('sparse_df') is not None
             and triple_kwargs.get('S_pao_full') is not None):
@@ -2385,6 +2471,16 @@ def run_lccsd_t_ext(mf, C_lmo, pno_spaces, strong_pairs,
         _tp("ENERGY pass distinct (serial)")
         et_degen_values = [_do_degen(ik) for ik in valid_pairs]
         _tp("ENERGY pass degenerate (serial)")
+
+    if _qvvc_lib is not None:
+        _st = np.zeros(5, dtype=np.float64)
+        _qvvc_lib.DLPNOqvv_cache_stats(_st.ctypes.data_as(
+            __import__('ctypes').c_void_p))
+        print(f'  (T) qvv pair-cache: built={int(_st[0])} '
+              f'hits={int(_st[1])} fallback={int(_st[2])} '
+              f'skipped={int(_st[3])} mem={_st[4]/2**30:.2f} GiB', flush=True)
+        _QVV_PAIR_ID_MAP = None
+        _qvvc_lib.DLPNOqvv_cache_free()
 
     if _tpool_owned:
         _tpool.shutdown(wait=True)
