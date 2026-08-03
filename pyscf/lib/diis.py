@@ -259,9 +259,14 @@ class DIIS:
         else:
             try:
                 c = numpy.linalg.solve(h, g)
-            except numpy.linalg.linalg.LinAlgError as e:
+            except numpy.linalg.LinAlgError:
+                # Singular despite passing the eigenvalue screen: fall back
+                # to the same regularized pseudo-inverse used for detected
+                # linear dependence instead of aborting the calculation.
                 logger.warn(self, ' diis singular, eigh(h) %s', w)
-                raise e
+                idx = abs(w) > 1e-12
+                c = numpy.dot(v[:,idx]*(1./w[idx]),
+                              numpy.dot(v[:,idx].T.conj(), g))
         logger.debug1(self, 'diis-c %s', c)
 
         xnew = None
