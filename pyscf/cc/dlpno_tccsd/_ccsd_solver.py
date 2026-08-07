@@ -2498,6 +2498,26 @@ def run_remaining_cycles_via_class(
 
     if _omp_ctx is not None:
         _omp_ctx.__exit__(None, None, None)
+    # Reached max_cycle without meeting the stopping criterion.  With
+    # DLPNO_REQUIRE_CONV=1 (campaign drivers) abort when the amplitudes are
+    # not merely slow but WRONG: on MOBH35 rxn 02 'end' the CCSD oscillated
+    # with Rmax ~ 25-50 and the silently-accepted amplitudes poisoned (T)
+    # by -211 Eh.  A run that is simply grinding (rxn 08: dE 2.9e-07,
+    # Rmax 3.7e-06 at cycle 100 - 2e-4 kcal/mol) is usable, so judge by
+    # sanity thresholds rather than by the tight dual criterion.
+    _last_dE = abs(locals().get('dE', float('nan')))
+    _last_R = abs(locals().get('r_max', float('nan')))
+    if os.environ.get('DLPNO_REQUIRE_CONV', '0') == '1':
+        _bad_dE = float(os.environ.get('DLPNO_CONV_SANITY_DE', '1e-5'))
+        _bad_R = float(os.environ.get('DLPNO_CONV_SANITY_R', '1e-3'))
+        if not (_last_dE < _bad_dE and _last_R < _bad_R):
+            raise RuntimeError(
+                f'DLPNO-CCSD diverged / stalled after {max_cycle} cycles '
+                f'(dE={_last_dE:.3e}, Rmax={_last_R:.3e}); aborting '
+                f'(DLPNO_REQUIRE_CONV=1)')
+    print(f'  WARNING: DLPNO-CCSD hit max_cycle={max_cycle} without meeting '
+          f'the stopping criterion (dE={_last_dE:.3e}, Rmax={_last_R:.3e}); '
+          f'accepting near-converged amplitudes.', flush=True)
     return max_cycle - 1, e_prev
 
 

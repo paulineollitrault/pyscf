@@ -942,7 +942,12 @@ def run_dlpno_tccsd_t(mf, ncas=None, nelec=None, mo_init=None,
             t1_cas=t1_cas, t2_cas=t2_cas,
             occ_cas_idx=occ_cas_idx, vir_cas_idx=vir_cas_idx,
             mo_coeff_cas=mo_coeff_cas_arg, s1e=s1e,
-            conv_tol=ccsd_conv_tol, max_cycle=ccsd_max_cycle,
+            conv_tol=ccsd_conv_tol,
+            # DLPNO_CCSD_MAX_CYCLE lets a campaign driver give strongly
+            # correlated systems more iterations without a code change
+            # (MOBH35 rxn 08 was still improving at the 100-cycle cap).
+            max_cycle=int(_os.environ.get('DLPNO_CCSD_MAX_CYCLE',
+                                          ccsd_max_cycle)),
             ncores=ncores, C_pao=C_pao, verbose=verbose,
             negligible_pairs=negligible_pairs,
             _pool=_shared_pool)
