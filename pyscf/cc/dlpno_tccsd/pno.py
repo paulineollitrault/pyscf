@@ -24,6 +24,7 @@ References:
     Ye & Berkelbach, JCTC 2024 (for ovL integral infrastructure)
 """
 
+import json
 import os
 import numpy as np
 from functools import reduce
@@ -393,11 +394,18 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         # ~200 GB of the box's 247 GB for the rest of make_pnos).  At
         # water-64 / 64 workers this gives |aux| ≈ 33 (~33 GB peak).
         _bytes_per_q = 2 * nao_loc * max(nao_loc, _npao_loc) * 8
-        try:
-            _n_workers_est = (max(1, _pool._max_workers)
-                              if _pool is not None else 1)
-        except AttributeError:
-            _n_workers_est = 8
+        # REPRODUCIBILITY: the aux-shell partition must NOT depend on how
+        # many workers happen to be in the pool. It used to be derived from
+        # _pool._max_workers, so a 16-worker and a 32-worker run split the
+        # DF integrals into different blocks, handed BLAS different GEMM
+        # shapes, and ended up with slightly different integrals. That noise
+        # is invisible on its own, but it propagates through the iterative
+        # LMP2 into the pair densities and flips borderline PNO keep/drop
+        # decisions -- worth up to ~0.2 kcal/mol on an S22 dimer, and the
+        # difference between a benchmark that reproduces and one that does
+        # not. Use a fixed nominal width instead; lower
+        # DLPNO_PNO_AUX_WORKERS if peak memory here is a problem.
+        _n_workers_est = int(os.environ.get('DLPNO_PNO_AUX_WORKERS', '32'))
         _target_peak_bytes = 32 * 1024 ** 3
         _target_q_per_block = max(
             8, int(_target_peak_bytes
@@ -716,6 +724,21 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
             D_pair *= 0.5
 
         pno_occ_init, U_pno_init = np.linalg.eigh(D_pair)
+        # DLPNO_DUMP_PNO_OCC=<path>: append this pair's raw occupation
+        # spectrum plus the quantities any plausible normalisation could use
+        # (trace, SC-MP2 pair energy, amplitude norm). Lets us replay
+        # alternative selection rules offline and compare PNO counts with
+        # ORCA, which reports "Pair density normalization ... MP2 norm".
+        _dump_occ = os.environ.get('DLPNO_DUMP_PNO_OCC')
+        if _dump_occ:
+            _o = np.sort(np.asarray(pno_occ_init))[::-1]
+            with open(_dump_occ, 'a') as _fh:
+                _fh.write(json.dumps({
+                    'i': int(i), 'j': int(j),
+                    'trace': float(np.sum(_o)),
+                    'e_ij': float(e_ij_init),
+                    't2_norm2': float(np.sum(T2_sc_init ** 2)),
+                    'occ': [float(x) for x in _o]}) + '\n')
         # Sort by VALUE descending (matching Psi4's descending diagonalize)
         order = np.argsort(pno_occ_init)[::-1]
         pno_occ_init = pno_occ_init[order]
