@@ -191,15 +191,32 @@ void DLPNOwm_replay_pair(
             }
         }
         if (nks == 0) continue;
+        /* pda[] uses -1 for "this PAO is not on this atom's page", exactly
+         * as lda[] does for LMO rows above.  The row side masks it; the
+         * column side used to feed it straight into the offset below, so a
+         * single absent column read one double PAST THE LEFT EDGE of the
+         * page (AddressSanitizer: heap-buffer-overflow, dlpno_wm_replay.c
+         * :214).  That returned whatever the allocator happened to hold, so
+         * the CCSD residual picked up garbage that changed run to run --
+         * (H2O)8 at the published TightPNO gave E_corr anywhere from -4.19
+         * to +4.08 Eh, or diverged.  Absent columns only appear once the
+         * PAO domains are small enough, which is why the defect hid at a
+         * tighter-than-published T_CutDO.
+         *
+         * An absent column contributes nothing, so its sub[] entries are
+         * zero -- the same meaning as dropping an absent row. */
+        long n_absent = 0;
         for (long v = 0; v < nred; v++) {
             pcols[v] = pda[used[v]];
+            if (pcols[v] < 0) n_absent++;
         }
 
         int n_rp = 0;
         for (long v = 0; v < nred; ) {
+            if (pcols[v] < 0) { v++; continue; }
             long v0 = v, s0 = pcols[v];
             v++;
-            while (v < nred && pcols[v] == s0 + (v - v0)) v++;
+            while (v < nred && pcols[v] >= 0 && pcols[v] == s0 + (v - v0)) v++;
             rp_v0[n_rp] = v0; rp_s0[n_rp] = s0; rp_len[n_rp] = v - v0;
             n_rp++;
         }
@@ -210,6 +227,8 @@ void DLPNOwm_replay_pair(
             for (int t = 0; t < nks; t++) {
                 const double *pr = pq + krows[t] * np_pg;
                 double *sr = sq + (size_t)t * nred;
+                /* runs no longer cover every column when some are absent */
+                if (n_absent) memset(sr, 0, sizeof(double) * (size_t)nred);
                 for (int r = 0; r < n_rp; r++) {
                     memcpy(sr + rp_v0[r], pr + rp_s0[r],
                            sizeof(double) * rp_len[r]);

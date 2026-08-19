@@ -1548,9 +1548,26 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                     # Store this centerQ's proj block + index metadata for
                     # the post-fit aux-first contraction.  qia pages are
                     # persistent per-atom stacks — only references kept.
+                    # _pair_used_in_Q holds POSITIONS within this atom's
+                    # page (DLPNOcompute_pair_used stores
+                    # riatom_to_paos_ext_dense[centerQ][pao_global], and
+                    # pair_used_inv is indexed by that position). The replay
+                    # consumers, both here and in DLPNOwm_replay_pair, use
+                    # this array as GLOBAL PAO indices -- pda[used[v]] and
+                    # searchsorted(pair_used_pao_global, used[v]). Those two
+                    # readings agree only while an atom's PAO list spans
+                    # every PAO, i.e. while the map is the identity, which is
+                    # true at large domains and false at the published
+                    # TightPNO T_CutDO. Pass the global indices the
+                    # consumers actually want. Order is preserved: both
+                    # pair_used_pao_global and riatom_to_paos_ext[A] are
+                    # ascending, so position order is global order.
+                    _used_global = np.ascontiguousarray(
+                        pair_used_pao_global[
+                            _paos_dense_at[pair_used_pao_global] >= 0])
                     _replay.append((
                         local_Q_long, _atom_pos_long, centerQ,
-                        _proj_c, _pair_used_in_Q.copy(),
+                        _proj_c, _used_global,
                         _lmos_dense_at, _paos_dense_at))
                 if (not _auxfirst) and _kj_flat is not None and do_proj:
                     _libcc_centerQ.DLPNOpartners_centerQ_step(
@@ -1939,12 +1956,25 @@ def compute_cc_integrals_sparse(mol, auxmol, C_lmo, C_pao, pno_spaces,
                         continue
                     _ks = _all_k[_kmask]
                     _krows = np.ascontiguousarray(_k_rows[_kmask])
-                    _pcols = np.ascontiguousarray(_pda[_used])
-                    if _gq is not None:
-                        _sub = np.empty((_nQp_b, _ks.size, _n_red_c))
-                        _gq(qia_atom[_cq], _apos, _krows, _pcols, _sub)
-                    else:
-                        _sub = qia_atom[_cq][np.ix_(_apos, _krows, _pcols)]
+                    # pda uses -1 for "PAO not on this atom's page", the
+                    # same convention _lda uses for rows just above. Fancy
+                    # indexing would WRAP a -1 round to the last column and
+                    # silently mix in the wrong PAO, so mask it: an absent
+                    # column contributes zero, like a dropped absent row.
+                    # (The C kernel had the matching bug as a heap overread;
+                    # see dlpno_wm_replay.c.)
+                    _pcols_raw = _pda[_used]
+                    _pmask = _pcols_raw >= 0
+                    _pcols = np.ascontiguousarray(_pcols_raw[_pmask])
+                    _sub = np.zeros((_nQp_b, _ks.size, _n_red_c))
+                    if _pcols.size:
+                        if _gq is not None:
+                            _sub_c = np.empty((_nQp_b, _ks.size, _pcols.size))
+                            _gq(qia_atom[_cq], _apos, _krows, _pcols, _sub_c)
+                        else:
+                            _sub_c = qia_atom[_cq][
+                                np.ix_(_apos, _krows, _pcols)]
+                        _sub[:, :, _pmask] = _sub_c
                     _sub2 = _sub.reshape(_nQp_b, -1)
                     _kl = np.ascontiguousarray(p_lmos_dense[_ks])
                     # ONE dgemm for both i and j K-sides.
