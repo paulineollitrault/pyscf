@@ -276,6 +276,27 @@ def _iterative_lmp2(pair_data, F_lmo, s1e, nocc_lmo,
 # Main PNO construction
 # ---------------------------------------------------------------------------
 
+def _aux_target_q_per_block(nao_loc, npao_loc,
+                            target_peak_bytes=32 * 1024 ** 3):
+    """Aux-shell block width for the DF int3c2e evaluation in make_pnos.
+
+    MUST NOT depend on the thread pool. It used to be sized from
+    ``_pool._max_workers``, so a 16-worker and a 32-worker run partitioned
+    the integrals differently, handed BLAS different GEMM shapes, and got
+    last-bit different integrals -- which propagates through the iterative
+    LMP2 into the pair densities and flips borderline PNO keep/drop
+    decisions (0.18 kcal/mol on an S22 dimer, and results that could not be
+    reproduced on a machine with a different core count).
+
+    The nominal width comes from DLPNO_PNO_AUX_WORKERS (default 32); lower
+    it if peak memory in this phase is a problem. Guarded by
+    pyscf/cc/test/test_dlpno_thread_invariance.py.
+    """
+    bytes_per_q = 2 * nao_loc * max(nao_loc, npao_loc) * 8
+    n_workers = int(os.environ.get('DLPNO_PNO_AUX_WORKERS', '32'))
+    return max(8, int(target_peak_bytes // max(1, bytes_per_q * n_workers)))
+
+
 def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
               T_CutPNO=1e-7, T_CutPairs=1e-4, T_CutPairs_MP2=1e-6,
               S_cut_domain=1e-8,
@@ -387,29 +408,13 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         aux_loc = _auxmol.ao_loc_nr()  # (naux_shells + 1,)
         n_aux_sh = _auxmol.nbas
         # Each per-block work-set holds TWO buffers simultaneously
-        # (raw_3c_block + half_block), each ~nao*max(nao,npao)*|aux| bytes.
-        # With N parallel workers via _pool.map, peak transient is
-        #   2 * N_workers * nao * max(nao, npao) * |aux| * 8.
-        # We size the block to cap total transient at ~32 GB (leaves
-        # ~200 GB of the box's 247 GB for the rest of make_pnos).  At
-        # water-64 / 64 workers this gives |aux| ≈ 33 (~33 GB peak).
-        _bytes_per_q = 2 * nao_loc * max(nao_loc, _npao_loc) * 8
-        # REPRODUCIBILITY: the aux-shell partition must NOT depend on how
-        # many workers happen to be in the pool. It used to be derived from
-        # _pool._max_workers, so a 16-worker and a 32-worker run split the
-        # DF integrals into different blocks, handed BLAS different GEMM
-        # shapes, and ended up with slightly different integrals. That noise
-        # is invisible on its own, but it propagates through the iterative
-        # LMP2 into the pair densities and flips borderline PNO keep/drop
-        # decisions -- worth up to ~0.2 kcal/mol on an S22 dimer, and the
-        # difference between a benchmark that reproduces and one that does
-        # not. Use a fixed nominal width instead; lower
-        # DLPNO_PNO_AUX_WORKERS if peak memory here is a problem.
-        _n_workers_est = int(os.environ.get('DLPNO_PNO_AUX_WORKERS', '32'))
-        _target_peak_bytes = 32 * 1024 ** 3
-        _target_q_per_block = max(
-            8, int(_target_peak_bytes
-                   // max(1, _bytes_per_q * _n_workers_est)))
+        # (raw_3c_block + half_block), each ~nao*max(nao,npao)*|aux| bytes,
+        # so peak transient is 2 * N * nao * max(nao,npao) * |aux| * 8 for N
+        # blocks in flight.  N is the NOMINAL worker count from the env, not
+        # the actual pool size: the partition must stay identical whatever
+        # thread count the run happens to use, or the results move.  Sizing
+        # for 32 caps the transient near 32 GB.
+        _target_q_per_block = _aux_target_q_per_block(nao_loc, _npao_loc)
 
         # Build aux-shell ranges hitting roughly _target_q_per_block AOs each.
         sh_ranges = []
@@ -424,6 +429,12 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         # Q index ranges for output slicing.
         q_ranges = [(int(aux_loc[lo]), int(aux_loc[hi]))
                     for lo, hi in sh_ranges]
+        # Recorded so a result can always be checked against the partition
+        # that produced it (this used to vary with the thread count).
+        log.info('DF aux partition: %d blocks, target %d AOs/block '
+                 '(DLPNO_PNO_AUX_WORKERS=%s) — independent of thread count',
+                 len(q_ranges), _target_q_per_block,
+                 os.environ.get('DLPNO_PNO_AUX_WORKERS', '32'))
 
         _mol_nbas = mf.mol.nbas
 
