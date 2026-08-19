@@ -61,20 +61,28 @@ TRIPLES = {
 
 PRESETS = {'TightPNO': TIGHTPNO, 'NormalPNO': NORMALPNO}
 
-# Published parameters that this implementation does not yet expose as a
-# separate knob. Listed explicitly so the gap is visible rather than implied
-# by silence; each is either fixed internally at the published value or
-# folded into another threshold.
-NOT_YET_WIRED = ('T_DiagScale', 'T_CutDO_ij', 'T_CutPre', 'T_CutMKN')
+# Published parameters this implementation does not expose as a driver
+# argument. Listed explicitly so the gap is visible rather than implied by
+# silence. The three MP2-stage PNO thresholds are make_pnos arguments whose
+# internal defaults already equal the TightPNO column (T_CutPNO_MP2 comes out
+# as T_CutPNO * 0.01 = 1e-9, T_CutEnergy_MP2 0.999, T_CutTrace_MP2 0.9999),
+# so TightPNO is reproduced exactly; NormalPNO is NOT, because those three
+# would need different values and cannot currently be set. T_CutMKN is fixed
+# at the published 1e-3 inside make_pnos.
+NOT_YET_WIRED = ('T_DiagScale', 'T_CutDO_ij', 'T_CutPre', 'T_CutMKN',
+                 'T_CutPNO_MP2', 'T_CutEnergy_MP2', 'T_CutTrace_MP2')
 
-# Keyword names accepted by run_dlpno_ccsd_t / make_pnos.
+# Keyword names run_dlpno_ccsd_t actually accepts (forwarded to
+# run_dlpno_tccsd_t). Passing anything else raises TypeError.
 _DRIVER_KEYS = ('T_CutPNO', 'T_CutEnergy', 'T_CutTrace', 'T_CutDO',
-                'T_CutPairs', 'T_CutPairs_MP2', 'T_CutPNO_MP2',
-                'T_CutEnergy_MP2', 'T_CutTrace_MP2')
+                'T_CutPairs', 'T_CutPairs_MP2')
 
 
 def thresholds(setting='TightPNO'):
     """Return the published thresholds for `setting` as driver kwargs.
+
+    Only the parameters the driver accepts are returned; see NOT_YET_WIRED
+    for the published ones that have no driver argument.
 
     >>> thresholds('TightPNO')['T_CutDO']
     0.005
