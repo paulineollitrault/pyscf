@@ -157,6 +157,17 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
 
     log = logger.new_logger(mol)
 
+    import time as _tm
+    _prof = os.environ.get('DLPNO_PROF_PAOS') == '1'
+    _t0 = [_tm.perf_counter()]
+
+    def _tick(what):
+        if _prof:
+            now = _tm.perf_counter()
+            print(f'    [PAOS-PROF] {what:22s} {now - _t0[0]:7.2f}s', flush=True)
+            _t0[0] = now
+
+
     if s1e is None:
         s1e = mf.get_ovlp()   # (nao, nao)
 
@@ -175,10 +186,12 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
     #
     # C_pao[:,μ] = e_μ - sum_i |i><i|S|e_μ> = δ[:,μ] - C_occ @ (C_occ^T @ S[:,μ])
     # In matrix form: C_pao = I - C_occ @ C_occ^T @ S
+    _tick('setup/C_occ')
     proj = np.dot(C_occ, np.dot(C_occ.T, s1e))   # (nao, nao)
     C_pao = np.eye(nao) - proj                     # (nao, nao); col = PAO
 
     # Normalize each PAO column so <μ̃|S|μ̃> = 1
+    _tick('proj + C_pao')
     S_pao = reduce(np.dot, (C_pao.T, s1e, C_pao))   # (nao, nao) PAO overlap
     norms = np.sqrt(np.diag(S_pao))
     # Columns with norm close to zero correspond to occupied-space directions;
@@ -188,11 +201,33 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
 
     # Recompute S_pao and F_pao after normalization
     S_pao = reduce(np.dot, (C_pao.T, s1e, C_pao))
-    fock_ao = mf.get_fock()
+    _tick('S_pao x2 + normalize')
+    # For a CONVERGED SCF the Roothaan equations give F exactly:
+    #     F C = S C diag(e)  and  C^T S C = 1   =>   F = S C diag(e) C^T S
+    # so the Fock matrix costs two GEMMs instead of a JK build.
+    #
+    # This matters because callers routinely drop the SCF's DF integrals to
+    # free memory (`mf.with_df._cderi = None`) before entering DLPNO. With
+    # cderi gone, mf.get_fock() silently REBUILDS the entire 3-index DF
+    # tensor: measured at 65.0 s of make_paos' 68.9 s on (H2O)34/cc-pVDZ --
+    # 94% of the stage, and the source of its N^3.45 scaling. The identity
+    # below reproduces mf.get_fock() to the SCF convergence level (2.5e-6 on
+    # that system) in 0.31 s.
+    fock_ao = None
+    if getattr(mf, 'converged', False):
+        _mo_c = getattr(mf, 'mo_coeff', None)
+        _mo_e = getattr(mf, 'mo_energy', None)
+        if _mo_c is not None and _mo_e is not None:
+            _sc = np.dot(s1e, _mo_c)
+            fock_ao = np.dot(_sc * np.asarray(_mo_e)[None, :], _sc.T)
+    if fock_ao is None:                      # unconverged or missing MOs
+        fock_ao = mf.get_fock()
+    _tick('get_fock')
     F_pao = reduce(np.dot, (C_pao.T, fock_ao, C_pao))
 
     # LMO domain assignment: select PAOs for each LMO's local virtual space.
 
+    _tick('F_pao')
     pao_domains = []
     ao_labels = mol.ao_labels(fmt=False)
     atom_ids = np.array([lbl[0] for lbl in ao_labels])
@@ -269,6 +304,7 @@ def make_paos(mf_or_mc, C_lmo, T_CutDO=0.02, s1e=None, with_df=None,
             if _ctx_mgr is not None:
                 _ctx_mgr.__exit__(None, None, None)
 
+        _tick('grid DOI loop')
         doi_iu = np.sqrt(doi_iu)
 
         for i in range(nocc_lmo):
