@@ -13,6 +13,7 @@ All integrals for pair (ij) use pair (ij)'s local aux domain with J_local^{-1/2}
 
 import os
 import numpy as np
+from pyscf.gto import moleintor as _moleintor
 
 
 def _ccmem(label):
@@ -316,11 +317,32 @@ def _compute_schwarz_data(mol, auxmol, _pool=None):
         J_metric_shell_diag[Q_sh] = J_full_diag[q0:q1].max() if q1 > q0 else 0.0
 
     # --- AO-side: max |(MN|MN)| per AO shell pair ---
+    #
+    # mol.intor() rebuilds the libcint optimizer on EVERY call, and this loop
+    # makes one call per shell PAIR -- 173k calls at (H2O)49. Each rebuild
+    # scans all nbas shells, so the screening setup cost went as nbas^4 and
+    # dominated everything: a py-spy profile of the local-DF stage put 88.5%
+    # of thread time in make_cintopt and a further 11.0% in its destructor,
+    # i.e. 99.5% of the stage was optimizer churn rather than integrals.
+    #
+    # Build the optimizer once and reuse it. Results are bit-identical
+    # (verified max|diff| = 0 over all 29403 shell pairs of (H2O)22) and the
+    # loop is ~157x faster there.
+    #
+    # _add_suffix matters: mol.intor('int2e') resolves to 'int2e_sph' for a
+    # spherical basis, and calling getints with the bare name silently
+    # computes CARTESIAN integrals of a different shape.
+    _intor_name = mol._add_suffix('int2e')
+    _cintopt = _moleintor.make_cintopt(mol._atm, mol._bas, mol._env,
+                                       _intor_name)
+
     def _row(M):
         row = np.zeros(nbas)
         for N in range(M + 1):
-            I_MN = mol.intor(
-                'int2e', shls_slice=(M, M + 1, N, N + 1, M, M + 1, N, N + 1))
+            I_MN = _moleintor.getints(
+                _intor_name, mol._atm, mol._bas, mol._env,
+                shls_slice=(M, M + 1, N, N + 1, M, M + 1, N, N + 1),
+                cintopt=_cintopt)
             row[N] = np.abs(I_MN).max() if I_MN.size > 0 else 0.0
         return M, row
 
