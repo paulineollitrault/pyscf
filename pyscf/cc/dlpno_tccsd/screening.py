@@ -68,6 +68,10 @@ def classify_pairs(pno_spaces, occ_cas_idx, vir_cas_idx,
     e_lmp2_strong = 0.0
     e_lmp2_negligible = 0.0   # static SC-MP2 correction from eliminated pairs
 
+    import os as _os_sc
+    _orca_pair_convention = (
+        _os_sc.environ.get('DLPNO_PAIRS_ORCA_CONVENTION') == '1')
+
     for (i, j), data in pno_spaces.items():
         e_ij = data['e_mp2']
         abs_e = abs(e_ij)
@@ -89,7 +93,25 @@ def classify_pairs(pno_spaces, occ_cas_idx, vir_cas_idx,
             continue
 
         fac = 1.0 if i == j else 2.0  # factor 2 for i<j pairs
-        if abs_e > T_CutPairs:
+        # NOTE: the threshold is applied to the BARE e_ij, not to fac*e_ij.
+        # That matches Psi4 (dlpno/ccsd.cc: e_ijs[ij] = e_ijs[ji] =
+        # e_ij_initial, then `fabs(e_ijs[ij]) >= T_CUT_PAIRS_`), where the
+        # factor of 2 comes from summing over ORDERED pairs rather than from
+        # a multiplier -- so this reproduces Jiang 2024, the paper this
+        # implementation follows.
+        #
+        # ORCA's TCutPairs is effectively 2x looser in these units: at the
+        # same nominal 1e-5 it treats ~20% more pairs at CCSD level (829 vs
+        # our 698 on (H2O)22 when emulated, against ORCA's ~836). That is a
+        # convention difference, NOT a defect here, and it accounts for most
+        # of the residual DLPNO-CCSD difference against ORCA -- which grows
+        # with system size because the count of borderline pairs does.
+        #
+        # Set DLPNO_PAIRS_ORCA_CONVENTION=1 for a like-for-like comparison
+        # against ORCA at a shared nominal threshold. It deliberately
+        # deviates from the published reference, so it is opt-in.
+        _e_test = fac * abs_e if _orca_pair_convention else abs_e
+        if _e_test > T_CutPairs:
             strong_pairs.append((i, j))
             e_lmp2_strong += fac * e_ij
         else:
