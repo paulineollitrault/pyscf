@@ -549,19 +549,49 @@ def make_pnos(mf, C_lmo, C_pao, pao_domains, S_pao, F_pao,
         # *bound* (which is a true upper bound on |e_ij|) is below the
         # SC-MP2 prescreen threshold — guaranteeing surviving pairs are a
         # superset of those the post-Phase-2a prescreen would have kept.
+        from pyscf.cc.dlpno_tccsd.screening import compute_doi_ij
         dipole_e, dipole_e_bound = compute_dipole_pair_energies(
             C_lmo, C_pao, mf.mol, F_lmo, pao_domains,
             S_pao, F_pao, with_df=mf.with_df)
+        # The dipole estimate is only valid for NON-OVERLAPPING LMOs, so the
+        # published screen is a disjunction of an overlap test and an energy
+        # test (Jiang 2024: "screen out the dipole pairs based on the
+        # T_CutDO_ij and T_CutPre cutoffs, the overlap and energy criteria
+        # used to ensure that LMOs i and j are non-overlapping"). Psi4
+        # dlpno.cc:722 implements exactly
+        #     keep if (overlap_big || energy_big || i == j)
+        #
+        # This code previously applied the ENERGY test alone, and against
+        # T_CutPairs_MP2 (1e-6) rather than T_CutPre (1e-7). Both errors drop
+        # pairs Psi4 keeps. The overlap test is the one that protects
+        # same-centre pairs, where the transition dipole can vanish by
+        # symmetry while the correlation is large: on CO the degenerate
+        # pi-pi' pair was discarded with an estimate below 1e-6 Eh while its
+        # true energy was -0.0239 Eh (29.9 kcal/mol), costing 16.9 kcal/mol
+        # in the total and 2.5 in (T).
+        doi_ij = compute_doi_ij(C_lmo, mf.with_df)
+        _t_cut_pre = float(os.environ.get('DLPNO_TCUTPRE', '1e-7'))
+        _t_cut_do_ij = float(os.environ.get('DLPNO_TCUTDOIJ', '1e-5'))
         keep_pairs_set = set()
+        _n_drop_energy_only = 0
         for i in range(nocc_lmo):
             for j in range(i, nocc_lmo):
-                if i == j or abs(dipole_e_bound[i, j]) >= T_CutPairs_MP2:
+                overlap_big = doi_ij[i, j] > _t_cut_do_ij
+                energy_big = abs(dipole_e_bound[i, j]) > _t_cut_pre
+                if i == j or overlap_big or energy_big:
                     keep_pairs_set.add((i, j))
                 else:
                     fac = 1.0 if i == j else 2.0
                     e_dipole_dropped += fac * dipole_e[i, j]
         _n_total = nocc_lmo * (nocc_lmo + 1) // 2
         _n_kept = len(keep_pairs_set)
+        # Log the COUNT, not just the estimated energy: a dropped pair whose
+        # dipole estimate is spuriously ~0 contributes ~0 to e_dipole_dropped,
+        # so the reported energy cannot reveal that anything was lost.
+        log.info('Dipole prescreen: kept %d / %d pairs (dropped %d, '
+                 'estimated %.3e Eh; T_CutPre=%.1e T_CutDO_ij=%.1e)',
+                 _n_kept, _n_total, _n_total - _n_kept, e_dipole_dropped,
+                 _t_cut_pre, _t_cut_do_ij)
 
     # ===================================================================
     # Phase 1: Build per-pair domain data and SC-MP2 initial guess
